@@ -19,10 +19,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
 	"ghostframe/internal/gft"
 )
 
-// Server is the GhostFrame-TLS server: one TCP port, TLS 1.3, knock -> proxy, otherwise -> web fallback.
+// Server is the GhostFrame-TLS server: one TCP+UDP port (TLS 1.3 + QUIC), knock -> proxy, otherwise -> web fallback.
 type Server struct {
 	cfg      *Config
 	psk      []byte
@@ -98,7 +100,17 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.logger.Printf("listening on %s (TLS1.3)", ln.Addr())
+	quicTLSCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"h3", "http/1.1"},
+	}
+	qln, err := quic.ListenAddr(ln.Addr().String(), quicTLSCfg, gft.DefaultQUICConfig())
+	if err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("quic listen %s: %w", ln.Addr(), err)
+	}
+	s.logger.Printf("listening on %s (TCP TLS1.3 + UDP QUIC)", ln.Addr())
 
 	var protos http.Protocols
 	protos.SetHTTP1(true)
@@ -113,8 +125,18 @@ func (s *Server) Run(ctx context.Context) error {
 		ErrorLog:          log.New(io.Discard, "", 0),
 	}
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() { defer wg.Done(); _ = hs.Serve(s.fallback) }()
+	go func() {
+		defer wg.Done()
+		for {
+			qconn, err := qln.Accept(ctx)
+			if err != nil {
+				return
+			}
+			go s.handleQUIC(ctx, qconn)
+		}
+	}()
 	go func() { // housekeeping
 		defer wg.Done()
 		t := time.NewTicker(time.Second)
@@ -139,6 +161,7 @@ func (s *Server) Run(ctx context.Context) error {
 		defer wg.Done()
 		<-ctx.Done()
 		_ = ln.Close()
+		_ = qln.Close()
 		_ = hs.Close()
 		s.fallback.Close()
 		s.closeAllSessions()
@@ -170,12 +193,16 @@ func (s *Server) closeAllSessions() {
 	s.smu.Unlock()
 }
 
-func remoteIP(c net.Conn) string {
-	h, _, err := net.SplitHostPort(c.RemoteAddr().String())
+func addrIP(a net.Addr) string {
+	h, _, err := net.SplitHostPort(a.String())
 	if err != nil {
-		return c.RemoteAddr().String()
+		return a.String()
 	}
 	return h
+}
+
+func remoteIP(c net.Conn) string {
+	return addrIP(c.RemoteAddr())
 }
 
 func isHTTP(b []byte) bool {
@@ -233,7 +260,33 @@ func (s *Server) handle(ctx context.Context, raw net.Conn, tlsCfg *tls.Config) {
 	s.serveSession(ctx, tc, ip)
 }
 
-func (s *Server) serveSession(ctx context.Context, tc *tls.Conn, ip string) {
+func (s *Server) handleQUIC(ctx context.Context, qconn *quic.Conn) {
+	ip := addrIP(qconn.RemoteAddr())
+	if s.audit.IsBanned(ip) {
+		_ = qconn.CloseWithError(0, "")
+		return
+	}
+	stCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	st, err := qconn.AcceptStream(stCtx)
+	cancel()
+	if err != nil {
+		_ = qconn.CloseWithError(0, "")
+		return
+	}
+	qsc := &gft.QUICStreamConn{Stream: st, Conn: qconn}
+	rc := gft.NewRewindConn(qsc)
+	res := s.verifier.ServerKnock(rc)
+	if res != gft.KnockOK {
+		s.audit.Record(ip, "quic-"+res.String())
+		s.logger.Printf("quic knock fail ip=%s reason=%s -> reject", ip, res)
+		_ = qsc.Close()
+		return
+	}
+	rc.StopRecording()
+	s.serveSession(ctx, qsc, ip)
+}
+
+func (s *Server) serveSession(ctx context.Context, tc net.Conn, ip string) {
 	sess := gft.NewSession(tc, false, s.params, s.handleConnect)
 	sess.OnBytes = s.stats.Add
 	id := s.nextSess.Add(1)

@@ -95,14 +95,15 @@ func UnmarshalParams(b []byte) (Params, error) {
 
 // Link is the decoded gft:// link.
 type Link struct {
-	V      int     `json:"v"`
-	Host   string  `json:"host"`
-	Port   int     `json:"port"`
-	SNI    string  `json:"sni"`
-	PSK    string  `json:"psk"` // base64
-	Pin    string  `json:"pin"` // sha256 hex of the leaf certificate DER
-	Params *Params `json:"params,omitempty"`
-	Remark string  `json:"-"`
+	V         int     `json:"v"`
+	Host      string  `json:"host"`
+	Port      int     `json:"port"`
+	SNI       string  `json:"sni"`
+	PSK       string  `json:"psk"`                 // base64
+	Pin       string  `json:"pin"`                 // sha256 hex of the leaf certificate DER
+	Transport string  `json:"transport,omitempty"` // "", "auto", "tcp", "quic"
+	Params    *Params `json:"params,omitempty"`
+	Remark    string  `json:"-"`
 }
 
 var hostRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.\-]{0,251}[A-Za-z0-9])?$`)
@@ -138,6 +139,11 @@ func (l *Link) Validate() error {
 	}
 	if _, err := hex.DecodeString(l.Pin); err != nil {
 		return errors.New("invalid pin hex")
+	}
+	switch strings.ToLower(l.Transport) {
+	case "", "auto", "tcp", "quic", "udp":
+	default:
+		return fmt.Errorf("unsupported transport %q", l.Transport)
 	}
 	if l.Params != nil {
 		if err := l.Params.Validate(); err != nil {

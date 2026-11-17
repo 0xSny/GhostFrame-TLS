@@ -2,11 +2,22 @@ package gft
 
 import (
 	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"io"
+	"math/big"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 // TestRewindConn: after reading k bytes (k in several boundary values) and rewinding,
@@ -195,4 +206,227 @@ func TestMuxEcho(t *testing.T) {
 		t.Fatalf("echo mismatch: %d vs %d", len(got), len(data))
 	}
 	t.Logf("echoed %d bytes through mux with flow control", len(got))
+}
+
+type memPacket struct {
+	data []byte
+	from net.Addr
+}
+
+type memPacketConn struct {
+	local   net.Addr
+	in      chan memPacket
+	peer    *memPacketConn
+	closed  chan struct{}
+	once    sync.Once
+	rMu     sync.Mutex
+	rDeadln time.Time
+}
+
+func newMemPacketPair() (*memPacketConn, *memPacketConn) {
+	a := &memPacketConn{
+		local:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001},
+		in:     make(chan memPacket, 256),
+		closed: make(chan struct{}),
+	}
+	b := &memPacketConn{
+		local:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40002},
+		in:     make(chan memPacket, 256),
+		closed: make(chan struct{}),
+	}
+	a.peer = b
+	b.peer = a
+	return a, b
+}
+
+func (m *memPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		m.rMu.Lock()
+		dl := m.rDeadln
+		m.rMu.Unlock()
+		var timerCh <-chan time.Time
+		if !dl.IsZero() {
+			d := time.Until(dl)
+			if d <= 0 {
+				return 0, nil, context.DeadlineExceeded
+			}
+			t := time.NewTimer(d)
+			defer t.Stop()
+			timerCh = t.C
+		}
+		select {
+		case pkt := <-m.in:
+			n := copy(p, pkt.data)
+			return n, pkt.from, nil
+		case <-m.closed:
+			return 0, nil, net.ErrClosed
+		case <-timerCh:
+			return 0, nil, context.DeadlineExceeded
+		}
+	}
+}
+
+func (m *memPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	select {
+	case <-m.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+	cp := append([]byte(nil), p...)
+	select {
+	case m.peer.in <- memPacket{data: cp, from: m.local}:
+	case <-m.peer.closed:
+	default:
+	}
+	return len(p), nil
+}
+
+func (m *memPacketConn) Close() error {
+	m.once.Do(func() { close(m.closed) })
+	return nil
+}
+func (m *memPacketConn) LocalAddr() net.Addr                { return m.local }
+func (m *memPacketConn) SetDeadline(t time.Time) error      { return m.SetReadDeadline(t) }
+func (m *memPacketConn) SetWriteDeadline(_ time.Time) error { return nil }
+func (m *memPacketConn) SetReadDeadline(t time.Time) error {
+	m.rMu.Lock()
+	m.rDeadln = t
+	m.rMu.Unlock()
+	return nil
+}
+
+// TestQUICStreamAndKnock verifies real quic-go TLS 1.3 handshake + Pinning + Knock + Mux
+// over an in-memory PacketConn pair (independent of OS loopback UDP firewall rules).
+func TestQUICStreamAndKnock(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		DNSNames:     []string{"blog.example.test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ := x509.ParseCertificate(der)
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+
+	psk := make([]byte, 32)
+	_, _ = rand.Read(psk)
+	link := &Link{
+		V:         1,
+		Host:      "127.0.0.1",
+		Port:      40002,
+		SNI:       "blog.example.test",
+		PSK:       base64.StdEncoding.EncodeToString(psk),
+		Pin:       PinOf(leaf),
+		Transport: "quic",
+	}
+
+	srvPC, cliPC := newMemPacketPair()
+	defer srvPC.Close()
+	defer cliPC.Close()
+
+	srvTLS := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"h3"},
+	}
+	qln, err := quic.Listen(srvPC, srvTLS, DefaultQUICConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer qln.Close()
+
+	ps := NewParamStore(DefaultParams())
+	verifier := NewKnockVerifier(psk)
+
+	go func() {
+		qc, err := qln.Accept(context.Background())
+		if err != nil {
+			return
+		}
+		st, err := qc.AcceptStream(context.Background())
+		if err != nil {
+			return
+		}
+		qsc := &QUICStreamConn{Stream: st, Conn: qc}
+		rc := NewRewindConn(qsc)
+		if res := verifier.ServerKnock(rc); res != KnockOK {
+			_ = qsc.Close()
+			return
+		}
+		rc.StopRecording()
+		srv := NewSession(qsc, false, ps, func(s *Stream, target string, first []byte) {
+			defer s.Close()
+			if len(first) > 0 {
+				_, _ = s.Write(first)
+			}
+			buf := make([]byte, 1024)
+			for {
+				n, err := s.Read(buf)
+				if n > 0 {
+					_, _ = s.Write(buf[:n])
+				}
+				if err != nil {
+					return
+				}
+			}
+		})
+		_ = srv.Run()
+	}()
+
+	cliTLS, err := TLSConfigFor(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cliTLS.NextProtos = []string{"h3"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	qc, err := quic.Dial(ctx, cliPC, srvPC.LocalAddr(), cliTLS, DefaultQUICConfig())
+	if err != nil {
+		t.Fatalf("quic.Dial: %v", err)
+	}
+	defer qc.CloseWithError(0, "")
+
+	st, err := qc.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qsc := &QUICStreamConn{Stream: st, Conn: qc}
+	if _, err := qsc.Write(BuildKnock(psk, time.Now())); err != nil {
+		t.Fatal(err)
+	}
+
+	cli := NewSession(qsc, true, ps, nil)
+	go func() { _ = cli.Run() }()
+	defer cli.Close()
+
+	s, err := cli.OpenStream("example.org:443", []byte("quic-0rtt|"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	want := "quic-0rtt|ok"
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(s, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	_ = s.Close()
+
+	// Verify bad Pin fails on TLSConfigFor
+	bad := *link
+	bad.Pin = strings.Repeat("00", 32)
+	badCfg, _ := TLSConfigFor(&bad)
+	if err := badCfg.VerifyConnection(tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}); err == nil {
+		t.Fatal("bad pin must be rejected")
+	}
+	t.Log("QUIC + Pinning + Knock + 0-RTT Mux OK")
 }

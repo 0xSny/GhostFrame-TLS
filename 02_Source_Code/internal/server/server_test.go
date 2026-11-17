@@ -312,3 +312,130 @@ func TestProxyEndToEnd(t *testing.T) {
 	}
 	t.Logf("bad-PSK ping failed as expected: %v", err)
 }
+
+func loopbackUDPAllowed() bool {
+	s, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		return false
+	}
+	defer s.Close()
+	c, err := net.DialUDP("udp4", nil, s.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		return false
+	}
+	defer c.Close()
+	_, _ = c.Write([]byte("ping"))
+	_ = s.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	var buf [8]byte
+	_, _, err = s.ReadFromUDP(buf[:])
+	return err == nil
+}
+
+func TestQUICAndUTLSEndToEnd(t *testing.T) {
+	AllowPrivateTargets = true
+	defer func() { AllowPrivateTargets = false }()
+	s, link, _, cancel := startTestServer(t)
+	defer cancel()
+
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, err := c.Read(buf)
+					if n > 0 {
+						if _, werr := c.Write(buf[:n]); werr != nil {
+							return
+						}
+					}
+					if err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+
+	udpLoopOK := loopbackUDPAllowed()
+
+	for _, mode := range []string{"tcp", "quic", "auto"} {
+		t.Run(mode, func(t *testing.T) {
+			if mode == "quic" && !udpLoopOK {
+				t.Skip("OS loopback UDP 127.0.0.1 blocked by host firewall; QUIC covered by gft.TestQUICStreamAndKnock & live deploy")
+			}
+			l := *link
+			l.Transport = mode
+			ps := gft.NewParamStore(gft.DefaultParams())
+			sess, actualMode, hs, err := gft.DialSessionInfo(context.Background(), &l, ps, 5*time.Second)
+			if err != nil {
+				t.Fatalf("DialSessionInfo(%s): %v", mode, err)
+			}
+			defer sess.Close()
+
+			st, err := sess.OpenStream(echo.Addr().String(), []byte("dual-0rtt|"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.Write([]byte(mode)); err != nil {
+				t.Fatal(err)
+			}
+			want := "dual-0rtt|" + mode
+			got := make([]byte, len(want))
+			if _, err := io.ReadFull(st, got); err != nil {
+				t.Fatalf("ReadFull(%s): %v", mode, err)
+			}
+			if string(got) != want {
+				t.Fatalf("got %q, want %q", got, want)
+			}
+			_ = st.Close()
+
+			pr, err := gft.Ping(context.Background(), &l, 5*time.Second)
+			if err != nil {
+				t.Fatalf("Ping(%s): %v", mode, err)
+			}
+			t.Logf("mode=%s actual=%s pingTransport=%s hs=%v rtt=%v", mode, actualMode, pr.Transport, hs, pr.KnockRTT)
+		})
+	}
+
+	// Bad Pin must fail on uTLS TCP
+	badPin := *link
+	badPin.Pin = strings.Repeat("00", 32)
+	badPin.Transport = "tcp"
+	if _, _, err := gft.DialKnockTCP(context.Background(), &badPin, 3*time.Second); err == nil {
+		t.Fatal("uTLS bad pin must fail")
+	}
+
+	if udpLoopOK {
+		badPin.Transport = "quic"
+		if _, _, err := gft.DialKnockQUIC(context.Background(), &badPin, 3*time.Second); err == nil {
+			t.Fatal("QUIC bad pin must fail")
+		}
+		badPSK := *link
+		badPSK.Transport = "quic"
+		badPSK.PSK = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+		if _, err := gft.Ping(context.Background(), &badPSK, 3*time.Second); err == nil {
+			t.Fatal("QUIC bad PSK must fail")
+		}
+		time.Sleep(100 * time.Millisecond)
+		foundQuicAudit := false
+		for _, entry := range s.audit.List() {
+			if entry.Reasons["quic-hmac"] > 0 {
+				foundQuicAudit = true
+				break
+			}
+		}
+		if !foundQuicAudit {
+			t.Fatalf("expected quic-hmac audit entry, got %+v", s.audit.List())
+		}
+	}
+}

@@ -28,6 +28,7 @@ func (ws *WebServer) Handler() http.Handler {
 	mux.HandleFunc("/api/connect", ws.handleConnect)
 	mux.HandleFunc("/api/disconnect", ws.handleDisconnect)
 	mux.HandleFunc("/api/sysproxy", ws.handleSysProxy)
+	mux.HandleFunc("/api/transport", ws.handleTransport)
 	mux.HandleFunc("/api/clash", ws.handleClash)
 	return mux
 }
@@ -89,6 +90,26 @@ func (ws *WebServer) handleSysProxy(w http.ResponseWriter, r *http.Request) {
 	_ = ws.engine.SetSysProxyToggle(req.Enable)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "enable": req.Enable})
+}
+
+func (ws *WebServer) handleTransport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if err := ws.engine.SetTransport(req.Mode); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mode": req.Mode})
 }
 
 func (ws *WebServer) handleClash(w http.ResponseWriter, r *http.Request) {

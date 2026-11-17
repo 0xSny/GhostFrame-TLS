@@ -50,6 +50,7 @@ type Engine struct {
 	config     ClientConfig
 	state      ConnState
 	lastErr    string
+	activeMode string
 	sess       *gft.Session
 	paramStore *gft.ParamStore
 
@@ -173,16 +174,21 @@ func (e *Engine) Connect() error {
 	e.lastErr = ""
 	e.mu.Unlock()
 
-	e.Logf("Connecting to Japan node %s:%d via TLS 1.3 Knock...", l.Host, l.Port)
+	tmode := l.Transport
+	if tmode == "" {
+		tmode = "auto"
+	}
+	e.Logf("Connecting to %s:%d (mode=%s, uTLS+QUIC Dual-Stack)...", l.Host, l.Port, tmode)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	sess, hs, err := gft.DialSession(ctx, l, e.paramStore, 8*time.Second)
+	sess, activeMode, hs, err := gft.DialSessionInfo(ctx, l, e.paramStore, 10*time.Second)
 	if err != nil {
 		e.mu.Lock()
 		e.state = StateError
 		e.lastErr = err.Error()
+		e.activeMode = ""
 		e.mu.Unlock()
 		e.Logf("Connection failed: %v", err)
 		return err
@@ -192,11 +198,12 @@ func (e *Engine) Connect() error {
 	e.sess = sess
 	e.state = StateConnected
 	e.lastErr = ""
+	e.activeMode = activeMode
 	e.pingMs = hs.Milliseconds()
 	e.stopPing = make(chan struct{})
 	e.mu.Unlock()
 
-	e.Logf("Connected successfully! TLS 1.3 handshake: %v", hs)
+	e.Logf("Connected successfully via [%s]! Handshake: %v", activeMode, hs)
 
 	if e.config.SysProxy {
 		if err := SetSystemProxy(e.config.HTTPAddr, true); err != nil {
@@ -229,6 +236,7 @@ func (e *Engine) Disconnect() {
 	}
 	s := e.sess
 	e.sess = nil
+	e.activeMode = ""
 	e.mu.Unlock()
 
 	if s != nil {
@@ -249,6 +257,7 @@ func (e *Engine) watchSession(s *gft.Session) {
 	if e.sess == s {
 		e.state = StateDisconnected
 		e.sess = nil
+		e.activeMode = ""
 		if e.stopPing != nil {
 			select {
 			case <-e.stopPing:
@@ -368,6 +377,22 @@ func (e *Engine) Logf(format string, args ...any) {
 	fmt.Printf("[%s] %s\n", entry.Time, msg)
 }
 
+// SetTransport updates the preferred transport mode ("auto", "tcp", "quic").
+func (e *Engine) SetTransport(mode string) error {
+	switch mode {
+	case "", "auto", "tcp", "quic", "udp":
+	default:
+		return fmt.Errorf("invalid transport mode: %s", mode)
+	}
+	e.mu.Lock()
+	if e.config.Link != nil {
+		e.config.Link.Transport = mode
+	}
+	e.mu.Unlock()
+	e.Logf("Transport preference updated to: %s", mode)
+	return e.SaveConfig()
+}
+
 // Status returns the current engine state snapshot for the UI.
 func (e *Engine) Status() map[string]any {
 	e.mu.RLock()
@@ -382,7 +407,7 @@ func (e *Engine) Status() map[string]any {
 	histCopy := make([]TrafficPoint, len(e.history))
 	copy(histCopy, e.history)
 
-	var nodeName, nodeHost string
+	var nodeName, nodeHost, tPref string
 	var nodePort int
 	if e.config.Link != nil {
 		nodeName = e.config.Link.Remark
@@ -391,25 +416,31 @@ func (e *Engine) Status() map[string]any {
 		}
 		nodeHost = e.config.Link.Host
 		nodePort = e.config.Link.Port
+		tPref = e.config.Link.Transport
+	}
+	if tPref == "" {
+		tPref = "auto"
 	}
 
 	return map[string]any{
-		"state":       string(e.state),
-		"last_err":    e.lastErr,
-		"ping_ms":     e.pingMs,
-		"up_bps":      e.curUpBps,
-		"down_bps":    e.curDownBps,
-		"total_up":    totalUp,
-		"total_down":  totalDown,
-		"history":     histCopy,
-		"sys_proxy":   e.config.SysProxy,
-		"socks_addr":  e.config.SocksAddr,
-		"http_addr":   e.config.HTTPAddr,
-		"node_name":   nodeName,
-		"node_host":   nodeHost,
-		"node_port":   nodePort,
-		"link_uri":    e.LinkURI(),
-		"clash_yaml":  e.ClashYAML(),
+		"state":            string(e.state),
+		"last_err":         e.lastErr,
+		"active_transport": e.activeMode,
+		"transport_pref":   tPref,
+		"ping_ms":          e.pingMs,
+		"up_bps":           e.curUpBps,
+		"down_bps":         e.curDownBps,
+		"total_up":         totalUp,
+		"total_down":       totalDown,
+		"history":          histCopy,
+		"sys_proxy":        e.config.SysProxy,
+		"socks_addr":       e.config.SocksAddr,
+		"http_addr":        e.config.HTTPAddr,
+		"node_name":        nodeName,
+		"node_host":        nodeHost,
+		"node_port":        nodePort,
+		"link_uri":         e.LinkURI(),
+		"clash_yaml":       e.ClashYAML(),
 	}
 }
 
