@@ -133,6 +133,18 @@ type asset struct {
 }
 
 func (s *Server) buildRouter() http.Handler {
+	fb := s.buildFallbackHandler()
+	prefix := s.cfg.PanelPath
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == prefix || strings.HasPrefix(r.URL.Path, prefix+"/") {
+			s.panel.serve(w, r, strings.TrimPrefix(r.URL.Path, prefix))
+			return
+		}
+		fb.ServeHTTP(w, r)
+	})
+}
+
+func blogHandler() http.Handler {
 	assets := map[string]asset{}
 	var idx strings.Builder
 	idx.WriteString(`<h1>Latest posts</h1>`)
@@ -150,12 +162,7 @@ func (s *Server) buildRouter() http.Handler {
 	assets["/robots.txt"] = asset{robots, "text/plain; charset=utf-8", "public, max-age=3600"}
 	assets["/favicon.ico"] = asset{makeFavicon(), "image/x-icon", "public, max-age=86400"}
 
-	prefix := s.cfg.PanelPath
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == prefix || strings.HasPrefix(r.URL.Path, prefix+"/") {
-			s.panel.serve(w, r, strings.TrimPrefix(r.URL.Path, prefix))
-			return
-		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			methodNotAllowed(w)
 			return

@@ -4,9 +4,14 @@
 *.dll
 *.so
 *.dylib
+*-linux-*
 gft-server-linux-amd64
-gft-client-gui
-gft-server
+dist/
+/gft-client-gui
+/gft-server
+/02_Source_Code/gft-client-gui
+/02_Source_Code/gft-server
+bin/
 
 # Go build & test artifacts
 *.test
@@ -17,6 +22,7 @@ __debug_bin*
 __pycache__/
 *.pyc
 deploy_japan.py
+verify_test.py
 deploy_record.json
 test_results.json
 egress_result.json

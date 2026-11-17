@@ -133,6 +133,18 @@ func (a *Audit) List() []AuditEntry {
 	return out
 }
 
+// Clear empties all recorded audit events (preserving manual bans or clearing all when clearBans is true).
+func (a *Audit) Clear(clearBans bool) {
+	a.mu.Lock()
+	a.entries = map[string]*AuditEntry{}
+	if clearBans {
+		a.banned = map[string]bool{}
+	}
+	a.dirty = true
+	a.mu.Unlock()
+	a.Flush()
+}
+
 func (a *Audit) Flush() {
 	if a.path == "" {
 		return

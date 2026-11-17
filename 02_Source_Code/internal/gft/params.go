@@ -6,25 +6,25 @@ import (
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 )
 
-// Params are the tunable obfuscation parameters.
+// Params are the tunable obfuscation and keepalive parameters for GFT v2.
 type Params struct {
-	PadMin  int `json:"pmin"`  // minimum padding bytes (0-255)
-	PadMax  int `json:"pmax"`  // maximum padding bytes (0-255)
-	PadProb int `json:"pprob"` // percent chance of padding after the first 5 frames (0-100)
-	HbMinMs int `json:"hbmin"` // min noise heartbeat interval (ms)
-	HbMaxMs int `json:"hbmax"` // max noise heartbeat interval (ms)
+	PadMin  int `json:"pmin"`  // min small-packet perturbation padding (0..64)
+	PadMax  int `json:"pmax"`  // max small-packet perturbation padding (0..512)
+	PadProb int `json:"pprob"` // probability % for small-packet perturbation after frame 8 (0..100)
+	HbMinMs int `json:"hbmin"` // min idle-aware noise heartbeat interval (ms)
+	HbMaxMs int `json:"hbmax"` // max idle-aware noise heartbeat interval (ms)
 }
 
+// DefaultParams returns the v2 production defaults.
 func DefaultParams() Params {
-	return Params{PadMin: 8, PadMax: 96, PadProb: 30, HbMinMs: 15000, HbMaxMs: 45000}
+	return Params{PadMin: 0, PadMax: 64, PadProb: 35, HbMinMs: 25000, HbMaxMs: 55000}
 }
 
 func (p Params) Validate() error {
-	if p.PadMin < 0 || p.PadMax > 255 || p.PadMin > p.PadMax {
-		return errors.New("pmin/pmax must satisfy 0<=pmin<=pmax<=255")
+	if p.PadMin < 0 || p.PadMax > 512 || p.PadMin > p.PadMax {
+		return errors.New("pmin/pmax must satisfy 0<=pmin<=pmax<=512")
 	}
 	if p.PadProb < 0 || p.PadProb > 100 {
 		return errors.New("pprob must be 0..100")
@@ -35,7 +35,7 @@ func (p Params) Validate() error {
 	return nil
 }
 
-// ParamStore holds hot-swappable params.
+// ParamStore holds hot-swappable obfuscation params.
 type ParamStore struct{ v atomic.Pointer[Params] }
 
 func NewParamStore(p Params) *ParamStore { s := &ParamStore{}; s.v.Store(&p); return s }
@@ -74,14 +74,38 @@ func fillRandom(b []byte) {
 	}
 }
 
-const frameBufSize = 6 + 65535 + 255
+const frameBufSize = 8 + 65535 + 512
 
-var bufPool = sync.Pool{New: func() any { b := make([]byte, frameBufSize); return &b }}
+var (
+	bufPool    = sync.Pool{New: func() any { b := make([]byte, frameBufSize); return &b }}
+	lowMemPool = make(chan *[]byte, 12)
+)
 
 // GetBuf returns a pooled frame-sized buffer.
-func GetBuf() *[]byte { return bufPool.Get().(*[]byte) }
+func GetBuf() *[]byte {
+	if IsLowMemMode() {
+		select {
+		case b := <-lowMemPool:
+			return b
+		default:
+			b := make([]byte, frameBufSize)
+			return &b
+		}
+	}
+	return bufPool.Get().(*[]byte)
+}
 
-// PutBuf returns a buffer to the pool.
-func PutBuf(b *[]byte) { bufPool.Put(b) }
-
-var _ = unsafe.Sizeof(0)
+// PutBuf returns a buffer to the pool (bounded to 12 buffers in LowMemMode).
+func PutBuf(b *[]byte) {
+	if b == nil {
+		return
+	}
+	if IsLowMemMode() {
+		select {
+		case lowMemPool <- b:
+		default:
+		}
+		return
+	}
+	bufPool.Put(b)
+}

@@ -1,187 +1,97 @@
-# GhostFrame-TLS (GFT) Pro
+# GhostFrame-TLS (GFT) v3.2
 
-> **Next-Generation High-Stealth Anti-Censorship Proxy Protocol with 0-RTT Multiplexing & Lossless Decoy Fallback**
+> **Native Multi-Platform · Decentralized Non-CDN SNI Probing · Built-in `gft` TUI Control Center · Phicomm N1 / Router Hardware Tuning**
 
-[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](https://golang.org)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-blue)](https://github.com)
+[![CI](https://github.com/Spittingjiu/GhostFrame-TLS/actions/workflows/ci.yml/badge.svg)](https://github.com/Spittingjiu/GhostFrame-TLS/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://golang.org)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20(amd64%2Farm64)%20|%20Windows%20|%20OpenWrt-blue)](https://github.com/Spittingjiu/GhostFrame-TLS)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
-## ⚡ Overview
+## ⚡ Architecture Highlights (v3.2)
 
-**GhostFrame-TLS (GFT)** is a self-designed, production-grade anti-censorship tunnel and proxy protocol. It combines **TLS 1.3 certificate pinning**, an initial **dynamic cryptographic Knock Frame (HMAC-SHA256)**, **0-RTT address piggybacking**, and a lossless stream rewind mechanism (**`RewindConn`**) that falls back to a high-fidelity English engineering blog.
+1. **One-Line Deployment & Built-in `gft` Control Center (`internal/tui`)**:
+   - Unified `gft-server` binary exposes an interactive UTF-8/ANSI-aligned dashboard (`gft` symlink or `gft-server menu`) with 4 transactional safety locks (process lockfile, `.bak` backup + atomic rename, isolated `nft`/`iptables` `gft_hop` namespace, and 2.5s health-probe automatic rollback on broken changes).
+   - Pure-Go embedded terminal half-block QR generator, multi-platform delivery card (Windows / Phicomm N1 / OpenClash), audit IP banning, OTA release updater with SHA-256 verification, and clean uninstall.
+2. **Decentralized Non-CDN SNI Probing & Key-Preserving Rotation (`internal/sni`)**:
+   - Zero centralized CDN or vendor defaults: concurrently probes regional university/research origins (`APAC-JP-KR`, `APAC-SG-HK`, `NA`, `EU`), enforces 4 checks (public non-self IP, TLS 1.3 + `h2`, CDN fingerprint exclusion, low RTT), and randomly selects among Top-5 via `crypto/rand`.
+   - `RotateSNI` preserves the server private key so SPKI `Pin` stays identical for existing clients during SNI rotation.
+3. **Unified Core Across Desktop & Phicomm N1 / Routers**:
+   - **Windows (`GhostFrame-Pro.exe`)**: 100% pure Go zero-CGO native Win32/GDI+/DWM console + dynamic vector system tray (`internal/winui`), zero browser wrappers, `-no-sysproxy` / `GFT_NO_SYSPROXY=1` sandbox protection.
+   - **Linux / Phicomm N1 S905D / OpenWrt (`gft-core`)**: Headless daemon with `-low-mem` (`4MB` stream window & bounded pool <35MB RSS) and automatic `ChaCha20-Poly1305` prioritization when ARM64 hardware lacks AES extensions.
+4. **Dual-Track QUIC + uTLS Racing & Seamless UDP Continuity**:
+   - Pre-TLS `SessionID` HMAC + Pre-QUIC `AuthPacketConn` silent drops + 0ms `RewindConn` mirroring.
+   - Fragmented RFC 9221 Datagrams (`<=8192B`) + multiplexed QUIC stream UDP fallback (`<=65507B`) + `ClientID` NAT port preservation across 35–65s UDP port hopping and QUIC↔TCP failovers.
 
-To active GFW probing or port scanners, the server behaves identically to a genuine Nginx web server. Only clients possessing the pre-shared key (PSK) can unlock the encrypted proxy multiplexer.
-
-```
-       +--------------------------------------------------------+
-       |                  Client (gft-client-gui)               |
-       |  [SOCKS5: 10808] [HTTP: 10809] [Wininet SysProxy Toggle]|
-       +---------------------------+----------------------------+
-                                   | TLS 1.3 + Dynamic Knock Frame
-                                   v
-       +--------------------------------------------------------+
-       |                  Server (gft-server)                   |
-       |                 Listening on Port 8443                 |
-       +---------------------------+----------------------------+
-                                   |
-         +-------------------------+-------------------------+
-         | Knock Verified (HMAC OK)| Knock Failed / HTTP Probe
-         v                         v
-+------------------+     +--------------------+---------------------+
-| GFT 0-RTT Mux    |     | Lossless RewindConn| Threat Perception   |
-| Stream Forwarder |     | Fallback Router    | Trap Audit Table    |
-+--------+---------+     +---------+----------+----------+----------+
-         |                         |                     |
-         v                         v                     v
-   Target Internet          Decoy Tech Blog        Secret Panel
- (api.ip.sb / Google)       (nginx/1.24.0)    (/gft-panel-.../)
+```text
+[Apps / Games / OpenClash / Mihomo]
+        │  SOCKS5 (TCP + UDP ASSOCIATE) / HTTP CONNECT
+        ▼
+[GhostFrame-Pro.exe (Win32) | gft-core (N1 arm64 / Linux)]
+  ├─ Router: CN-IP / CN-Domain Bypass (Zero Local DNS Leak)
+  ├─ ApexScheduler (ClientID NAT Preservation + SchedulerUDPAssoc)
+  │    ├─ [QUIC Track]: Fragmented Datagrams / Stream UDP + Port Hopping
+  │    └─ [TCP Pool]:  uTLS Chrome PQ + SNI Record Split + ChaCha20 (N1 S905D)
+        ▼  TCP/UDP :443 (+ isolated gft_hop UDP range -> :443)
+[gft-server (Dual-Stack) + `gft` TUI]
+  ├─ TCP MirrorInspector ──► Pass: TLS 1.3 + ClientAuth(ClientID) ──► Shared NAT Pool
+  │                      └── Fail: 0ms RewindConn Bridge ──► Auto-Probed Non-CDN SNI
+  └─ UDP AuthPacketConn  ──► Pass: QUIC + Fragment Reassembly ──► Shared NAT Pool
+                         └── Fail: 100% Silent Drop
 ```
 
 ---
 
-## 🌟 Key Architecture & Highlights
+## 🚀 Quick One-Line Install
 
-### 1. Cryptographic Knock Frame (Anti-Replay & Zero-Fingerprint)
-- **Structure**: `[16B Nonce] [8B UnixNano Timestamp] [32B HMAC-SHA256(PSK, Nonce || Ts)] [Dynamic Padding (16-128B)]`
-- **Clock Drift Window**: Strictly enforced at ±90 seconds.
-- **Replay Protection**: Nonce cache with 120-second TTL prevents replay attacks.
-- **Dynamic Padding**: HMAC-derived pseudo-random padding lengths eliminate packet-size statistical profiling.
+### Server (Ubuntu / Debian / Rocky / Arch Linux)
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Spittingjiu/GhostFrame-TLS/main/install.sh)
+```
 
-### 2. Lossless Rewind & Same-Port Decoy Blog Fallback (`RewindConn`)
-- If the first packet is not a valid GFT Knock frame, the connection cursor is rewinded via an in-memory buffer ring and passed seamlessly to an internal HTTP router.
-- **Root (`/`)**: Returns a clean, modern English engineering blog (*Quiet Compiler - Systems & Compilers Engineering*) with `Server: nginx/1.24.0` headers.
-- **Active Probers**: Scanner requests receive `200 OK` or `404 Not Found` identical to a standard Nginx server.
+Unattended server setup with port hopping:
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Spittingjiu/GhostFrame-TLS/main/install.sh) \
+  --unattended --port 443 --hop 20000-30000
+```
 
-### 3. Stealth Web Management Panel & Threat Perception
-- **Secret Path**: Concealed at a randomized path (e.g. `/gft-panel-<random-32-chars>/`).
-- **Strict Secrecy**: Unauthenticated requests to the secret path return `404 Not Found`.
-- **Live Metrics**: Real-time CPU, RAM, Goroutine count, and active tunnel count.
-- **Threat Perception Log**: Captures and audits every failed probe IP, timestamp, and failure reason (HMAC mismatch, timestamp replay, web probe).
+After installation, type `gft` at any time to open the control center.
 
-### 4. 0-RTT Multiplexed Stream Architecture
-- **Header**: 6-byte lightweight framing: `[4B StreamID] [1B Flags] [1B PaddingLen] [Payload]`.
-- **0-RTT Address Piggybacking**: Destination address is bundled directly into the first payload frame, eliminating round-trip latency.
-- **Zero-Allocation Relay**: Stream forwarding uses `sync.Pool` 32KB buffers to achieve 0 memory allocation during forwarding loops.
-
-### 5. Native-like Desktop GUI Client (`gft-client-gui`)
-- **App Window**: Launches an Edge/Chrome `--app` standalone window (940x660) without browser address bars or bookmark menus.
-- **Zero-GC Canvas Traffic Chart**: Real-time bandwidth curve rendered on HTML5 Canvas with HiDPI (Retina) support and pre-allocated typed arrays.
-- **Windows System Proxy Auto-Config**: Direct registry manipulation (`HKCU\...\Internet Settings`) + `wininet.dll` notification (`InternetSetOptionW`) with automatic cleanup on exit.
-- **Dual Protocols**: Local SOCKS5 (`127.0.0.1:10808`) and HTTP proxy (`127.0.0.1:10809`).
-- **Clash Verge Compatibility**: One-click copy ready-to-paste Clash YAML proxy snippets.
+### Client Daemon (Phicomm N1 / OpenWrt procd / Armbian / Linux Router)
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Spittingjiu/GhostFrame-TLS/main/install.sh) \
+  --role client --link "gft3://..." --socks 0.0.0.0:10808 --low-mem
+```
 
 ---
 
-## 🛠️ Build & Installation
+## 🛠️ Building from Source
 
-### Prerequisites
-- Go 1.24 or higher
-- GCC (optional, pure Go standard library with zero CGO required)
-
-### 1. Compile Server (Linux amd64)
 ```bash
 cd 02_Source_Code
-GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o gft-server ./cmd/gft-server
+
+# 1. Server (Linux amd64 / arm64)
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o gft-server-linux-amd64 ./cmd/gft-server
+
+# 2. Router / N1 Core (Linux arm64)
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o gft-core-linux-arm64 ./cmd/gft-core
+
+# 3. Windows Native GUI & Tray Client
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H=windowsgui" -o ../GhostFrame-Pro.exe ./cmd/gft-client-gui
 ```
 
-### 2. Compile Client (Windows)
+---
+
+## 🧪 Testing & Safe Sandbox
+
+All tests and sandboxed client launches avoid mutating Windows Registry Internet Settings automatically (`testing.Testing()` / `GFT_NO_SYSPROXY=1` / `-no-sysproxy`):
+
 ```bash
 cd 02_Source_Code
-go build -ldflags="-s -w -H=windowsgui" -o gft-client-gui.exe ./cmd/gft-client-gui
+GFT_NO_SYSPROXY=1 go vet ./...
+GFT_NO_SYSPROXY=1 go test -race -v ./...
 ```
-
----
-
-## 🚀 Quick Start
-
-### 1. Initialize Server on VPS
-Run `init` to automatically generate ECDSA P-256 self-signed certificates, certificate SHA-256 Pin, secure PSK, and admin panel secrets:
-```bash
-./gft-server init \
-  -conf-dir /etc/gft \
-  -state-dir /var/lib/gft \
-  -host <YOUR_VPS_IP> \
-  -sni blog.quietcompiler.net \
-  -listen :8443
-```
-
-Start the server:
-```bash
-./gft-server run -config /etc/gft/server.json
-```
-
-Or deploy as a systemd service:
-```ini
-[Unit]
-Description=GhostFrame-TLS Server
-After=network.target
-
-[Service]
-ExecStart=/opt/ghostframe/gft-server run -config /etc/gft/server.json
-Restart=always
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 2. Run Client GUI
-Copy `client.example.json` to `client.json` and fill in your server IP, PSK, and certificate Pin:
-```json
-{
-  "link": {
-    "v": 1,
-    "host": "216.23.84.249",
-    "port": 8443,
-    "sni": "blog.quietcompiler.net",
-    "psk": "<YOUR_BASE64_PSK>",
-    "pin": "<YOUR_SHA256_CERT_PIN>",
-    "remark": "GhostFrame Tokyo Node"
-  },
-  "socks_addr": "127.0.0.1:10808",
-  "http_addr": "127.0.0.1:10809",
-  "sys_proxy": false
-}
-```
-
-Double click `启动GFT图形客户端.bat` or run:
-```bash
-./gft-client-gui.exe
-```
-
----
-
-## 📋 Clash Verge / Meta Configuration
-
-```yaml
-proxies:
-  - name: "GhostFrame-TLS Node"
-    type: socks5
-    server: 127.0.0.1
-    port: 10808
-    udp: true
-    skip-cert-verify: true
-
-proxy-groups:
-  - name: "Proxy"
-    type: select
-    proxies:
-      - "GhostFrame-TLS Node"
-      - DIRECT
-```
-
----
-
-## 🧪 Testing & Verification
-
-Run the full automated test suite:
-```bash
-cd 02_Source_Code
-go test -v ./...
-```
-All tests verify Knock replay detection, timing attacks, stream rewind, flow control, and end-to-end proxy echo.
 
 ---
 

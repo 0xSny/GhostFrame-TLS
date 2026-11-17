@@ -38,6 +38,10 @@ func refreshSysProxy() {
 
 // SetSystemProxy sets or unsets the Windows Internet Settings system proxy.
 func SetSystemProxy(addr string, enable bool) error {
+	if IsMockSysProxy() {
+		setMockSystemProxy(addr, enable)
+		return nil
+	}
 	subKey, err := syscall.UTF16PtrFromString(`Software\Microsoft\Windows\CurrentVersion\Internet Settings`)
 	if err != nil {
 		return err
@@ -101,6 +105,9 @@ func SetSystemProxy(addr string, enable bool) error {
 
 // GetSystemProxy returns current system proxy settings.
 func GetSystemProxy() (enabled bool, server string, err error) {
+	if IsMockSysProxy() {
+		return getMockSystemProxy()
+	}
 	subKey, err := syscall.UTF16PtrFromString(`Software\Microsoft\Windows\CurrentVersion\Internet Settings`)
 	if err != nil {
 		return false, "", err
@@ -134,7 +141,7 @@ func GetSystemProxy() (enabled bool, server string, err error) {
 	}
 
 	valNameServer, _ := syscall.UTF16PtrFromString("ProxyServer")
-	var buf [256]uint16
+	var buf [512]uint16
 	valLen = uint32(len(buf) * 2)
 	r1, _, _ = procRegQueryValue.Call(
 		hKey,
@@ -148,4 +155,106 @@ func GetSystemProxy() (enabled bool, server string, err error) {
 		server = syscall.UTF16ToString(buf[:])
 	}
 	return enabled, server, nil
+}
+
+// QueryFullSystemProxy reads ProxyEnable, ProxyServer, and ProxyOverride from Registry.
+func QueryFullSystemProxy() (ProxySnapshot, error) {
+	if IsMockSysProxy() {
+		return queryMockSystemProxy(), nil
+	}
+	var snap ProxySnapshot
+	subKey, err := syscall.UTF16PtrFromString(`Software\Microsoft\Windows\CurrentVersion\Internet Settings`)
+	if err != nil {
+		return snap, err
+	}
+	var hKey uintptr
+	r1, _, err := procRegOpenKeyEx.Call(
+		uintptr(hkeyCurrentUser),
+		uintptr(unsafe.Pointer(subKey)),
+		0,
+		uintptr(keyQueryValue),
+		uintptr(unsafe.Pointer(&hKey)),
+	)
+	if r1 != 0 {
+		return snap, err
+	}
+	defer procRegCloseKey.Call(hKey)
+
+	valNameEnable, _ := syscall.UTF16PtrFromString("ProxyEnable")
+	var valType, enableDword, valLen uint32
+	valLen = 4
+	r1, _, _ = procRegQueryValue.Call(
+		hKey,
+		uintptr(unsafe.Pointer(valNameEnable)),
+		0,
+		uintptr(unsafe.Pointer(&valType)),
+		uintptr(unsafe.Pointer(&enableDword)),
+		uintptr(unsafe.Pointer(&valLen)),
+	)
+	if r1 == 0 && enableDword == 1 {
+		snap.Enabled = true
+	}
+
+	readSZ := func(name string) string {
+		vn, _ := syscall.UTF16PtrFromString(name)
+		var b [1024]uint16
+		l := uint32(len(b) * 2)
+		var vt uint32
+		rc, _, _ := procRegQueryValue.Call(
+			hKey,
+			uintptr(unsafe.Pointer(vn)),
+			0,
+			uintptr(unsafe.Pointer(&vt)),
+			uintptr(unsafe.Pointer(&b[0])),
+			uintptr(unsafe.Pointer(&l)),
+		)
+		if rc == 0 {
+			return syscall.UTF16ToString(b[:])
+		}
+		return ""
+	}
+	snap.Server = readSZ("ProxyServer")
+	snap.Override = readSZ("ProxyOverride")
+	return snap, nil
+}
+
+// ApplySystemProxySnapshot restores an exact ProxySnapshot back to the Windows Registry.
+func ApplySystemProxySnapshot(snap ProxySnapshot) error {
+	if IsMockSysProxy() {
+		applyMockSystemProxySnapshot(snap)
+		return nil
+	}
+	subKey, err := syscall.UTF16PtrFromString(`Software\Microsoft\Windows\CurrentVersion\Internet Settings`)
+	if err != nil {
+		return err
+	}
+	var hKey uintptr
+	r1, _, err := procRegOpenKeyEx.Call(
+		uintptr(hkeyCurrentUser),
+		uintptr(unsafe.Pointer(subKey)),
+		0,
+		uintptr(keySetValue),
+		uintptr(unsafe.Pointer(&hKey)),
+	)
+	if r1 != 0 {
+		return err
+	}
+	defer procRegCloseKey.Call(hKey)
+
+	valNameEnable, _ := syscall.UTF16PtrFromString("ProxyEnable")
+	var enableDword uint32
+	if snap.Enabled {
+		enableDword = 1
+	}
+	procRegSetValueEx.Call(hKey, uintptr(unsafe.Pointer(valNameEnable)), 0, uintptr(regDword), uintptr(unsafe.Pointer(&enableDword)), 4)
+
+	writeSZ := func(name, val string) {
+		vn, _ := syscall.UTF16PtrFromString(name)
+		ub, _ := syscall.UTF16FromString(val)
+		procRegSetValueEx.Call(hKey, uintptr(unsafe.Pointer(vn)), 0, uintptr(regSz), uintptr(unsafe.Pointer(&ub[0])), uintptr(len(ub)*2))
+	}
+	writeSZ("ProxyServer", snap.Server)
+	writeSZ("ProxyOverride", snap.Override)
+	refreshSysProxy()
+	return nil
 }

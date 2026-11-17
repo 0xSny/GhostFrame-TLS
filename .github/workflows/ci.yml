@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      GFT_NO_SYSPROXY: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 02_Source_Code/go.mod
+          cache-dependency-path: 02_Source_Code/go.sum
+
+      - name: Vet and Test (with Race Detector)
+        shell: bash
+        run: |
+          cd 02_Source_Code
+          go vet ./...
+          go test -race -v ./...
+
+      - name: Verify install.sh Syntax (Linux)
+        if: runner.os == 'Linux'
+        run: bash -n install.sh

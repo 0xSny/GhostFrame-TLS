@@ -41,9 +41,9 @@ func (d deadliner) Read(p []byte) (int, error) {
 	return d.c.Read(p)
 }
 
-// Relay pipes a stream and a TCP-like connection in both directions until both finish.
+// Relay pipes a DataStream and a TCP-like connection in both directions until both finish.
 // idle is the per-read idle timeout applied on the TCP side.
-func Relay(st *Stream, c net.Conn, idle time.Duration) {
+func Relay(st DataStream, c net.Conn, idle time.Duration) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { // stream -> conn

@@ -3,11 +3,13 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"ghostframe/internal/gft"
@@ -22,12 +24,15 @@ const (
 	StateError        ConnState = "error"
 )
 
-// ClientConfig holds saved client preferences and current node.
+// ClientConfig holds saved client preferences, nodes, and routing mode.
 type ClientConfig struct {
-	Link      *gft.Link `json:"link"`
-	SocksAddr string    `json:"socks_addr"`
-	HTTPAddr  string    `json:"http_addr"`
-	SysProxy  bool      `json:"sys_proxy"`
+	Link       *gft.Link   `json:"link,omitempty"`
+	Nodes      []*gft.Link `json:"nodes,omitempty"`
+	ActiveNode int         `json:"active_node,omitempty"`
+	RouteMode  RouteMode   `json:"route_mode,omitempty"` // "rule" (default), "global", "direct"
+	SocksAddr  string      `json:"socks_addr"`
+	HTTPAddr   string      `json:"http_addr"`
+	SysProxy   bool        `json:"sys_proxy"`
 }
 
 // LogEntry is a single line in the client rolling log.
@@ -43,44 +48,76 @@ type TrafficPoint struct {
 	Down uint64 `json:"down"`
 }
 
-// Engine coordinates client tunnels, GFT session, pinger, and system proxy.
-type Engine struct {
-	mu         sync.RWMutex
-	cfgPath    string
-	config     ClientConfig
-	state      ConnState
-	lastErr    string
-	activeMode string
-	sess       *gft.Session
-	paramStore *gft.ParamStore
+// PingSummary holds a manual probe result.
+type PingSummary struct {
+	RTTMs     int64
+	Transport string
+}
 
-	socksSrv *SOCKS5Server
-	httpSrv  *HTTPProxyServer
+// Engine coordinates GFT v3 ApexScheduler, CN/Domain Router, SOCKS5 (TCP+UDP),
+// HTTP proxy, and crash-safe Windows system proxy.
+type Engine struct {
+	mu               sync.RWMutex
+	cfgPath          string
+	proxyBackupPath  string
+	config           ClientConfig
+	state            ConnState
+	lastErr          string
+	sched            *gft.ApexScheduler
+	paramStore       *gft.ParamStore
+	router           *Router
+	socksSrv         *SOCKS5Server
+	httpSrv          *HTTPProxyServer
 
 	// Stats
-	prevUp    uint64
-	prevDown  uint64
-	curUpBps  uint64
+	prevUp     uint64
+	prevDown   uint64
+	curUpBps   uint64
 	curDownBps uint64
-	pingMs    int64
-	history   []TrafficPoint
+	pingMs     int64
+	history    []TrafficPoint
 
 	// Rolling log
 	logMu sync.Mutex
 	logs  []LogEntry
 
-	stopPing chan struct{}
+	stopStats chan struct{}
+	stopOnce  sync.Once
 }
 
-// NewEngine initializes the client engine with a config path.
+// directStreamConn adapts a direct net.Conn to gft.DataStream for Rule/Direct routing.
+type directStreamConn struct {
+	net.Conn
+	target string
+}
+
+func (d *directStreamConn) CloseWrite() error {
+	if cw, ok := d.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func (d *directStreamConn) RemoteTarget() string { return d.target }
+
+// NewEngine initializes the client engine and recovers any crash-orphaned system proxy.
 func NewEngine(cfgPath string) (*Engine, error) {
+	backupPath := ""
+	if cfgPath != "" {
+		backupPath = filepath.Join(filepath.Dir(cfgPath), "sysproxy_backup.json")
+	}
+
 	e := &Engine{
-		cfgPath:    cfgPath,
-		state:      StateDisconnected,
-		paramStore: gft.NewParamStore(gft.DefaultParams()),
-		history:    make([]TrafficPoint, 0, 60),
-		logs:       make([]LogEntry, 0, 200),
+		cfgPath:         cfgPath,
+		proxyBackupPath: backupPath,
+		state:           StateDisconnected,
+		paramStore:      gft.NewParamStore(gft.DefaultParams()),
+		router:          NewRouter(),
+		history:         make([]TrafficPoint, 0, 60),
+		logs:            make([]LogEntry, 0, 200),
+		stopStats:       make(chan struct{}),
 		config: ClientConfig{
+			RouteMode: RouteRule,
 			SocksAddr: "127.0.0.1:10808",
 			HTTPAddr:  "127.0.0.1:10809",
 			SysProxy:  false,
@@ -93,22 +130,64 @@ func NewEngine(cfgPath string) (*Engine, error) {
 		}
 	}
 
-	if e.config.Link != nil && e.config.Link.Params != nil {
-		e.paramStore.Set(*e.config.Link.Params)
+	if len(e.config.Nodes) == 0 && e.config.Link != nil {
+		e.config.Nodes = []*gft.Link{e.config.Link}
+		e.config.ActiveNode = 0
+	}
+	if e.config.ActiveNode < 0 || e.config.ActiveNode >= len(e.config.Nodes) {
+		e.config.ActiveNode = 0
+	}
+	if len(e.config.Nodes) > 0 {
+		e.config.Link = e.config.Nodes[e.config.ActiveNode]
+	}
+	if e.config.RouteMode == "" {
+		e.config.RouteMode = RouteRule
+	}
+
+	if active := e.activeLinkLocked(); active != nil && active.Params != nil {
+		e.paramStore.Set(*active.Params)
+	}
+
+	if recovered, rerr := RecoverSystemProxyIfDirty(e.proxyBackupPath); recovered {
+		if rerr == nil {
+			e.Logf("Recovered pre-crash Windows system proxy settings cleanly")
+		} else {
+			e.Logf("System proxy recovery warning: %v", rerr)
+		}
 	}
 
 	e.socksSrv = NewSOCKS5Server(e.config.SocksAddr, e)
 	e.httpSrv = NewHTTPProxyServer(e.config.HTTPAddr, e)
-
 	return e, nil
 }
 
-// StartServers binds and listens on the local SOCKS5 and HTTP proxy ports.
+func (e *Engine) activeLinkLocked() *gft.Link {
+	if len(e.config.Nodes) > 0 && e.config.ActiveNode >= 0 && e.config.ActiveNode < len(e.config.Nodes) {
+		return e.config.Nodes[e.config.ActiveNode]
+	}
+	return e.config.Link
+}
+
+// OverrideListenAddrs updates the local SOCKS5/HTTP listener addresses prior to StartServers.
+func (e *Engine) OverrideListenAddrs(socksAddr, httpAddr string) {
+	e.mu.Lock()
+	if socksAddr != "" {
+		e.config.SocksAddr = socksAddr
+		e.socksSrv = NewSOCKS5Server(socksAddr, e)
+	}
+	if httpAddr != "" {
+		e.config.HTTPAddr = httpAddr
+		e.httpSrv = NewHTTPProxyServer(httpAddr, e)
+	}
+	e.mu.Unlock()
+}
+
+// StartServers binds and listens on local SOCKS5 and HTTP proxy ports.
 func (e *Engine) StartServers() error {
 	if err := e.socksSrv.Start(); err != nil {
 		return fmt.Errorf("socks5 listen on %s: %w", e.config.SocksAddr, err)
 	}
-	e.Logf("SOCKS5 proxy listening on %s", e.config.SocksAddr)
+	e.Logf("SOCKS5 (TCP + UDP ASSOCIATE) listening on %s", e.config.SocksAddr)
 
 	if err := e.httpSrv.Start(); err != nil {
 		_ = e.socksSrv.Close()
@@ -120,106 +199,253 @@ func (e *Engine) StartServers() error {
 	return nil
 }
 
-// SaveConfig writes the current configuration to disk.
+// SaveConfig writes current client configuration to disk cleanly.
 func (e *Engine) SaveConfig() error {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-	if e.cfgPath == "" {
+	cfgCopy := e.config
+	cfgPath := e.cfgPath
+	e.mu.RUnlock()
+	if cfgPath == "" {
 		return nil
 	}
-	_ = os.MkdirAll(filepath.Dir(e.cfgPath), 0o755)
-	b, err := json.MarshalIndent(e.config, "", "  ")
+	_ = os.MkdirAll(filepath.Dir(cfgPath), 0o755)
+	b, err := json.MarshalIndent(cfgCopy, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(e.cfgPath, b, 0o644)
+	return os.WriteFile(cfgPath, b, 0o600)
 }
 
-// SetLink updates the node link.
+// SetLink replaces or sets the active node.
 func (e *Engine) SetLink(l *gft.Link) error {
 	e.mu.Lock()
-	e.config.Link = l
-	if l != nil && l.Params != nil {
-		e.paramStore.Set(*l.Params)
+	if l != nil {
+		if len(e.config.Nodes) == 0 {
+			e.config.Nodes = []*gft.Link{l}
+			e.config.ActiveNode = 0
+		} else {
+			e.config.Nodes[e.config.ActiveNode] = l
+		}
+		e.config.Link = l
+		if l.Params != nil {
+			e.paramStore.Set(*l.Params)
+		}
 	}
 	e.mu.Unlock()
 	return e.SaveConfig()
 }
 
-// ActiveSession returns the current live GFT session if connected.
-func (e *Engine) ActiveSession() *gft.Session {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	if e.state == StateConnected {
-		return e.sess
+// ImportLink adds (or updates duplicate host:port:psk) a gft3/gft2 node link and selects it.
+func (e *Engine) ImportLink(uri string, switchTo bool) (int, error) {
+	link, err := gft.ParseLink(uri)
+	if err != nil {
+		return -1, err
 	}
-	return nil
+	if link.Remark == "" {
+		link.Remark = fmt.Sprintf("%s:%d", link.Host, link.Port)
+	}
+	e.mu.Lock()
+	idx := -1
+	for i, existing := range e.config.Nodes {
+		if existing != nil && existing.Host == link.Host && existing.Port == link.Port && existing.PSK == link.PSK {
+			e.config.Nodes[i] = link
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		e.config.Nodes = append(e.config.Nodes, link)
+		idx = len(e.config.Nodes) - 1
+	}
+	if switchTo || len(e.config.Nodes) == 1 {
+		e.config.ActiveNode = idx
+		e.config.Link = link
+		if link.Params != nil {
+			e.paramStore.Set(*link.Params)
+		}
+	}
+	e.mu.Unlock()
+	if err := e.SaveConfig(); err != nil {
+		return idx, err
+	}
+	e.Logf("Imported node #%d: %s (%s:%d)", idx+1, link.Remark, link.Host, link.Port)
+	return idx, nil
 }
 
-// Connect dials the GFT server and establishes the multiplexed tunnel.
+// SelectNode switches active node (disconnecting any running session first).
+func (e *Engine) SelectNode(idx int) error {
+	e.Disconnect()
+	e.mu.Lock()
+	if idx < 0 || idx >= len(e.config.Nodes) {
+		e.mu.Unlock()
+		return errors.New("node index out of range")
+	}
+	e.config.ActiveNode = idx
+	e.config.Link = e.config.Nodes[idx]
+	if e.config.Link != nil && e.config.Link.Params != nil {
+		e.paramStore.Set(*e.config.Link.Params)
+	}
+	name := ""
+	if e.config.Link != nil {
+		name = e.config.Link.Remark
+	}
+	e.mu.Unlock()
+	e.Logf("Switched active node to #%d (%s)", idx+1, name)
+	return e.SaveConfig()
+}
+
+// DeleteNode deletes a saved node by index.
+func (e *Engine) DeleteNode(idx int) error {
+	e.mu.Lock()
+	if idx < 0 || idx >= len(e.config.Nodes) {
+		e.mu.Unlock()
+		return errors.New("node index out of range")
+	}
+	wasActive := idx == e.config.ActiveNode
+	e.config.Nodes = append(e.config.Nodes[:idx], e.config.Nodes[idx+1:]...)
+	if len(e.config.Nodes) == 0 {
+		e.config.ActiveNode = 0
+		e.config.Link = nil
+	} else if e.config.ActiveNode >= len(e.config.Nodes) {
+		e.config.ActiveNode = len(e.config.Nodes) - 1
+		e.config.Link = e.config.Nodes[e.config.ActiveNode]
+	} else {
+		e.config.Link = e.config.Nodes[e.config.ActiveNode]
+	}
+	e.mu.Unlock()
+	if wasActive {
+		e.Disconnect()
+	}
+	return e.SaveConfig()
+}
+
+// SetRouteMode sets the client routing policy ("rule", "global", "direct").
+func (e *Engine) SetRouteMode(mode RouteMode) error {
+	switch mode {
+	case RouteRule, RouteGlobal, RouteDirect:
+	default:
+		return fmt.Errorf("invalid route mode: %q", mode)
+	}
+	e.mu.Lock()
+	e.config.RouteMode = mode
+	e.mu.Unlock()
+	e.Logf("Route mode changed to: %s", mode)
+	return e.SaveConfig()
+}
+
+// IsConnected returns whether the tunnel is active.
+func (e *Engine) IsConnected() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.state == StateConnected && e.sched != nil
+}
+
+// RouteDecision decides whether hostport should bypass or traverse GhostFrame.
+func (e *Engine) RouteDecision(hostport string) RouteAction {
+	e.mu.RLock()
+	mode := e.config.RouteMode
+	e.mu.RUnlock()
+	return e.router.Decide(mode, hostport)
+}
+
+// OpenTargetStream opens either a direct TCP connection or a multiplexed GFT stream
+// per Router policy (never leaking overseas DNS queries locally).
+func (e *Engine) OpenTargetStream(target string, first []byte) (gft.DataStream, RouteAction, error) {
+	e.mu.RLock()
+	state := e.state
+	sched := e.sched
+	mode := e.config.RouteMode
+	e.mu.RUnlock()
+
+	if state != StateConnected || sched == nil {
+		return nil, ActionProxy, errNoActiveSession
+	}
+	act := e.router.Decide(mode, target)
+	if act == ActionDirect {
+		c, err := net.DialTimeout("tcp", target, 8*time.Second)
+		if err != nil {
+			return nil, ActionDirect, err
+		}
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+		}
+		if len(first) > 0 {
+			if _, werr := c.Write(first); werr != nil {
+				_ = c.Close()
+				return nil, ActionDirect, werr
+			}
+		}
+		return &directStreamConn{Conn: c, target: target}, ActionDirect, nil
+	}
+	st, err := sched.OpenStream(target, first)
+	return st, ActionProxy, err
+}
+
+// OpenUDPAssociation opens a GFT UDP association (QUIC Datagrams or TCP Mux fallback).
+func (e *Engine) OpenUDPAssociation() (gft.UDPAssociation, error) {
+	e.mu.RLock()
+	state := e.state
+	sched := e.sched
+	e.mu.RUnlock()
+	if state != StateConnected || sched == nil {
+		return nil, errNoActiveSession
+	}
+	return sched.OpenUDP()
+}
+
+// Connect starts the ApexScheduler (QUIC Dual-Track + uTLS SessionPool).
 func (e *Engine) Connect() error {
 	e.mu.Lock()
 	if e.state == StateConnected || e.state == StateConnecting {
 		e.mu.Unlock()
 		return nil
 	}
-	l := e.config.Link
+	l := e.activeLinkLocked()
 	if l == nil {
 		e.state = StateError
 		e.lastErr = "no node configured"
 		e.mu.Unlock()
-		return fmt.Errorf("no node configured")
+		return errors.New("no node configured")
 	}
 	e.state = StateConnecting
 	e.lastErr = ""
 	e.mu.Unlock()
 
-	tmode := l.Transport
-	if tmode == "" {
-		tmode = "auto"
-	}
-	e.Logf("Connecting to %s:%d (mode=%s, uTLS+QUIC Dual-Stack)...", l.Host, l.Port, tmode)
+	e.Logf("Connecting to %s:%d (transport=%s, route=%s, Apex Dual-Track)...",
+		l.Host, l.Port, l.EffectiveTransport(), e.config.RouteMode)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	sess, activeMode, hs, err := gft.DialSessionInfo(ctx, l, e.paramStore, 10*time.Second)
-	if err != nil {
+	sched := gft.NewApexScheduler(l, e.paramStore, gft.DefaultPoolSize, e.Logf)
+	if err := sched.Start(8 * time.Second); err != nil {
+		sched.Close()
 		e.mu.Lock()
 		e.state = StateError
 		e.lastErr = err.Error()
-		e.activeMode = ""
 		e.mu.Unlock()
 		e.Logf("Connection failed: %v", err)
 		return err
 	}
 
+	st := sched.Stats()
 	e.mu.Lock()
-	e.sess = sess
+	e.sched = sched
 	e.state = StateConnected
 	e.lastErr = ""
-	e.activeMode = activeMode
-	e.pingMs = hs.Milliseconds()
-	e.stopPing = make(chan struct{})
+	e.pingMs = st.RTTMs
 	e.mu.Unlock()
 
-	e.Logf("Connected successfully via [%s]! Handshake: %v", activeMode, hs)
+	e.Logf("Connected via [%s] (RTT=%dms, conns=%d)", st.Mode, st.RTTMs, st.ActiveConns)
 
 	if e.config.SysProxy {
-		if err := SetSystemProxy(e.config.HTTPAddr, true); err != nil {
+		if err := EnableSystemProxyWithBackup(e.config.HTTPAddr, e.proxyBackupPath); err != nil {
 			e.Logf("Failed to enable system proxy: %v", err)
 		} else {
-			e.Logf("System proxy enabled (%s)", e.config.HTTPAddr)
+			e.Logf("System proxy enabled with crash-safe backup (%s)", e.config.HTTPAddr)
 		}
 	}
-
-	go e.pingLoop(e.stopPing)
-	go e.watchSession(sess)
-
 	return nil
 }
 
-// Disconnect cleanly tears down the active tunnel.
+// Disconnect stops the ApexScheduler and restores system proxy cleanly.
 func (e *Engine) Disconnect() {
 	e.mu.Lock()
 	if e.state != StateConnected && e.state != StateConnecting {
@@ -227,115 +453,62 @@ func (e *Engine) Disconnect() {
 		return
 	}
 	e.state = StateDisconnected
-	if e.stopPing != nil {
-		select {
-		case <-e.stopPing:
-		default:
-			close(e.stopPing)
-		}
-	}
-	s := e.sess
-	e.sess = nil
-	e.activeMode = ""
+	sched := e.sched
+	e.sched = nil
 	e.mu.Unlock()
 
-	if s != nil {
-		s.Close()
+	if sched != nil {
+		sched.Close()
 	}
 	if e.config.SysProxy {
-		_ = SetSystemProxy("", false)
-		e.Logf("System proxy disabled")
+		_ = DisableAndRestoreSystemProxy(e.proxyBackupPath)
+		e.Logf("System proxy restored cleanly")
 	}
 	e.Logf("Disconnected from node")
-}
-
-func (e *Engine) watchSession(s *gft.Session) {
-	// Session.Run() is running in a goroutine from DialSession.
-	// When closed or errored, reset state.
-	<-s.Done()
-	e.mu.Lock()
-	if e.sess == s {
-		e.state = StateDisconnected
-		e.sess = nil
-		e.activeMode = ""
-		if e.stopPing != nil {
-			select {
-			case <-e.stopPing:
-			default:
-				close(e.stopPing)
-			}
-		}
-		e.Logf("Session connection lost")
-		if e.config.SysProxy {
-			_ = SetSystemProxy("", false)
-		}
-	}
-	e.mu.Unlock()
-}
-
-func (e *Engine) pingLoop(stop chan struct{}) {
-	t := time.NewTicker(5 * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-t.C:
-			e.mu.RLock()
-			l := e.config.Link
-			connected := e.state == StateConnected
-			e.mu.RUnlock()
-			if !connected || l == nil {
-				return
-			}
-
-			pr, err := gft.Ping(context.Background(), l, 4*time.Second)
-			if err == nil {
-				e.mu.Lock()
-				e.pingMs = pr.Total.Milliseconds()
-				e.mu.Unlock()
-			}
-		}
-	}
 }
 
 func (e *Engine) statsLoop() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
-	for range t.C {
-		e.mu.Lock()
-		var curUp, curDown uint64
-		if e.sess != nil {
-			curUp = e.sess.UpBytes.Load()
-			curDown = e.sess.DownBytes.Load()
-		}
-		var upDelta, downDelta uint64
-		if curUp >= e.prevUp {
-			upDelta = curUp - e.prevUp
-		}
-		if curDown >= e.prevDown {
-			downDelta = curDown - e.prevDown
-		}
-		e.prevUp = curUp
-		e.prevDown = curDown
-		e.curUpBps = upDelta
-		e.curDownBps = downDelta
+	for {
+		select {
+		case <-e.stopStats:
+			return
+		case <-t.C:
+			e.mu.Lock()
+			var curUp, curDown uint64
+			if e.sched != nil {
+				st := e.sched.Stats()
+				curUp = st.TotalUp
+				curDown = st.TotalDown
+				if st.RTTMs > 0 {
+					e.pingMs = st.RTTMs
+				}
+			}
+			var upDelta, downDelta uint64
+			if curUp >= e.prevUp {
+				upDelta = curUp - e.prevUp
+			}
+			if curDown >= e.prevDown {
+				downDelta = curDown - e.prevDown
+			}
+			e.prevUp = curUp
+			e.prevDown = curDown
+			e.curUpBps = upDelta
+			e.curDownBps = downDelta
 
-		pt := TrafficPoint{
-			Time: time.Now().Unix(),
-			Up:   upDelta,
-			Down: downDelta,
+			pt := TrafficPoint{Time: time.Now().Unix(), Up: upDelta, Down: downDelta}
+			if len(e.history) >= 60 {
+				e.history = append(e.history[1:], pt)
+			} else {
+				e.history = append(e.history, pt)
+			}
+			e.mu.Unlock()
 		}
-		if len(e.history) >= 60 {
-			e.history = append(e.history[1:], pt)
-		} else {
-			e.history = append(e.history, pt)
-		}
-		e.mu.Unlock()
 	}
 }
 
-// SetSysProxyToggle toggles the Windows system proxy setting.
+// SetSysProxyToggle toggles the Windows system proxy setting with backup/restore.
 func (e *Engine) SetSysProxyToggle(enable bool) error {
 	e.mu.Lock()
 	e.config.SysProxy = enable
@@ -347,14 +520,14 @@ func (e *Engine) SetSysProxyToggle(enable bool) error {
 
 	if connected {
 		if enable {
-			if err := SetSystemProxy(httpAddr, true); err != nil {
+			if err := EnableSystemProxyWithBackup(httpAddr, e.proxyBackupPath); err != nil {
 				e.Logf("SetSystemProxy failed: %v", err)
 				return err
 			}
 			e.Logf("System proxy enabled (%s)", httpAddr)
 		} else {
-			_ = SetSystemProxy("", false)
-			e.Logf("System proxy disabled")
+			_ = DisableAndRestoreSystemProxy(e.proxyBackupPath)
+			e.Logf("System proxy restored cleanly")
 		}
 	}
 	return nil
@@ -374,71 +547,184 @@ func (e *Engine) Logf(format string, args ...any) {
 		e.logs = append(e.logs, entry)
 	}
 	e.logMu.Unlock()
-	fmt.Printf("[%s] %s\n", entry.Time, msg)
 }
 
-// SetTransport updates the preferred transport mode ("auto", "tcp", "quic").
+// PingNow performs an explicit user-triggered RTT probe (never background polling!).
+func (e *Engine) PingNow() (PingSummary, error) {
+	e.mu.RLock()
+	sched := e.sched
+	l := e.activeLinkLocked()
+	e.mu.RUnlock()
+
+	if sched != nil {
+		st := sched.Stats()
+		if st.RTTMs > 0 {
+			e.mu.Lock()
+			e.pingMs = st.RTTMs
+			e.mu.Unlock()
+			e.Logf("In-band RTT [%s]: %dms", st.Mode, st.RTTMs)
+			return PingSummary{RTTMs: st.RTTMs, Transport: st.Mode}, nil
+		}
+	}
+	if l == nil {
+		return PingSummary{}, errors.New("no node configured")
+	}
+	pr, err := gft.Ping(context.Background(), l, 5*time.Second)
+	if err != nil {
+		e.Logf("Manual ping failed: %v", err)
+		return PingSummary{}, err
+	}
+	ms := pr.KnockRTT.Milliseconds()
+	if ms <= 0 {
+		ms = 1
+	}
+	e.mu.Lock()
+	e.pingMs = ms
+	e.mu.Unlock()
+	e.Logf("Manual ping OK: Handshake=%v RTT=%dms", pr.Handshake.Round(time.Millisecond), ms)
+	return PingSummary{RTTMs: ms, Transport: "uTLS-" + l.EffectiveFP()}, nil
+}
+
+// SetTransport updates the active node's preferred transport ("auto", "tcp", "quic").
 func (e *Engine) SetTransport(mode string) error {
 	switch mode {
-	case "", "auto", "tcp", "quic", "udp":
+	case "", "auto", "tcp", "quic":
 	default:
 		return fmt.Errorf("invalid transport mode: %s", mode)
 	}
 	e.mu.Lock()
-	if e.config.Link != nil {
-		e.config.Link.Transport = mode
+	if l := e.activeLinkLocked(); l != nil {
+		l.Transport = mode
 	}
+	wasConnected := e.state == StateConnected
 	e.mu.Unlock()
+	_ = e.SaveConfig()
 	e.Logf("Transport preference updated to: %s", mode)
-	return e.SaveConfig()
+	if wasConnected {
+		e.Disconnect()
+		go func() { _ = e.Connect() }()
+	}
+	return nil
 }
 
-// Status returns the current engine state snapshot for the UI.
+// NodeSummary describes a configured server node for UI rendering.
+type NodeSummary struct {
+	Index     int    `json:"index"`
+	Name      string `json:"name"`
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	Verify    string `json:"verify"`
+	Transport string `json:"transport"`
+	HopRange  string `json:"hop_range,omitempty"`
+}
+
+// ClearLogs clears recorded client log entries.
+func (e *Engine) ClearLogs() {
+	e.logMu.Lock()
+	e.logs = e.logs[:0]
+	e.logMu.Unlock()
+}
+
+// Status returns the full UI status snapshot.
 func (e *Engine) Status() map[string]any {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	var totalUp, totalDown uint64
-	if e.sess != nil {
-		totalUp = e.sess.UpBytes.Load()
-		totalDown = e.sess.DownBytes.Load()
-	}
-
+	state := e.state
+	lastErr := e.lastErr
+	sched := e.sched
+	upBps := e.curUpBps
+	downBps := e.curDownBps
+	pingMs := e.pingMs
+	routeMode := e.config.RouteMode
+	sysProxy := e.config.SysProxy
+	socksAddr := e.config.SocksAddr
+	httpAddr := e.config.HTTPAddr
+	activeIdx := e.config.ActiveNode
 	histCopy := make([]TrafficPoint, len(e.history))
 	copy(histCopy, e.history)
 
-	var nodeName, nodeHost, tPref string
-	var nodePort int
-	if e.config.Link != nil {
-		nodeName = e.config.Link.Remark
-		if nodeName == "" {
-			nodeName = "Japan Tokyo VPS (GFT-TLS Pro)"
+	nodes := make([]NodeSummary, 0, len(e.config.Nodes))
+	for i, n := range e.config.Nodes {
+		if n == nil {
+			continue
 		}
-		nodeHost = e.config.Link.Host
-		nodePort = e.config.Link.Port
-		tPref = e.config.Link.Transport
+		name := n.Remark
+		if name == "" {
+			name = fmt.Sprintf("%s:%d", n.Host, n.Port)
+		}
+		nodes = append(nodes, NodeSummary{
+			Index:     i,
+			Name:      name,
+			Host:      n.Host,
+			Port:      n.Port,
+			Verify:    n.EffectiveVerify(),
+			Transport: n.EffectiveTransport(),
+			HopRange:  n.HopRange,
+		})
+	}
+	l := e.activeLinkLocked()
+	e.mu.RUnlock()
+
+	var totalUp, totalDown uint64
+	activeMode := ""
+	var quicPort, activeConns, activeStreams int
+	if sched != nil {
+		st := sched.Stats()
+		totalUp = st.TotalUp
+		totalDown = st.TotalDown
+		activeMode = st.Mode
+		quicPort = st.QUICPort
+		activeConns = st.ActiveConns
+		activeStreams = st.ActiveStreams
+		if st.RTTMs > 0 {
+			pingMs = st.RTTMs
+		}
+		if lastErr == "" && st.LastErr != "" && state != StateConnected {
+			lastErr = st.LastErr
+		}
+	}
+
+	var nodeName, nodeHost, tPref, verifyMode, hopRange string
+	var nodePort int
+	if l != nil {
+		nodeName = l.Remark
+		if nodeName == "" {
+			nodeName = fmt.Sprintf("%s:%d", l.Host, l.Port)
+		}
+		nodeHost = l.Host
+		nodePort = l.Port
+		tPref = l.EffectiveTransport()
+		verifyMode = l.EffectiveVerify()
+		hopRange = l.HopRange
 	}
 	if tPref == "" {
 		tPref = "auto"
 	}
 
 	return map[string]any{
-		"state":            string(e.state),
-		"last_err":         e.lastErr,
-		"active_transport": e.activeMode,
+		"state":            string(state),
+		"last_err":         lastErr,
+		"active_transport": activeMode,
 		"transport_pref":   tPref,
-		"ping_ms":          e.pingMs,
-		"up_bps":           e.curUpBps,
-		"down_bps":         e.curDownBps,
+		"route_mode":       string(routeMode),
+		"verify_mode":      verifyMode,
+		"hop_range":        hopRange,
+		"quic_port":        quicPort,
+		"active_conns":     activeConns,
+		"active_streams":   activeStreams,
+		"ping_ms":          pingMs,
+		"up_bps":           upBps,
+		"down_bps":         downBps,
 		"total_up":         totalUp,
 		"total_down":       totalDown,
 		"history":          histCopy,
-		"sys_proxy":        e.config.SysProxy,
-		"socks_addr":       e.config.SocksAddr,
-		"http_addr":        e.config.HTTPAddr,
+		"sys_proxy":        sysProxy,
+		"socks_addr":       socksAddr,
+		"http_addr":        httpAddr,
 		"node_name":        nodeName,
 		"node_host":        nodeHost,
 		"node_port":        nodePort,
+		"active_node":      activeIdx,
+		"nodes":            nodes,
 		"link_uri":         e.LinkURI(),
 		"clash_yaml":       e.ClashYAML(),
 	}
@@ -453,35 +739,54 @@ func (e *Engine) Logs() []LogEntry {
 	return cp
 }
 
-// LinkURI returns the `gft://...` link representation.
+// LinkURI returns the active node's gft3:// link.
 func (e *Engine) LinkURI() string {
-	if e.config.Link == nil {
+	e.mu.RLock()
+	l := e.activeLinkLocked()
+	e.mu.RUnlock()
+	if l == nil {
 		return ""
 	}
-	return e.config.Link.Encode()
+	return l.Encode()
 }
 
-// ClashYAML outputs Clash Verge / Clash Meta compatible node snippet.
+// ClashYAML outputs Clash Meta / Clash Verge compatible SOCKS5 (TCP+UDP) config.
 func (e *Engine) ClashYAML() string {
-	l := e.config.Link
+	e.mu.RLock()
+	l := e.activeLinkLocked()
+	socks := e.config.SocksAddr
+	e.mu.RUnlock()
 	if l == nil {
 		return "# No node configured"
 	}
-	return fmt.Sprintf(`- name: "%s"
-  type: socks5
-  server: 127.0.0.1
-  port: 10808
-  udp: true
-# Note: GhostFrame-TLS handles high-entropy Knock, TLS 1.3 and zero-delay mux locally.
-# Keep GhostFrame Client running on 127.0.0.1:10808.`, l.Remark)
+	host, portStr, err := net.SplitHostPort(socks)
+	if err != nil {
+		host, portStr = "127.0.0.1", "10808"
+	}
+	if host == "" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	port, _ := strconv.Atoi(portStr)
+	if port <= 0 {
+		port = 10808
+	}
+	name := l.Remark
+	if name == "" {
+		name = "GhostFrame-Apex"
+	}
+	return fmt.Sprintf(`proxies:
+  - name: "%s"
+    type: socks5
+    server: %s
+    port: %d
+    udp: true`, name, host, port)
 }
 
-// Close gracefully closes all servers and restores system proxy.
+// Close shuts down local proxy listeners, active tunnel, and restores system proxy.
 func (e *Engine) Close() {
+	e.stopOnce.Do(func() { close(e.stopStats) })
 	e.Disconnect()
 	_ = e.socksSrv.Close()
 	_ = e.httpSrv.Close()
-	_ = SetSystemProxy("", false)
+	_ = DisableAndRestoreSystemProxy(e.proxyBackupPath)
 }
-
-var _ = atomic.AddUint64

@@ -3,28 +3,18 @@ package gft
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/base64"
+	"encoding/binary"
 	"io"
-	"math/big"
 	"net"
-	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/quic-go/quic-go"
 )
 
-// TestRewindConn: after reading k bytes (k in several boundary values) and rewinding,
-// the consumer must see the exact original byte sequence - nothing lost, nothing duplicated.
 func TestRewindConn(t *testing.T) {
 	const total = 4096
-	for _, k := range []int{0, 1, 2, 55, 56, 56 + 0, 56 + 17, 56 + 63, 57, 1000, total} {
+	for _, k := range []int{0, 1, 2, 48, 56, 120, 1000, total} {
 		orig := make([]byte, total)
 		_, _ = rand.Read(orig)
 		cli, srv := net.Pipe()
@@ -46,132 +36,156 @@ func TestRewindConn(t *testing.T) {
 			t.Fatalf("k=%d: readall: %v", k, err)
 		}
 		if !bytes.Equal(got, orig) {
-			t.Fatalf("k=%d: byte sequence differs (got %d bytes, want %d)", k, len(got), len(orig))
+			t.Fatalf("k=%d: byte sequence differs (got %d, want %d)", k, len(got), len(orig))
 		}
-		t.Logf("k=%-5d OK: replayed %d bytes identical to original", k, len(got))
 	}
 }
 
-// TestRewindSmallReads ensures replay works when the consumer uses tiny buffers.
-func TestRewindSmallReads(t *testing.T) {
+func TestRewindSmallReadsAndConsumePrefix(t *testing.T) {
 	orig := make([]byte, 300)
 	_, _ = rand.Read(orig)
 	cli, srv := net.Pipe()
 	go func() { _, _ = cli.Write(orig); _ = cli.Close() }()
 	rc := NewRewindConn(srv)
-	_, _ = io.ReadFull(rc, make([]byte, 120))
-	rc.Rewind()
-	var got []byte
-	b := make([]byte, 7)
-	for {
-		n, err := rc.Read(b)
-		got = append(got, b[:n]...)
-		if err != nil {
-			break
-		}
+	_, _ = io.ReadFull(rc, make([]byte, 200))
+	// Discard first 120 bytes, keep coalesced [120:300]
+	rc.ConsumePrefix(120)
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !bytes.Equal(got, orig) {
-		t.Fatal("small-read replay mismatch")
+	if !bytes.Equal(got, orig[120:]) {
+		t.Fatalf("ConsumePrefix mismatch: got %d want %d", len(got), len(orig[120:]))
 	}
 }
 
-func TestKnock(t *testing.T) {
+func TestKnockV2(t *testing.T) {
 	psk := make([]byte, 32)
 	_, _ = rand.Read(psk)
 	now := time.Now()
 
-	t.Run("correct", func(t *testing.T) {
+	t.Run("correct_and_ack", func(t *testing.T) {
 		v := NewKnockVerifier(psk)
-		k := BuildKnock(psk, now)
-		pad, res := v.Check(k, now)
-		if res != KnockOK || pad != len(k)-KnockLen {
-			t.Fatalf("want OK pad=%d, got %v pad=%d", len(k)-KnockLen, res, pad)
+		pkt, salt, err := BuildKnockV2(psk, now, 4)
+		if err != nil {
+			t.Fatal(err)
 		}
-		t.Logf("correct knock accepted (pad=%d)", pad)
+		if len(pkt) < 240 || len(pkt) > 816 {
+			t.Fatalf("knock packet size out of [240,816]: %d", len(pkt))
+		}
+		s2, pad, flags, res := v.CheckPacket(pkt, now)
+		if res != KnockOK || s2 != salt || flags != 4 || KnockPrefixLen+pad != len(pkt) {
+			t.Fatalf("check failed: res=%v pad=%d len=%d flags=%d", res, pad, len(pkt), flags)
+		}
+
+		wantParams := DefaultParams()
+		ack, err := BuildServerAck(psk, salt, wantParams)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotParams, ok, err := ReadServerAck(bytes.NewReader(ack), psk, salt)
+		if err != nil || !ok || gotParams != wantParams {
+			t.Fatalf("ReadServerAck: ok=%v err=%v got=%+v", ok, err, gotParams)
+		}
 	})
-	t.Run("wrong_hmac", func(t *testing.T) {
+
+	t.Run("bad_auth_and_tamper", func(t *testing.T) {
 		v := NewKnockVerifier(psk)
 		bad := make([]byte, 32)
 		_, _ = rand.Read(bad)
-		k := BuildKnock(bad, now)
-		if _, res := v.Check(k, now); res != KnockBadHMAC {
-			t.Fatalf("want hmac, got %v", res)
+		pkt, _, _ := BuildKnockV2(bad, now, 1)
+		if _, _, _, res := v.CheckPacket(pkt, now); res != KnockBadAuth {
+			t.Fatalf("wrong psk: want auth, got %v", res)
 		}
-		k2 := BuildKnock(psk, now)
-		k2[30] ^= 0x01
-		if _, res := v.Check(k2, now); res != KnockBadHMAC {
-			t.Fatalf("tampered: want hmac, got %v", res)
+		pkt2, _, _, _ := func() ([]byte, [16]byte, error, error) {
+			p, s, e := BuildKnockV2(psk, now, 1)
+			return p, s, e, nil
+		}()
+		pkt2[20] ^= 0x01
+		if _, _, _, res := v.CheckPacket(pkt2, now); res != KnockBadAuth {
+			t.Fatalf("tampered: want auth, got %v", res)
 		}
-		t.Log("wrong/tampered HMAC rejected with reason=hmac")
 	})
+
 	t.Run("expired", func(t *testing.T) {
 		v := NewKnockVerifier(psk)
-		k := BuildKnock(psk, now.Add(-91*time.Second))
-		if _, res := v.Check(k, now); res != KnockExpired {
+		p1, _, _ := BuildKnockV2(psk, now.Add(-91*time.Second), 0)
+		if _, _, _, res := v.CheckPacket(p1, now); res != KnockExpired {
 			t.Fatalf("past: want expired, got %v", res)
 		}
-		k = BuildKnock(psk, now.Add(91*time.Second))
-		if _, res := v.Check(k, now); res != KnockExpired {
+		p2, _, _ := BuildKnockV2(psk, now.Add(91*time.Second), 0)
+		if _, _, _, res := v.CheckPacket(p2, now); res != KnockExpired {
 			t.Fatalf("future: want expired, got %v", res)
 		}
-		k = BuildKnock(psk, now.Add(-89*time.Second))
-		if _, res := v.Check(k, now); res != KnockOK {
+		p3, _, _ := BuildKnockV2(psk, now.Add(-89*time.Second), 0)
+		if _, _, _, res := v.CheckPacket(p3, now); res != KnockOK {
 			t.Fatalf("89s skew should pass, got %v", res)
 		}
-		t.Log("±91s rejected as expired; 89s skew accepted")
 	})
-	t.Run("replay", func(t *testing.T) {
+
+	t.Run("replay_and_sweep", func(t *testing.T) {
 		v := NewKnockVerifier(psk)
-		k := BuildKnock(psk, now)
-		if _, res := v.Check(k, now); res != KnockOK {
+		pkt, _, _ := BuildKnockV2(psk, now, 0)
+		if _, _, _, res := v.CheckPacket(pkt, now); res != KnockOK {
 			t.Fatalf("first use: %v", res)
 		}
-		if _, res := v.Check(k, now.Add(5*time.Second)); res != KnockReplay {
+		if _, _, _, res := v.CheckPacket(pkt, now.Add(10*time.Second)); res != KnockReplay {
 			t.Fatalf("second use: want replay, got %v", res)
 		}
-		// after TTL the nonce expires from cache, but then the timestamp is outside the window anyway
 		v.Sweep(now.Add(KnockReplayTTL + time.Second))
 		if v.CacheSize() != 0 {
 			t.Fatalf("sweep did not clear cache: %d", v.CacheSize())
 		}
-		t.Log("replayed knock rejected with reason=replay; cache swept after TTL")
 	})
 }
 
-// TestServerKnockTimeoutAndRewind: half knock -> timeout; bytes are replayable.
-func TestServerKnockHalfThenRewind(t *testing.T) {
+// TestZeroDelayFallbackSniffing ensures HTTP/1.1, HTTP/2 PRI, and short probes return in <50ms.
+func TestZeroDelayFallbackSniffing(t *testing.T) {
 	psk := make([]byte, 32)
 	v := NewKnockVerifier(psk)
-	cli, srv := net.Pipe()
-	half := []byte("GET / HT") // 8 bytes, < 56
-	go func() { _, _ = cli.Write(half) }()
-	rc := NewRewindConn(srv)
-	start := time.Now()
-	res := v.ServerKnock(rc)
-	if res != KnockTimeoutFail {
-		t.Fatalf("want timeout, got %v", res)
+
+	for _, tc := range []struct {
+		name string
+		send string
+		want KnockResult
+	}{
+		{"http1_get", "GET / HTTP/1.1\r\nHost: x\r\n\r\n", KnockHTTPProbe},
+		{"http2_preface", "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", KnockHTTPProbe},
+		{"short_garbage", "XXXX", KnockIncomplete},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cli, srv := net.Pipe()
+			go func() {
+				_, _ = cli.Write([]byte(tc.send))
+			}()
+			rc := NewRewindConn(srv)
+			t0 := time.Now()
+			_, _, res := v.VerifyFirstRead(rc, time.Now())
+			elapsed := time.Since(t0)
+			if res != tc.want {
+				t.Fatalf("want %v, got %v", tc.want, res)
+			}
+			if elapsed > 100*time.Millisecond {
+				t.Fatalf("sniff blocked too long: %v", elapsed)
+			}
+			_ = rc.SetReadDeadline(time.Time{})
+			rc.Rewind()
+			_ = cli.Close()
+			got, _ := io.ReadAll(rc)
+			if string(got) != tc.send {
+				t.Fatalf("rewound bytes %q != %q", got, tc.send)
+			}
+		})
 	}
-	if d := time.Since(start); d < 2900*time.Millisecond {
-		t.Fatalf("returned too early: %v", d)
-	}
-	_ = rc.SetReadDeadline(time.Time{})
-	rc.Rewind()
-	go func() { _, _ = cli.Write([]byte("TP/1.1")); _ = cli.Close() }()
-	got, _ := io.ReadAll(rc)
-	if string(got) != "GET / HTTP/1.1" {
-		t.Fatalf("got %q", got)
-	}
-	t.Logf("half knock timed out after %v, fallback saw %q", time.Since(start).Round(time.Millisecond), got)
 }
 
-// TestMuxEcho: two sessions over a pipe, echo through a stream with a large transfer (flow control).
-func TestMuxEcho(t *testing.T) {
+func TestMuxEchoAndAdaptivePadding(t *testing.T) {
 	a, b := net.Pipe()
 	ps := NewParamStore(DefaultParams())
 	srv := NewSession(b, false, ps, func(s *Stream, target string, first []byte) {
 		defer s.Close()
-		if target != "example.org:80" {
-			t.Errorf("target %q", target)
+		if len(first) > 0 {
+			_, _ = s.Write(first)
 		}
 		buf := make([]byte, 8192)
 		for {
@@ -191,242 +205,150 @@ func TestMuxEcho(t *testing.T) {
 	go cli.Run()
 	defer cli.Close()
 	defer srv.Close()
-	st, err := cli.OpenStream("example.org:80", nil)
+
+	st, err := cli.OpenStream("example.org:443", []byte("0rtt|"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	data := make([]byte, 3<<20)
+	data := make([]byte, 2<<20)
 	_, _ = rand.Read(data)
-	go func() { _, _ = st.Write(data); _ = st.CloseWrite() }()
+	go func() {
+		_, _ = st.Write(data)
+		_ = st.CloseWrite()
+	}()
 	got, err := io.ReadAll(st)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, data) {
-		t.Fatalf("echo mismatch: %d vs %d", len(got), len(data))
+	if !bytes.Equal(got[:5], []byte("0rtt|")) || !bytes.Equal(got[5:], data) {
+		t.Fatalf("echo mismatch: got %d", len(got))
 	}
-	t.Logf("echoed %d bytes through mux with flow control", len(got))
-}
 
-type memPacket struct {
-	data []byte
-	from net.Addr
-}
-
-type memPacketConn struct {
-	local   net.Addr
-	in      chan memPacket
-	peer    *memPacketConn
-	closed  chan struct{}
-	once    sync.Once
-	rMu     sync.Mutex
-	rDeadln time.Time
-}
-
-func newMemPacketPair() (*memPacketConn, *memPacketConn) {
-	a := &memPacketConn{
-		local:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001},
-		in:     make(chan memPacket, 256),
-		closed: make(chan struct{}),
-	}
-	b := &memPacketConn{
-		local:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40002},
-		in:     make(chan memPacket, 256),
-		closed: make(chan struct{}),
-	}
-	a.peer = b
-	b.peer = a
-	return a, b
-}
-
-func (m *memPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	for {
-		m.rMu.Lock()
-		dl := m.rDeadln
-		m.rMu.Unlock()
-		var timerCh <-chan time.Time
-		if !dl.IsZero() {
-			d := time.Until(dl)
-			if d <= 0 {
-				return 0, nil, context.DeadlineExceeded
-			}
-			t := time.NewTimer(d)
-			defer t.Stop()
-			timerCh = t.C
-		}
-		select {
-		case pkt := <-m.in:
-			n := copy(p, pkt.data)
-			return n, pkt.from, nil
-		case <-m.closed:
-			return 0, nil, net.ErrClosed
-		case <-timerCh:
-			return 0, nil, context.DeadlineExceeded
+	// Verify phased adaptive padding rules directly
+	p := DefaultParams()
+	big := make([]byte, 1500)
+	mid := make([]byte, 1024)
+	tlsApp := []byte{0x17, 0x03, 0x03, 0x00, 0x20}
+	for i := int64(0); i < 8; i++ {
+		pad := cli.computePadding(CmdData, big, i, p)
+		if pad < 64 || pad > 512 {
+			t.Fatalf("vision phase frame %d pad=%d out of [64,512]", i, pad)
 		}
 	}
+	if pad := cli.computePadding(CmdData, mid, 8, p); pad != 0 {
+		t.Fatalf("high-speed direct pass frame 8 >=1024B must have pad=0, got %d", pad)
+	}
+	if pad := cli.computePadding(CmdData, tlsApp, 8, p); pad != 0 {
+		t.Fatalf("inner TLS 0x17 frame 8 must have pad=0, got %d", pad)
+	}
 }
 
-func (m *memPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	select {
-	case <-m.closed:
-		return 0, net.ErrClosed
-	default:
-	}
-	cp := append([]byte(nil), p...)
-	select {
-	case m.peer.in <- memPacket{data: cp, from: m.local}:
-	case <-m.peer.closed:
-	default:
-	}
-	return len(p), nil
-}
-
-func (m *memPacketConn) Close() error {
-	m.once.Do(func() { close(m.closed) })
-	return nil
-}
-func (m *memPacketConn) LocalAddr() net.Addr                { return m.local }
-func (m *memPacketConn) SetDeadline(t time.Time) error      { return m.SetReadDeadline(t) }
-func (m *memPacketConn) SetWriteDeadline(_ time.Time) error { return nil }
-func (m *memPacketConn) SetReadDeadline(t time.Time) error {
-	m.rMu.Lock()
-	m.rDeadln = t
-	m.rMu.Unlock()
-	return nil
-}
-
-// TestQUICStreamAndKnock verifies real quic-go TLS 1.3 handshake + Pinning + Knock + Mux
-// over an in-memory PacketConn pair (independent of OS loopback UDP firewall rules).
-func TestQUICStreamAndKnock(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		DNSNames:     []string{"blog.example.test"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	leaf, _ := x509.ParseCertificate(der)
-	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
-
-	psk := make([]byte, 32)
-	_, _ = rand.Read(psk)
-	link := &Link{
-		V:         1,
-		Host:      "127.0.0.1",
-		Port:      40002,
-		SNI:       "blog.example.test",
-		PSK:       base64.StdEncoding.EncodeToString(psk),
-		Pin:       PinOf(leaf),
-		Transport: "quic",
-	}
-
-	srvPC, cliPC := newMemPacketPair()
-	defer srvPC.Close()
-	defer cliPC.Close()
-
-	srvTLS := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{"h3"},
-	}
-	qln, err := quic.Listen(srvPC, srvTLS, DefaultQUICConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer qln.Close()
-
+func TestMuxUDPDatagram(t *testing.T) {
+	a, b := net.Pipe()
 	ps := NewParamStore(DefaultParams())
-	verifier := NewKnockVerifier(psk)
+	var closedMu sync.Mutex
+	closedID := uint16(0)
 
-	go func() {
-		qc, err := qln.Accept(context.Background())
-		if err != nil {
-			return
+	srv := NewSession(b, false, ps, nil)
+	srv.SetUDPHandler(func(s *Session, id uint16, target string, data []byte) {
+		reply := append([]byte("ack:"+target+":"), data...)
+		_ = s.SendUDPDatagram(id, target, reply, 0)
+	}, func(_ *Session, id uint16) {
+		closedMu.Lock()
+		closedID = id
+		closedMu.Unlock()
+	})
+	cli := NewSession(a, true, ps, nil)
+	go srv.Run()
+	go cli.Run()
+	defer cli.Close()
+	defer srv.Close()
+
+	ust, err := cli.OpenUDP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ust.SendTo("1.1.1.1:53", []byte("dnsq")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case pkt := <-ust.Recv():
+		if string(pkt.Data) != "ack:1.1.1.1:53:dnsq" {
+			t.Fatalf("unexpected udp reply: %q", pkt.Data)
 		}
-		st, err := qc.AcceptStream(context.Background())
-		if err != nil {
-			return
+	case <-time.After(2 * time.Second):
+		t.Fatal("udp echo timeout")
+	}
+	wantID := ust.ID()
+	_ = ust.Close()
+	time.Sleep(50 * time.Millisecond)
+	closedMu.Lock()
+	gotClosed := closedID
+	closedMu.Unlock()
+	if gotClosed != wantID {
+		t.Fatalf("expected UDPClose id=%d, got %d", wantID, gotClosed)
+	}
+}
+
+func TestSessionPoolLeastLoadedAndDrain(t *testing.T) {
+	ps := NewParamStore(DefaultParams())
+	link := &Link{V: 2, Host: "example.com", Port: 443, SNI: "example.com", PSK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", Verify: "ca"}
+
+	var mu sync.Mutex
+	var srvConns []net.Conn
+	defer func() {
+		mu.Lock()
+		for _, c := range srvConns {
+			_ = c.Close()
 		}
-		qsc := &QUICStreamConn{Stream: st, Conn: qc}
-		rc := NewRewindConn(qsc)
-		if res := verifier.ServerKnock(rc); res != KnockOK {
-			_ = qsc.Close()
-			return
-		}
-		rc.StopRecording()
-		srv := NewSession(qsc, false, ps, func(s *Stream, target string, first []byte) {
-			defer s.Close()
-			if len(first) > 0 {
-				_, _ = s.Write(first)
-			}
-			buf := make([]byte, 1024)
-			for {
-				n, err := s.Read(buf)
-				if n > 0 {
-					_, _ = s.Write(buf[:n])
-				}
-				if err != nil {
-					return
-				}
-			}
-		})
-		_ = srv.Run()
+		mu.Unlock()
 	}()
 
-	cliTLS, err := TLSConfigFor(link)
+	pool := NewSessionPool(link, ps, 2, nil)
+	pool.dialFn = func(ctx context.Context, _ *Link, store *ParamStore, _ uint16, _ time.Duration) (*Session, time.Duration, error) {
+		c, s := net.Pipe()
+		srv := NewSession(s, false, store, nil)
+		go srv.Run()
+		mu.Lock()
+		srvConns = append(srvConns, s)
+		mu.Unlock()
+		cli := NewSession(c, true, store, nil)
+		go cli.Run()
+		return cli, 2 * time.Millisecond, nil
+	}
+
+	if err := pool.Start(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	// Wait for keeper to bring pool up to 2
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if pool.Stats().ActiveConns == 2 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if pool.Stats().ActiveConns != 2 {
+		t.Fatalf("expected 2 active conns, got %+v", pool.Stats())
+	}
+
+	// Open a stream on session 1; next Acquire must select the less-loaded session 2.
+	s1, err := pool.Acquire()
 	if err != nil {
 		t.Fatal(err)
 	}
-	cliTLS.NextProtos = []string{"h3"}
+	s1.mu.Lock()
+	s1.streams[99] = newStream(s1, 99)
+	s1.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	qc, err := quic.Dial(ctx, cliPC, srvPC.LocalAddr(), cliTLS, DefaultQUICConfig())
-	if err != nil {
-		t.Fatalf("quic.Dial: %v", err)
-	}
-	defer qc.CloseWithError(0, "")
-
-	st, err := qc.OpenStreamSync(ctx)
+	s2, err := pool.Acquire()
 	if err != nil {
 		t.Fatal(err)
 	}
-	qsc := &QUICStreamConn{Stream: st, Conn: qc}
-	if _, err := qsc.Write(BuildKnock(psk, time.Now())); err != nil {
-		t.Fatal(err)
+	if s1 == s2 {
+		t.Fatal("least-loaded scheduler picked already loaded session")
 	}
-
-	cli := NewSession(qsc, true, ps, nil)
-	go func() { _ = cli.Run() }()
-	defer cli.Close()
-
-	s, err := cli.OpenStream("example.org:443", []byte("quic-0rtt|"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Write([]byte("ok")); err != nil {
-		t.Fatal(err)
-	}
-	want := "quic-0rtt|ok"
-	got := make([]byte, len(want))
-	if _, err := io.ReadFull(s, got); err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
-	_ = s.Close()
-
-	// Verify bad Pin fails on TLSConfigFor
-	bad := *link
-	bad.Pin = strings.Repeat("00", 32)
-	badCfg, _ := TLSConfigFor(&bad)
-	if err := badCfg.VerifyConnection(tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}); err == nil {
-		t.Fatal("bad pin must be rejected")
-	}
-	t.Log("QUIC + Pinning + Knock + 0-RTT Mux OK")
+	_ = binary.BigEndian
 }

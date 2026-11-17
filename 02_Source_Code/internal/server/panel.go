@@ -3,7 +3,6 @@ package server
 import (
 	"crypto/rand"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -170,6 +169,14 @@ func (p *Panel) serveAPI(w http.ResponseWriter, r *http.Request, action string) 
 	}
 
 	switch action {
+	case "session":
+		cookie, _ := r.Cookie(sessionCookieName)
+		token := ""
+		if cookie != nil {
+			token = cookie.Value
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "csrf": token})
+		return
 	case "logout":
 		if r.Method == http.MethodPost {
 			http.SetCookie(w, &http.Cookie{
@@ -177,7 +184,7 @@ func (p *Panel) serveAPI(w http.ResponseWriter, r *http.Request, action string) 
 				Value:    "",
 				Path:     p.srv.cfg.PanelPath,
 				HttpOnly: true,
-				Secure:   true,
+				Secure:   r.TLS != nil,
 				SameSite: http.SameSiteStrictMode,
 				MaxAge:   -1,
 			})
@@ -256,7 +263,7 @@ func (p *Panel) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Value:    token,
 		Path:     p.srv.cfg.PanelPath,
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   int(sessionTTL / time.Second),
 	})
@@ -353,30 +360,9 @@ func (p *Panel) handleUpdateParams(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Panel) handleLink(w http.ResponseWriter, r *http.Request) {
-	host, portStr, err := net.SplitHostPort(p.srv.cfg.Listen)
-	port := 8443
-	if err == nil {
-		if p, e := net.LookupPort("tcp", portStr); e == nil {
-			port = p
-		}
-	}
-	if p.srv.cfg.PublicHost != "" {
-		host = p.srv.cfg.PublicHost
-	}
-
 	curParams := p.srv.params.Get()
-	linkObj := gft.Link{
-		V:      1,
-		Host:   host,
-		Port:   port,
-		SNI:    p.srv.cfg.SNI,
-		PSK:    p.srv.cfg.PSK,
-		Pin:    p.srv.cfg.Pin,
-		Params: &curParams,
-	}
-	rawJSON, _ := json.Marshal(linkObj)
-	encoded := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(rawJSON)
-	uri := "gft://" + encoded + "#Japan-GhostFrame"
+	linkObj := p.srv.cfg.Link(curParams)
+	uri := linkObj.Encode()
 
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"uri":     uri,

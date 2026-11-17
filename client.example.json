@@ -1,20 +1,22 @@
 {
-  "link": {
-    "v": 1,
-    "host": "your-server-ip-or-domain",
-    "port": 8443,
-    "sni": "blog.quietcompiler.net",
-    "psk": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-    "pin": "b2229239ac7e570de073a3c4e4486299fea8c6b1cce7f181099831641bf83eed",
-    "params": {
-      "pmin": 16,
-      "pmax": 64,
-      "pprob": 80,
-      "hbmin": 3000,
-      "hbmax": 7000
-    },
-    "remark": "GhostFrame-TLS Tokyo Node"
-  },
+  "nodes": [
+    {
+      "v": 3,
+      "host": "198.51.100.10",
+      "port": 443,
+      "sni": "ftp.jaist.ac.jp",
+      "psk": "<YOUR_BASE64_PSK>",
+      "verify": "spki",
+      "pin": "<YOUR_SHA256_CERT_PIN>",
+      "fp": "chrome",
+      "transport": "auto",
+      "split_sni": true,
+      "hop_range": "",
+      "remark": "Example GFT v3 Apex Node"
+    }
+  ],
+  "active_node": 0,
+  "route_mode": "rule",
   "socks_addr": "127.0.0.1:10808",
   "http_addr": "127.0.0.1:10809",
   "sys_proxy": false

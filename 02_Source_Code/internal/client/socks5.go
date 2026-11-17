@@ -12,7 +12,7 @@ import (
 	"ghostframe/internal/gft"
 )
 
-// SOCKS5Server handles incoming SOCKS5 requests and tunnels them via GFT engine.
+// SOCKS5Server handles SOCKS5 CONNECT (0x01) and UDP ASSOCIATE (0x03) requests.
 type SOCKS5Server struct {
 	addr     string
 	engine   *Engine
@@ -52,6 +52,9 @@ func (s *SOCKS5Server) Start() error {
 					continue
 				}
 			}
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+			}
 			go s.handleConn(c)
 		}
 	}()
@@ -84,99 +87,276 @@ func (s *SOCKS5Server) Close() error {
 	return nil
 }
 
+func readSOCKS5Target(r io.Reader, atyp byte) (string, error) {
+	var host string
+	switch atyp {
+	case 0x01:
+		var ip [4]byte
+		if _, err := io.ReadFull(r, ip[:]); err != nil {
+			return "", err
+		}
+		host = net.IP(ip[:]).String()
+	case 0x03:
+		var l [1]byte
+		if _, err := io.ReadFull(r, l[:]); err != nil {
+			return "", err
+		}
+		domain := make([]byte, l[0])
+		if _, err := io.ReadFull(r, domain); err != nil {
+			return "", err
+		}
+		host = string(domain)
+	case 0x04:
+		var ip [16]byte
+		if _, err := io.ReadFull(r, ip[:]); err != nil {
+			return "", err
+		}
+		host = net.IP(ip[:]).String()
+	default:
+		return "", errors.New("unsupported atyp")
+	}
+	var portBuf [2]byte
+	if _, err := io.ReadFull(r, portBuf[:]); err != nil {
+		return "", err
+	}
+	port := binary.BigEndian.Uint16(portBuf[:])
+	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
+}
+
 func (s *SOCKS5Server) handleConn(c net.Conn) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 
-	// 1. Negotiation
 	var head [2]byte
-	if _, err := io.ReadFull(c, head[:]); err != nil {
+	if _, err := io.ReadFull(c, head[:]); err != nil || head[0] != 0x05 {
 		return
-	}
-	if head[0] != 0x05 {
-		return // Not SOCKS5
 	}
 	nmethods := int(head[1])
 	methods := make([]byte, nmethods)
 	if _, err := io.ReadFull(c, methods); err != nil {
 		return
 	}
-
-	// Accept NO AUTH (0x00)
 	if _, err := c.Write([]byte{0x05, 0x00}); err != nil {
 		return
 	}
 
-	// 2. Request
 	var reqHead [4]byte
-	if _, err := io.ReadFull(c, reqHead[:]); err != nil {
-		return
-	}
-	if reqHead[0] != 0x05 || reqHead[1] != 0x01 { // Only CMD 0x01 (CONNECT) supported
-		_, _ = c.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	if _, err := io.ReadFull(c, reqHead[:]); err != nil || reqHead[0] != 0x05 {
 		return
 	}
 
-	var host string
-	switch reqHead[3] {
-	case 0x01: // IPv4
-		var ip [4]byte
-		if _, err := io.ReadFull(c, ip[:]); err != nil {
-			return
-		}
-		host = net.IP(ip[:]).String()
-	case 0x03: // FQDN
-		var l [1]byte
-		if _, err := io.ReadFull(c, l[:]); err != nil {
-			return
-		}
-		domain := make([]byte, l[0])
-		if _, err := io.ReadFull(c, domain); err != nil {
-			return
-		}
-		host = string(domain)
-	case 0x04: // IPv6
-		var ip [16]byte
-		if _, err := io.ReadFull(c, ip[:]); err != nil {
-			return
-		}
-		host = net.IP(ip[:]).String()
-	default:
+	target, err := readSOCKS5Target(c, reqHead[3])
+	if err != nil {
 		_, _ = c.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 
-	var portBuf [2]byte
-	if _, err := io.ReadFull(c, portBuf[:]); err != nil {
+	switch reqHead[1] {
+	case 0x01: // CONNECT
+		st, _, err := s.engine.OpenTargetStream(target, nil)
+		if err != nil {
+			_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
+		defer st.Close()
+
+		if _, err := c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+			return
+		}
+		_ = c.SetDeadline(time.Time{})
+		gft.Relay(st, c, 15*time.Minute)
+
+	case 0x03: // UDP ASSOCIATE (RFC 1928)
+		s.handleUDPAssociate(c)
+
+	default:
+		_, _ = c.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	}
+}
+
+func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
+	if !s.engine.IsConnected() {
+		_, _ = ctrl.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
-	port := binary.BigEndian.Uint16(portBuf[:])
-	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
-
-	// Check if active session is available
-	sess := s.engine.ActiveSession()
-	if sess == nil {
-		s.engine.Logf("[SOCKS5] Error: Not connected to GFT server, rejecting %s", target)
-		_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
+	bindIP := "127.0.0.1"
+	if la, ok := ctrl.LocalAddr().(*net.TCPAddr); ok && la.IP != nil {
+		if v4 := la.IP.To4(); v4 != nil {
+			bindIP = v4.String()
+		}
 	}
-
-	st, err := sess.OpenStream(target, nil)
+	udpConn, err := net.ListenPacket("udp4", net.JoinHostPort(bindIP, "0"))
 	if err != nil {
-		s.engine.Logf("[SOCKS5] OpenStream to %s failed: %v", target, err)
-		_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		_, _ = ctrl.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
-	defer st.Close()
+	defer udpConn.Close()
 
-	// Success response
-	if _, err := c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+	ua := udpConn.LocalAddr().(*net.UDPAddr)
+	ip4 := ua.IP.To4()
+	if ip4 == nil {
+		ip4 = net.IPv4(127, 0, 0, 1)
+	}
+	var rep [10]byte
+	rep[0], rep[1], rep[2], rep[3] = 0x05, 0x00, 0x00, 0x01
+	copy(rep[4:8], ip4)
+	binary.BigEndian.PutUint16(rep[8:10], uint16(ua.Port))
+	if _, err := ctrl.Write(rep[:]); err != nil {
 		return
 	}
+	_ = ctrl.SetDeadline(time.Time{})
 
-	_ = c.SetDeadline(time.Time{})
-	s.engine.Logf("[SOCKS5] Tunneling %s -> %s", c.RemoteAddr(), target)
-	gft.Relay(st, c, 15*time.Minute)
+	var assoc gft.UDPAssociation
+	var directPC net.PacketConn
+	var assocMu sync.Mutex
+	done := make(chan struct{})
+	defer func() {
+		close(done)
+		assocMu.Lock()
+		if assoc != nil {
+			_ = assoc.Close()
+		}
+		if directPC != nil {
+			_ = directPC.Close()
+		}
+		assocMu.Unlock()
+	}()
+
+	var clientAddrMu sync.RWMutex
+	var clientAddr net.Addr
+
+	// Watch TCP control connection: closing it terminates the UDP association per RFC 1928.
+	go func() {
+		var sink [32]byte
+		for {
+			if _, err := ctrl.Read(sink[:]); err != nil {
+				_ = udpConn.Close()
+				return
+			}
+		}
+	}()
+
+	sendBackToClient := func(srcTarget string, payload []byte) {
+		clientAddrMu.RLock()
+		ca := clientAddr
+		clientAddrMu.RUnlock()
+		if ca == nil {
+			return
+		}
+		ab, err := gft.EncodeAddr(srcTarget)
+		if err != nil {
+			return
+		}
+		pkt := make([]byte, 3+len(ab)+len(payload))
+		// RSV(2)=0, FRAG(1)=0, ATYP|ADDR|PORT, DATA
+		copy(pkt[3:], ab)
+		copy(pkt[3+len(ab):], payload)
+		_, _ = udpConn.WriteTo(pkt, ca)
+	}
+
+	ensureProxyAssoc := func() (gft.UDPAssociation, error) {
+		assocMu.Lock()
+		defer assocMu.Unlock()
+		if assoc != nil {
+			select {
+			case <-assoc.Done():
+				assoc = nil
+			default:
+				return assoc, nil
+			}
+		}
+		a, err := s.engine.OpenUDPAssociation()
+		if err != nil {
+			return nil, err
+		}
+		assoc = a
+		go func(u gft.UDPAssociation) {
+			for {
+				select {
+				case <-done:
+					return
+				case <-u.Done():
+					assocMu.Lock()
+					if assoc == u {
+						assoc = nil
+					}
+					assocMu.Unlock()
+					return
+				case pkt, ok := <-u.Recv():
+					if !ok {
+						assocMu.Lock()
+						if assoc == u {
+							assoc = nil
+						}
+						assocMu.Unlock()
+						return
+					}
+					sendBackToClient(pkt.Target, pkt.Data)
+				}
+			}
+		}(a)
+		return a, nil
+	}
+
+	ensureDirectUDP := func() (net.PacketConn, error) {
+		assocMu.Lock()
+		defer assocMu.Unlock()
+		if directPC != nil {
+			return directPC, nil
+		}
+		pc, err := net.ListenPacket("udp", ":0")
+		if err != nil {
+			return nil, err
+		}
+		directPC = pc
+		go func() {
+			dbuf := make([]byte, 64*1024)
+			for {
+				dn, da, derr := pc.ReadFrom(dbuf)
+				if derr != nil {
+					return
+				}
+				sendBackToClient(da.String(), dbuf[:dn])
+			}
+		}()
+		return pc, nil
+	}
+
+	buf := make([]byte, 64*1024)
+	for {
+		n, fromAddr, err := udpConn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		if n < 10 || buf[2] != 0x00 { // drop fragmented SOCKS5 UDP packets
+			continue
+		}
+		clientAddrMu.Lock()
+		clientAddr = fromAddr
+		clientAddrMu.Unlock()
+
+		target, payload, err := gft.DecodeAddr(buf[3:n])
+		if err != nil {
+			continue
+		}
+		if s.engine.RouteDecision(target) == ActionDirect {
+			pc, err := ensureDirectUDP()
+			if err != nil {
+				continue
+			}
+			uaDst, err := net.ResolveUDPAddr("udp", target)
+			if err != nil {
+				continue
+			}
+			_, _ = pc.WriteTo(payload, uaDst)
+		} else {
+			a, err := ensureProxyAssoc()
+			if err != nil {
+				continue
+			}
+			_ = a.SendTo(target, payload)
+		}
+	}
 }
 
 var errNoActiveSession = errors.New("no active GFT session")

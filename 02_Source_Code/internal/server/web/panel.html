@@ -203,17 +203,29 @@ tr:hover td { background: var(--bg-card-hover); }
   <!-- Connection & Clash Config -->
   <div class="section-box">
     <div class="section-title"><span>Node Export & Integration</span></div>
-    <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">Universal GFT Import URI:</div>
-    <div class="code-box" id="link-box">Loading gft:// link...</div>
-    <button class="btn" onclick="copyText('link-box')">Copy gft:// Link</button>
+    <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">Universal GFT v2 Import URI:</div>
+    <div class="code-box" id="link-box">Loading gft2:// link...</div>
+    <button class="btn" onclick="copyText('link-box')">Copy gft2:// Link</button>
     
-    <div style="margin-top: 18px; font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">Clash Verge / Meta Proxy Configuration YAML:</div>
+    <div style="margin-top: 18px; font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">Clash Meta / Mihomo Proxy Configuration YAML:</div>
     <pre class="code-box" id="clash-box" style="white-space: pre;">Loading YAML...</pre>
     <button class="btn" onclick="copyText('clash-box')">Copy Clash YAML</button>
   </div>
 </div>
 
 <script>
+let csrfToken = '';
+async function ensureCSRF() {
+  if (csrfToken) return csrfToken;
+  try {
+    const res = await fetch('api/session');
+    if (res.ok) {
+      const d = await res.json();
+      if (d && d.csrf) csrfToken = d.csrf;
+    }
+  } catch (e) {}
+  return csrfToken;
+}
 function fmtBytes(b) {
   if (!b || b <= 0) return '0 B';
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -327,9 +339,10 @@ async function fetchAudit() {
 }
 
 async function setBan(ip, banned) {
+  const token = await ensureCSRF();
   await fetch('api/ban', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
     body: JSON.stringify({ ip, banned })
   });
   fetchAudit();
@@ -349,6 +362,7 @@ async function fetchParams() {
 }
 
 async function saveParams() {
+  const token = await ensureCSRF();
   const p = {
     pmin: parseInt(document.getElementById('pmin').value, 10),
     pmax: parseInt(document.getElementById('pmax').value, 10),
@@ -358,7 +372,7 @@ async function saveParams() {
   };
   const res = await fetch('api/params', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
     body: JSON.stringify(p)
   });
   if (res.ok) alert('Obfuscation parameters hot-updated successfully!');
@@ -373,13 +387,12 @@ async function fetchLink() {
     linkData = data;
     document.getElementById('link-box').textContent = data.uri;
     
-    const clashYaml = `- name: "Japan-GhostFrame-Node"
+    const clashYaml = `- name: "GhostFrame-v2-Node"
   type: socks5
   server: 127.0.0.1
   port: 10808
-  # Local GhostFrame Client automatically tunnels traffic over TLS 1.3
-  # Remote Node: ${data.link.host}:${data.link.port}
-  # Cert Pin: ${data.pin}`;
+  udp: true
+  # Remote Node: ${data.link.host}:${data.link.port} (${data.link.verify || 'spki'})`;
     document.getElementById('clash-box').textContent = clashYaml;
   } catch (e) {}
 }
@@ -392,11 +405,13 @@ function copyText(id) {
 }
 
 async function logout() {
-  await fetch('api/logout', { method: 'POST' });
+  const token = await ensureCSRF();
+  await fetch('api/logout', { method: 'POST', headers: { 'X-CSRF-Token': token } });
   location.reload();
 }
 
 // Initial fetch & poll
+ensureCSRF();
 fetchStats();
 fetchAudit();
 fetchParams();

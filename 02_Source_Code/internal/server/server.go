@@ -6,41 +6,63 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/net/http2"
 
 	"ghostframe/internal/gft"
 )
 
-// Server is the GhostFrame-TLS server: one TCP+UDP port (TLS 1.3 + QUIC), knock -> proxy, otherwise -> web fallback.
-type Server struct {
-	cfg      *Config
-	psk      []byte
-	verifier *gft.KnockVerifier
-	params   *gft.ParamStore
-	audit    *Audit
-	stats    *Stats
-	panel    *Panel
-	web      http.Handler
-	fallback *chanListener
-	started  time.Time
+const (
+	maxUDPPerSession = 128
+	udpIdleTimeout   = 60 * time.Second
+	internalPanelHost = "gft.internal.panel:80"
+)
 
-	smu      sync.Mutex
-	sessions map[uint64]*sessEntry
-	nextSess atomic.Uint64
-	logger   *log.Logger
+// Server is the GhostFrame-TLS v3 Apex dual-stack server:
+//   - TCP: 0ms Pre-TLS MirrorInspector -> TLS 1.3 + ClientAuth -> Ghost Frame v3 Mux
+//     (probes/scanners are transparently mirrored to CamouflageTarget or fallback HTTP/H2)
+//   - UDP: Pre-QUIC AuthPacketConn (drops unknown packets silently) -> QUIC + RFC9221 UDP
+type Server struct {
+	cfg           *Config
+	psk           []byte
+	stego         *gft.StegoVerifier
+	verifier      *gft.KnockVerifier
+	outbound      *FastOutbound
+	params        *gft.ParamStore
+	audit         *Audit
+	stats         *Stats
+	panel         *Panel
+	web           http.Handler
+	fallback      *chanListener
+	panelListener *chanListener
+	started       time.Time
+
+	testUDPPC net.PacketConn // optional injection for tests
+	tcpAddrMu sync.RWMutex
+	tcpAddr   net.Addr
+	udpAddr   net.Addr
+
+	smu       sync.Mutex
+	sessions  map[uint64]*sessEntry
+	nextSess  atomic.Uint64
+	udpMgrMu  sync.Mutex
+	udpMgrs   map[[8]byte]*udpManager
+	logger    *log.Logger
 }
 
 type sessEntry struct {
@@ -58,19 +80,72 @@ func New(cfg *Config, logger *log.Logger) (*Server, error) {
 	if err != nil || len(psk) < 16 {
 		return nil, errors.New("bad psk in config")
 	}
-	s := &Server{cfg: cfg, psk: psk, verifier: gft.NewKnockVerifier(psk), sessions: map[uint64]*sessEntry{},
-		started: time.Now(), logger: logger}
+	s := &Server{
+		cfg:      cfg,
+		psk:      psk,
+		stego:    gft.NewStegoVerifier(psk),
+		verifier: gft.NewKnockVerifier(psk),
+		outbound: NewFastOutbound(),
+		sessions: map[uint64]*sessEntry{},
+		udpMgrs:  map[[8]byte]*udpManager{},
+		started:  time.Now(),
+		logger:   logger,
+	}
 	s.params = gft.NewParamStore(s.loadParams())
 	s.audit = NewAudit(filepath.Join(cfg.StateDir, "audit.json"))
 	s.stats = NewStats()
 	s.fallback = newChanListener()
+	s.panelListener = newChanListener()
 	s.panel = newPanel(s)
 	s.web = s.buildRouter()
 	return s, nil
 }
 
+// TCPAddr returns the active TCP listen address once Run has started.
+func (s *Server) TCPAddr() net.Addr {
+	s.tcpAddrMu.RLock()
+	defer s.tcpAddrMu.RUnlock()
+	return s.tcpAddr
+}
+
+// UDPAddr returns the active UDP QUIC listen address once Run has started (nil if QUIC disabled).
+func (s *Server) UDPAddr() net.Addr {
+	s.tcpAddrMu.RLock()
+	defer s.tcpAddrMu.RUnlock()
+	return s.udpAddr
+}
+
+// SetTestUDPConn injects a custom net.PacketConn for QUIC unit tests.
+func (s *Server) SetTestUDPConn(pc net.PacketConn) {
+	s.testUDPPC = pc
+}
+
+func (s *Server) buildFallbackHandler() http.Handler {
+	if strings.EqualFold(s.cfg.FallbackMode, "reverse_proxy") && s.cfg.FallbackTarget != "" {
+		if u, err := url.Parse(s.cfg.FallbackTarget); err == nil && u.Scheme != "" && u.Host != "" {
+			rp := httputil.NewSingleHostReverseProxy(u)
+			origDirector := rp.Director
+			rp.Director = func(req *http.Request) {
+				origHost := req.Host
+				origDirector(req)
+				if origHost != "" {
+					req.Host = origHost
+				}
+			}
+			rp.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
+				http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			}
+			return rp
+		}
+	}
+	return blogHandler()
+}
+
 func (s *Server) loadParams() gft.Params {
 	p := gft.DefaultParams()
+	if s.cfg.Params != nil && s.cfg.Params.Validate() == nil {
+		p = *s.cfg.Params
+	}
 	if b, err := os.ReadFile(filepath.Join(s.cfg.StateDir, "params.json")); err == nil {
 		var q gft.Params
 		if json.Unmarshal(b, &q) == nil && q.Validate() == nil {
@@ -80,64 +155,215 @@ func (s *Server) loadParams() gft.Params {
 	return p
 }
 
+// RuntimeSnapshot captures live telemetry persisted periodically for CLI/TUI dashboards.
+type RuntimeSnapshot struct {
+	UpdatedAt    int64  `json:"updated_at"`
+	TotalUp      uint64 `json:"total_up"`
+	TotalDown    uint64 `json:"total_down"`
+	UpBps        uint64 `json:"up_bps"`
+	DownBps      uint64 `json:"down_bps"`
+	Sessions     int    `json:"sessions"`
+	BlockedCount int    `json:"blocked_count"`
+}
+
+func (s *Server) writeRuntimeSnapshot() {
+	if s.cfg.StateDir == "" {
+		return
+	}
+	st := s.stats.Snapshot()
+	s.smu.Lock()
+	sc := len(s.sessions)
+	s.smu.Unlock()
+	snap := RuntimeSnapshot{
+		UpdatedAt:    time.Now().Unix(),
+		TotalUp:      st.UpTotal,
+		TotalDown:    st.DownTotal,
+		UpBps:        st.UpRate,
+		DownBps:      st.DownRate,
+		Sessions:     sc,
+		BlockedCount: len(s.audit.List()),
+	}
+	b, _ := json.Marshal(snap)
+	_ = os.WriteFile(filepath.Join(s.cfg.StateDir, "stats.json"), b, 0o600)
+}
+
 func (s *Server) saveParams(p gft.Params) {
 	b, _ := json.Marshal(p)
 	_ = os.WriteFile(filepath.Join(s.cfg.StateDir, "params.json"), b, 0o600)
 }
 
-// Run serves until ctx is cancelled.
-func (s *Server) Run(ctx context.Context) error {
-	cert, err := tls.LoadX509KeyPair(s.cfg.CertFile, s.cfg.KeyFile)
+type certReloader struct {
+	certFile string
+	keyFile  string
+	mu       sync.Mutex
+	modTime  time.Time
+	cert     atomic.Pointer[tls.Certificate]
+}
+
+func newCertReloader(certFile, keyFile string) (*certReloader, error) {
+	r := &certReloader{certFile: certFile, keyFile: keyFile}
+	if err := r.reloadIfChanged(true); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *certReloader) reloadIfChanged(force bool) error {
+	st, err := os.Stat(r.certFile)
 	if err != nil {
 		return err
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !force && !st.ModTime().After(r.modTime) {
+		return nil
+	}
+	cert, err := tls.LoadX509KeyPair(r.certFile, r.keyFile)
+	if err != nil {
+		return err
+	}
+	r.cert.Store(&cert)
+	r.modTime = st.ModTime()
+	return nil
+}
+
+func (r *certReloader) getCertificate(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	c := r.cert.Load()
+	if c == nil {
+		return nil, errors.New("no certificate loaded")
+	}
+	return c, nil
+}
+
+func (s *Server) buildTLSConfig(ctx context.Context) (*tls.Config, error) {
 	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{"h2", "http/1.1"},
+		MinVersion: tls.VersionTLS13,
+		NextProtos: []string{"h2", "http/1.1"},
+	}
+	gft.OptimizeTLSConfigForHardware(tlsCfg)
+	switch strings.ToLower(s.cfg.CertMode) {
+	case "acme":
+		domains := s.cfg.ACMEDomains
+		if len(domains) == 0 && s.cfg.SNI != "" {
+			domains = []string{s.cfg.SNI}
+		}
+		cacheDir := s.cfg.ACMECacheDir
+		if cacheDir == "" {
+			cacheDir = filepath.Join(s.cfg.StateDir, "acme")
+		}
+		mgr := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			Cache:      autocert.DirCache(cacheDir),
+			HostPolicy: autocert.HostWhitelist(domains...),
+			Email:      s.cfg.ACMEEmail,
+		}
+		tlsCfg.GetCertificate = mgr.GetCertificate
+		return tlsCfg, nil
+	default: // "file" or "self_signed_90d"
+		reloader, err := newCertReloader(s.cfg.CertFile, s.cfg.KeyFile)
+		if err != nil {
+			return nil, err
+		}
+		tlsCfg.GetCertificate = reloader.getCertificate
+		go func() {
+			t := time.NewTicker(5 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					_ = reloader.reloadIfChanged(false)
+				}
+			}
+		}()
+		return tlsCfg, nil
+	}
+}
+
+// Run serves dual-stack TCP (:443) and QUIC UDP (:443) until ctx is cancelled.
+func (s *Server) Run(ctx context.Context) error {
+	tlsCfg, err := s.buildTLSConfig(ctx)
+	if err != nil {
+		return err
 	}
 	ln, err := net.Listen("tcp", s.cfg.Listen)
 	if err != nil {
 		return err
 	}
-	quicTLSCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{"h3", "http/1.1"},
-	}
-	qln, err := quic.ListenAddr(ln.Addr().String(), quicTLSCfg, gft.DefaultQUICConfig())
-	if err != nil {
-		_ = ln.Close()
-		return fmt.Errorf("quic listen %s: %w", ln.Addr(), err)
-	}
-	s.logger.Printf("listening on %s (TCP TLS1.3 + UDP QUIC)", ln.Addr())
+	s.tcpAddrMu.Lock()
+	s.tcpAddr = ln.Addr()
+	s.tcpAddrMu.Unlock()
 
-	var protos http.Protocols
-	protos.SetHTTP1(true)
-	protos.SetUnencryptedHTTP2(true)
+	// Optional QUIC listener on matching UDP port (unless DisableQUIC).
+	var qLn *quic.Listener
+	var qTr *quic.Transport
+	var rawUDP net.PacketConn
+	if !s.cfg.DisableQUIC {
+		pc := s.testUDPPC
+		if pc == nil {
+			udpBind := s.cfg.Listen
+			if host, _, err := net.SplitHostPort(ln.Addr().String()); err == nil {
+				if ta, ok := ln.Addr().(*net.TCPAddr); ok {
+					// Keep configured bind host if any, or use resolved port
+					cfgHost, cfgPort, _ := net.SplitHostPort(s.cfg.Listen)
+					if cfgPort == "0" {
+						udpBind = net.JoinHostPort(cfgHost, strconv.Itoa(ta.Port))
+					} else {
+						_ = host
+					}
+				}
+			}
+			pc, err = net.ListenPacket("udp", udpBind)
+			if err != nil {
+				_ = ln.Close()
+				return err
+			}
+		}
+		rawUDP = pc
+		s.tcpAddrMu.Lock()
+		s.udpAddr = pc.LocalAddr()
+		s.tcpAddrMu.Unlock()
+
+		authPC := gft.NewAuthPacketConn(pc, s.stego)
+		qTr = &quic.Transport{Conn: authPC}
+		quicTLS := tlsCfg.Clone()
+		quicTLS.NextProtos = []string{"h3"}
+		qLn, err = qTr.Listen(quicTLS, gft.QUICConfig())
+		if err != nil {
+			_ = pc.Close()
+			_ = ln.Close()
+			return err
+		}
+	}
+
+	s.logger.Printf("GFT v3 Apex listening tcp=%s quic=%v (cert=%s fallback=%s target=%s)",
+		ln.Addr(), qLn != nil, s.cfg.CertMode, s.cfg.FallbackMode, s.cfg.CamouflageTarget)
+
+	// Public HTTP/1.1 fallback server (reverse_proxy or builtin_blog)
 	hs := &http.Server{
 		Handler:           s.web,
-		Protocols:         &protos,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		ErrorLog:          log.New(io.Discard, "", 0),
 	}
+	// Internal tunnel-only management panel server ("gft.internal.panel:80")
+	panelSrv := &http.Server{
+		Handler:           s.web,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ErrorLog:          log.New(io.Discard, "", 0),
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(4)
 	go func() { defer wg.Done(); _ = hs.Serve(s.fallback) }()
+	go func() { defer wg.Done(); _ = panelSrv.Serve(s.panelListener) }()
 	go func() {
-		defer wg.Done()
-		for {
-			qconn, err := qln.Accept(ctx)
-			if err != nil {
-				return
-			}
-			go s.handleQUIC(ctx, qconn)
-		}
-	}()
-	go func() { // housekeeping
 		defer wg.Done()
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
@@ -149,10 +375,14 @@ func (s *Server) Run(ctx context.Context) error {
 			case <-t.C:
 				s.stats.Sample()
 				n++
+				if n%3 == 0 {
+					s.writeRuntimeSnapshot()
+				}
 				if n%30 == 0 {
 					s.verifier.Sweep(time.Now())
 					s.audit.Flush()
 					s.panel.sweep()
+					s.sweepUDPMgrs(10 * time.Minute)
 				}
 			}
 		}
@@ -161,28 +391,134 @@ func (s *Server) Run(ctx context.Context) error {
 		defer wg.Done()
 		<-ctx.Done()
 		_ = ln.Close()
-		_ = qln.Close()
+		if rawUDP != nil {
+			_ = rawUDP.Close()
+		}
+		if qLn != nil {
+			_ = qLn.Close()
+		}
+		if qTr != nil {
+			_ = qTr.Close()
+		}
 		_ = hs.Close()
+		_ = panelSrv.Close()
 		s.fallback.Close()
+		s.panelListener.Close()
 		s.closeAllSessions()
 	}()
+
+	if qLn != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				qc, err := qLn.Accept(ctx)
+				if err != nil {
+					return
+				}
+				go s.serveQUIC(ctx, qc)
+			}
+		}()
+	}
+
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
-				break
-			}
-			if errors.Is(err, net.ErrClosed) {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				break
 			}
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		go s.handle(ctx, c, tlsCfg)
+		if tcpC, ok := c.(*net.TCPConn); ok {
+			_ = tcpC.SetNoDelay(true)
+		}
+		go s.handleTCP(ctx, c, tlsCfg)
 	}
 	wg.Wait()
 	s.audit.Flush()
 	return nil
+}
+
+func (s *Server) serveQUIC(ctx context.Context, qc *quic.Conn) {
+	ip := addrIP(qc.RemoteAddr())
+	if s.audit.IsBanned(ip) {
+		_ = qc.CloseWithError(0, "banned")
+		return
+	}
+	s.logger.Printf("quic session opened from %s", ip)
+	var mgrMu sync.Mutex
+	var mgr *udpManager
+	var mgrShared bool
+	var lastSink atomic.Pointer[gft.UDPReplySink]
+	getMgr := func(sink gft.UDPReplySink) *udpManager {
+		lastSink.Store(&sink)
+		mgrMu.Lock()
+		defer mgrMu.Unlock()
+		if mgr == nil {
+			mgr, mgrShared = s.getOrCreateUDPManager([8]byte{}, sink)
+		}
+		return mgr
+	}
+	onClientID := func(cid [8]byte) {
+		mgrMu.Lock()
+		defer mgrMu.Unlock()
+		if mgr != nil {
+			return
+		}
+		var sink gft.UDPReplySink
+		if sp := lastSink.Load(); sp != nil {
+			sink = *sp
+		}
+		mgr, mgrShared = s.getOrCreateUDPManager(cid, sink)
+	}
+	_ = gft.ServeQUICConnWithAuth(ctx, qc, s.stego, s.params, onClientID, s.handleDataStream,
+		func(sink gft.UDPReplySink, id uint16, target string, data []byte) {
+			getMgr(sink).handleDatagramSink(sink, id, target, data)
+		},
+		func(sink gft.UDPReplySink, id uint16) {
+			getMgr(sink).handleClose(id)
+		},
+	)
+	mgrMu.Lock()
+	m := mgr
+	shared := mgrShared
+	mgrMu.Unlock()
+	if m != nil && !shared {
+		m.closeAll()
+	}
+}
+
+func (s *Server) getOrCreateUDPManager(clientID [8]byte, fallbackSink gft.UDPReplySink) (*udpManager, bool) {
+	if clientID == ([8]byte{}) {
+		return newUDPManager(fallbackSink, true, s.outbound, s.logger), false
+	}
+	s.udpMgrMu.Lock()
+	defer s.udpMgrMu.Unlock()
+	m, ok := s.udpMgrs[clientID]
+	if !ok {
+		m = newUDPManager(fallbackSink, false, s.outbound, s.logger)
+		s.udpMgrs[clientID] = m
+	} else {
+		m.lastUsed.Store(time.Now().UnixNano())
+	}
+	return m, true
+}
+
+func (s *Server) sweepUDPMgrs(idleTTL time.Duration) {
+	cutoff := time.Now().Add(-idleTTL).UnixNano()
+	var expired []*udpManager
+	s.udpMgrMu.Lock()
+	for k, m := range s.udpMgrs {
+		if m.lastUsed.Load() < cutoff {
+			expired = append(expired, m)
+			delete(s.udpMgrs, k)
+		}
+	}
+	s.udpMgrMu.Unlock()
+	for _, m := range expired {
+		m.closeAll()
+	}
 }
 
 func (s *Server) closeAllSessions() {
@@ -191,6 +527,12 @@ func (s *Server) closeAllSessions() {
 		e.Sess.Close()
 	}
 	s.smu.Unlock()
+	s.udpMgrMu.Lock()
+	for k, m := range s.udpMgrs {
+		delete(s.udpMgrs, k)
+		m.closeAll()
+	}
+	s.udpMgrMu.Unlock()
 }
 
 func addrIP(a net.Addr) string {
@@ -201,106 +543,155 @@ func addrIP(a net.Addr) string {
 	return h
 }
 
-func remoteIP(c net.Conn) string {
-	return addrIP(c.RemoteAddr())
-}
-
-func isHTTP(b []byte) bool {
-	methods := []string{"GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS ", "TRACE ", "PATCH ", "CONNECT ", "PRI "}
-	for _, m := range methods {
-		if len(b) >= len(m) && strings.HasPrefix(string(b), m) {
-			return true
-		}
-		if len(b) < len(m) && strings.HasPrefix(m, string(b)) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Server) handle(ctx context.Context, raw net.Conn, tlsCfg *tls.Config) {
-	ip := remoteIP(raw)
+func (s *Server) handleTCP(ctx context.Context, raw net.Conn, tlsCfg *tls.Config) {
+	ip := addrIP(raw.RemoteAddr())
 	if s.audit.IsBanned(ip) {
 		_ = raw.Close()
 		return
 	}
-	tc := tls.Server(raw, tlsCfg)
+
+	// Pre-TLS zero-characteristic inspection (0ms RewindConn)
+	rc := gft.NewRewindConn(raw)
+	if !gft.MirrorInspector(rc, s.stego) {
+		s.audit.Record(ip, "pre_tls_probe")
+		if strings.EqualFold(s.cfg.FallbackMode, "mirror") && s.cfg.CamouflageTarget != "" {
+			s.logger.Printf("pre-tls fail ip=%s -> transparent mirror %s", ip, s.cfg.CamouflageTarget)
+			s.mirrorBridge(rc, s.cfg.CamouflageTarget)
+			return
+		}
+		s.logger.Printf("pre-tls fail ip=%s -> local tls fallback", ip)
+		tc := tls.Server(rc, tlsCfg)
+		_ = tc.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := tc.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return
+		}
+		_ = tc.SetDeadline(time.Time{})
+		s.serveHTTPFallback(ctx, tc)
+		return
+	}
+
+	// Validated stego ClientHello -> proceed to TLS 1.3 handshake
+	tc := tls.Server(rc, tlsCfg)
 	_ = tc.SetDeadline(time.Now().Add(10 * time.Second))
-	if err := tc.Handshake(); err != nil {
+	if err := tc.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
 		return
 	}
 	_ = tc.SetDeadline(time.Time{})
-	rc := gft.NewRewindConn(tc)
-	res := s.verifier.ServerKnock(rc)
+
+	// Post-TLS ClientAuthFrame verification (defense-in-depth)
+	authRC := gft.NewRewindConn(tc)
+	if salt, clientID, err := s.stego.VerifyClientAuthFrameWithID(authRC); err == nil {
+		authRC.StopRecording()
+		ack, aerr := gft.BuildServerAuthAck(s.psk, salt, s.params.Get())
+		if aerr == nil {
+			_, _ = authRC.Write(ack)
+		}
+		s.serveTCPSession(ctx, authRC, ip, clientID)
+		return
+	}
+
+	// Backwards-compatible fallback to v2 Knock if someone speaks v2 after stego hello
+	authRC.Rewind()
+	salt2, _, res := s.verifier.VerifyFirstRead(authRC, time.Now())
 	if res != gft.KnockOK {
 		s.audit.Record(ip, res.String())
-		s.logger.Printf("knock fail ip=%s reason=%s -> fallback", ip, res)
-		_ = rc.SetReadDeadline(time.Time{})
-		if isHTTP(rc.RecordedBytes()) {
-			rc.Rewind()
-		} else {
-			if rc.Recorded() >= 16 {
-				pad := gft.PadLenFor(rc.RecordedBytes()[:16])
-				if pad > 0 {
-					var junk [64]byte
-					_ = tc.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-					_, _ = io.ReadFull(tc, junk[:pad])
-					_ = tc.SetReadDeadline(time.Time{})
-				}
-			}
-			rc.StopRecording()
-		}
-		if !s.fallback.push(rc) {
-			_ = rc.Close()
-		}
+		_ = authRC.SetReadDeadline(time.Time{})
+		authRC.Rewind()
+		s.serveHTTPFallback(ctx, &tlsRewindConn{Conn: authRC, proto: tc.ConnectionState().NegotiatedProtocol})
 		return
 	}
-	rc.StopRecording()
-	s.serveSession(ctx, tc, ip)
+	ack, err := gft.BuildServerAck(s.psk, salt2, s.params.Get())
+	if err == nil {
+		_, _ = authRC.Write(ack)
+	}
+	s.serveTCPSession(ctx, authRC, ip, [8]byte{})
 }
 
-func (s *Server) handleQUIC(ctx context.Context, qconn *quic.Conn) {
-	ip := addrIP(qconn.RemoteAddr())
-	if s.audit.IsBanned(ip) {
-		_ = qconn.CloseWithError(0, "")
+type tlsRewindConn struct {
+	net.Conn
+	proto string
+}
+
+func (s *Server) serveHTTPFallback(ctx context.Context, conn net.Conn) {
+	proto := ""
+	if tc, ok := conn.(*tls.Conn); ok {
+		proto = tc.ConnectionState().NegotiatedProtocol
+	} else if trc, ok := conn.(*tlsRewindConn); ok {
+		proto = trc.proto
+	}
+	if proto == "h2" {
+		h2srv := &http2.Server{}
+		h2srv.ServeConn(conn, &http2.ServeConnOpts{
+			Context: ctx,
+			Handler: s.web,
+		})
+		_ = conn.Close()
 		return
 	}
-	stCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	st, err := qconn.AcceptStream(stCtx)
-	cancel()
+	if !s.fallback.push(conn) {
+		_ = conn.Close()
+	}
+}
+
+func (s *Server) mirrorBridge(clientConn net.Conn, target string) {
+	defer clientConn.Close()
+	d := net.Dialer{Timeout: 6 * time.Second}
+	upstream, err := d.Dial("tcp", target)
 	if err != nil {
-		_ = qconn.CloseWithError(0, "")
 		return
 	}
-	qsc := &gft.QUICStreamConn{Stream: st, Conn: qconn}
-	rc := gft.NewRewindConn(qsc)
-	res := s.verifier.ServerKnock(rc)
-	if res != gft.KnockOK {
-		s.audit.Record(ip, "quic-"+res.String())
-		s.logger.Printf("quic knock fail ip=%s reason=%s -> reject", ip, res)
-		_ = qsc.Close()
-		return
+	defer upstream.Close()
+	if tc, ok := upstream.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
 	}
-	rc.StopRecording()
-	s.serveSession(ctx, qsc, ip)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(upstream, clientConn)
+		if cw, ok := upstream.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(clientConn, upstream)
+		if cw, ok := clientConn.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+	}()
+	wg.Wait()
 }
 
-func (s *Server) serveSession(ctx context.Context, tc net.Conn, ip string) {
-	sess := gft.NewSession(tc, false, s.params, s.handleConnect)
+func (s *Server) serveTCPSession(_ context.Context, conn net.Conn, ip string, clientID [8]byte) {
+	sess := gft.NewSession(conn, false, s.params, func(st *gft.Stream, target string, first []byte) {
+		s.handleDataStream(st, target, first)
+	})
 	sess.OnBytes = s.stats.Add
+
+	udpMgr, shared := s.getOrCreateUDPManager(clientID, sess)
+	sess.SetUDPHandler(func(_ *gft.Session, id uint16, target string, data []byte) {
+		udpMgr.handleDatagramSink(sess, id, target, data)
+	}, func(_ *gft.Session, id uint16) {
+		udpMgr.handleClose(id)
+	})
+
 	id := s.nextSess.Add(1)
 	s.smu.Lock()
 	s.sessions[id] = &sessEntry{ID: id, IP: ip, Since: time.Now(), Sess: sess}
 	s.smu.Unlock()
-	s.logger.Printf("session %d opened from %s", id, ip)
-	go func() { _ = sess.SendParams(s.params.Get()) }()
+	s.logger.Printf("tcp session %d opened from %s", id, ip)
 	_ = sess.Run()
+	if !shared {
+		udpMgr.closeAll()
+	}
 	sess.Close()
 	s.smu.Lock()
 	delete(s.sessions, id)
 	s.smu.Unlock()
-	s.logger.Printf("session %d closed", id)
+	s.logger.Printf("tcp session %d closed", id)
 }
 
 var errBlockedTarget = errors.New("blocked target")
@@ -309,24 +700,26 @@ var errBlockedTarget = errors.New("blocked target")
 var AllowPrivateTargets bool
 
 func blockedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() || ip.IsMulticast()
 }
 
-func (s *Server) handleConnect(st *gft.Stream, target string, first []byte) {
-	d := net.Dialer{Timeout: 10 * time.Second, Control: func(network, address string, _ syscall.RawConn) error {
-		h, _, err := net.SplitHostPort(address)
-		if err != nil {
-			return err
+func (s *Server) handleDataStream(st gft.DataStream, target string, first []byte) {
+	if strings.EqualFold(target, internalPanelHost) {
+		c := newStreamNetConn(st, first)
+		if !s.panelListener.push(c) {
+			_ = c.Close()
 		}
-		if ip := net.ParseIP(h); ip == nil || (blockedIP(ip) && !AllowPrivateTargets) {
-			return errBlockedTarget
-		}
-		return nil
-	}}
-	c, err := d.Dial("tcp", target)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	c, err := s.outbound.DialTCP(ctx, target)
+	cancel()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "DEBUG DIAL FAILED: target=%s err=%v AllowPrivate=%v\n", target, err, AllowPrivateTargets)
 		s.logger.Printf("handleConnect dial %s failed: %v", target, err)
 		_ = st.Close()
 		return
@@ -340,6 +733,38 @@ func (s *Server) handleConnect(st *gft.Stream, target string, first []byte) {
 	}
 	gft.Relay(st, c, 15*time.Minute)
 }
+
+// streamNetConn wraps a DataStream (plus optional 0-RTT initial bytes) as net.Conn
+// so internal HTTP requests (e.g. gft.internal.panel:80) run through standard http.Server.
+type streamNetConn struct {
+	st    gft.DataStream
+	first []byte
+	off   int
+}
+
+func newStreamNetConn(st gft.DataStream, first []byte) *streamNetConn {
+	return &streamNetConn{st: st, first: first}
+}
+
+func (c *streamNetConn) Read(p []byte) (int, error) {
+	if c.off < len(c.first) {
+		n := copy(p, c.first[c.off:])
+		c.off += n
+		if c.off >= len(c.first) {
+			c.first = nil
+		}
+		return n, nil
+	}
+	return c.st.Read(p)
+}
+
+func (c *streamNetConn) Write(p []byte) (int, error)        { return c.st.Write(p) }
+func (c *streamNetConn) Close() error                       { return c.st.Close() }
+func (c *streamNetConn) LocalAddr() net.Addr                { return dummyAddr{} }
+func (c *streamNetConn) RemoteAddr() net.Addr               { return dummyAddr{} }
+func (c *streamNetConn) SetDeadline(t time.Time) error      { return nil }
+func (c *streamNetConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *streamNetConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // ---- fallback listener --------------------------------------------------------
 
@@ -371,13 +796,14 @@ func (l *chanListener) Accept() (net.Conn, error) {
 	}
 }
 
-func (l *chanListener) Close() error { l.once.Do(func() { close(l.done) }); return nil }
-func (l *chanListener) Addr() net.Addr {
-	return &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+func (l *chanListener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return nil
 }
 
-// Handler exposes the fallback web handler (used by tests).
-func (s *Server) Handler() http.Handler { return s.web }
+type dummyAddr struct{}
 
-// Verifier exposes the knock verifier (tests).
-func (s *Server) Verifier() *gft.KnockVerifier { return s.verifier }
+func (dummyAddr) Network() string { return "tcp" }
+func (dummyAddr) String() string  { return "fallback" }
+
+func (l *chanListener) Addr() net.Addr { return dummyAddr{} }

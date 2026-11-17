@@ -1,0 +1,119 @@
+package sni
+
+import (
+	"context"
+	"crypto/tls"
+	"net"
+	"net/http"
+	"testing"
+	"time"
+)
+
+func TestPoolHasNoMajorVendorDefaultsAndCoversFourRegions(t *testing.T) {
+	pool := LoadPool("")
+	for _, reg := range OrderedRegions {
+		if len(pool[reg]) < 5 {
+			t.Fatalf("region %s expected >= 5 candidates, got %d", reg, len(pool[reg]))
+		}
+	}
+	for _, c := range FlattenPool(pool) {
+		if c.Domain == "www.microsoft.com" || c.Domain == "www.apple.com" || c.Domain == "www.cloudflare.com" {
+			t.Fatalf("prohibited centralized CDN/vendor default found in pool: %s", c.Domain)
+		}
+	}
+}
+
+func TestProbeFiltersCDNAndSelfIPAndSelectsTopK(t *testing.T) {
+	selfIP := "198.51.100.10"
+	obsMap := map[string]ProbeObservation{
+		"self.example": {
+			IPs:         []net.IP{net.ParseIP(selfIP)},
+			TLSVersion:  tls.VersionTLS13,
+			ALPN:        "h2",
+			Issuer:      "Let's Encrypt",
+			HandshakeRT: 3 * time.Millisecond,
+		},
+		"cdn-cf.example": {
+			IPs:         []net.IP{net.ParseIP("93.184.216.34")},
+			TLSVersion:  tls.VersionTLS13,
+			ALPN:        "h2",
+			Issuer:      "Google Trust Services",
+			Headers:     http.Header{"Server": []string{"cloudflare"}, "Cf-Ray": []string{"88abc-NRT"}},
+			HandshakeRT: 4 * time.Millisecond,
+		},
+		"cdn-fastly.example": {
+			IPs:         []net.IP{net.ParseIP("93.184.216.35")},
+			TLSVersion:  tls.VersionTLS13,
+			ALPN:        "h2",
+			Issuer:      "GlobalSign",
+			Headers:     http.Header{"X-Served-By": []string{"cache-nrt-fastly"}},
+			HandshakeRT: 5 * time.Millisecond,
+		},
+		"tls12-only.example": {
+			IPs:         []net.IP{net.ParseIP("93.184.216.36")},
+			TLSVersion:  tls.VersionTLS12,
+			ALPN:        "http/1.1",
+			HandshakeRT: 5 * time.Millisecond,
+		},
+		"ftp.jaist.ac.jp": {
+			IPs:         []net.IP{net.ParseIP("150.65.7.130")},
+			TLSVersion:  tls.VersionTLS13,
+			ALPN:        "h2",
+			Issuer:      "National Institute of Informatics",
+			Headers:     http.Header{"Server": []string{"Apache"}},
+			HandshakeRT: 6 * time.Millisecond,
+		},
+		"ftp.riken.jp": {
+			IPs:         []net.IP{net.ParseIP("134.160.38.1")},
+			TLSVersion:  tls.VersionTLS13,
+			ALPN:        "h2",
+			Issuer:      "Let's Encrypt",
+			Headers:     http.Header{"Server": []string{"nginx"}},
+			HandshakeRT: 11 * time.Millisecond,
+		},
+		"slow-univ.example": {
+			IPs:         []net.IP{net.ParseIP("130.1.1.1")},
+			TLSVersion:  tls.VersionTLS13,
+			ALPN:        "h2",
+			Issuer:      "DigiCert",
+			Headers:     http.Header{"Server": []string{"nginx"}},
+			HandshakeRT: 75 * time.Millisecond,
+		},
+	}
+
+	cands := []Candidate{
+		{Region: "JP", Domain: "self.example"},
+		{Region: "JP", Domain: "cdn-cf.example"},
+		{Region: "JP", Domain: "cdn-fastly.example"},
+		{Region: "JP", Domain: "tls12-only.example"},
+		{Region: "APAC-JP-KR", Domain: "ftp.jaist.ac.jp"},
+		{Region: "APAC-JP-KR", Domain: "ftp.riken.jp"},
+		{Region: "EU", Domain: "slow-univ.example"},
+	}
+
+	results := ProbeAll(context.Background(), cands, ProbeOptions{
+		SelfPublicIP: selfIP,
+		ObserveFn: func(_ context.Context, d string) ProbeObservation {
+			return obsMap[d]
+		},
+	})
+
+	sorted := QualifiedSorted(results)
+	if len(sorted) != 3 {
+		t.Fatalf("expected exactly 3 qualified non-CDN origins, got %d: %+v", len(sorted), sorted)
+	}
+	if sorted[0].Domain != "ftp.jaist.ac.jp" || sorted[2].Domain != "slow-univ.example" || !sorted[2].LatencyWarn {
+		t.Fatalf("unexpected sorted order or latency warning: %+v", sorted)
+	}
+
+	// Ensure SelectTopKRandom picks within Top-2 when k=2
+	for i := 0; i < 10; i++ {
+		pick, err := SelectTopKRandom(results, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pick.Domain != "ftp.jaist.ac.jp" && pick.Domain != "ftp.riken.jp" {
+			t.Fatalf("expected top-2 pick, got %s", pick.Domain)
+		}
+	}
+}

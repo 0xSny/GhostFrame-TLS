@@ -48,6 +48,18 @@ func (r *RewindConn) StopRecording() {
 	r.replaying = false
 }
 
+// ConsumePrefix discards the first n recorded bytes and preserves any coalesced
+// trailing bytes (e.g. 0-RTT business frames) so they are read first before Conn.Read.
+func (r *RewindConn) ConsumePrefix(n int) {
+	r.recording = false
+	if n >= len(r.rec) {
+		r.rec, r.pos, r.replaying = nil, 0, false
+		return
+	}
+	r.pos = n
+	r.replaying = true
+}
+
 // Recorded returns the number of recorded bytes (testing).
 func (r *RewindConn) Recorded() int { return len(r.rec) }
 

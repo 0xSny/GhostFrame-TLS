@@ -4,270 +4,219 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"strconv"
-	"strings"
-	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
 	utls "github.com/refraction-networking/utls"
 )
 
-// TLSConfigFor builds a client TLS config that authenticates the server ONLY by
-// SHA-256 fingerprint pinning of the leaf certificate (self-signed servers).
-// A pin is mandatory: a link without a valid pin is rejected.
-func TLSConfigFor(l *Link) (*tls.Config, error) {
-	want, err := hex.DecodeString(l.Pin)
-	if err != nil || len(want) != sha256.Size {
-		return nil, errors.New("invalid pin")
+func clientHelloIDFor(fp string) utls.ClientHelloID {
+	switch fp {
+	case "edge":
+		return utls.HelloEdge_Auto
+	case "firefox":
+		return utls.HelloFirefox_Auto
+	case "ios":
+		return utls.HelloIOS_Auto
+	default:
+		return utls.HelloChrome_Auto
 	}
+}
+
+// UTLSConfigFor builds a uTLS client config honoring Link.Verify ("ca" or "spki").
+func UTLSConfigFor(l *Link) (*utls.Config, error) {
 	sni := l.SNI
 	if sni == "" && net.ParseIP(l.Host) == nil {
 		sni = l.Host
 	}
-	return &tls.Config{
+	cfg := &utls.Config{
 		ServerName: sni,
-		MinVersion: tls.VersionTLS13,
+		MinVersion: utls.VersionTLS13,
 		NextProtos: []string{"h2", "http/1.1"},
-		// Standard Go pattern for fingerprint pinning: chain verification is replaced by the
-		// mandatory pin comparison in VerifyConnection below (the connection fails without a match).
-		InsecureSkipVerify: true,
-		VerifyConnection: func(cs tls.ConnectionState) error {
+	}
+
+	switch l.EffectiveVerify() {
+	case "ca":
+		cfg.InsecureSkipVerify = false
+	case "spki":
+		want, err := hex.DecodeString(l.Pin)
+		if err != nil || len(want) != sha256.Size {
+			return nil, errors.New("invalid spki pin")
+		}
+		cfg.InsecureSkipVerify = true
+		cfg.VerifyConnection = func(cs utls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
 				return errors.New("no peer certificate")
 			}
-			sum := sha256.Sum256(cs.PeerCertificates[0].Raw)
+			sum := sha256.Sum256(cs.PeerCertificates[0].RawSubjectPublicKeyInfo)
 			if subtle.ConstantTimeCompare(sum[:], want) != 1 {
-				return errors.New("certificate pin mismatch")
+				return errors.New("certificate spki pin mismatch")
 			}
 			return nil
-		},
-	}, nil
+		}
+	default:
+		return nil, fmt.Errorf("unsupported verify mode %q", l.Verify)
+	}
+	return cfg, nil
 }
 
-func uTLSConfigFor(l *Link) (*utls.Config, error) {
-	want, err := hex.DecodeString(l.Pin)
-	if err != nil || len(want) != sha256.Size {
-		return nil, errors.New("invalid pin")
-	}
-	sni := l.SNI
-	if sni == "" && net.ParseIP(l.Host) == nil {
-		sni = l.Host
-	}
-	return &utls.Config{
-		ServerName:         sni,
-		MinVersion:         utls.VersionTLS13,
-		NextProtos:         []string{"h2", "http/1.1"},
-		InsecureSkipVerify: true,
-		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return errors.New("no peer certificate")
-			}
-			sum := sha256.Sum256(rawCerts[0])
-			if subtle.ConstantTimeCompare(sum[:], want) != 1 {
-				return errors.New("certificate pin mismatch")
-			}
-			return nil
-		},
-	}, nil
+// DialV3Stealth performs TCP (NoDelay + optional RecordSplitConn) + uTLS ClientHello
+// with Pre-TLS SessionID steganography (bound to ClientRandom) + post-TLS ClientAuthFrame.
+func DialV3Stealth(ctx context.Context, l *Link, timeout time.Duration) (net.Conn, []byte, time.Duration, error) {
+	return DialV3StealthWithID(ctx, l, timeout, DefaultClientID)
 }
 
-// PinOf returns the hex SHA-256 pin of a certificate.
-func PinOf(c *x509.Certificate) string { s := sha256.Sum256(c.Raw); return hex.EncodeToString(s[:]) }
-
-// DialKnockTCP performs TCP + uTLS (Chrome ClientHello fingerprint + Pinning) and sends the Knock Frame.
-func DialKnockTCP(ctx context.Context, l *Link, timeout time.Duration) (net.Conn, time.Duration, error) {
+// DialV3StealthWithID connects with an explicit 8-byte ClientID for server NAT port preservation.
+func DialV3StealthWithID(ctx context.Context, l *Link, timeout time.Duration, clientID [8]byte) (net.Conn, []byte, time.Duration, error) {
 	psk, err := l.PSKBytes()
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
-	ucfg, err := uTLSConfigFor(l)
+	ucfg, err := UTLSConfigFor(l)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	d := net.Dialer{Timeout: timeout}
 	raw, err := d.DialContext(ctx, "tcp", net.JoinHostPort(l.Host, strconv.Itoa(l.Port)))
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
-	uc := utls.UClient(raw, ucfg, utls.HelloChrome_Auto)
+	if tc, ok := raw.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+	var transport net.Conn = raw
+	if l.SplitSNI || l.V >= 3 {
+		transport = NewRecordSplitConn(raw)
+	}
+	uc := newUClientWithHardware(transport, ucfg, clientHelloIDFor(l.EffectiveFP()))
+	if err := InjectStegoSessionID(uc, psk, time.Now()); err != nil {
+		_ = raw.Close()
+		return nil, nil, 0, err
+	}
 	t0 := time.Now()
 	_ = uc.SetDeadline(time.Now().Add(timeout))
 	if err := uc.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	hs := time.Since(t0)
-	if _, err := uc.Write(BuildKnock(psk, time.Now())); err != nil {
+
+	authFrame, salt, err := BuildClientAuthFrameWithID(psk, time.Now(), clientID)
+	if err != nil {
 		_ = raw.Close()
-		return nil, 0, err
+		return nil, nil, 0, err
+	}
+	if _, err := uc.Write(authFrame); err != nil {
+		_ = raw.Close()
+		return nil, nil, 0, err
 	}
 	_ = uc.SetDeadline(time.Time{})
-	return uc, hs, nil
+	return uc, salt, hs, nil
 }
 
-// DialKnockQUIC performs QUIC (TLS 1.3 over UDP + Pinning, HTTP/3 ALPN camouflage) and sends the Knock Frame.
-func DialKnockQUIC(ctx context.Context, l *Link, timeout time.Duration) (net.Conn, time.Duration, error) {
+// DialKnock performs TCP (NoDelay) + uTLS browser fingerprint handshake and
+// atomically writes the single-syscall Knock v2 packet.
+func DialKnock(ctx context.Context, l *Link, poolFlags uint16, timeout time.Duration) (net.Conn, [16]byte, time.Duration, error) {
+	var salt [16]byte
+	psk, err := l.PSKBytes()
+	if err != nil {
+		return nil, salt, 0, err
+	}
+	ucfg, err := UTLSConfigFor(l)
+	if err != nil {
+		return nil, salt, 0, err
+	}
+
+	d := net.Dialer{Timeout: timeout}
+	raw, err := d.DialContext(ctx, "tcp", net.JoinHostPort(l.Host, strconv.Itoa(l.Port)))
+	if err != nil {
+		return nil, salt, 0, err
+	}
+	if tc, ok := raw.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+
+	uc := newUClientWithHardware(raw, ucfg, clientHelloIDFor(l.EffectiveFP()))
+	t0 := time.Now()
+	_ = uc.SetDeadline(time.Now().Add(timeout))
+	if err := uc.HandshakeContext(ctx); err != nil {
+		_ = raw.Close()
+		return nil, salt, 0, err
+	}
+	hs := time.Since(t0)
+
+	pkt, salt, err := BuildKnockV2(psk, time.Now(), poolFlags)
+	if err != nil {
+		_ = raw.Close()
+		return nil, salt, 0, err
+	}
+	// Single atomic Write() call so Knock v2 lands in one TLS record.
+	if _, err := uc.Write(pkt); err != nil {
+		_ = raw.Close()
+		return nil, salt, 0, err
+	}
+	_ = uc.SetDeadline(time.Time{})
+	return uc, salt, hs, nil
+}
+
+// DialSession connects using v3 Pre-TLS stealth (default for V>=3 or SplitSNI)
+// or Knock v2 fallback and starts a Ghost Frame Session.
+func DialSession(ctx context.Context, l *Link, ps *ParamStore, poolFlags uint16, timeout time.Duration) (*Session, time.Duration, error) {
+	return DialSessionWithID(ctx, l, ps, poolFlags, timeout, DefaultClientID)
+}
+
+// DialSessionWithID connects using an explicit 8-byte ClientID for server NAT port preservation.
+func DialSessionWithID(ctx context.Context, l *Link, ps *ParamStore, poolFlags uint16, timeout time.Duration, clientID [8]byte) (*Session, time.Duration, error) {
 	psk, err := l.PSKBytes()
 	if err != nil {
 		return nil, 0, err
 	}
-	cfg, err := TLSConfigFor(l)
-	if err != nil {
-		return nil, 0, err
-	}
-	cfg.NextProtos = []string{"h3", "http/1.1"}
-
-	dialCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	addr := net.JoinHostPort(l.Host, strconv.Itoa(l.Port))
-	t0 := time.Now()
-	qconn, err := quic.DialAddr(dialCtx, addr, cfg, DefaultQUICConfig())
-	if err != nil {
-		return nil, 0, err
-	}
-	hs := time.Since(t0)
-
-	st, err := qconn.OpenStreamSync(dialCtx)
-	if err != nil {
-		_ = qconn.CloseWithError(0, "")
-		return nil, 0, err
-	}
-	qsc := &QUICStreamConn{Stream: st, Conn: qconn}
-	_ = qsc.SetDeadline(time.Now().Add(timeout))
-	if _, err := qsc.Write(BuildKnock(psk, time.Now())); err != nil {
-		_ = qsc.Close()
-		return nil, 0, err
-	}
-	_ = qsc.SetDeadline(time.Time{})
-	return qsc, hs, nil
-}
-
-type dialRaceRes struct {
-	conn net.Conn
-	hs   time.Duration
-	mode string
-	err  error
-}
-
-// DialKnockProto dials according to l.Transport ("auto", "tcp", "quic"/"udp").
-// In "auto" mode it performs a staggered Happy Eyeballs race: uTLS-TCP starts first
-// and QUIC-UDP joins after 200ms (or immediately if TCP fails), defeating TCP blocking cleanly.
-func DialKnockProto(ctx context.Context, l *Link, timeout time.Duration) (net.Conn, string, time.Duration, error) {
-	mode := strings.ToLower(strings.TrimSpace(l.Transport))
-	switch mode {
-	case "tcp":
-		c, hs, err := DialKnockTCP(ctx, l, timeout)
-		return c, "tcp-utls", hs, err
-	case "quic", "udp":
-		c, hs, err := DialKnockQUIC(ctx, l, timeout)
-		return c, "quic-udp", hs, err
-	case "", "auto":
-		raceCtx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-
-		ch := make(chan dialRaceRes, 2)
-		tcpFailedEarly := make(chan struct{})
-		var failOnce sync.Once
-
-		go func() {
-			c, hs, err := DialKnockTCP(raceCtx, l, timeout)
-			if err != nil {
-				failOnce.Do(func() { close(tcpFailedEarly) })
-			}
-			ch <- dialRaceRes{conn: c, hs: hs, mode: "tcp-utls", err: err}
-		}()
-
-		go func() {
-			// Stagger QUIC by 200ms so unblocked TCP wins cleanly, while blocked TCP falls back immediately.
-			select {
-			case <-time.After(200 * time.Millisecond):
-			case <-tcpFailedEarly:
-			case <-raceCtx.Done():
-				ch <- dialRaceRes{mode: "quic-udp", err: raceCtx.Err()}
-				return
-			}
-			c, hs, err := DialKnockQUIC(raceCtx, l, timeout)
-			ch <- dialRaceRes{conn: c, hs: hs, mode: "quic-udp", err: err}
-		}()
-
-		var errs []string
-		for i := 0; i < 2; i++ {
-			r := <-ch
-			if r.err == nil && r.conn != nil {
-				cancel()
-				// Drain loser asynchronously so no leaked connection stays open.
-				if i == 0 {
-					go func() {
-						if r2 := <-ch; r2.conn != nil {
-							_ = r2.conn.Close()
-						}
-					}()
-				}
-				return r.conn, r.mode, r.hs, nil
-			}
-			if r.err != nil {
-				errs = append(errs, fmt.Sprintf("%s: %v", r.mode, r.err))
-			}
+	if l.V >= 3 || l.SplitSNI {
+		conn, salt, hs, err := DialV3StealthWithID(ctx, l, timeout, clientID)
+		if err != nil {
+			return nil, 0, err
 		}
-		return nil, "", 0, fmt.Errorf("all transports failed (%s)", strings.Join(errs, "; "))
-	default:
-		return nil, "", 0, fmt.Errorf("unsupported transport %q", l.Transport)
+		s := NewSession(conn, true, ps, nil)
+		s.SetExpectedV3Ack(psk, salt)
+		s.SetOnParam(func(p Params) { ps.Set(p) })
+		go func() { _ = s.Run() }()
+		return s, hs, nil
 	}
-}
-
-// DialKnock performs dual-stack (or selected) TLS1.3/QUIC handshake + Pinning and sends the Knock Frame.
-func DialKnock(ctx context.Context, l *Link, timeout time.Duration) (net.Conn, time.Duration, error) {
-	c, _, hs, err := DialKnockProto(ctx, l, timeout)
-	return c, hs, err
-}
-
-// DialSessionInfo connects, starts a client session, and also returns the winning transport mode.
-func DialSessionInfo(ctx context.Context, l *Link, ps *ParamStore, timeout time.Duration) (*Session, string, time.Duration, error) {
-	c, mode, hs, err := DialKnockProto(ctx, l, timeout)
+	uc, salt, hs, err := DialKnock(ctx, l, poolFlags, timeout)
 	if err != nil {
-		return nil, "", 0, err
+		return nil, 0, err
 	}
-	s := NewSession(c, true, ps, nil)
+	s := NewSession(uc, true, ps, nil)
+	s.SetExpectedAck(psk, salt)
 	s.SetOnParam(func(p Params) { ps.Set(p) })
 	go func() { _ = s.Run() }()
-	return s, mode, hs, nil
+	return s, hs, nil
 }
 
-// DialSession connects and starts a client session (read loop running).
-func DialSession(ctx context.Context, l *Link, ps *ParamStore, timeout time.Duration) (*Session, time.Duration, error) {
-	s, _, hs, err := DialSessionInfo(ctx, l, ps, timeout)
-	return s, hs, err
-}
-
-// PingResult holds real handshake + knock round-trip latencies.
+// PingResult holds handshake and in-session echo latencies.
 type PingResult struct {
-	Handshake time.Duration // TCP/QUIC handshake time
-	KnockRTT  time.Duration // knock sent -> echo response received
+	Handshake time.Duration
+	KnockRTT  time.Duration
 	Total     time.Duration
-	Transport string // "tcp-utls" or "quic-udp"
 }
 
-// Ping dials a fresh connection, knocks, and measures an echo round trip.
+// Ping measures a full handshake + auth + in-band CmdPing echo RTT (for CLI/tests).
 func Ping(ctx context.Context, l *Link, timeout time.Duration) (PingResult, error) {
 	t0 := time.Now()
 	ps := NewParamStore(DefaultParams())
 	if l.Params != nil {
 		ps.Set(*l.Params)
 	}
-	c, mode, hs, err := DialKnockProto(ctx, l, timeout)
+	s, hs, err := DialSession(ctx, l, ps, 0, timeout)
 	if err != nil {
 		return PingResult{}, err
 	}
-	s := NewSession(c, true, ps, nil)
 	defer s.Close()
+
 	got := make(chan time.Duration, 1)
 	s.SetOnPing(func(d time.Duration) {
 		select {
@@ -275,13 +224,13 @@ func Ping(ctx context.Context, l *Link, timeout time.Duration) (PingResult, erro
 		default:
 		}
 	})
-	go func() { _ = s.Run() }()
+
 	if err := s.SendPingReq(); err != nil {
 		return PingResult{}, err
 	}
 	select {
 	case d := <-got:
-		return PingResult{Handshake: hs, KnockRTT: d, Total: time.Since(t0), Transport: mode}, nil
+		return PingResult{Handshake: hs, KnockRTT: d, Total: time.Since(t0)}, nil
 	case <-time.After(timeout):
 		return PingResult{}, errors.New("knock echo timeout")
 	case <-ctx.Done():

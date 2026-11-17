@@ -3,8 +3,6 @@ package client
 import (
 	"bufio"
 	"bytes"
-	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -54,6 +52,9 @@ func (s *HTTPProxyServer) Start() error {
 					continue
 				}
 			}
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+			}
 			go s.handleConn(c)
 		}
 	}()
@@ -96,8 +97,7 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		return
 	}
 
-	sess := s.engine.ActiveSession()
-	if sess == nil {
+	if !s.engine.IsConnected() {
 		s.engine.Logf("[HTTP Proxy] Rejecting %s %s: not connected", req.Method, req.Host)
 		resp := "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nGhostFrame not connected to server\r\n"
 		_, _ = c.Write([]byte(resp))
@@ -105,13 +105,11 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 	}
 
 	if req.Method == http.MethodConnect {
-		// HTTPS Tunnel: CONNECT host:port HTTP/1.1
 		target := req.Host
 		if !strings.Contains(target, ":") {
 			target += ":443"
 		}
-
-		st, err := sess.OpenStream(target, nil)
+		st, _, err := s.engine.OpenTargetStream(target, nil)
 		if err != nil {
 			s.engine.Logf("[HTTP Proxy] CONNECT %s failed: %v", target, err)
 			_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
@@ -122,20 +120,15 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		if _, err := c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 			return
 		}
-
 		_ = c.SetDeadline(time.Time{})
-		s.engine.Logf("[HTTP Proxy] Tunneling HTTPS %s -> %s", c.RemoteAddr(), target)
 		gft.Relay(st, c, 15*time.Minute)
 		return
 	}
 
-	// Plain HTTP Request
 	target := req.Host
 	if !strings.Contains(target, ":") {
 		target += ":80"
 	}
-
-	// Prepare request to write through stream
 	req.RequestURI = ""
 	if req.URL.Scheme == "" {
 		req.URL.Scheme = "http"
@@ -149,8 +142,7 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		return
 	}
 
-	// 0-RTT: Send request header + initial body
-	st, err := sess.OpenStream(target, reqBuf.Bytes())
+	st, _, err := s.engine.OpenTargetStream(target, reqBuf.Bytes())
 	if err != nil {
 		s.engine.Logf("[HTTP Proxy] %s %s failed: %v", req.Method, target, err)
 		_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
@@ -159,9 +151,5 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 	defer st.Close()
 
 	_ = c.SetDeadline(time.Time{})
-	s.engine.Logf("[HTTP Proxy] Forwarding HTTP %s %s -> %s", req.Method, req.URL.Path, target)
 	gft.Relay(st, c, 15*time.Minute)
 }
-
-var _ = fmt.Sprintf
-var _ = io.Copy

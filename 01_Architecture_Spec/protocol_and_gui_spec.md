@@ -1,6 +1,7 @@
-# GhostFrame-TLS (GFT) Pro 规范 v1.0（技术经理签发）
+# GhostFrame-TLS (GFT) 历史设计规范归档 (v1 基线)
 
-交付位置：`Desktop/GhostFrame_Project/01_Architecture_Spec/protocol_and_gui_spec.md`（工程师需原样复制并可补充实现细节）。
+交付位置：`01_Architecture_Spec/protocol_and_gui_spec.md`。
+> 注：生产主力架构已全面升级至 GhostFrame-TLS (GFT) v3 Apex。
 
 ## 1. 协议
 ### 1.1 传输
@@ -41,13 +42,11 @@
 ## 3. `gft://` 链接格式
 `gft://<base64url(JSON)>#<备注>`，JSON：`{"v":1,"host":"","port":443,"sni":"","psk":"<base64>","pin":"<sha256 hex>","params":{...}}`。客户端必须校验 `v` 与字段合法性。
 
-## 4. 桌面客户端
-- Go 本地服务，监听 `127.0.0.1` 随机/固定端口，内嵌 WebUI；启动时调用 Edge/Chrome `--app=http://127.0.0.1:PORT` 打开无边框窗口（Windows 优先 Edge；找不到则回退系统默认浏览器）。零 CGO，`CGO_ENABLED=0` 交叉编译。
-- WebUI 本地 API 必须带随机启动 Token，防止其他网页/进程 CSRF 调用。
-- 功能：大尺寸连接/断开按钮、真实 TLS 握手+Knock 往返延迟测速、实时速率波形（Canvas）、SOCKS5 与 HTTP 端口显示（默认 127.0.0.1:10808 / 10809，仅监听回环）、系统代理开关（Windows 注册表 + 通知刷新；**退出/崩溃恢复时必须还原原设置**）、实时日志窗口（日志不得含 PSK）、`gft://` 导入。
-- API：`GET /api/state`、`POST /api/connect`、`POST /api/disconnect`、`POST /api/ping`、`POST /api/sysproxy`、`POST /api/import`、`GET /api/logs`（SSE）、`GET /api/traffic`（SSE）。
-- UI 要求：暗黑现代风，响应式，无黑框控制台（Windows 用 `-H=windowsgui`）。
-- 桌面 `启动GFT图形客户端.bat`：双击启动并自动加载日本节点配置。
+## 4. 桌面客户端 (v3.1 纯 Go 原生窗口与系统托盘)
+- 100% 纯 Go (`CGO_ENABLED=0`) 基于 Windows 原生 Win32/DWM/GDI+/Shell32 API 构建单可执行文件 `GhostFrame-Pro.exe`（严禁任何 WebUI、本地 GUI HTTP 端口或浏览器 `--app` 进程）。
+- 单实例互斥锁保护 (`Local\GhostFrameTLSPro_SingleInstance`)，重复启动自动唤醒已存在控制台窗口。
+- 功能：大尺寸连接/断开控制、QUIC Dual-Track + uTLS 双栈智能竞速、60 秒双曲线流量波形、SOCKS5 (`127.0.0.1:10808`) 与 HTTP (`127.0.0.1:10809`) 本地代理、系统代理备份与异常退出恢复、Win32 右下角系统托盘动态矢量图标与右键菜单、`gft3://` 剪贴板一键导入与 Clash YAML 导出、200 行可滚动高亮日志流。
+- 无黑框控制台（Windows 使用 `-H=windowsgui`）；非 Windows 平台提供简洁无头 CLI 守护模式。
 
 ## 5. 零 GC 与健壮性（遵循项目 AGENTS 规范）
 - 数据转发热路径使用 `sync.Pool` 缓冲区，禁止每帧分配。
