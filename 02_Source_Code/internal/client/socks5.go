@@ -153,8 +153,15 @@ func (s *SOCKS5Server) handleConn(c net.Conn) {
 
 	switch reqHead[1] {
 	case 0x01: // CONNECT
-		st, _, err := s.engine.OpenTargetStream(target, nil)
+		if !s.engine.IsConnected() {
+			_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
+		st, act, err := s.engine.OpenTargetStream(target, nil)
 		if err != nil {
+			if act == ActionProxy {
+				s.engine.Logf("[SOCKS5] CONNECT %s failed: %v", target, err)
+			}
 			_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 			return
 		}

@@ -627,3 +627,51 @@ func TestQUICUDPOversized1350And16KB(t *testing.T) {
 		}
 	}
 }
+
+func TestApexSchedulerRapidStartCloseNoWaitGroupRace(t *testing.T) {
+	ps := NewParamStore(DefaultParams())
+	link := &Link{
+		V:         3,
+		Host:      "127.0.0.1",
+		Port:      1,
+		SNI:       "ftp.jaist.ac.jp",
+		PSK:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		Verify:    "ca",
+		Transport: "auto",
+	}
+	for i := 0; i < 20; i++ {
+		sched := NewApexScheduler(link, ps, 1, nil)
+		sched.limiter.minJitMs = 0
+		sched.limiter.maxJitMs = 0
+		// Force r1 (tcp) immediate failure and r2 (quic) immediate mock success so Start launches async r2 wait goroutine
+		sched.pool.dialFn = func(_ context.Context, _ *Link, _ *ParamStore, _ uint16, _ time.Duration) (*Session, time.Duration, error) {
+			time.Sleep(15 * time.Millisecond)
+			return nil, 0, errors.New("mock tcp fail")
+		}
+		cRaw, sRaw := newMemPacketPair()
+		cert, pin := makeTestCertAndPin(t, "ftp.jaist.ac.jp")
+		link.Verify = "spki"
+		link.Pin = pin
+		srvTr := &quic.Transport{Conn: sRaw}
+		ln, lerr := srvTr.Listen(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13, NextProtos: []string{"h3"}}, QUICConfig())
+		if lerr != nil {
+			_ = cRaw.Close()
+			_ = sRaw.Close()
+			t.Fatal(lerr)
+		}
+		go func() {
+			qc, err := ln.Accept(context.Background())
+			if err == nil {
+				go func() { _ = ServeQUICConn(context.Background(), qc, NewStegoVerifier(make([]byte, 32)), ps, nil, nil, nil) }()
+			}
+		}()
+		sched.SetQUICDialHookForTest(func(ctx context.Context, dl *Link, dps *ParamStore, _ int, timeout time.Duration, clientID [8]byte) (*QUICSession, time.Duration, error) {
+			return DialQUICWithPacketConnAndID(ctx, cRaw, true, sRaw.LocalAddr(), 443, dl, dps, timeout, clientID)
+		})
+		_ = sched.Start(time.Second)
+		sched.Close()
+		_ = ln.Close()
+		_ = sRaw.Close()
+		_ = srvTr.Close()
+	}
+}

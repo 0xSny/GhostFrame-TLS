@@ -175,8 +175,8 @@ func TestRouterZeroDNSLeakAndCNBypass(t *testing.T) {
 		{RouteRule, "nonexistent-overseas-test.invalid:443", ActionProxy},
 		{RouteGlobal, "www.baidu.com:443", ActionProxy},
 		{RouteGlobal, "127.0.0.1:8080", ActionDirect},
-		{RouteDirect, "api.github.com:443", ActionDirect},
-		{RouteDirect, "gft.internal.panel:80", ActionProxy},
+		{RouteCore, "api.github.com:443", ActionProxy},
+		{RouteCore, "127.0.0.1:8080", ActionDirect},
 		{RouteRule, "gft.internal.panel:80", ActionProxy},
 	}
 	for _, tc := range cases {
@@ -264,6 +264,72 @@ func TestSOCKS5UDPAssociateRejectedWhenDisconnected(t *testing.T) {
 	}
 	if resp[1] != 0x05 {
 		t.Fatalf("expected 0x05 error when disconnected, got %d", resp[1])
+	}
+}
+
+func TestUnifiedRouteCoreAndSysProxyLinkage(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "client.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"route_mode":"direct"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := NewEngine(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	if st := eng.Status(); st["route_mode"] != "core" {
+		t.Fatalf("expected legacy 'direct' migrated to 'core', got %v", st["route_mode"])
+	}
+
+	if err := eng.SetRouteMode(RouteRule); err != nil {
+		t.Fatal(err)
+	}
+	if !eng.Status()["sys_proxy"].(bool) {
+		t.Fatalf("expected sys_proxy=true in Rule mode")
+	}
+
+	if err := eng.SetRouteMode(RouteCore); err != nil {
+		t.Fatal(err)
+	}
+	if eng.Status()["sys_proxy"].(bool) {
+		t.Fatalf("expected sys_proxy=false in Core mode")
+	}
+}
+
+func TestHTTPProxyThrottledDisconnectLogAndSilentDirectFailure(t *testing.T) {
+	eng, err := NewEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	hp := NewHTTPProxyServer("127.0.0.1:0", eng)
+	if err := hp.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer hp.Close()
+
+	for i := 0; i < 4; i++ {
+		c, err := net.Dial("tcp", hp.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = c.Write([]byte("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"))
+		_, _ = io.ReadAll(c)
+		_ = c.Close()
+	}
+
+	// 4 immediate bursts while disconnected must produce at most 1 waiting log line
+	logs := eng.Logs()
+	waitCount := 0
+	for _, l := range logs {
+		if strings.Contains(l.Message, "Waiting for connection") {
+			waitCount++
+		}
+	}
+	if waitCount != 1 {
+		t.Fatalf("expected 1 throttled waiting log line across 4 bursts, got %d (%+v)", waitCount, logs)
 	}
 }
 

@@ -134,7 +134,19 @@ type ApexScheduler struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	loopMu sync.Mutex
+	closed bool
 	wg     sync.WaitGroup
+}
+
+func (a *ApexScheduler) launchLoop(fn func()) {
+	a.loopMu.Lock()
+	defer a.loopMu.Unlock()
+	if a.closed || a.ctx.Err() != nil {
+		return
+	}
+	a.wg.Add(1)
+	go fn()
 }
 
 // NewApexScheduler creates an Apex dual-track scheduler for link.
@@ -220,8 +232,7 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 		if err := a.dialQUICNow(connectTimeout); err != nil {
 			return err
 		}
-		a.wg.Add(1)
-		go a.quicMaintainLoop()
+		a.launchLoop(a.quicMaintainLoop)
 		return nil
 	default: // "auto": race QUIC + TCP simultaneously so 0ms failover is ready immediately
 		type res struct {
@@ -238,8 +249,7 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 
 		r1 := <-ch
 		if r1.err == nil {
-			a.wg.Add(1)
-			go func() {
+			a.launchLoop(func() {
 				defer a.wg.Done()
 				select {
 				case <-a.ctx.Done():
@@ -250,16 +260,14 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 							if a.onLog != nil {
 								a.onLog("TCP track initial dial deferred (%v); running on QUIC", r2.err)
 							}
-							a.wg.Add(1)
-							go a.retryTCPStartLoop(connectTimeout)
+							a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
 						} else if a.onLog != nil {
 							a.onLog("QUIC track unavailable (%v); 0ms fallback active on TCP-uTLS", r2.err)
 						}
 					}
 				}
-			}()
-			a.wg.Add(1)
-			go a.quicMaintainLoop()
+			})
+			a.launchLoop(a.quicMaintainLoop)
 			return nil
 		}
 
@@ -274,27 +282,34 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 			if a.onLog != nil {
 				a.onLog("TCP track initial dial deferred (%v); running on QUIC", r1.err)
 			}
-			a.wg.Add(1)
-			go a.retryTCPStartLoop(connectTimeout)
+			a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
 		} else if a.onLog != nil {
 			a.onLog("QUIC track unavailable (%v); 0ms fallback active on TCP-uTLS", r1.err)
 		}
-		a.wg.Add(1)
-		go a.quicMaintainLoop()
+		a.launchLoop(a.quicMaintainLoop)
 		return nil
 	}
 }
 
 func (a *ApexScheduler) retryTCPStartLoop(timeout time.Duration) {
 	defer a.wg.Done()
+	backoff := 4 * time.Second
 	for {
+		jit := time.Duration(randRange(200, 1200)) * time.Millisecond
 		select {
 		case <-a.ctx.Done():
 			return
-		case <-time.After(4 * time.Second):
+		case <-time.After(backoff + jit):
+		}
+		if a.ctx.Err() != nil {
+			return
 		}
 		if err := a.pool.Start(timeout); err == nil {
 			return
+		}
+		backoff *= 2
+		if backoff > 60*time.Second {
+			backoff = 60 * time.Second
 		}
 	}
 }
@@ -481,7 +496,7 @@ func (a *ApexScheduler) activeQUICForSend() *QUICSession {
 	if a.link.EffectiveTransport() == "auto" {
 		qRTT := a.quicRTTMs.Load()
 		tRTT := a.pool.rttMs.Load()
-		if qRTT > 150 && tRTT > 0 && qRTT > (tRTT*18)/10 && len(a.pool.entries) > 0 {
+		if qRTT > 150 && tRTT > 0 && qRTT > (tRTT*18)/10 && a.pool.Stats().ActiveConns > 0 {
 			return nil
 		}
 	}
@@ -799,7 +814,10 @@ func (a *ApexScheduler) Stats() ApexStats {
 
 // Close shuts down QUIC Dual-Track, UDP associations, and TCP SessionPool cleanly.
 func (a *ApexScheduler) Close() {
+	a.loopMu.Lock()
+	a.closed = true
 	a.cancel()
+	a.loopMu.Unlock()
 
 	a.udpMu.Lock()
 	assocs := make([]*SchedulerUDPAssoc, 0, len(a.udpAssocs))

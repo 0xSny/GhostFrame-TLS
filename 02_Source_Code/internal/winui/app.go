@@ -53,11 +53,10 @@ const (
 	hitNodeDelete
 	hitRouteRule
 	hitRouteGlobal
-	hitRouteDirect
+	hitRouteCore
 	hitTransAuto
 	hitTransQUIC
 	hitTransTCP
-	hitSysProxy
 	hitCopyClash
 	hitCopyLink
 	hitClearLogs
@@ -158,6 +157,8 @@ func Run(eng *client.Engine) error {
 		HIconSm:       appIcon,
 	}
 	atom, _, err := pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wcx)))
+	runtime.KeepAlive(&wcx)
+	runtime.KeepAlive(clsPtr)
 	if atom == 0 {
 		return fmt.Errorf("RegisterClassExW failed: %v", err)
 	}
@@ -176,10 +177,11 @@ func Run(eng *client.Engine) error {
 	}
 	_ = sysDPI
 
+	titlePtr := utf16Ptr("GhostFrame-Pro v3.2.1")
 	hwnd, _, err := pCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(clsPtr)),
-		uintptr(unsafe.Pointer(utf16Ptr("GhostFrame-Pro v3.1"))),
+		uintptr(unsafe.Pointer(titlePtr)),
 		wsOverlappedWindow|wsClipChildren,
 		posX,
 		posY,
@@ -190,6 +192,8 @@ func Run(eng *client.Engine) error {
 		hInst,
 		0,
 	)
+	runtime.KeepAlive(clsPtr)
+	runtime.KeepAlive(titlePtr)
 	if hwnd == 0 {
 		return fmt.Errorf("CreateWindowExW failed: %v", err)
 	}
@@ -357,6 +361,10 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		a.showAndFocus()
 		return 0
 
+	case wmAppRefresh:
+		a.invalidate()
+		return 0
+
 	case wmAppTray:
 		ev := uint32(lParam & 0xFFFF)
 		switch ev {
@@ -369,6 +377,7 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 				func() { a.importFromClipboard() },
 				func() { _, _, _ = pPostMessageW.Call(hwnd, wmAppQuit, 0, 0) },
 				func(msg string, isErr bool) { a.setToast(msg, isErr) },
+				func() { a.postRefresh() },
 			)
 		}
 		return 0
@@ -443,13 +452,19 @@ func (a *appUI) invalidate() {
 	}
 }
 
+func (a *appUI) postRefresh() {
+	if a.hwnd != 0 {
+		_, _, _ = pPostMessageW.Call(a.hwnd, wmAppRefresh, 0, 0)
+	}
+}
+
 func (a *appUI) setToast(msg string, isErr bool) {
 	a.toastMu.Lock()
 	a.toastText = msg
 	a.toastErr = isErr
 	a.toastUntil = time.Now().Add(2600 * time.Millisecond)
 	a.toastMu.Unlock()
-	a.invalidate()
+	a.postRefresh()
 }
 
 func (a *appUI) hitTest(x, y int32) (hitKind, int) {
@@ -465,7 +480,6 @@ func (a *appUI) hitTest(x, y int32) (hitKind, int) {
 func (a *appUI) handleClick(k hitKind, idx int) {
 	st := a.eng.Status()
 	state := client.ConnState(strVal(st["state"]))
-	sysProxy := boolVal(st["sys_proxy"])
 	activeIdx := intVal(st["active_node"])
 
 	switch k {
@@ -480,7 +494,7 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 				} else {
 					a.setToast("安全隧道已建立", false)
 				}
-				a.invalidate()
+				a.postRefresh()
 			}()
 		}
 	case hitPing:
@@ -491,7 +505,7 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 			} else {
 				a.setToast(fmt.Sprintf("延迟 %dms (%s)", pr.RTTMs, pr.Transport), false)
 			}
-			a.invalidate()
+			a.postRefresh()
 		}()
 	case hitImport:
 		a.importFromClipboard()
@@ -505,7 +519,7 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 			} else {
 				a.setToast("已切换并持久化节点", false)
 			}
-			a.invalidate()
+			a.postRefresh()
 		}(idx)
 	case hitNodeDelete:
 		a.nodeDropOpen = false
@@ -516,39 +530,31 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 		}
 	case hitRouteRule:
 		_ = a.eng.SetRouteMode(client.RouteRule)
-		a.setToast("分流模式: Rule (CN 直连)", false)
+		a.setToast("模式已切换: Rule (智能分流)", false)
 	case hitRouteGlobal:
 		_ = a.eng.SetRouteMode(client.RouteGlobal)
-		a.setToast("分流模式: Global (全局代理)", false)
-	case hitRouteDirect:
-		_ = a.eng.SetRouteMode(client.RouteDirect)
-		a.setToast("分流模式: Direct (全部直连)", false)
+		a.setToast("模式已切换: Global (全局代理)", false)
+	case hitRouteCore:
+		_ = a.eng.SetRouteMode(client.RouteCore)
+		a.setToast("模式已切换: Core (仅开放本地端口)", false)
 	case hitTransAuto:
 		go func() {
 			_ = a.eng.SetTransport("auto")
 			a.setToast("传输通道: Auto (QUIC+TCP)", false)
-			a.invalidate()
+			a.postRefresh()
 		}()
 	case hitTransQUIC:
 		go func() {
 			_ = a.eng.SetTransport("quic")
 			a.setToast("传输通道: QUIC (极速端口跳跃)", false)
-			a.invalidate()
+			a.postRefresh()
 		}()
 	case hitTransTCP:
 		go func() {
 			_ = a.eng.SetTransport("tcp")
 			a.setToast("传输通道: TCP (uTLS 强稳健)", false)
-			a.invalidate()
+			a.postRefresh()
 		}()
-	case hitSysProxy:
-		if err := a.eng.SetSysProxyToggle(!sysProxy); err != nil {
-			a.setToast("系统代理切换失败: "+err.Error(), true)
-		} else if !sysProxy {
-			a.setToast("已启用系统代理 (WinINET)", false)
-		} else {
-			a.setToast("已还原系统直连设置", false)
-		}
 	case hitCopyClash:
 		yaml := a.eng.ClashYAML()
 		if SetClipboardText(a.hwnd, yaml) {
@@ -630,10 +636,16 @@ func (a *appUI) paint(hdc uintptr) {
 	var rc rect
 	_, _, _ = pGetClientRect.Call(a.hwnd, uintptr(unsafe.Pointer(&rc)))
 	w, h := rc.width(), rc.height()
-	if !a.buf.ensure(hdc, w, h) {
+	ok, recreated := a.buf.ensure(hdc, w, h, func() {
+		if a.fonts != nil {
+			a.fonts.destroy()
+			a.fonts = nil
+		}
+	})
+	if !ok {
 		return
 	}
-	if a.fonts == nil {
+	if recreated || a.fonts == nil {
 		a.fonts = initFontSet(a.buf.dc, a.dpi)
 	}
 
@@ -659,7 +671,11 @@ func (a *appUI) paint(hdc uintptr) {
 	a.drawHeroCard(rect{Left: leftR.Left, Top: leftR.Top, Right: leftR.Right, Bottom: leftR.Top + s(146)}, st)
 	a.drawNodeCard(rect{Left: leftR.Left, Top: leftR.Top + s(158), Right: leftR.Right, Bottom: leftR.Bottom}, st)
 
-	chartBot := rightR.Top + s(248)
+	chartH := maxI32(s(175), (rightR.height()-s(12))*50/100)
+	chartBot := minI32(rightR.Bottom-s(120), rightR.Top+chartH)
+	if chartBot <= rightR.Top+s(110) {
+		chartBot = rightR.Top + s(175)
+	}
 	a.drawTrafficCard(rect{Left: rightR.Left, Top: rightR.Top, Right: rightR.Right, Bottom: chartBot}, st)
 	a.drawLogCard(rect{Left: rightR.Left, Top: chartBot + s(12), Right: rightR.Right, Bottom: rightR.Bottom}, logs)
 
@@ -668,6 +684,7 @@ func (a *appUI) paint(hdc uintptr) {
 	}
 	a.drawToast(w, h)
 
+	a.fonts.flush()
 	_, _, _ = pBitBlt.Call(hdc, 0, 0, uintptr(w), uintptr(h), a.buf.dc, 0, 0, srcCopy)
 }
 
@@ -757,7 +774,7 @@ func (a *appUI) drawHeroCard(r rect, st map[string]any) {
 		btnText = "◌  正在建立双栈隐写通道..."
 	default:
 		c0, c1 = colBtnIdleA, colBtnIdleB
-		btnText = "▶  连接安全隧道 (v3.1 Apex)"
+		btnText = "▶  连接安全隧道 (v3.2.1 Apex)"
 	}
 	if a.hoverID == hitConnect {
 		c0 = lerpColor(c0, 0xFFFFFFFF, 0.10)
@@ -804,15 +821,14 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 
 	routeMode := strVal(st["route_mode"])
 	transPref := strVal(st["transport_pref"])
-	sysProxy := boolVal(st["sys_proxy"])
 	nodeName := strVal(st["node_name"])
 	if nodeName == "" {
 		nodeName = "未选择节点 (Ctrl+V 粘贴导入)"
 	}
 
-	y := r.Top + s(14)
+	y := r.Top + s(16)
 	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Left + s(140), y + s(20)}, colTextSub, "当前节点")
-	y += s(24)
+	y += s(26)
 
 	delR := rect{r.Right - s(66), y, r.Right - s(16), y + s(34)}
 	dropR := rect{r.Left + s(16), y, delR.Left - s(8), y + s(34)}
@@ -832,54 +848,46 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 
 	a.drawButton(delR, hitNodeDelete, "删除", colBg, colBorderHi, colRed)
 
-	// Segmented: Route Mode
-	y += s(46)
-	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Right - s(16), y + s(20)}, colTextSub, "智能分流")
-	y += s(24)
-	a.drawSeg3(rect{r.Left + s(16), y, r.Right - s(16), y + s(32)},
-		[3]string{"Rule", "Global", "Direct"},
-		[3]bool{routeMode == "rule", routeMode == "global", routeMode == "direct"},
-		[3]hitKind{hitRouteRule, hitRouteGlobal, hitRouteDirect},
+	// Segmented: Unified Route + System Proxy Mode
+	y += s(52)
+	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Right - s(16), y + s(20)}, colTextSub, "运行模式 (连接自动联动)")
+	y += s(26)
+	isCore := routeMode == "core" || routeMode == "direct"
+	a.drawSeg3(rect{r.Left + s(16), y, r.Right - s(16), y + s(34)},
+		[3]string{"Rule 智能", "Global 全局", "Core 仅端口"},
+		[3]bool{routeMode == "rule" || routeMode == "", routeMode == "global", isCore},
+		[3]hitKind{hitRouteRule, hitRouteGlobal, hitRouteCore},
 		colEmerald,
 	)
 
 	// Segmented: Transport Preference
-	y += s(44)
+	y += s(52)
 	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Right - s(16), y + s(20)}, colTextSub, "传输内核")
-	y += s(24)
-	a.drawSeg3(rect{r.Left + s(16), y, r.Right - s(16), y + s(32)},
+	y += s(26)
+	a.drawSeg3(rect{r.Left + s(16), y, r.Right - s(16), y + s(34)},
 		[3]string{"Auto 双栈", "QUIC 极速", "TCP uTLS"},
 		[3]bool{transPref == "auto", transPref == "quic", transPref == "tcp"},
 		[3]hitKind{hitTransAuto, hitTransQUIC, hitTransTCP},
 		colCyan,
 	)
 
-	// System Proxy Switch Row
-	y += s(46)
-	spRow := rect{r.Left + s(16), y, r.Right - s(16), y + s(40)}
-	a.buf.fillRoundRect(spRow.Left, spRow.Top, spRow.width(), spRow.height(), s(10), colBg)
-	f.drawText(f.fBody, f.fmtLeft, rect{spRow.Left + s(12), spRow.Top, spRow.Right - s(70), spRow.Bottom}, colTextMain, "Windows 系统代理")
-	pillW, pillH := s(48), s(24)
-	pillX := spRow.Right - s(12) - pillW
-	pillY := spRow.Top + (spRow.height()-pillH)/2
-	pillCol := colBorderHi
-	knobX := float32(pillX + s(12))
-	if sysProxy {
-		pillCol = colEmerald
-		knobX = float32(pillX + pillW - s(12))
+	// Unified Mode Status Hint
+	modeHint := "已启用联动：连接后自动接管系统代理并支持 CN 直连"
+	if routeMode == "global" {
+		modeHint = "已启用联动：连接后自动全局代理所有非本地流量"
+	} else if isCore {
+		modeHint = "仅开放本地 10808 / 10809 端口，不修改系统代理"
 	}
-	a.buf.fillRoundRect(pillX, pillY, pillW, pillH, pillH/2, pillCol)
-	a.buf.fillCircle(knobX, float32(pillY)+float32(pillH)/2, float32(s(9)), 0xFFFFFFFF)
-	a.hits = append(a.hits, hitBox{id: hitSysProxy, rect: spRow})
+	f.drawText(f.fSmall, f.fmtLeft, rect{r.Left + s(16), y + s(46), r.Right - s(16), y + s(68)}, colTextMuted, modeHint)
 
 	// Bottom Copy Action Row
-	btnY := r.Bottom - s(50)
-	if btnY < spRow.Bottom+s(10) {
-		btnY = spRow.Bottom + s(10)
+	btnY := r.Bottom - s(52)
+	if btnY < y+s(74) {
+		btnY = y + s(74)
 	}
 	halfW := (r.width() - s(40)) / 2
-	c1R := rect{r.Left + s(16), btnY, r.Left + s(16) + halfW, btnY + s(34)}
-	c2R := rect{c1R.Right + s(8), btnY, r.Right - s(16), btnY + s(34)}
+	c1R := rect{r.Left + s(16), btnY, r.Left + s(16) + halfW, btnY + s(36)}
+	c2R := rect{c1R.Right + s(8), btnY, r.Right - s(16), btnY + s(36)}
 	a.drawButton(c1R, hitCopyClash, "复制 Clash YAML", colCardAlt, colBorderHi, colSky)
 	a.drawButton(c2R, hitCopyLink, "复制 gft3://", colCardAlt, colBorderHi, colEmerald)
 }

@@ -5,6 +5,7 @@ package main
 import (
 	"flag"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 
 	"golang.org/x/sys/windows"
@@ -14,7 +15,26 @@ import (
 	"ghostframe/internal/winui"
 )
 
+func initCrashLog() *os.File {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
+	}
+	dir := filepath.Join(home, ".gft")
+	_ = os.MkdirAll(dir, 0o755)
+	f, err := os.OpenFile(filepath.Join(dir, "crash.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil
+	}
+	_ = debug.SetCrashOutput(f, debug.CrashOptions{})
+	return f
+}
+
 func main() {
+	if crashFile := initCrashLog(); crashFile != nil {
+		defer crashFile.Close()
+	}
+
 	cfgFlag := flag.String("config", "", "path to client config.json")
 	autoConnect := flag.Bool("connect", false, "automatically connect tunnel on startup")
 	noSysProxy := flag.Bool("no-sysproxy", false, "disable real Windows Registry system proxy writes (sandbox mode)")

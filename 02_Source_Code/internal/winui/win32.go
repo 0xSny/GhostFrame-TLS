@@ -4,6 +4,8 @@ package winui
 
 import (
 	"math"
+	"os"
+	"runtime"
 	"syscall"
 	"unicode/utf16"
 	"unsafe"
@@ -15,9 +17,10 @@ const (
 	windowClassName = "GhostFrameProWndClass"
 	singleMutexName = `Local\GhostFrameTLSPro_SingleInstance`
 
-	wmAppWake = 0x8001 // WM_APP + 1
-	wmAppTray = 0x8002 // WM_APP + 2
-	wmAppQuit = 0x8003 // WM_APP + 3
+	wmAppWake    = 0x8001 // WM_APP + 1
+	wmAppTray    = 0x8002 // WM_APP + 2
+	wmAppQuit    = 0x8003 // WM_APP + 3
+	wmAppRefresh = 0x8004 // WM_APP + 4
 
 	wmCreate          = 0x0001
 	wmDestroy         = 0x0002
@@ -105,6 +108,7 @@ var (
 	pGetModuleHandleW              = kernel32.NewProc("GetModuleHandleW")
 	pGlobalAlloc                   = kernel32.NewProc("GlobalAlloc")
 	pGlobalLock                    = kernel32.NewProc("GlobalLock")
+	pGlobalSize                    = kernel32.NewProc("GlobalSize")
 	pGlobalUnlock                  = kernel32.NewProc("GlobalUnlock")
 	pSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
 	pGetDpiForWindow               = user32.NewProc("GetDpiForWindow")
@@ -173,6 +177,7 @@ var (
 	pGdipSetStringFormatLineAlign  = gdiplus.NewProc("GdipSetStringFormatLineAlign")
 	pGdipSetStringFormatTrimming   = gdiplus.NewProc("GdipSetStringFormatTrimming")
 	pGdipDrawString                = gdiplus.NewProc("GdipDrawString")
+	pGdipFlush                     = gdiplus.NewProc("GdipFlush")
 )
 
 type point struct {
@@ -342,12 +347,18 @@ func applyDarkWindowChrome(hwnd uintptr) {
 // instance already owns it, this sends the wakeup message to its window and
 // returns (0, false) so the caller can exit cleanly.
 func AcquireSingleInstance() (windows.Handle, bool) {
-	h, err := windows.CreateMutex(nil, false, utf16Ptr(singleMutexName))
+	if os.Getenv("GFT_NO_SINGLE_INSTANCE") == "1" {
+		return 0, true
+	}
+	mutPtr := utf16Ptr(singleMutexName)
+	h, err := windows.CreateMutex(nil, false, mutPtr)
+	runtime.KeepAlive(mutPtr)
 	if h != 0 && err == windows.ERROR_ALREADY_EXISTS {
 		_ = windows.CloseHandle(h)
 		cls := utf16Ptr(windowClassName)
 		for i := 0; i < 6; i++ {
 			hwnd, _, _ := pFindWindowW.Call(uintptr(unsafe.Pointer(cls)), 0)
+			runtime.KeepAlive(cls)
 			if hwnd != 0 {
 				_, _, _ = pPostMessageW.Call(hwnd, wmAppWake, 0, 0)
 				_, _, _ = pShowWindow.Call(hwnd, swRestore)
@@ -396,7 +407,7 @@ func SetClipboardText(hwnd uintptr, s string) bool {
 	return r != 0
 }
 
-// GetClipboardText reads UTF-16 text from the native Windows clipboard.
+// GetClipboardText reads UTF-16 text from the native Windows clipboard with strict GlobalSize bounds.
 func GetClipboardText(hwnd uintptr) string {
 	ok, _, _ := pOpenClipboard.Call(hwnd)
 	if ok == 0 {
@@ -407,14 +418,21 @@ func GetClipboardText(hwnd uintptr) string {
 	if hData == 0 {
 		return ""
 	}
+	byteSize, _, _ := pGlobalSize.Call(hData)
+	maxUnits := int(byteSize / 2)
+	if maxUnits <= 0 {
+		return ""
+	}
+	if maxUnits > 128*1024 {
+		maxUnits = 128 * 1024
+	}
 	ptr, _, _ := pGlobalLock.Call(hData)
 	if ptr == 0 {
 		return ""
 	}
 	defer func() { _, _, _ = pGlobalUnlock.Call(hData) }()
 
-	const maxRunes = 64 * 1024
-	src := unsafe.Slice((*uint16)(osPtr(ptr)), maxRunes)
+	src := unsafe.Slice((*uint16)(osPtr(ptr)), maxUnits)
 	n := 0
 	for n < len(src) && src[n] != 0 {
 		n++
@@ -432,18 +450,21 @@ type backBuffer struct {
 	pixels []uint32
 }
 
-func (b *backBuffer) ensure(refDC uintptr, w, h int32) bool {
+func (b *backBuffer) ensure(refDC uintptr, w, h int32, onBeforeRelease func()) (bool, bool) {
 	if w <= 0 || h <= 0 {
-		return false
+		return false, false
 	}
 	if b.dc != 0 && b.w == w && b.h == h {
-		return true
+		return true, false
+	}
+	if onBeforeRelease != nil {
+		onBeforeRelease()
 	}
 	b.release()
 
 	dc, _, _ := pCreateCompatibleDC.Call(refDC)
 	if dc == 0 {
-		return false
+		return false, true
 	}
 	bmi := bitmapInfo{
 		BmiHeader: bitmapInfoHeader{
@@ -457,9 +478,10 @@ func (b *backBuffer) ensure(refDC uintptr, w, h int32) bool {
 	}
 	var bits unsafe.Pointer
 	bmp, _, _ := pCreateDIBSection.Call(dc, uintptr(unsafe.Pointer(&bmi)), dibRGBColors, uintptr(unsafe.Pointer(&bits)), 0, 0)
+	runtime.KeepAlive(&bmi)
 	if bmp == 0 || bits == nil {
 		_, _, _ = pDeleteDC.Call(dc)
-		return false
+		return false, true
 	}
 	old, _, _ := pSelectObject.Call(dc, bmp)
 	b.dc = dc
@@ -468,7 +490,7 @@ func (b *backBuffer) ensure(refDC uintptr, w, h int32) bool {
 	b.w = w
 	b.h = h
 	b.pixels = unsafe.Slice((*uint32)(bits), int(w)*int(h))
-	return true
+	return true, true
 }
 
 func (b *backBuffer) release() {
@@ -681,6 +703,14 @@ func (b *backBuffer) fillRect(x, y, w, h int32, col uint32) {
 }
 
 func (b *backBuffer) drawLineAA(x1, y1, x2, y2, thickness float32, col uint32, clip rect) {
+	clip.Left = maxI32(0, clip.Left)
+	clip.Top = maxI32(0, clip.Top)
+	clip.Right = minI32(b.w, clip.Right)
+	clip.Bottom = minI32(b.h, clip.Bottom)
+	if clip.Right <= clip.Left || clip.Bottom <= clip.Top {
+		return
+	}
+
 	minX := maxI32(clip.Left, int32(minF32(x1, x2)-thickness-2))
 	maxX := minI32(clip.Right, int32(maxF32(x1, x2)+thickness+2)+1)
 	minY := maxI32(clip.Top, int32(minF32(y1, y2)-thickness-2))
@@ -716,16 +746,26 @@ func (b *backBuffer) drawLineAA(x1, y1, x2, y2, thickness float32, col uint32, c
 					cov = 1
 				}
 				if cov > 0 {
-					b.pixels[row+int(px)] = blendPixel(b.pixels[row+int(px)], col, cov)
+					idx := row + int(px)
+					if uint(idx) < uint(len(b.pixels)) {
+						b.pixels[idx] = blendPixel(b.pixels[idx], col, cov)
+					}
 				}
 			}
 		}
 	}
 }
 
-// fillPolyArea shades the vertical gradient fill beneath a piecewise-linear curve down to baseY.
+// fillCurveArea shades the vertical gradient fill beneath a piecewise-linear curve down to baseY.
 func (b *backBuffer) fillCurveArea(xs, ys []float32, baseY float32, topCol, botCol uint32, clip rect) {
 	if len(xs) < 2 || len(xs) != len(ys) {
+		return
+	}
+	clip.Left = maxI32(0, clip.Left)
+	clip.Top = maxI32(0, clip.Top)
+	clip.Right = minI32(b.w, clip.Right)
+	clip.Bottom = minI32(b.h, clip.Bottom)
+	if clip.Right <= clip.Left || clip.Bottom <= clip.Top {
 		return
 	}
 	yEnd := minI32(clip.Bottom, int32(baseY))
@@ -762,7 +802,9 @@ func (b *backBuffer) fillCurveArea(xs, ys []float32, baseY float32, topCol, botC
 				vT := (float32(py) - yCurve) / h
 				c := lerpColor(topCol, botCol, vT)
 				idx := int(py)*int(b.w) + int(px)
-				b.pixels[idx] = blendPixel(b.pixels[idx], c, cov)
+				if uint(idx) < uint(len(b.pixels)) {
+					b.pixels[idx] = blendPixel(b.pixels[idx], c, cov)
+				}
 			}
 		}
 	}
@@ -835,11 +877,19 @@ func createGDIPFont(hdc uintptr, face string, negHeight, weight int32) uintptr {
 	copyUTF16(lf.LfFaceName[:], face)
 	var f uintptr
 	_, _, _ = pGdipCreateFontFromLogfontW.Call(hdc, uintptr(unsafe.Pointer(&lf)), uintptr(unsafe.Pointer(&f)))
+	runtime.KeepAlive(&lf)
 	if f == 0 {
 		copyUTF16(lf.LfFaceName[:], "Segoe UI")
 		_, _, _ = pGdipCreateFontFromLogfontW.Call(hdc, uintptr(unsafe.Pointer(&lf)), uintptr(unsafe.Pointer(&f)))
+		runtime.KeepAlive(&lf)
 	}
 	return f
+}
+
+func (fs *fontSet) flush() {
+	if fs != nil && fs.graphics != 0 {
+		_, _, _ = pGdipFlush.Call(fs.graphics, 1) // FlushIntentionSync
+	}
 }
 
 func (fs *fontSet) destroy() {
@@ -858,6 +908,7 @@ func (fs *fontSet) destroy() {
 	}
 	if fs.graphics != 0 {
 		_, _, _ = pGdipDeleteGraphics.Call(fs.graphics)
+		fs.graphics = 0
 	}
 }
 
@@ -891,6 +942,8 @@ func (fs *fontSet) drawText(font, strFmt uintptr, r rect, col uint32, text strin
 		strFmt,
 		brush,
 	)
+	runtime.KeepAlive(u)
+	runtime.KeepAlive(&rf)
 }
 
 func maxI32(a, b int32) int32 {

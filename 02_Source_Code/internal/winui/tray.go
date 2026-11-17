@@ -5,6 +5,7 @@ package winui
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"unsafe"
 
 	"ghostframe/internal/client"
@@ -15,12 +16,11 @@ const (
 
 	cmdOpen      = 1001
 	cmdToggle    = 1002
-	cmdSysProxy  = 1003
 	cmdImport    = 1004
 	cmdQuit      = 1005
 	cmdRouteRule = 1101
 	cmdRouteGlob = 1102
-	cmdRouteDir  = 1103
+	cmdRouteCore = 1103
 	cmdTransAuto = 1201
 	cmdTransQUIC = 1202
 	cmdTransTCP  = 1203
@@ -201,12 +201,15 @@ func (tm *trayManager) addOrModify(state client.ConnState, tip string) {
 
 	if !tm.added {
 		ok, _, _ := pShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
+		runtime.KeepAlive(&nid)
 		if ok != 0 {
 			tm.added = true
 			_, _, _ = pShellNotifyIconW.Call(nimSetVersion, uintptr(unsafe.Pointer(&nid)))
+			runtime.KeepAlive(&nid)
 		}
 	} else {
 		_, _, _ = pShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(&nid)))
+		runtime.KeepAlive(&nid)
 	}
 	tm.lastState = state
 	tm.lastTip = tip
@@ -247,6 +250,7 @@ func (tm *trayManager) destroy() {
 			UID:    trayIconID,
 		}
 		_, _, _ = pShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
+		runtime.KeepAlive(&nid)
 		tm.added = false
 	}
 	for k, ic := range tm.icons {
@@ -257,12 +261,11 @@ func (tm *trayManager) destroy() {
 	}
 }
 
-func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImport func(), onQuit func(), onToast func(string, bool)) {
+func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImport func(), onQuit func(), onToast func(string, bool), onRefresh func()) {
 	st := eng.Status()
 	state := client.ConnState(strVal(st["state"]))
 	routeMode := strVal(st["route_mode"])
 	transPref := strVal(st["transport_pref"])
-	sysProxy := boolVal(st["sys_proxy"])
 	activeIdx := intVal(st["active_node"])
 	nodes, _ := st["nodes"].([]client.NodeSummary)
 
@@ -273,11 +276,14 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 	defer func() { _, _, _ = pDestroyMenu.Call(hMenu) }()
 
 	appendItem := func(menu uintptr, flags uint32, id uintptr, text string) {
+		var txt *uint16
 		var txtPtr uintptr
 		if text != "" {
-			txtPtr = uintptr(unsafe.Pointer(utf16Ptr(text)))
+			txt = utf16Ptr(text)
+			txtPtr = uintptr(unsafe.Pointer(txt))
 		}
 		_, _, _ = pAppendMenuW.Call(menu, uintptr(flags), id, txtPtr)
+		runtime.KeepAlive(txt)
 	}
 
 	appendItem(hMenu, mfString, cmdOpen, "打开 GhostFrame-Pro 控制台")
@@ -286,11 +292,6 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 	} else {
 		appendItem(hMenu, mfString, cmdToggle, "连接安全隧道")
 	}
-	spFlags := uint32(mfString)
-	if sysProxy {
-		spFlags |= mfChecked
-	}
-	appendItem(hMenu, spFlags, cmdSysProxy, "系统代理 (WinINET)")
 	appendItem(hMenu, mfSeparator, 0, "")
 
 	// Route Submenu
@@ -300,18 +301,18 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 		val  string
 		name string
 	}{
-		{cmdRouteRule, "rule", "Rule (CN 绕过直连)"},
-		{cmdRouteGlob, "global", "Global (全局代理)"},
-		{cmdRouteDir, "direct", "Direct (全部直连)"},
+		{cmdRouteRule, "rule", "Rule (智能分流 + 自动系统代理)"},
+		{cmdRouteGlob, "global", "Global (全局代理 + 自动系统代理)"},
+		{cmdRouteCore, "core", "Core (仅开放 10808/10809 端口)"},
 	}
 	for _, ri := range routeItems {
 		f := uint32(mfString)
-		if routeMode == ri.val {
+		if routeMode == ri.val || (ri.val == "core" && routeMode == "direct") {
 			f |= mfChecked
 		}
 		appendItem(hRoute, f, ri.id, ri.name)
 	}
-	appendItem(hMenu, mfPopup, hRoute, "分流模式")
+	appendItem(hMenu, mfPopup, hRoute, "运行模式")
 
 	// Transport Submenu
 	hTrans, _, _ := pCreatePopupMenu.Call()
@@ -354,6 +355,7 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 
 	var pt point
 	_, _, _ = pGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	runtime.KeepAlive(&pt)
 	_, _, _ = pSetForegroundWindow.Call(tm.hwnd)
 	cmd, _, _ := pTrackPopupMenuEx.Call(hMenu, tpmLeftAlign|tpmRightButton|tpmReturnCmd|tpmNonotify, uintptr(pt.X), uintptr(pt.Y), tm.hwnd, 0)
 	_, _, _ = pPostMessageW.Call(tm.hwnd, 0, 0, 0)
@@ -365,39 +367,53 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 		if state == client.StateConnected || state == client.StateConnecting {
 			eng.Disconnect()
 			onToast("已断开安全隧道", false)
+			onRefresh()
 		} else {
 			go func() {
 				if err := eng.Connect(); err != nil {
 					onToast("连接失败: "+err.Error(), true)
+				} else {
+					onToast("安全隧道已建立", false)
 				}
+				onRefresh()
 			}()
 		}
-	case cmd == cmdSysProxy:
-		_ = eng.SetSysProxyToggle(!sysProxy)
 	case cmd == cmdRouteRule:
 		_ = eng.SetRouteMode(client.RouteRule)
-		onToast("分流模式已切换: Rule", false)
+		onToast("模式已切换: Rule (智能分流)", false)
 	case cmd == cmdRouteGlob:
 		_ = eng.SetRouteMode(client.RouteGlobal)
-		onToast("分流模式已切换: Global", false)
-	case cmd == cmdRouteDir:
-		_ = eng.SetRouteMode(client.RouteDirect)
-		onToast("分流模式已切换: Direct", false)
+		onToast("模式已切换: Global (全局代理)", false)
+	case cmd == cmdRouteCore:
+		_ = eng.SetRouteMode(client.RouteCore)
+		onToast("模式已切换: Core (仅端口)", false)
 	case cmd == cmdTransAuto:
-		_ = eng.SetTransport("auto")
-		onToast("传输偏好已切换: Auto", false)
+		go func() {
+			_ = eng.SetTransport("auto")
+			onToast("传输偏好已切换: Auto", false)
+			onRefresh()
+		}()
 	case cmd == cmdTransQUIC:
-		_ = eng.SetTransport("quic")
-		onToast("传输偏好已切换: QUIC", false)
+		go func() {
+			_ = eng.SetTransport("quic")
+			onToast("传输偏好已切换: QUIC", false)
+			onRefresh()
+		}()
 	case cmd == cmdTransTCP:
-		_ = eng.SetTransport("tcp")
-		onToast("传输偏好已切换: TCP", false)
+		go func() {
+			_ = eng.SetTransport("tcp")
+			onToast("传输偏好已切换: TCP", false)
+			onRefresh()
+		}()
 	case cmd == cmdImport:
 		onImport()
 	case cmd == cmdQuit:
 		onQuit()
 	case cmd >= cmdNodeBase && int(cmd-cmdNodeBase) < len(nodes):
 		idx := nodes[int(cmd-cmdNodeBase)].Index
-		go func(i int) { _ = eng.SelectNode(i) }(idx)
+		go func(i int) {
+			_ = eng.SelectNode(i)
+			onRefresh()
+		}(idx)
 	}
 }

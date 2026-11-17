@@ -11,9 +11,10 @@ import (
 type RouteMode string
 
 const (
-	RouteRule   RouteMode = "rule"   // Mainland CN / Private direct; everything else via GhostFrame (zero DNS leak)
-	RouteGlobal RouteMode = "global" // All traffic (except internal/loopback checks) via GhostFrame
-	RouteDirect RouteMode = "direct" // Direct outbound (except gft.internal.panel)
+	RouteRule   RouteMode = "rule"   // Mainland CN / Private direct + auto system proxy
+	RouteGlobal RouteMode = "global" // All traffic (except loopback) via GhostFrame + auto system proxy
+	RouteCore   RouteMode = "core"   // Port-only mode (10808/10809 via tunnel, never touches system proxy)
+	RouteDirect RouteMode = "direct" // Legacy config alias automatically mapped to RouteCore
 )
 
 // RouteAction is the per-request forwarding decision.
@@ -215,10 +216,8 @@ func (r *Router) Decide(mode RouteMode, hostport string) RouteAction {
 	}
 
 	switch mode {
-	case RouteDirect:
-		return ActionDirect
-	case RouteGlobal:
-		// Still keep loopback local so local GUI/apps don't loop into VPS.
+	case RouteCore, RouteDirect, RouteGlobal:
+		// Keep loopback direct so local GUI/apps never loop into VPS; everything else uses tunnel.
 		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 			return ActionDirect
 		}

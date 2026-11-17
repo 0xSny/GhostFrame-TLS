@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ghostframe/internal/gft"
@@ -14,11 +15,20 @@ import (
 
 // HTTPProxyServer handles incoming HTTP and HTTPS (CONNECT) proxy requests.
 type HTTPProxyServer struct {
-	addr     string
-	engine   *Engine
-	listener net.Listener
-	closed   chan struct{}
-	mu       sync.Mutex
+	addr         string
+	engine       *Engine
+	listener     net.Listener
+	closed       chan struct{}
+	mu           sync.Mutex
+	lastDisLogNs atomic.Int64
+}
+
+func (s *HTTPProxyServer) logDisconnectedThrottled() {
+	now := time.Now().UnixNano()
+	prev := s.lastDisLogNs.Load()
+	if now-prev >= int64(5*time.Second) && s.lastDisLogNs.CompareAndSwap(prev, now) {
+		s.engine.Logf("[HTTP Proxy] Waiting for connection: local requests paused until connected")
+	}
 }
 
 // NewHTTPProxyServer creates a new HTTP proxy server instance.
@@ -98,7 +108,7 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 	}
 
 	if !s.engine.IsConnected() {
-		s.engine.Logf("[HTTP Proxy] Rejecting %s %s: not connected", req.Method, req.Host)
+		s.logDisconnectedThrottled()
 		resp := "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nGhostFrame not connected to server\r\n"
 		_, _ = c.Write([]byte(resp))
 		return
@@ -109,9 +119,11 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		if !strings.Contains(target, ":") {
 			target += ":443"
 		}
-		st, _, err := s.engine.OpenTargetStream(target, nil)
+		st, act, err := s.engine.OpenTargetStream(target, nil)
 		if err != nil {
-			s.engine.Logf("[HTTP Proxy] CONNECT %s failed: %v", target, err)
+			if act == ActionProxy {
+				s.engine.Logf("[HTTP Proxy] CONNECT %s failed: %v", target, err)
+			}
 			_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 			return
 		}
@@ -142,9 +154,11 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		return
 	}
 
-	st, _, err := s.engine.OpenTargetStream(target, reqBuf.Bytes())
+	st, act, err := s.engine.OpenTargetStream(target, reqBuf.Bytes())
 	if err != nil {
-		s.engine.Logf("[HTTP Proxy] %s %s failed: %v", req.Method, target, err)
+		if act == ActionProxy {
+			s.engine.Logf("[HTTP Proxy] %s %s failed: %v", req.Method, target, err)
+		}
 		_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}

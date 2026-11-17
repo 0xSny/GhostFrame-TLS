@@ -68,6 +68,7 @@ type Engine struct {
 	router           *Router
 	socksSrv         *SOCKS5Server
 	httpSrv          *HTTPProxyServer
+	sysProxyApplied  bool
 
 	// Stats
 	prevUp     uint64
@@ -142,7 +143,10 @@ func NewEngine(cfgPath string) (*Engine, error) {
 	}
 	if e.config.RouteMode == "" {
 		e.config.RouteMode = RouteRule
+	} else if e.config.RouteMode == RouteDirect {
+		e.config.RouteMode = RouteCore
 	}
+	e.config.SysProxy = e.config.RouteMode != RouteCore
 
 	if active := e.activeLinkLocked(); active != nil && active.Params != nil {
 		e.paramStore.Set(*active.Params)
@@ -319,16 +323,44 @@ func (e *Engine) DeleteNode(idx int) error {
 	return e.SaveConfig()
 }
 
-// SetRouteMode sets the client routing policy ("rule", "global", "direct").
+// SetRouteMode sets the unified routing/proxy mode ("rule", "global", "core"; legacy "direct" -> "core").
 func (e *Engine) SetRouteMode(mode RouteMode) error {
+	if mode == RouteDirect {
+		mode = RouteCore
+	}
 	switch mode {
-	case RouteRule, RouteGlobal, RouteDirect:
+	case RouteRule, RouteGlobal, RouteCore:
 	default:
 		return fmt.Errorf("invalid route mode: %q", mode)
 	}
 	e.mu.Lock()
 	e.config.RouteMode = mode
+	wantSysProxy := mode != RouteCore
+	e.config.SysProxy = wantSysProxy
+	connected := e.state == StateConnected
+	httpAddr := e.config.HTTPAddr
+	wasApplied := e.sysProxyApplied
 	e.mu.Unlock()
+
+	if connected {
+		if wantSysProxy {
+			if err := EnableSystemProxyWithBackup(httpAddr, e.proxyBackupPath); err != nil {
+				e.Logf("Failed to enable system proxy: %v", err)
+			} else {
+				e.mu.Lock()
+				e.sysProxyApplied = true
+				e.mu.Unlock()
+				e.Logf("System proxy enabled (%s)", httpAddr)
+			}
+		} else if wasApplied {
+			_ = DisableAndRestoreSystemProxy(e.proxyBackupPath)
+			e.mu.Lock()
+			e.sysProxyApplied = false
+			e.mu.Unlock()
+			e.Logf("Core mode: system proxy restored cleanly (ports listening)")
+		}
+	}
+
 	e.Logf("Route mode changed to: %s", mode)
 	return e.SaveConfig()
 }
@@ -431,16 +463,25 @@ func (e *Engine) Connect() error {
 	e.state = StateConnected
 	e.lastErr = ""
 	e.pingMs = st.RTTMs
+	mode := e.config.RouteMode
+	httpAddr := e.config.HTTPAddr
+	socksAddr := e.config.SocksAddr
+	e.config.SysProxy = mode != RouteCore
 	e.mu.Unlock()
 
 	e.Logf("Connected via [%s] (RTT=%dms, conns=%d)", st.Mode, st.RTTMs, st.ActiveConns)
 
-	if e.config.SysProxy {
-		if err := EnableSystemProxyWithBackup(e.config.HTTPAddr, e.proxyBackupPath); err != nil {
+	if mode != RouteCore {
+		if err := EnableSystemProxyWithBackup(httpAddr, e.proxyBackupPath); err != nil {
 			e.Logf("Failed to enable system proxy: %v", err)
 		} else {
-			e.Logf("System proxy enabled with crash-safe backup (%s)", e.config.HTTPAddr)
+			e.mu.Lock()
+			e.sysProxyApplied = true
+			e.mu.Unlock()
+			e.Logf("System proxy enabled with crash-safe backup (%s)", httpAddr)
 		}
+	} else {
+		e.Logf("Core mode active: local proxy ready (%s / %s), system proxy untouched", socksAddr, httpAddr)
 	}
 	return nil
 }
@@ -455,12 +496,14 @@ func (e *Engine) Disconnect() {
 	e.state = StateDisconnected
 	sched := e.sched
 	e.sched = nil
+	wasApplied := e.sysProxyApplied
+	e.sysProxyApplied = false
 	e.mu.Unlock()
 
 	if sched != nil {
 		sched.Close()
 	}
-	if e.config.SysProxy {
+	if wasApplied {
 		_ = DisableAndRestoreSystemProxy(e.proxyBackupPath)
 		e.Logf("System proxy restored cleanly")
 	}
@@ -782,11 +825,11 @@ func (e *Engine) ClashYAML() string {
     udp: true`, name, host, port)
 }
 
-// Close shuts down local proxy listeners, active tunnel, and restores system proxy.
+// Close shuts down local proxy listeners, active tunnel, and restores system proxy if applied.
 func (e *Engine) Close() {
 	e.stopOnce.Do(func() { close(e.stopStats) })
 	e.Disconnect()
 	_ = e.socksSrv.Close()
 	_ = e.httpSrv.Close()
-	_ = DisableAndRestoreSystemProxy(e.proxyBackupPath)
+	_, _ = RecoverSystemProxyIfDirty(e.proxyBackupPath)
 }
