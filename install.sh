@@ -297,6 +297,7 @@ ExecStart=/opt/ghostframe/gft-server run -config /etc/gft/server.json
 Restart=always
 RestartSec=2s
 LimitNOFILE=1048576
+Environment=GOMEMLIMIT=256MiB
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true

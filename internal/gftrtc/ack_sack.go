@@ -192,7 +192,6 @@ type inFlightPkt struct {
 	wireBytes int
 	frames    []ReliableFrame
 	retired   bool
-	ptoCount  uint8
 }
 
 type lossBucket struct {
@@ -332,6 +331,14 @@ func (lt *LossTracker) InFlightBytes() int {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
 	return lt.inFlightBytes
+}
+
+// Clear releases all tracked in-flight packet references when a session shuts down.
+func (lt *LossTracker) Clear() {
+	lt.mu.Lock()
+	clear(lt.sent)
+	lt.inFlightBytes = 0
+	lt.mu.Unlock()
 }
 
 // LossRate returns the smoothed 2-second packet loss rate in [0, 1].
@@ -477,10 +484,10 @@ func (lt *LossTracker) OnSACK(largestAcked uint64, ackDelayUs uint32, blocks []S
 				if lt.inFlightBytes < 0 {
 					lt.inFlightBytes = 0
 				}
-			}
-			lostCount++
-			if len(p.frames) > 0 {
-				res.LostFrames = append(res.LostFrames, p.frames...)
+				lostCount++
+				if len(p.frames) > 0 {
+					res.LostFrames = append(res.LostFrames, p.frames...)
+				}
 			}
 		}
 	}
@@ -551,28 +558,27 @@ func (lt *LossTracker) PollTimeouts(now time.Time) (lostFrames []ReliableFrame, 
 				if lt.inFlightBytes < 0 {
 					lt.inFlightBytes = 0
 				}
-			}
-			lostCount++
-			if len(p.frames) > 0 {
-				lostFrames = append(lostFrames, p.frames...)
+				lostCount++
+				if len(p.frames) > 0 {
+					lostFrames = append(lostFrames, p.frames...)
+				}
 			}
 		} else if rtoExpired {
-			// Retire in-flight credit once and re-arm sentAt while keeping pn in lt.sent
-			// so late SACKs for the original transmission still calibrate SRTT/minRTT.
 			if !p.retired {
+				// Retire in-flight credit and transfer frames once; keep pn through one grace RTO
+				// window so late SACKs for the original transmission still calibrate SRTT/minRTT.
 				p.retired = true
 				lt.inFlightBytes -= p.wireBytes
 				if lt.inFlightBytes < 0 {
 					lt.inFlightBytes = 0
 				}
-			}
-			p.ptoCount++
-			p.sentAt = now
-			hitPTO = true
-			if len(p.frames) > 0 {
-				lostFrames = append(lostFrames, p.frames...)
-			}
-			if p.ptoCount >= 6 {
+				p.sentAt = now
+				hitPTO = true
+				if len(p.frames) > 0 {
+					lostFrames = append(lostFrames, p.frames...)
+					p.frames = nil
+				}
+			} else {
 				delete(lt.sent, pn)
 				lostCount++
 			}

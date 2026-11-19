@@ -707,6 +707,10 @@ func (s *RTCSession) timerLoop() {
 				s.cc.OnFeedback(0, lossRate, srtt, minRTT, ptoCount, now)
 				s.kickSend()
 			}
+			if ptoCount >= 10 && now.Sub(time.Unix(0, s.lastRecvNs.Load())) >= 25*time.Second {
+				s.fail(errors.New("gftrtc: peer unresponsive"))
+				return
+			}
 
 			// Server idle timeout cleanup
 			if !s.isClient {
@@ -1563,6 +1567,15 @@ func (s *RTCSession) fail(err error) {
 			u.CloseLocal()
 		}
 		s.mu.Unlock()
+
+		s.qMu.Lock()
+		s.retransmitQ = nil
+		s.ctrlQ = nil
+		s.udpQ = nil
+		s.sendRR = nil
+		clear(s.inSendRR)
+		s.qMu.Unlock()
+		s.loss.Clear()
 	})
 }
 

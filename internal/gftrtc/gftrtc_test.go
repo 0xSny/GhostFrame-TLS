@@ -910,3 +910,33 @@ func TestHighRTT170msAutoProbeDownload(t *testing.T) {
 	t.Logf("170ms RTT + 3%% loss 4MB Auto-Probe download: %v (hs=%v, FEC=%d)",
 		time.Since(t0).Round(time.Millisecond), hs.Round(time.Millisecond), cli.Stats().FECRecovered)
 }
+
+func TestPTOZeroAmplificationOnBlackhole(t *testing.T) {
+	lt := NewLossTracker()
+	now := time.Now()
+	const initialPkts = 8
+
+	var nextPN uint64
+	for i := 0; i < initialPkts; i++ {
+		nextPN++
+		lt.OnPacketSent(nextPN, 1200, []ReliableFrame{{Bytes: []byte{byte(i)}}}, now)
+	}
+
+	for round := 0; round < 15; round++ {
+		now = now.Add(5 * time.Second)
+		lostFrames, _, _, _, _ := lt.PollTimeouts(now)
+		if len(lostFrames) > initialPkts {
+			t.Fatalf("round %d: PTO amplification leaked %d frames (want <= %d)", round, len(lostFrames), initialPkts)
+		}
+		for _, f := range lostFrames {
+			nextPN++
+			lt.OnPacketSent(nextPN, 1200, []ReliableFrame{f}, now)
+		}
+		lt.mu.Lock()
+		tracked := len(lt.sent)
+		lt.mu.Unlock()
+		if tracked > initialPkts*2 {
+			t.Fatalf("round %d: lt.sent grew unboundedly to %d (want <= %d)", round, tracked, initialPkts*2)
+		}
+	}
+}
