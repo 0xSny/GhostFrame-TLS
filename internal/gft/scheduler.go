@@ -8,18 +8,18 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"ghostframe/internal/gftrtc"
 )
 
 const (
-	DefaultQUICPoolSize = 3
-	quicHopMinAge       = 35 * time.Second
-	quicHopMaxAge       = 65 * time.Second
-	quicDrainUDPIdle    = 15 * time.Second
-	quicDrainMaxTimeout = 60 * time.Second
+	DefaultRTCPoolSize = 2
+	rtcHopMinAge       = 25 * time.Second
+	rtcHopMaxAge       = 50 * time.Second
+	rtcDrainUDPIdle    = 15 * time.Second
 )
 
-// DialLimiter implements a 2-token, 2/sec token bucket with jitter to prevent
-// reconnect storms that trigger DPI heuristics.
+// DialLimiter implements a token bucket with jitter to prevent reconnect storms.
 type DialLimiter struct {
 	mu       sync.Mutex
 	tokens   float64
@@ -80,46 +80,45 @@ func (d *DialLimiter) Wait(ctx context.Context) error {
 	return nil
 }
 
-// ApexStats reports live status across both QUIC Dual-Track and TCP uTLS pool.
+// ApexStats reports live status across both GFT-RTC striped sessions and TCP uTLS pool.
 type ApexStats struct {
-	Mode          string `json:"mode"` // "QUIC", "TCP-uTLS", "TCP-Fallback", "Starting"
-	QUICConnected bool   `json:"quic_connected"`
-	QUICPort      int    `json:"quic_port"`
-	QUICRTTMs     int64  `json:"quic_rtt_ms"`
-	TCPRTTMs      int64  `json:"tcp_rtt_ms"`
-	RTTMs         int64  `json:"rtt_ms"`
-	ActiveConns   int    `json:"active_conns"`
-	ActiveStreams int    `json:"active_streams"`
-	TotalUp       uint64 `json:"total_up"`
-	TotalDown     uint64 `json:"total_down"`
-	LastErr       string `json:"last_err"`
+	Mode          string  `json:"mode"` // "RTC-Smart", "TCP-uTLS", "TCP-Fallback", "Starting"
+	RTCConnected  bool    `json:"rtc_connected"`
+	RTCPort       int     `json:"rtc_port"`
+	RTCRTTMs      int64   `json:"rtc_rtt_ms"`
+	TCPRTTMs      int64   `json:"tcp_rtt_ms"`
+	RTTMs         int64   `json:"rtt_ms"`
+	FECRecovered  uint64  `json:"fec_recovered"`
+	LossRate      float64 `json:"loss_rate"`
+	PacingMbps    float64 `json:"pacing_mbps"`
+	ActiveConns   int     `json:"active_conns"`
+	ActiveStreams int     `json:"active_streams"`
+	TotalUp       uint64  `json:"total_up"`
+	TotalDown     uint64  `json:"total_down"`
+	LastErr       string  `json:"last_err"`
 }
 
-type quicSlot struct {
-	sess       *QUICSession
+type rtcSlot struct {
+	sess       *gftrtc.RTCSession
 	createdAt  time.Time
+	lastHopAt  time.Time
 	maxAge     time.Duration
 	degradedAt time.Time
 }
 
-type drainingQUIC struct {
-	sess       *QUICSession
-	drainingAt time.Time
-}
-
-// ApexScheduler races and coordinates a Striped QUIC Dual-Track pool (with dynamic port
-// hopping and fragmented RFC 9221 Datagrams) alongside the uTLS SessionPool, providing
-// 0ms failover and cross-hop ClientID NAT port preservation.
+// ApexScheduler races and coordinates a Striped GFT-RTC Dual-Session pool (with 0ms WebRTC
+// socket migration port hopping, XOR-FEC, and Smart-Brutal CC) alongside the TCP uTLS SessionPool.
 type ApexScheduler struct {
-	link        *Link
-	ps          *ParamStore
-	clientID    [8]byte
-	limiter     *DialLimiter // alias of tcpLimiter for test compatibility
-	tcpLimiter  *DialLimiter
-	quicLimiter *DialLimiter
-	pool        *SessionPool
-	onLog       func(string, ...any)
-	quicDialFn  func(ctx context.Context, l *Link, ps *ParamStore, port int, timeout time.Duration) (*QUICSession, time.Duration, error)
+	link       *Link
+	ps         *ParamStore
+	clientID   [8]byte
+	limiter    *DialLimiter // alias of tcpLimiter
+	tcpLimiter *DialLimiter
+	rtcLimiter *DialLimiter
+	pool       *SessionPool
+	onLog      func(string, ...any)
+	rtcDialFn  func(ctx context.Context, l *Link, ps *ParamStore, port int, timeout time.Duration) (*gftrtc.RTCSession, time.Duration, error)
+	rtcHopFn   func(sess *gftrtc.RTCSession, nextPort int) error
 
 	hopMinAge    time.Duration
 	hopMaxAge    time.Duration
@@ -127,18 +126,18 @@ type ApexScheduler struct {
 	maintainTick time.Duration
 
 	mu           sync.Mutex
-	quicSlots    []*quicSlot
-	quicDrain    []*drainingQUIC
-	retiredQUp   uint64
-	retiredQDown uint64
+	rtcSlots     []*rtcSlot
+	retiredRUp   uint64
+	retiredRDown uint64
+	retiredFEC   uint64
 	lastErr      string
 
-	quicRR      atomic.Uint64
+	rtcRR       atomic.Uint64
 	nextAssocID atomic.Uint32
 	udpMu       sync.Mutex
 	udpAssocs   map[uint16]*SchedulerUDPAssoc
 
-	quicRTTMs atomic.Int64
+	rtcRTTMs atomic.Int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -157,7 +156,7 @@ func (a *ApexScheduler) launchLoop(fn func()) {
 	go fn()
 }
 
-// NewApexScheduler creates an Apex dual-track scheduler for link.
+// NewApexScheduler creates an Apex dual-track scheduler (GFT-RTC + TCP-uTLS) for link.
 func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string, ...any)) *ApexScheduler {
 	var cid [8]byte
 	if _, err := io.ReadFull(rand.Reader, cid[:]); err != nil {
@@ -165,7 +164,7 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	tcpLim := NewDialLimiter()
-	quicLim := &DialLimiter{
+	rtcLim := &DialLimiter{
 		tokens:   4,
 		cap:      4,
 		rate:     4,
@@ -179,11 +178,11 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 		clientID:     cid,
 		limiter:      tcpLim,
 		tcpLimiter:   tcpLim,
-		quicLimiter:  quicLim,
+		rtcLimiter:   rtcLim,
 		onLog:        logf,
-		hopMinAge:    quicHopMinAge,
-		hopMaxAge:    quicHopMaxAge,
-		drainUDPIdle: quicDrainUDPIdle,
+		hopMinAge:    rtcHopMinAge,
+		hopMaxAge:    rtcHopMaxAge,
+		drainUDPIdle: rtcDrainUDPIdle,
 		maintainTick: 2 * time.Second,
 		udpAssocs:    make(map[uint16]*SchedulerUDPAssoc),
 		ctx:          ctx,
@@ -197,23 +196,23 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 		return DialSessionWithID(dialCtx, dl, dps, flags, timeout, a.clientID)
 	}
 	a.pool = pool
-	a.quicDialFn = func(dialCtx context.Context, dl *Link, dps *ParamStore, port int, timeout time.Duration) (*QUICSession, time.Duration, error) {
-		return DialQUICSessionWithID(dialCtx, dl, dps, port, timeout, a.clientID)
+	a.rtcDialFn = func(dialCtx context.Context, dl *Link, dps *ParamStore, port int, timeout time.Duration) (*gftrtc.RTCSession, time.Duration, error) {
+		return DialRTCSessionWithID(dialCtx, dl, dps, port, timeout, a.clientID)
+	}
+	a.rtcHopFn = func(sess *gftrtc.RTCSession, nextPort int) error {
+		return sess.Hop(nextPort)
 	}
 	return a
 }
 
-func (a *ApexScheduler) quicPoolTarget() int {
-	if _, _, hasHop := a.link.ParseHopRange(); hasHop {
-		return DefaultQUICPoolSize
-	}
-	return 2
+func (a *ApexScheduler) rtcPoolTarget() int {
+	return DefaultRTCPoolSize // 2 concurrent striped UDP 5-tuples
 }
 
 // ClientID returns the 8-byte session-group identifier used for server NAT preservation.
 func (a *ApexScheduler) ClientID() [8]byte { return a.clientID }
 
-// SetHopTimingsForTest overrides port-hop and drain intervals for unit tests.
+// SetHopTimingsForTest overrides port-hop and maintain intervals for unit tests.
 func (a *ApexScheduler) SetHopTimingsForTest(minAge, maxAge, drainUDPIdle, tick time.Duration) {
 	a.mu.Lock()
 	a.hopMinAge = minAge
@@ -225,7 +224,7 @@ func (a *ApexScheduler) SetHopTimingsForTest(minAge, maxAge, drainUDPIdle, tick 
 
 // SetDialJitterForTest overrides dial rate-limiter jitter and rate for tests.
 func (a *ApexScheduler) SetDialJitterForTest(minMs, maxMs int, rate float64) {
-	for _, lim := range []*DialLimiter{a.tcpLimiter, a.quicLimiter} {
+	for _, lim := range []*DialLimiter{a.tcpLimiter, a.rtcLimiter} {
 		lim.mu.Lock()
 		lim.minJitMs = minMs
 		lim.maxJitMs = maxMs
@@ -240,28 +239,48 @@ func (a *ApexScheduler) SetDialJitterForTest(minMs, maxMs int, rate float64) {
 	}
 }
 
-// SetQUICDialHookForTest overrides the QUIC dial function used by the scheduler.
-func (a *ApexScheduler) SetQUICDialHookForTest(fn func(ctx context.Context, l *Link, ps *ParamStore, port int, timeout time.Duration, clientID [8]byte) (*QUICSession, time.Duration, error)) {
+// SetRTCDialHookForTest overrides the GFT-RTC dial function used by the scheduler.
+func (a *ApexScheduler) SetRTCDialHookForTest(fn func(ctx context.Context, l *Link, ps *ParamStore, port int, timeout time.Duration, clientID [8]byte) (*gftrtc.RTCSession, time.Duration, error)) {
 	a.mu.Lock()
-	a.quicDialFn = func(dialCtx context.Context, dl *Link, dps *ParamStore, port int, timeout time.Duration) (*QUICSession, time.Duration, error) {
+	a.rtcDialFn = func(dialCtx context.Context, dl *Link, dps *ParamStore, port int, timeout time.Duration) (*gftrtc.RTCSession, time.Duration, error) {
 		return fn(dialCtx, dl, dps, port, timeout, a.clientID)
 	}
 	a.mu.Unlock()
 }
 
-// Start connects initial tracks based on Link.EffectiveTransport ("auto", "quic", "tcp").
+// SetRTCHopHookForTest overrides how 0ms port hopping replaces UDP sockets in tests.
+func (a *ApexScheduler) SetRTCHopHookForTest(fn func(sess *gftrtc.RTCSession, nextPort int) error) {
+	a.mu.Lock()
+	a.rtcHopFn = fn
+	a.mu.Unlock()
+}
+
+// UpdateBandwidth updates pacing targets on active GFT-RTC sessions live.
+func (a *ApexScheduler) UpdateBandwidth(upMbps, downMbps int) {
+	a.mu.Lock()
+	a.link.UpMbps = upMbps
+	a.link.DownMbps = downMbps
+	for _, sl := range a.rtcSlots {
+		if sl != nil && sl.sess != nil {
+			sl.sess.UpdateBandwidth(upMbps)
+		}
+	}
+	a.mu.Unlock()
+}
+
+// Start connects initial tracks based on Link.EffectiveTransport ("auto", "rtc", "tcp").
 func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 	tr := a.link.EffectiveTransport()
 	switch tr {
 	case "tcp":
 		return a.pool.Start(connectTimeout)
-	case "quic":
-		if err := a.dialQUICNow(connectTimeout); err != nil {
+	case "rtc":
+		if err := a.dialRTCNow(connectTimeout); err != nil {
 			return err
 		}
-		a.launchLoop(a.quicMaintainLoop)
+		a.launchLoop(a.rtcMaintainLoop)
 		return nil
-	default: // "auto": race QUIC + TCP simultaneously so 0ms failover is ready immediately
+	default: // "auto": race GFT-RTC + TCP-uTLS simultaneously
 		type res struct {
 			kind string
 			err  error
@@ -271,7 +290,7 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 			ch <- res{"tcp", a.pool.Start(connectTimeout)}
 		}()
 		go func() {
-			ch <- res{"quic", a.dialQUICNow(connectTimeout)}
+			ch <- res{"rtc", a.dialRTCNow(connectTimeout)}
 		}()
 
 		r1 := <-ch
@@ -285,35 +304,35 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 					if r2.err != nil {
 						if r2.kind == "tcp" {
 							if a.onLog != nil {
-								a.onLog("TCP track initial dial deferred (%v); running on QUIC", r2.err)
+								a.onLog("TCP track deferred (%v); running on GFT-RTC Smart-Brutal", r2.err)
 							}
 							a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
 						} else if a.onLog != nil {
-							a.onLog("QUIC track unavailable (%v); 0ms fallback active on TCP-uTLS", r2.err)
+							a.onLog("GFT-RTC track unavailable (%v); 0ms fallback active on TCP-uTLS", r2.err)
 						}
 					}
 				}
 			})
-			a.launchLoop(a.quicMaintainLoop)
+			a.launchLoop(a.rtcMaintainLoop)
 			return nil
 		}
 
 		r2 := <-ch
 		if r2.err != nil {
-			if r1.kind == "quic" {
+			if r1.kind == "rtc" {
 				return r1.err
 			}
 			return r2.err
 		}
 		if r1.kind == "tcp" {
 			if a.onLog != nil {
-				a.onLog("TCP track initial dial deferred (%v); running on QUIC", r1.err)
+				a.onLog("TCP track deferred (%v); running on GFT-RTC Smart-Brutal", r1.err)
 			}
 			a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
 		} else if a.onLog != nil {
-			a.onLog("QUIC track unavailable (%v); 0ms fallback active on TCP-uTLS", r1.err)
+			a.onLog("GFT-RTC track unavailable (%v); 0ms fallback active on TCP-uTLS", r1.err)
 		}
-		a.launchLoop(a.quicMaintainLoop)
+		a.launchLoop(a.rtcMaintainLoop)
 		return nil
 	}
 }
@@ -345,7 +364,7 @@ func (a *ApexScheduler) randomHopAge() time.Duration {
 	minMs := int(a.hopMinAge.Milliseconds())
 	maxMs := int(a.hopMaxAge.Milliseconds())
 	if minMs <= 0 {
-		return 35 * time.Second
+		return 25 * time.Second
 	}
 	if maxMs <= minMs {
 		return time.Duration(minMs) * time.Millisecond
@@ -353,14 +372,14 @@ func (a *ApexScheduler) randomHopAge() time.Duration {
 	return time.Duration(randRange(minMs, maxMs)) * time.Millisecond
 }
 
-func (a *ApexScheduler) dialOneQUICSlot(timeout time.Duration) (*quicSlot, error) {
-	if err := a.quicLimiter.Wait(a.ctx); err != nil {
+func (a *ApexScheduler) dialOneRTCSlot(timeout time.Duration) (*rtcSlot, error) {
+	if err := a.rtcLimiter.Wait(a.ctx); err != nil {
 		return nil, err
 	}
 	port := PickHopPort(a.link)
 	dialCtx, cancel := context.WithTimeout(a.ctx, timeout)
 	defer cancel()
-	qs, hs, err := a.quicDialFn(dialCtx, a.link, a.ps, port, timeout)
+	sess, hs, err := a.rtcDialFn(dialCtx, a.link, a.ps, port, timeout)
 	if err != nil {
 		a.mu.Lock()
 		a.lastErr = err.Error()
@@ -368,42 +387,43 @@ func (a *ApexScheduler) dialOneQUICSlot(timeout time.Duration) (*quicSlot, error
 		return nil, err
 	}
 	if a.ctx.Err() != nil {
-		qs.Close()
+		sess.Close()
 		return nil, a.ctx.Err()
 	}
 	ms := hs.Milliseconds()
 	if ms <= 0 {
 		ms = 1
 	}
-	a.quicRTTMs.Store(ms)
+	a.rtcRTTMs.Store(ms)
 
 	now := time.Now()
-	slot := &quicSlot{
-		sess:      qs,
+	slot := &rtcSlot{
+		sess:      sess,
 		createdAt: now,
+		lastHopAt: now,
 		maxAge:    a.randomHopAge(),
 	}
 	if a.onLog != nil {
-		a.onLog("QUIC Dual-Track connected (UDP :%d, RTT=%dms)", port, ms)
+		a.onLog("GFT-RTC connected (UDP :%d, Cipher=%s, RTT=%dms)", port, sess.Stats().Cipher, ms)
 	}
 	return slot, nil
 }
 
-func (a *ApexScheduler) dialQUICNow(timeout time.Duration) error {
-	target := a.quicPoolTarget()
+func (a *ApexScheduler) dialRTCNow(timeout time.Duration) error {
+	target := a.rtcPoolTarget()
 	if target <= 1 {
 		target = 1
 	}
 
 	var wg sync.WaitGroup
 	var resMu sync.Mutex
-	var slots []*quicSlot
+	var slots []*rtcSlot
 	var lastErr error
 	for i := 0; i < target; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sl, err := a.dialOneQUICSlot(timeout)
+			sl, err := a.dialOneRTCSlot(timeout)
 			resMu.Lock()
 			if err == nil && sl != nil {
 				slots = append(slots, sl)
@@ -417,7 +437,7 @@ func (a *ApexScheduler) dialQUICNow(timeout time.Duration) error {
 
 	if len(slots) == 0 {
 		if lastErr == nil {
-			lastErr = errors.New("gft: quic pool dial failed")
+			lastErr = errors.New("gft: rtc pool dial failed")
 		}
 		return lastErr
 	}
@@ -430,12 +450,12 @@ func (a *ApexScheduler) dialQUICNow(timeout time.Duration) error {
 		}
 		return context.Canceled
 	}
-	a.quicSlots = append(a.quicSlots, slots...)
+	a.rtcSlots = append(a.rtcSlots, slots...)
 	a.mu.Unlock()
 	return nil
 }
 
-func (a *ApexScheduler) quicMaintainLoop() {
+func (a *ApexScheduler) rtcMaintainLoop() {
 	defer a.wg.Done()
 	a.mu.Lock()
 	tickDur := a.maintainTick
@@ -444,7 +464,7 @@ func (a *ApexScheduler) quicMaintainLoop() {
 		tickDur = 2 * time.Second
 	}
 	t := time.NewTicker(tickDur)
-	pingTicker := time.NewTicker(20 * time.Second)
+	pingTicker := time.NewTicker(18 * time.Second)
 	defer t.Stop()
 	defer pingTicker.Stop()
 
@@ -454,90 +474,60 @@ func (a *ApexScheduler) quicMaintainLoop() {
 		case <-a.ctx.Done():
 			return
 		case <-pingTicker.C:
-			q := a.activeQUICForSend()
-			if q != nil {
-				if rtt, err := q.ProbeRTT(4 * time.Second); err == nil {
+			if rs := a.activeRTCForSend(); rs != nil {
+				if rtt, err := rs.ProbeRTT(4 * time.Second); err == nil {
 					ms := rtt.Milliseconds()
 					if ms <= 0 {
 						ms = 1
 					}
-					a.quicRTTMs.Store(ms)
+					a.rtcRTTMs.Store(ms)
 				}
 			}
 		case <-t.C:
 			now := time.Now()
-			target := a.quicPoolTarget()
+			target := a.rtcPoolTarget()
 			_, _, hasHop := a.link.ParseHopRange()
 
 			a.mu.Lock()
-			drainUDPIdle := a.drainUDPIdle
-			var aliveDrain []*drainingQUIC
-			for _, dq := range a.quicDrain {
-				select {
-				case <-dq.sess.Done():
-					a.retiredQUp += dq.sess.UpBytes.Load()
-					a.retiredQDown += dq.sess.DownBytes.Load()
-				default:
-					lastUDP := dq.sess.LastUDPTime()
-					udpIdleOK := lastUDP.IsZero() && now.Sub(dq.drainingAt) >= drainUDPIdle
-					if !lastUDP.IsZero() && now.Sub(lastUDP) >= drainUDPIdle {
-						udpIdleOK = true
-					}
-					hardExpired := now.Sub(dq.drainingAt) >= quicDrainMaxTimeout
-					if (dq.sess.NumStreams() == 0 && udpIdleOK) || hardExpired {
-						a.retiredQUp += dq.sess.UpBytes.Load()
-						a.retiredQDown += dq.sess.DownBytes.Load()
-						dq.sess.Close()
-					} else {
-						aliveDrain = append(aliveDrain, dq)
-					}
-				}
-			}
-			a.quicDrain = aliveDrain
-
-			var keepSlots []*quicSlot
-			var expiredHopSlots []*quicSlot
-			for _, sl := range a.quicSlots {
+			var keepSlots []*rtcSlot
+			var dueHop []*rtcSlot
+			for _, sl := range a.rtcSlots {
 				select {
 				case <-sl.sess.Done():
-					a.retiredQUp += sl.sess.UpBytes.Load()
-					a.retiredQDown += sl.sess.DownBytes.Load()
+					st := sl.sess.Stats()
+					a.retiredRUp += st.UpBytes
+					a.retiredRDown += st.DownBytes
+					a.retiredFEC += st.FECRecovered
 				default:
-					if hasHop && now.Sub(sl.createdAt) >= sl.maxAge {
-						expiredHopSlots = append(expiredHopSlots, sl)
-					} else {
-						keepSlots = append(keepSlots, sl)
+					if hasHop && now.Sub(sl.lastHopAt) >= sl.maxAge {
+						dueHop = append(dueHop, sl)
 					}
+					keepSlots = append(keepSlots, sl)
 				}
 			}
-			a.quicSlots = keepSlots
+			a.rtcSlots = keepSlots
 			missing := target - len(keepSlots)
+			hopFn := a.rtcHopFn
 			a.mu.Unlock()
 
-			// Rotate expired hop slots seamlessly: dial replacement before draining old slot
-			for _, oldSl := range expiredHopSlots {
-				newSl, err := a.dialOneQUICSlot(6 * time.Second)
-				a.mu.Lock()
-				if err == nil && newSl != nil && !a.closed {
-					a.quicSlots = append(a.quicSlots, newSl)
-					a.quicDrain = append(a.quicDrain, &drainingQUIC{sess: oldSl.sess, drainingAt: time.Now()})
-				} else {
-					if newSl != nil {
-						newSl.sess.Close()
+			// Execute 0ms in-place socket port-hop migration (zero stream interruption!)
+			for _, sl := range dueHop {
+				oldPort := sl.sess.RemotePort()
+				nextPort := PickHopPort(a.link)
+				if err := hopFn(sl.sess, nextPort); err == nil {
+					a.mu.Lock()
+					sl.lastHopAt = time.Now()
+					sl.maxAge = a.randomHopAge()
+					a.mu.Unlock()
+					if a.onLog != nil {
+						a.onLog("RTC 0ms Port-Hop migrated (UDP :%d -> :%d)", oldPort, nextPort)
 					}
-					// Keep old slot alive if hop dial failed unless already closed
-					select {
-					case <-oldSl.sess.Done():
-						a.retiredQUp += oldSl.sess.UpBytes.Load()
-						a.retiredQDown += oldSl.sess.DownBytes.Load()
-					default:
-						a.quicSlots = append(a.quicSlots, oldSl)
-					}
+				} else if a.onLog != nil {
+					a.onLog("RTC Port-Hop notice: %v", err)
 				}
-				a.mu.Unlock()
 			}
 
-			// Top up any missing slots in parallel
+			// Top up any closed/missing RTC slots
 			if missing > 0 {
 				var dialErr error
 				var wg sync.WaitGroup
@@ -546,7 +536,7 @@ func (a *ApexScheduler) quicMaintainLoop() {
 					wg.Add(1)
 					go func() {
 						defer wg.Done()
-						sl, err := a.dialOneQUICSlot(6 * time.Second)
+						sl, err := a.dialOneRTCSlot(6 * time.Second)
 						if err != nil {
 							dMu.Lock()
 							dialErr = err
@@ -555,7 +545,7 @@ func (a *ApexScheduler) quicMaintainLoop() {
 						}
 						a.mu.Lock()
 						if !a.closed && a.ctx.Err() == nil {
-							a.quicSlots = append(a.quicSlots, sl)
+							a.rtcSlots = append(a.rtcSlots, sl)
 						} else {
 							sl.sess.Close()
 						}
@@ -565,7 +555,7 @@ func (a *ApexScheduler) quicMaintainLoop() {
 				wg.Wait()
 				if dialErr != nil {
 					a.mu.Lock()
-					curLen := len(a.quicSlots)
+					curLen := len(a.rtcSlots)
 					a.mu.Unlock()
 					if curLen == 0 {
 						select {
@@ -586,21 +576,21 @@ func (a *ApexScheduler) quicMaintainLoop() {
 	}
 }
 
-func (a *ApexScheduler) activeQUICForSend() *QUICSession {
+func (a *ApexScheduler) activeRTCForSend() *gftrtc.RTCSession {
 	if a.link.EffectiveTransport() == "tcp" {
 		return nil
 	}
 	now := time.Now()
 	a.mu.Lock()
-	var best *QUICSession
+	var best *gftrtc.RTCSession
 	bestStreams := int(^uint(0) >> 1)
-	n := len(a.quicSlots)
+	n := len(a.rtcSlots)
 	start := 0
 	if n > 1 {
-		start = int(a.quicRR.Add(1)-1) % n
+		start = int(a.rtcRR.Add(1)-1) % n
 	}
 	for i := 0; i < n; i++ {
-		sl := a.quicSlots[(start+i)%n]
+		sl := a.rtcSlots[(start+i)%n]
 		if sl == nil || sl.sess == nil {
 			continue
 		}
@@ -623,20 +613,20 @@ func (a *ApexScheduler) activeQUICForSend() *QUICSession {
 		return nil
 	}
 	if a.link.EffectiveTransport() == "auto" {
-		qRTT := a.quicRTTMs.Load()
+		rRTT := a.rtcRTTMs.Load()
 		tRTT := a.pool.rttMs.Load()
-		if qRTT > 150 && tRTT > 0 && qRTT > (tRTT*18)/10 && a.pool.Stats().ActiveConns > 0 {
+		if rRTT > 180 && tRTT > 0 && rRTT > tRTT*2 && a.pool.Stats().ActiveConns > 0 {
 			return nil
 		}
 	}
 	return best
 }
 
-func (a *ApexScheduler) markQUICDegraded(q *QUICSession, err error) {
+func (a *ApexScheduler) markRTCDegraded(r *gftrtc.RTCSession, err error) {
 	now := time.Now()
 	a.mu.Lock()
-	for _, sl := range a.quicSlots {
-		if sl != nil && sl.sess == q {
+	for _, sl := range a.rtcSlots {
+		if sl != nil && sl.sess == r {
 			sl.degradedAt = now
 			if err != nil {
 				a.lastErr = err.Error()
@@ -647,18 +637,18 @@ func (a *ApexScheduler) markQUICDegraded(q *QUICSession, err error) {
 	a.mu.Unlock()
 }
 
-// OpenStream routes a TCP tunnel stream over QUIC Dual-Track when healthy, falling
-// back in 0ms to the uTLS TCP SessionPool if UDP fails or is throttled.
+// OpenStream routes a TCP tunnel stream over GFT-RTC striped pool when healthy,
+// falling back in 0ms to the uTLS TCP SessionPool if UDP fails or is throttled.
 func (a *ApexScheduler) OpenStream(target string, first []byte) (DataStream, error) {
-	if q := a.activeQUICForSend(); q != nil {
-		st, err := q.OpenStream(target, first)
+	if r := a.activeRTCForSend(); r != nil {
+		st, err := r.OpenStream(target, first)
 		if err == nil {
 			return st, nil
 		}
-		a.markQUICDegraded(q, err)
+		a.markRTCDegraded(r, err)
 	}
-	if a.link.EffectiveTransport() == "quic" {
-		return nil, errors.New("gft: quic track unavailable")
+	if a.link.EffectiveTransport() == "rtc" {
+		return nil, errors.New("gft: rtc track unavailable")
 	}
 	st, err := a.pool.OpenStream(target, first)
 	if err != nil {
@@ -667,8 +657,8 @@ func (a *ApexScheduler) OpenStream(target string, first []byte) (DataStream, err
 	return st, nil
 }
 
-// SchedulerUDPAssoc is a persistent virtual UDP association across QUIC port hops
-// and QUIC<->TCP 0ms failovers, preserving the exact server-side NAT socket.
+// SchedulerUDPAssoc is a persistent virtual UDP association across RTC port hops
+// and RTC<->TCP 0ms failovers, preserving the exact server-side NAT socket via ClientID.
 type SchedulerUDPAssoc struct {
 	sched *ApexScheduler
 	id    uint16
@@ -800,23 +790,23 @@ func (u *SchedulerUDPAssoc) SendTo(target string, data []byte) error {
 	default:
 	}
 
-	if q := u.sched.activeQUICForSend(); q != nil {
-		sub, err := u.bindUnderlying(q, func() (UDPAssociation, error) {
-			return q.OpenUDPWithID(u.id)
+	if r := u.sched.activeRTCForSend(); r != nil {
+		sub, err := u.bindUnderlying(r, func() (UDPAssociation, error) {
+			return r.OpenUDPWithID(u.id)
 		})
 		if err == nil {
 			if serr := sub.SendTo(target, data); serr == nil {
 				return nil
 			} else {
-				u.sched.markQUICDegraded(q, serr)
+				u.sched.markRTCDegraded(r, serr)
 			}
 		} else {
-			u.sched.markQUICDegraded(q, err)
+			u.sched.markRTCDegraded(r, err)
 		}
 	}
 
-	if u.sched.link.EffectiveTransport() == "quic" {
-		return errors.New("gft: quic udp track unavailable")
+	if u.sched.link.EffectiveTransport() == "rtc" {
+		return errors.New("gft: rtc udp track unavailable")
 	}
 
 	s, err := u.sched.pool.Acquire()
@@ -824,11 +814,7 @@ func (u *SchedulerUDPAssoc) SendTo(target string, data []byte) error {
 		return err
 	}
 	sub, err := u.bindUnderlying(s, func() (UDPAssociation, error) {
-		st, err := s.OpenUDPWithID(u.id)
-		if err != nil {
-			return nil, err
-		}
-		return st, nil
+		return s.OpenUDPWithID(u.id)
 	})
 	if err != nil {
 		return err
@@ -855,7 +841,6 @@ func (u *SchedulerUDPAssoc) Close() error {
 		delete(u.sched.udpAssocs, u.id)
 		u.sched.udpMu.Unlock()
 
-		// Tell server to release the ClientID NAT socket once via active/last track.
 		closedRemote := false
 		if last != nil {
 			_ = last.Close()
@@ -866,8 +851,8 @@ func (u *SchedulerUDPAssoc) Close() error {
 				if !closedRemote {
 					_ = sub.Close()
 					closedRemote = true
-				} else if qs, ok := sub.(*QUICUDPAssoc); ok {
-					qs.closeLocal()
+				} else if rs, ok := sub.(*gftrtc.RTCUDPAssoc); ok {
+					rs.CloseLocal()
 				} else if ts, ok := sub.(*UDPStream); ok {
 					ts.closeLocal()
 				}
@@ -877,32 +862,34 @@ func (u *SchedulerUDPAssoc) Close() error {
 	return nil
 }
 
-// Stats returns a live metrics snapshot across QUIC and TCP tracks.
+// Stats returns a live metrics snapshot across GFT-RTC and TCP-uTLS tracks.
 func (a *ApexScheduler) Stats() ApexStats {
 	ps := a.pool.Stats()
 	a.mu.Lock()
-	qUp, qDown := a.retiredQUp, a.retiredQDown
-	var qPort, qStreams, qAliveCount int
-	for _, sl := range a.quicSlots {
+	rUp, rDown, rFEC := a.retiredRUp, a.retiredRDown, a.retiredFEC
+	var rPort, rStreams, rAliveCount int
+	var sumPacing, maxLoss float64
+	for _, sl := range a.rtcSlots {
 		if sl == nil || sl.sess == nil {
 			continue
 		}
+		st := sl.sess.Stats()
+		rUp += st.UpBytes
+		rDown += st.DownBytes
+		rFEC += st.FECRecovered
 		select {
 		case <-sl.sess.Done():
 		default:
-			qAliveCount++
-			if qPort == 0 {
-				qPort = sl.sess.RemotePort()
+			rAliveCount++
+			if rPort == 0 {
+				rPort = st.RemotePort
 			}
-			qStreams += sl.sess.NumStreams()
+			rStreams += st.ActiveStream
+			sumPacing += st.PacingMbps
+			if st.LossRate > maxLoss {
+				maxLoss = st.LossRate
+			}
 		}
-		qUp += sl.sess.UpBytes.Load()
-		qDown += sl.sess.DownBytes.Load()
-	}
-	for _, dq := range a.quicDrain {
-		qUp += dq.sess.UpBytes.Load()
-		qDown += dq.sess.DownBytes.Load()
-		qStreams += dq.sess.NumStreams()
 	}
 	lErr := a.lastErr
 	a.mu.Unlock()
@@ -910,17 +897,17 @@ func (a *ApexScheduler) Stats() ApexStats {
 	if lErr == "" {
 		lErr = ps.LastErr
 	}
-	qRTT := a.quicRTTMs.Load()
+	rRTT := a.rtcRTTMs.Load()
 	tRTT := ps.RTTMs
 	mode := "Starting"
 	bestRTT := tRTT
-	conns := ps.ActiveConns + ps.DrainingConns + qAliveCount
-	qAlive := qAliveCount > 0
-	if qAlive {
-		if a.activeQUICForSend() != nil {
-			mode = "QUIC"
-			if qRTT > 0 {
-				bestRTT = qRTT
+	conns := ps.ActiveConns + ps.DrainingConns + rAliveCount
+	rAlive := rAliveCount > 0
+	if rAlive {
+		if a.activeRTCForSend() != nil {
+			mode = "RTC-Smart"
+			if rRTT > 0 {
+				bestRTT = rRTT
 			}
 		} else if ps.ActiveConns > 0 {
 			mode = "TCP-Fallback"
@@ -935,20 +922,23 @@ func (a *ApexScheduler) Stats() ApexStats {
 
 	return ApexStats{
 		Mode:          mode,
-		QUICConnected: qAlive,
-		QUICPort:      qPort,
-		QUICRTTMs:     qRTT,
+		RTCConnected:  rAlive,
+		RTCPort:       rPort,
+		RTCRTTMs:      rRTT,
 		TCPRTTMs:      tRTT,
 		RTTMs:         bestRTT,
+		FECRecovered:  rFEC,
+		LossRate:      maxLoss,
+		PacingMbps:    sumPacing,
 		ActiveConns:   conns,
-		ActiveStreams: ps.ActiveStreams + qStreams,
-		TotalUp:       ps.TotalUp + qUp,
-		TotalDown:     ps.TotalDown + qDown,
+		ActiveStreams: ps.ActiveStreams + rStreams,
+		TotalUp:       ps.TotalUp + rUp,
+		TotalDown:     ps.TotalDown + rDown,
 		LastErr:       lErr,
 	}
 }
 
-// Close shuts down QUIC Dual-Track, UDP associations, and TCP SessionPool cleanly.
+// Close shuts down GFT-RTC striped sessions, UDP associations, and TCP SessionPool cleanly.
 func (a *ApexScheduler) Close() {
 	a.loopMu.Lock()
 	a.closed = true
@@ -966,16 +956,12 @@ func (a *ApexScheduler) Close() {
 	}
 
 	a.mu.Lock()
-	for _, sl := range a.quicSlots {
+	for _, sl := range a.rtcSlots {
 		if sl != nil && sl.sess != nil {
 			sl.sess.Close()
 		}
 	}
-	a.quicSlots = nil
-	for _, dq := range a.quicDrain {
-		dq.sess.Close()
-	}
-	a.quicDrain = nil
+	a.rtcSlots = nil
 	a.mu.Unlock()
 	a.pool.Close()
 	a.wg.Wait()

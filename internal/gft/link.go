@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,79 +13,25 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"ghostframe/internal/gftrtc"
 )
 
 // Address types in CONNECT and UDP payloads.
 const (
-	AtypIPv4   = 1
-	AtypDomain = 3
-	AtypIPv6   = 4
+	AtypIPv4   = gftrtc.AtypIPv4
+	AtypDomain = gftrtc.AtypDomain
+	AtypIPv6   = gftrtc.AtypIPv6
 )
 
 // EncodeAddr encodes "host:port" as [atyp | addr | port BE].
 func EncodeAddr(hostport string) ([]byte, error) {
-	h, ps, err := net.SplitHostPort(hostport)
-	if err != nil {
-		return nil, err
-	}
-	port, err := strconv.Atoi(ps)
-	if err != nil || port < 1 || port > 65535 {
-		return nil, errors.New("bad port")
-	}
-	var out []byte
-	if ip := net.ParseIP(h); ip != nil {
-		if v4 := ip.To4(); v4 != nil {
-			out = append(out, AtypIPv4)
-			out = append(out, v4...)
-		} else {
-			out = append(out, AtypIPv6)
-			out = append(out, ip.To16()...)
-		}
-	} else {
-		if len(h) == 0 || len(h) > 255 {
-			return nil, errors.New("bad host")
-		}
-		out = append(out, AtypDomain, byte(len(h)))
-		out = append(out, h...)
-	}
-	out = binary.BigEndian.AppendUint16(out, uint16(port))
-	return out, nil
+	return gftrtc.EncodeAddr(hostport)
 }
 
 // DecodeAddr parses an address; rest is any trailing payload bytes.
 func DecodeAddr(b []byte) (hostport string, rest []byte, err error) {
-	if len(b) < 1 {
-		return "", nil, errors.New("short addr")
-	}
-	var host string
-	var off int
-	switch b[0] {
-	case AtypIPv4:
-		if len(b) < 1+4+2 {
-			return "", nil, errors.New("short addr")
-		}
-		host = net.IP(b[1:5]).String()
-		off = 5
-	case AtypIPv6:
-		if len(b) < 1+16+2 {
-			return "", nil, errors.New("short addr")
-		}
-		host = net.IP(b[1:17]).String()
-		off = 17
-	case AtypDomain:
-		if len(b) < 2 || len(b) < 2+int(b[1])+2 || b[1] == 0 {
-			return "", nil, errors.New("short addr")
-		}
-		host = string(b[2 : 2+int(b[1])])
-		off = 2 + int(b[1])
-	default:
-		return "", nil, errors.New("bad atyp")
-	}
-	port := binary.BigEndian.Uint16(b[off:])
-	if port == 0 {
-		return "", nil, errors.New("bad port")
-	}
-	return net.JoinHostPort(host, strconv.Itoa(int(port))), b[off+2:], nil
+	return gftrtc.DecodeAddr(b)
 }
 
 // SPKIOf returns the hex SHA-256 hash of a certificate's SubjectPublicKeyInfo (SPKI).
@@ -115,9 +60,11 @@ type Link struct {
 	Verify    string  `json:"verify,omitempty"`    // "ca" or "spki"
 	Pin       string  `json:"pin,omitempty"`       // SHA-256 hex of SPKI (required for "spki")
 	FP        string  `json:"fp,omitempty"`        // "chrome" (default), "edge", "firefox", "ios"
-	Transport string  `json:"transport,omitempty"` // "auto" (default dual-track), "quic", "tcp"
+	Transport string  `json:"transport,omitempty"` // "auto" (default dual-track), "rtc" (or legacy "quic"), "tcp"
 	SplitSNI  bool    `json:"split_sni,omitempty"` // split first ClientHello record across SNI
-	HopRange  string  `json:"hop_range,omitempty"` // optional UDP port range e.g. "20000-30000"
+	HopRange  string  `json:"hop_range,omitempty"` // optional UDP port range e.g. "20000-40000"
+	UpMbps    int     `json:"up_mbps,omitempty"`   // optional Smart-Brutal upload target Mbps (0 = Auto-Probe)
+	DownMbps  int     `json:"down_mbps,omitempty"` // optional Smart-Brutal download target Mbps (0 = Auto-Probe)
 	Params    *Params `json:"params,omitempty"`
 	Remark    string  `json:"-"`
 }
@@ -154,13 +101,17 @@ func (l *Link) EffectiveFP() string {
 	return fp
 }
 
-// EffectiveTransport returns normalized transport strategy: "auto", "quic", or "tcp".
+// EffectiveTransport returns normalized transport strategy: "auto", "rtc", or "tcp" (maps legacy "quic" -> "rtc").
 func (l *Link) EffectiveTransport() string {
 	t := strings.ToLower(strings.TrimSpace(l.Transport))
-	if t == "" {
+	switch t {
+	case "", "auto":
 		return "auto"
+	case "quic", "rtc":
+		return "rtc"
+	default:
+		return t
 	}
-	return t
 }
 
 // ParseHopRange returns minPort, maxPort, ok for UDP dynamic port hopping.
@@ -220,9 +171,12 @@ func (l *Link) Validate() error {
 		return fmt.Errorf("unsupported fingerprint %q", l.FP)
 	}
 	switch l.EffectiveTransport() {
-	case "auto", "quic", "tcp":
+	case "auto", "rtc", "tcp":
 	default:
 		return fmt.Errorf("unsupported transport %q", l.Transport)
+	}
+	if l.UpMbps < 0 || l.UpMbps > 65535 || l.DownMbps < 0 || l.DownMbps > 65535 {
+		return errors.New("up_mbps/down_mbps must be 0..65535")
 	}
 	if strings.TrimSpace(l.HopRange) != "" {
 		if _, _, ok := l.ParseHopRange(); !ok {

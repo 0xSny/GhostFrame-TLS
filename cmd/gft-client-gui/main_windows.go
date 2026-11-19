@@ -67,7 +67,7 @@ func main() {
 	if err := eng.StartServers(); err != nil {
 		os.Exit(1)
 	}
-	eng.Logf("GhostFrame-Pro v3.2 native desktop initialized")
+	eng.Logf("GhostFrame-Pro v3.4 (GFT-RTC) native desktop initialized")
 
 	if *autoConnect {
 		go func() { _ = eng.Connect() }()

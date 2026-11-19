@@ -28,7 +28,7 @@ import (
 const (
 	DefaultConfigPath = "/etc/gft/server.json"
 	ReleaseRepo       = "Spittingjiu/GhostFrame-TLS"
-	SysctlConfPath    = "/etc/sysctl.d/99-gft-apex.conf"
+	SysctlConfPath    = "/etc/sysctl.d/99-gft-rtc.conf"
 )
 
 // Controller drives the interactive `gft` terminal control center.
@@ -86,15 +86,15 @@ func (c *Controller) pause(sc *bufio.Scanner) {
 func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState string, snap server.RuntimeSnapshot, sniRTT time.Duration) string {
 	b := c.Box
 	var sb strings.Builder
-	sb.WriteString(b.Top("GhostFrame-TLS (GFT) v3.2 Apex 交互控制中心") + "\n")
+	sb.WriteString(b.Top("GhostFrame-RTC (GFT) v3.4 Apex 交互控制中心") + "\n")
 
 	svcBadge := b.c("\x1b[31m", "[○] 已停止")
 	if active {
 		svcBadge = b.c("\x1b[32m", "[●] 运行中")
 	}
-	quicBadge := "QUIC: 启用"
-	if cfg.DisableQUIC {
-		quicBadge = "QUIC: 关闭"
+	rtcBadge := "GFT-RTC: 启用"
+	if cfg.IsRTCDisabled() {
+		rtcBadge = "GFT-RTC: 关闭"
 	}
 	hopBadge := "关闭"
 	if cfg.HopRange != "" {
@@ -107,7 +107,7 @@ func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState s
 
 	port := ConfigListenPort(cfg.Listen)
 	sb.WriteString(b.Line(fmt.Sprintf("服务状态: %s   |  内核拥塞: %s  |  监听端口: %d", svcBadge, bbrState, port)) + "\n")
-	sb.WriteString(b.Line(fmt.Sprintf("双栈传输: %s  |  UDP 跳跃: %s   |  校验模式: %s", quicBadge, hopBadge, strings.ToUpper(cfg.CertMode))) + "\n")
+	sb.WriteString(b.Line(fmt.Sprintf("双栈传输: %s  |  UDP 跳跃: %s   |  校验模式: %s", rtcBadge, hopBadge, strings.ToUpper(cfg.CertMode))) + "\n")
 	sb.WriteString(b.Line(fmt.Sprintf("伪装域名: %s (本机握手: %s) | 回落: %s", cfg.SNI, rttTxt, cfg.FallbackMode)) + "\n")
 	sb.WriteString(b.Line(fmt.Sprintf("实时流量: ↑%s ↓%s (速率 ↑%s/s ↓%s/s) | 拦截探测: %d 次",
 		fmtBytes(snap.TotalUp), fmtBytes(snap.TotalDown),
@@ -145,7 +145,7 @@ func ShowDeliveryCard(cfgPath string, out io.Writer) error {
 	qr, qerr := RenderTerminalQR(uri, c.Box.UTF8)
 
 	b := c.Box
-	c.printf("%s\n", b.Top("GhostFrame-TLS (GFT) v3.2 多端部署交付卡"))
+	c.printf("%s\n", b.Top("GhostFrame-RTC (GFT) v3.4 多端部署交付卡"))
 	c.printf("%s\n", b.Line(fmt.Sprintf("节点地址: %s:%d   SNI: %s   Hop: %s",
 		cfg.PublicHost, ConfigListenPort(cfg.Listen), cfg.SNI, nonEmpty(cfg.HopRange, "未开启"))))
 	c.printf("%s\n", b.Bottom())
@@ -369,9 +369,9 @@ func (c *Controller) printProbeChecklist(r sni.ProbeResult) {
 
 func (c *Controller) handlePortAndQUICMenu(sc *bufio.Scanner, cfg *server.Config) {
 	curPort := ConfigListenPort(cfg.Listen)
-	c.printf("\n--- 监听端口 (%d) 与 QUIC 双栈 (%v) ---\n", curPort, !cfg.DisableQUIC)
+	c.printf("\n--- 监听端口 (%d) 与 GFT-RTC 双栈 (%v) ---\n", curPort, !cfg.IsRTCDisabled())
 	c.printf("  [1] 修改主监听端口 (将预检冲突并同步更新 Hop 目标端口)\n")
-	c.printf("  [2] 切换 QUIC UDP 通道开关 (当前: %v)\n", !cfg.DisableQUIC)
+	c.printf("  [2] 切换 GFT-RTC UDP 通道开关 (当前: %v)\n", !cfg.IsRTCDisabled())
 	sub := c.prompt(sc, "请选择:")
 	switch sub {
 	case "1":
@@ -398,12 +398,14 @@ func (c *Controller) handlePortAndQUICMenu(sc *bufio.Scanner, cfg *server.Config
 		}
 	case "2":
 		if err := c.Tx.Apply(func(nc *server.Config) error {
-			nc.DisableQUIC = !nc.DisableQUIC
+			nextDisabled := !nc.IsRTCDisabled()
+			nc.DisableRTC = nextDisabled
+			nc.DisableQUIC = nextDisabled
 			return nil
 		}); err != nil {
 			c.errMsg(err.Error())
 		} else {
-			c.okMsg("QUIC 双栈开关已更新")
+			c.okMsg("GFT-RTC 双栈开关已更新")
 		}
 	}
 	c.pause(sc)
@@ -623,15 +625,16 @@ func (c *Controller) handleSelfCheckMenu(sc *bufio.Scanner, cfg *server.Config) 
 	port := ConfigListenPort(cfg.Listen)
 	c.printf("  4. 本机监听套接字状态 (:%d): %v\n", port, CheckPortOccupied(port))
 
-	if strings.EqualFold(c.prompt(sc, "\n是否一键写入 /etc/sysctl.d/99-gft-apex.conf 并应用 BBR + 25MB UDP 缓冲? [y/N]:"), "y") {
+	if strings.EqualFold(c.prompt(sc, "\n是否一键写入 /etc/sysctl.d/99-gft-rtc.conf 并应用 BBR + 32MB UDP 缓冲? [y/N]:"), "y") {
 		sysctlBody := "net.core.default_qdisc = fq\n" +
 			"net.ipv4.tcp_congestion_control = bbr\n" +
-			"net.core.rmem_max = 26214400\n" +
-			"net.core.wmem_max = 26214400\n" +
-			"net.core.rmem_default = 2097152\n" +
-			"net.core.wmem_default = 2097152\n" +
-			"net.ipv4.udp_rmem_min = 16384\n" +
-			"net.ipv4.udp_wmem_min = 16384\n"
+			"net.core.rmem_max = 33554432\n" +
+			"net.core.wmem_max = 33554432\n" +
+			"net.core.rmem_default = 8388608\n" +
+			"net.core.wmem_default = 8388608\n" +
+			"net.ipv4.udp_rmem_min = 65536\n" +
+			"net.ipv4.udp_wmem_min = 65536\n" +
+			"net.core.netdev_max_backlog = 16384\n"
 		if err := server.WriteFileAtomic(SysctlConfPath, []byte(sysctlBody), 0o644); err != nil {
 			c.errMsg(err.Error())
 		} else {
@@ -639,7 +642,7 @@ func (c *Controller) handleSelfCheckMenu(sc *bufio.Scanner, cfg *server.Config) 
 			if aerr != nil {
 				c.warnMsg(string(out))
 			} else {
-				c.okMsg("BBR + fq 与 25MB QUIC UDP 缓冲调优已持久化生效！")
+				c.okMsg("BBR + fq 与 32MB GFT-RTC UDP 缓冲调优已持久化生效！")
 			}
 		}
 	}

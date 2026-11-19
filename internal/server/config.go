@@ -31,26 +31,33 @@ import (
 
 // Config is the on-disk server configuration (/etc/gft/server.json, mode 0600).
 type Config struct {
-	Listen           string   `json:"listen"`
-	PublicHost       string   `json:"public_host"`
-	SNI              string   `json:"sni"`
-	PSK              string   `json:"psk"` // base64
-	CertMode         string   `json:"cert_mode,omitempty"`          // "acme", "file", "self_signed_90d"
-	CertFile         string   `json:"cert_file,omitempty"`
-	KeyFile          string   `json:"key_file,omitempty"`
-	ACMEDomains      []string `json:"acme_domains,omitempty"`
-	ACMECacheDir     string   `json:"acme_cache_dir,omitempty"`
-	ACMEEmail        string   `json:"acme_email,omitempty"`
-	FallbackMode     string   `json:"fallback_mode,omitempty"`      // "mirror" (default), "reverse_proxy", "builtin_blog"
-	FallbackTarget   string   `json:"fallback_target,omitempty"`    // e.g. "http://127.0.0.1:8080"
-	CamouflageTarget string   `json:"camouflage_target,omitempty"`  // e.g. "<selected-sni>:443"
-	HopRange         string   `json:"hop_range,omitempty"`          // e.g. "20000-30000"
-	DisableQUIC      bool     `json:"disable_quic,omitempty"`
+	Listen           string      `json:"listen"`
+	PublicHost       string      `json:"public_host"`
+	SNI              string      `json:"sni"`
+	PSK              string      `json:"psk"`                 // base64
+	CertMode         string      `json:"cert_mode,omitempty"` // "acme", "file", "self_signed_90d"
+	CertFile         string      `json:"cert_file,omitempty"`
+	KeyFile          string      `json:"key_file,omitempty"`
+	ACMEDomains      []string    `json:"acme_domains,omitempty"`
+	ACMECacheDir     string      `json:"acme_cache_dir,omitempty"`
+	ACMEEmail        string      `json:"acme_email,omitempty"`
+	FallbackMode     string      `json:"fallback_mode,omitempty"`     // "mirror" (default), "reverse_proxy", "builtin_blog"
+	FallbackTarget   string      `json:"fallback_target,omitempty"`   // e.g. "http://127.0.0.1:8080"
+	CamouflageTarget string      `json:"camouflage_target,omitempty"` // e.g. "<selected-sni>:443"
+	HopRange         string      `json:"hop_range,omitempty"`         // e.g. "20000-40000"
+	DisableRTC       bool        `json:"disable_rtc,omitempty"`
+	DisableQUIC      bool        `json:"disable_quic,omitempty"` // legacy alias for DisableRTC
+	TxMbps           int         `json:"tx_mbps,omitempty"`      // optional server Smart-Brutal max TX Mbps (0 = Auto)
 	Params           *gft.Params `json:"params,omitempty"`
-	PanelPath        string   `json:"panel_path"`                   // e.g. /gft-panel-xxxxxxxx
-	PanelHash        string   `json:"panel_hash"`                   // bcrypt
-	Pin              string   `json:"pin"`                          // SPKI SHA-256 hex
-	StateDir         string   `json:"state_dir"`
+	PanelPath        string      `json:"panel_path"` // e.g. /gft-panel-xxxxxxxx
+	PanelHash        string      `json:"panel_hash"` // bcrypt
+	Pin              string      `json:"pin"`        // SPKI SHA-256 hex
+	StateDir         string      `json:"state_dir"`
+}
+
+// IsRTCDisabled reports whether GhostFrame-RTC UDP transport is disabled in server config.
+func (c *Config) IsRTCDisabled() bool {
+	return c != nil && (c.DisableRTC || c.DisableQUIC)
 }
 
 func LoadConfig(path string) (*Config, error) {

@@ -19,7 +19,7 @@ import (
 	"ghostframe/internal/tui"
 )
 
-const version = "v3.2.0"
+const version = "v3.4.0"
 
 func main() {
 	base := strings.TrimSuffix(filepath.Base(os.Args[0]), filepath.Ext(os.Args[0]))

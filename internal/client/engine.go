@@ -58,21 +58,21 @@ type PingSummary struct {
 // Engine coordinates GFT v3 ApexScheduler, CN/Domain Router, SOCKS5 (TCP+UDP),
 // HTTP proxy, and crash-safe Windows system proxy.
 type Engine struct {
-	mu               sync.RWMutex
-	portSwapMu       sync.Mutex
-	cfgPath          string
-	proxyBackupPath  string
-	config           ClientConfig
-	state            ConnState
-	lastErr          string
-	sched            *gft.ApexScheduler
-	connectingSched  *gft.ApexScheduler
-	connectGen       uint64
-	paramStore       *gft.ParamStore
-	router           *Router
-	socksSrv         *SOCKS5Server
-	httpSrv          *HTTPProxyServer
-	sysProxyApplied  bool
+	mu              sync.RWMutex
+	portSwapMu      sync.Mutex
+	cfgPath         string
+	proxyBackupPath string
+	config          ClientConfig
+	state           ConnState
+	lastErr         string
+	sched           *gft.ApexScheduler
+	connectingSched *gft.ApexScheduler
+	connectGen      uint64
+	paramStore      *gft.ParamStore
+	router          *Router
+	socksSrv        *SOCKS5Server
+	httpSrv         *HTTPProxyServer
+	sysProxyApplied bool
 
 	// Stats
 	prevUp     uint64
@@ -754,10 +754,13 @@ func (e *Engine) PingNow() (PingSummary, error) {
 	return PingSummary{RTTMs: ms, Transport: "uTLS-" + l.EffectiveFP()}, nil
 }
 
-// SetTransport updates the active node's preferred transport ("auto", "tcp", "quic").
+// SetTransport updates the active node's preferred transport ("auto", "rtc", "tcp").
+// Legacy "quic" values are normalized seamlessly to "rtc".
 func (e *Engine) SetTransport(mode string) error {
 	switch mode {
-	case "", "auto", "tcp", "quic":
+	case "", "auto", "tcp", "rtc":
+	case "quic":
+		mode = "rtc"
 	default:
 		return fmt.Errorf("invalid transport mode: %s", mode)
 	}
@@ -774,6 +777,30 @@ func (e *Engine) SetTransport(mode string) error {
 		go func() { _ = e.Connect() }()
 	}
 	return nil
+}
+
+// SetBandwidthLimits configures Smart-Brutal upload/download target Mbps (0 = Auto-Probe)
+// on the active node and applies live updates immediately if connected.
+func (e *Engine) SetBandwidthLimits(upMbps, downMbps int) error {
+	if upMbps < 0 || upMbps > 65535 || downMbps < 0 || downMbps > 65535 {
+		return errors.New("带宽目标必须在 0-65535 Mbps 之间")
+	}
+	e.mu.Lock()
+	l := e.activeLinkLocked()
+	if l == nil {
+		e.mu.Unlock()
+		return errors.New("未选择节点")
+	}
+	l.UpMbps = upMbps
+	l.DownMbps = downMbps
+	sched := e.sched
+	e.mu.Unlock()
+
+	if sched != nil {
+		sched.UpdateBandwidth(upMbps, downMbps)
+	}
+	e.Logf("Smart-Brutal 带宽设置已更新: 上行=%d Mbps 下行=%d Mbps (0=自动探测)", upMbps, downMbps)
+	return e.SaveConfig()
 }
 
 // NodeSummary describes a configured server node for UI rendering.
@@ -833,15 +860,19 @@ func (e *Engine) Status() map[string]any {
 	l := e.activeLinkLocked()
 	e.mu.RUnlock()
 
-	var totalUp, totalDown uint64
+	var totalUp, totalDown, fecRecovered uint64
 	activeMode := ""
-	var quicPort, activeConns, activeStreams int
+	var rtcPort, activeConns, activeStreams int
+	var lossPct, pacingMbps float64
 	if sched != nil {
 		st := sched.Stats()
 		totalUp = st.TotalUp
 		totalDown = st.TotalDown
 		activeMode = st.Mode
-		quicPort = st.QUICPort
+		rtcPort = st.RTCPort
+		fecRecovered = st.FECRecovered
+		lossPct = st.LossRate * 100.0
+		pacingMbps = st.PacingMbps
 		activeConns = st.ActiveConns
 		activeStreams = st.ActiveStreams
 		if st.RTTMs > 0 {
@@ -853,7 +884,7 @@ func (e *Engine) Status() map[string]any {
 	}
 
 	var nodeName, nodeHost, tPref, verifyMode, hopRange string
-	var nodePort int
+	var nodePort, upMbps, downMbps int
 	if l != nil {
 		nodeName = l.Remark
 		if nodeName == "" {
@@ -864,6 +895,8 @@ func (e *Engine) Status() map[string]any {
 		tPref = l.EffectiveTransport()
 		verifyMode = l.EffectiveVerify()
 		hopRange = l.HopRange
+		upMbps = l.UpMbps
+		downMbps = l.DownMbps
 	}
 	if tPref == "" {
 		tPref = "auto"
@@ -877,7 +910,12 @@ func (e *Engine) Status() map[string]any {
 		"route_mode":       string(routeMode),
 		"verify_mode":      verifyMode,
 		"hop_range":        hopRange,
-		"quic_port":        quicPort,
+		"rtc_port":         rtcPort,
+		"fec_recovered":    fecRecovered,
+		"loss_pct":         lossPct,
+		"pacing_mbps":      pacingMbps,
+		"up_mbps":          upMbps,
+		"down_mbps":        downMbps,
 		"active_conns":     activeConns,
 		"active_streams":   activeStreams,
 		"ping_ms":          pingMs,

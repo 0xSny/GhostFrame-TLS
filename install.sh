@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# GhostFrame-TLS (GFT) v3.2 Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
+# GhostFrame-RTC (GFT) v3.4 Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
 REPO="Spittingjiu/GhostFrame-TLS"
 ROLE="server"
 UNATTENDED=0
@@ -21,7 +21,7 @@ die()  { printf "\033[1;31m[×]\033[0m %s\n" "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-GhostFrame-TLS (GFT) v3.2 Installer
+GhostFrame-RTC (GFT) v3.4 Installer
 
 Usage:
   install.sh [options]
@@ -29,7 +29,7 @@ Usage:
 Options:
   --role <server|client>   Install server + `gft` TUI or `gft-core` client daemon (default: server)
   --unattended             Non-interactive server deployment
-  --port <1-65535>         Server main TLS/QUIC listen port (default: 443)
+  --port <1-65535>         Server main TCP/RTC listen port (default: 443)
   --hop <min-max>          Server UDP port hopping range (e.g. 20000-30000)
   --sni <domain>           Override auto-selected non-CDN camouflage SNI
   --link <gft3://...>      Client gft3:// URI for --role client
@@ -125,21 +125,22 @@ sync_ntp_clock() {
 }
 sync_ntp_clock
 
-# 3. Kernel BBR + 25MB QUIC UDP Buffers (/etc/sysctl.d/99-gft-apex.conf)
+# 3. Kernel BBR + 32MB GFT-RTC UDP Buffers (/etc/sysctl.d/99-gft-rtc.conf)
 apply_sysctl_tuning() {
   if [[ -d /etc/sysctl.d ]]; then
-    cat > /etc/sysctl.d/99-gft-apex.conf <<'EOF'
+    cat > /etc/sysctl.d/99-gft-rtc.conf <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 26214400
-net.core.wmem_max = 26214400
-net.core.rmem_default = 2097152
-net.core.wmem_default = 2097152
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 8388608
+net.core.wmem_default = 8388608
+net.ipv4.udp_rmem_min = 65536
+net.ipv4.udp_wmem_min = 65536
+net.core.netdev_max_backlog = 16384
 EOF
     sysctl --system >/dev/null 2>&1 || true
-    ok "Applied BBR + fq and 25MB QUIC UDP buffers (/etc/sysctl.d/99-gft-apex.conf)"
+    ok "Applied BBR + fq and 32MB GFT-RTC UDP buffers (/etc/sysctl.d/99-gft-rtc.conf)"
   fi
 }
 
@@ -284,7 +285,7 @@ install_server() {
 
   cat > /etc/systemd/system/ghostframe.service <<'EOF'
 [Unit]
-Description=GhostFrame-TLS (GFT) v3.2 Apex Dual-Stack Server
+Description=GhostFrame-RTC (GFT) v3.4 Dual-Stack Server
 After=network-online.target
 Wants=network-online.target
 
@@ -330,7 +331,7 @@ install_client() {
   if [[ "$INIT_SYS" == "systemd" ]]; then
     cat > /etc/systemd/system/gft-core.service <<EOF
 [Unit]
-Description=GhostFrame-TLS (GFT) v3.2 Headless Core Daemon
+Description=GhostFrame-RTC (GFT) v3.4 Headless Core Daemon
 After=network-online.target
 Wants=network-online.target
 

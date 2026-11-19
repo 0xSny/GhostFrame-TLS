@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"ghostframe/internal/gft"
+	"ghostframe/internal/gftrtc"
 )
 
 // udpSwitchAddr implements net.Addr for virtual multi-client packet switches.
@@ -166,8 +167,8 @@ func (e *switchEnd) Close() error {
 	return nil
 }
 
-func (e *switchEnd) LocalAddr() net.Addr              { return e.addr }
-func (e *switchEnd) SetDeadline(t time.Time) error     { return e.SetReadDeadline(t) }
+func (e *switchEnd) LocalAddr() net.Addr                { return e.addr }
+func (e *switchEnd) SetDeadline(t time.Time) error      { return e.SetReadDeadline(t) }
 func (e *switchEnd) SetWriteDeadline(t time.Time) error { return nil }
 func (e *switchEnd) SetReadDeadline(t time.Time) error {
 	e.mu.Lock()
@@ -178,9 +179,9 @@ func (e *switchEnd) SetReadDeadline(t time.Time) error {
 
 // TestPortHoppingSeamlessUDPContinuity verifies that during rapid QUIC dynamic
 // port hops (3+ migrations) followed by an abrupt UDP blackout failover to TCP-uTLS:
-// 1. A continuous UDP flow experiences 0 dropped packets across all hops & failover.
-// 2. The server preserves the exact same outbound NAT UDP socket/port throughout,
-//    identified across distinct QUIC and TCP sessions via ClientID.
+//  1. A continuous UDP flow experiences 0 dropped packets across all hops & failover.
+//  2. The server preserves the exact same outbound NAT UDP socket/port throughout,
+//     identified across distinct QUIC and TCP sessions via ClientID.
 func TestPortHoppingSeamlessUDPContinuity(t *testing.T) {
 	prevAllow := AllowPrivateTargets
 	AllowPrivateTargets = true
@@ -277,20 +278,28 @@ func TestPortHoppingSeamlessUDPContinuity(t *testing.T) {
 	sched.SetDialJitterForTest(0, 0, 100)
 	sched.SetHopTimingsForTest(160*time.Millisecond, 160*time.Millisecond, 600*time.Millisecond, 25*time.Millisecond)
 
-	var quicDialCount atomic.Int32
+	var rtcDialCount atomic.Int32
+	var rtcHopCount atomic.Int32
 	var forceUDPBlackout atomic.Bool
-	sched.SetQUICDialHookForTest(func(ctx context.Context, dl *gft.Link, dps *gft.ParamStore, hopPort int, timeout time.Duration, clientID [8]byte) (*gft.QUICSession, time.Duration, error) {
-		quicDialCount.Add(1)
+	sched.SetRTCDialHookForTest(func(ctx context.Context, dl *gft.Link, dps *gft.ParamStore, hopPort int, timeout time.Duration, clientID [8]byte) (*gftrtc.RTCSession, time.Duration, error) {
+		rtcDialCount.Add(1)
 		if forceUDPBlackout.Load() {
 			return nil, 0, errors.New("simulated udp blackout")
 		}
 		ce := sw.newClientEnd()
-		qs, hs, err := gft.DialQUICWithPacketConnAndID(ctx, ce, true, sw.srvAddr, hopPort, dl, dps, timeout, clientID)
+		rs, hs, err := gft.DialRTCWithPacketConnAndID(ctx, ce, true, sw.srvAddr, hopPort, dl, dps, timeout, clientID)
 		if err != nil {
 			_ = ce.Close()
 			return nil, 0, err
 		}
-		return qs, hs, nil
+		return rs, hs, nil
+	})
+	sched.SetRTCHopHookForTest(func(sess *gftrtc.RTCSession, nextPort int) error {
+		rtcHopCount.Add(1)
+		if forceUDPBlackout.Load() {
+			return errors.New("simulated udp blackout")
+		}
+		return sess.HopWithPacketConn(sw.newClientEnd(), true, sw.srvAddr, nextPort)
 	})
 
 	if err := sched.Start(4 * time.Second); err != nil {
@@ -318,7 +327,7 @@ func TestPortHoppingSeamlessUDPContinuity(t *testing.T) {
 					t.Fatalf("phase=%s echo mismatch: got %q want %q", phase, pkt.Data, msg)
 				}
 			case <-time.After(2500 * time.Millisecond):
-				t.Fatalf("phase=%s timeout waiting for %q (quicDials=%d)", phase, msg, quicDialCount.Load())
+				t.Fatalf("phase=%s timeout waiting for %q (rtcDials=%d rtcHops=%d)", phase, msg, rtcDialCount.Load(), rtcHopCount.Load())
 			}
 			if gap > 0 {
 				time.Sleep(gap)
@@ -326,14 +335,14 @@ func TestPortHoppingSeamlessUDPContinuity(t *testing.T) {
 		}
 	}
 
-	// Phase 1: ~900ms over QUIC spanning >= 3 dynamic port hops (160ms hop interval).
-	sendAndVerify("quic-hop", 24, 38*time.Millisecond)
+	// Phase 1: ~900ms over GFT-RTC spanning >= 3 dynamic 0ms socket hops (160ms hop interval).
+	sendAndVerify("rtc-hop", 24, 38*time.Millisecond)
 
-	if hops := quicDialCount.Load(); hops < 3 {
-		t.Fatalf("expected >= 3 QUIC dials (hops) during phase 1, got %d", hops)
+	if hops := rtcHopCount.Load(); hops < 3 {
+		t.Fatalf("expected >= 3 0ms RTC socket hops during phase 1, got %d", hops)
 	}
 
-	// Phase 2: force sudden UDP blackout (close active QUIC client sockets + block new QUIC dials)
+	// Phase 2: force sudden UDP blackout (close active RTC client sockets + block new RTC dials)
 	// so scheduler triggers 0ms failover to TCP-uTLS.
 	forceUDPBlackout.Store(true)
 	sw.closeClients()

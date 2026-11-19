@@ -22,7 +22,7 @@ const (
 	cmdRouteGlob = 1102
 	cmdRouteCore = 1103
 	cmdTransAuto = 1201
-	cmdTransQUIC = 1202
+	cmdTransRTC  = 1202
 	cmdTransTCP  = 1203
 	cmdNodeBase  = 2000
 )
@@ -98,17 +98,17 @@ func CreateVectorIcon(state client.ConnState) uintptr {
 			ringCol := lerpColor(ringA, ringB, gradT)
 
 			// Outer colored ring band
-			ringDist := float32(math.Abs(float64(dist - (outerR-1.3))))
+			ringDist := float32(math.Abs(float64(dist - (outerR - 1.3))))
 			ringMix := clamp01(1.3 - ringDist)
 
 			// Stylized inner spectral prism / chevron emblem
 			// Upper diagonal + lower chevron forming a futuristic "G" shard
 			ax := float32(math.Abs(float64(dx)))
-			dTop := float32(math.Abs(float64((dy + 2.5) - (-ax*0.55))))
+			dTop := float32(math.Abs(float64((dy + 2.5) - (-ax * 0.55))))
 			dLeft := float32(math.Abs(float64(dx+3.2))) + maxF32(0, float32(math.Abs(float64(dy)))-4.6)*4
 			dBar := float32(math.Abs(float64(dy-1.2))) + maxF32(0, -dx)*4 + maxF32(0, dx-5.2)*4
 			dRightStem := float32(math.Abs(float64(dx-4.2))) + maxF32(0, -(dy-1.2))*4 + maxF32(0, dy-5.0)*4
-			dBot := float32(math.Abs(float64((dy-4.6) - (-dx*0.18)))) + maxF32(0, float32(math.Abs(float64(dx)))-4.5)*4
+			dBot := float32(math.Abs(float64((dy-4.6)-(-dx*0.18)))) + maxF32(0, float32(math.Abs(float64(dx)))-4.5)*4
 
 			glyphD := minF32(dTop+maxF32(0, ax-5.2)*4, minF32(dLeft, minF32(dBar, minF32(dRightStem, dBot))))
 			glyphMix := float32(0)
@@ -321,13 +321,13 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 		val  string
 		name string
 	}{
-		{cmdTransAuto, "auto", "Auto (QUIC+TCP 双栈竞速)"},
-		{cmdTransQUIC, "quic", "QUIC (端口跳跃极速)"},
+		{cmdTransAuto, "auto", "Auto (RTC+TCP 双栈竞速)"},
+		{cmdTransRTC, "rtc", "RTC (WebRTC拟态抗丢包)"},
 		{cmdTransTCP, "tcp", "TCP (uTLS 强稳健)"},
 	}
 	for _, ti := range transItems {
 		f := uint32(mfString)
-		if transPref == ti.val {
+		if transPref == ti.val || (ti.val == "rtc" && transPref == "quic") {
 			f |= mfChecked
 		}
 		appendItem(hTrans, f, ti.id, ti.name)
@@ -393,10 +393,10 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 			onToast("传输偏好已切换: Auto", false)
 			onRefresh()
 		}()
-	case cmd == cmdTransQUIC:
+	case cmd == cmdTransRTC:
 		go func() {
-			_ = eng.SetTransport("quic")
-			onToast("传输偏好已切换: QUIC", false)
+			_ = eng.SetTransport("rtc")
+			onToast("传输偏好已切换: GFT-RTC", false)
 			onRefresh()
 		}()
 	case cmd == cmdTransTCP:

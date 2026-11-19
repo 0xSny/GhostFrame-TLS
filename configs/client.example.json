@@ -11,8 +11,10 @@
       "fp": "chrome",
       "transport": "auto",
       "split_sni": true,
-      "hop_range": "",
-      "remark": "Example GFT v3 Apex Node"
+      "hop_range": "20000-40000",
+      "up_mbps": 0,
+      "down_mbps": 0,
+      "remark": "Example GFT-RTC v3.4 Apex Node"
     }
   ],
   "active_node": 0,

@@ -23,18 +23,18 @@ systemctl status ghostframe
 journalctl -u ghostframe -f
 ```
 
-### Recommended High-BDP Kernel Tuning (`/etc/sysctl.d/99-gft-apex.conf`)
+### Recommended High-BDP Kernel Tuning (`/etc/sysctl.d/99-gft-rtc.conf`)
 
 ```ini
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
 net.core.rmem_default = 8388608
 net.core.wmem_default = 8388608
 net.ipv4.udp_rmem_min = 65536
 net.ipv4.udp_wmem_min = 65536
-net.core.netdev_max_backlog = 250000
+net.core.netdev_max_backlog = 16384
 ```
 
 Apply with `sysctl --system`.

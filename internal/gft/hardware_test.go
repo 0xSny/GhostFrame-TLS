@@ -4,6 +4,8 @@ import (
 	"net"
 	"testing"
 
+	"ghostframe/internal/gftrtc"
+
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -18,11 +20,8 @@ func TestLowMemModeAndHardwareCipherOrder(t *testing.T) {
 	if EffectiveMaxStreamWindow() != maxStreamWindow {
 		t.Fatalf("expected default 16MB window, got %d", EffectiveMaxStreamWindow())
 	}
-	if QUICConfig().InitialStreamReceiveWindow != 4*1024*1024 || QUICConfig().InitialConnectionReceiveWindow != 8*1024*1024 {
-		t.Fatalf("unexpected default QUIC init windows: stream=%d conn=%d", QUICConfig().InitialStreamReceiveWindow, QUICConfig().InitialConnectionReceiveWindow)
-	}
-	if QUICConfig().MaxStreamReceiveWindow != 16*1024*1024 {
-		t.Fatalf("expected 16MB QUIC stream window, got %d", QUICConfig().MaxStreamReceiveWindow)
+	if gftrtc.EffectiveInitStreamWindow() != 4*1024*1024 || gftrtc.EffectiveMaxStreamWindow() != 16*1024*1024 {
+		t.Fatalf("unexpected default RTC windows: init=%d max=%d", gftrtc.EffectiveInitStreamWindow(), gftrtc.EffectiveMaxStreamWindow())
 	}
 	if EffectiveUDPSocketBuffer() != 8*1024*1024 {
 		t.Fatalf("expected 8MB UDP socket buffer, got %d", EffectiveUDPSocketBuffer())
@@ -35,26 +34,19 @@ func TestLowMemModeAndHardwareCipherOrder(t *testing.T) {
 	if EffectiveMaxStreamWindow() != 4*1024*1024 {
 		t.Fatalf("expected 4MB window in LowMemMode, got %d", EffectiveMaxStreamWindow())
 	}
-	if QUICConfig().MaxStreamReceiveWindow != 4*1024*1024 {
-		t.Fatalf("expected 4MB QUIC stream window in LowMemMode, got %d", QUICConfig().MaxStreamReceiveWindow)
+	if gftrtc.EffectiveMaxStreamWindow() != 4*1024*1024 {
+		t.Fatalf("expected 4MB RTC stream window in LowMemMode, got %d", gftrtc.EffectiveMaxStreamWindow())
 	}
 	if EffectiveUDPSocketBuffer() != 1024*1024 {
 		t.Fatalf("expected 1MB UDP socket buffer in LowMemMode, got %d", EffectiveUDPSocketBuffer())
 	}
 
-	// Verify AuthPacketConn forwards SetReadBuffer / SetWriteBuffer to underlying UDPConn
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer pc.Close()
-	authPC := NewAuthPacketConn(pc, nil)
-	if err := authPC.SetReadBuffer(2 * 1024 * 1024); err != nil {
-		t.Fatalf("AuthPacketConn.SetReadBuffer failed: %v", err)
-	}
-	if err := authPC.SetWriteBuffer(2 * 1024 * 1024); err != nil {
-		t.Fatalf("AuthPacketConn.SetWriteBuffer failed: %v", err)
-	}
+	TuneUDPSocketBuffers(pc)
 	bp := GetBuf()
 	PutBuf(bp)
 

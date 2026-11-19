@@ -14,7 +14,7 @@ import (
 	"ghostframe/internal/gft"
 )
 
-const version = "v3.2.0"
+const version = "v3.4.0"
 
 func main() {
 	cfgFlag := flag.String("config", "", "optional path to client.json (e.g. /etc/gft/client.json)")
@@ -22,7 +22,7 @@ func main() {
 	socksFlag := flag.String("socks", "", "override SOCKS5 listen address (e.g. 0.0.0.0:10808)")
 	httpFlag := flag.String("http", "", "override HTTP proxy listen address (e.g. 127.0.0.1:10809)")
 	routeFlag := flag.String("route", "", "routing mode: rule, global, or direct")
-	transFlag := flag.String("transport", "", "transport preference: auto, quic, or tcp")
+	transFlag := flag.String("transport", "", "transport preference: auto, rtc, or tcp")
 	lowMem := flag.Bool("low-mem", false, "enable low-memory router mode (<35MB RSS, 4MB stream windows, ideal for Phicomm N1/S905D)")
 	noSysProxy := flag.Bool("no-sysproxy", false, "disable real system proxy modifications (sandbox mode)")
 	showVer := flag.Bool("version", false, "print gft-core version and hardware capabilities")

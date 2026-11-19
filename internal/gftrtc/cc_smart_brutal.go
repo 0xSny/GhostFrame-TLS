@@ -1,0 +1,380 @@
+package gftrtc
+
+import (
+	mrand "math/rand/v2"
+	"sync"
+	"time"
+)
+
+const (
+	ccInitialAutoBps = 12_000_000.0 / 8.0  // 12 Mbps initial Auto-Probe floor (ramps fast over 170ms links)
+	ccMinRateBps     = 256_000.0 / 8.0     // 256 Kbps absolute floor
+	ccMaxAutoBps     = 600_000_000.0 / 8.0 // 600 Mbps sanity cap
+)
+
+type ccState uint8
+
+const (
+	ccSlowStart ccState = iota
+	ccCruise
+	ccProbeUp
+	ccDrain
+)
+
+// SmartBrutalCC implements latency-gradient dual-zone Smart-Brutal congestion control
+// paired with a 60fps jittered video-frame micro-burst pacer.
+type SmartBrutalCC struct {
+	mu sync.Mutex
+
+	targetBps float64 // >0 if user/node configured explicit Mbps target; 0 = Auto-Probe
+	state     ccState
+	baseRate  float64 // current uncompensated base bytes/sec
+	bEst      float64 // estimated physical bottleneck bytes/sec
+
+	lastRho       float64
+	lastLossRate  float64
+	lastRoundAt   time.Time
+	lastBackoffAt time.Time
+	rttRounds     int
+
+	roundBytes   int64
+	roundStart   time.Time
+	peakDelivery float64
+
+	// 60fps micro-burst pacer state
+	sliceDur    time.Duration
+	sliceNextAt time.Time
+	tokenBudget float64
+	maxBurstCap float64
+}
+
+// NewSmartBrutalCC creates a Smart-Brutal controller. targetMbps == 0 enables Auto-Probe.
+func NewSmartBrutalCC(targetMbps int) *SmartBrutalCC {
+	now := time.Now()
+	c := &SmartBrutalCC{
+		state:       ccSlowStart,
+		baseRate:    ccInitialAutoBps,
+		bEst:        ccInitialAutoBps,
+		lastRho:     1.0,
+		lastRoundAt: now,
+		roundStart:  now,
+		sliceDur:    randomFrameSlice(),
+		sliceNextAt: now,
+	}
+	c.SetTargetMbps(targetMbps)
+	c.refillFrameSliceLocked(now)
+	return c
+}
+
+func randomFrameSlice() time.Duration {
+	return time.Duration(12+mrand.IntN(5)) * time.Millisecond // 12ms..16ms (~60-83fps)
+}
+
+// SetTargetMbps dynamically updates the target pacing bandwidth (0 = Auto-Probe).
+func (c *SmartBrutalCC) SetTargetMbps(mbps int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if mbps <= 0 {
+		c.targetBps = 0
+		if c.baseRate < ccInitialAutoBps {
+			c.baseRate = ccInitialAutoBps
+		}
+		return
+	}
+	c.targetBps = float64(mbps) * 1_000_000.0 / 8.0
+	c.baseRate = c.targetBps
+	c.bEst = c.targetBps
+	c.state = ccCruise
+}
+
+// TargetMbps returns the configured target Mbps (0 if Auto-Probe).
+func (c *SmartBrutalCC) TargetMbps() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.targetBps <= 0 {
+		return 0
+	}
+	return int((c.targetBps*8.0)/1_000_000.0 + 0.5)
+}
+
+// OnFeedback updates latency gradient rho = SRTT / minRTT, delivery rate, and Zone A/B decisions.
+func (c *SmartBrutalCC) OnFeedback(ackedBytes int, lossRate float64, srtt, minRTT time.Duration, ptoCount int, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.lastLossRate = lossRate
+	if minRTT <= 0 {
+		minRTT = srtt
+	}
+	if minRTT <= 0 {
+		minRTT = 20 * time.Millisecond
+	}
+	rho := float64(srtt) / float64(minRTT)
+	if rho < 1.0 {
+		rho = 1.0
+	}
+	c.lastRho = rho
+
+	if ackedBytes > 0 {
+		c.roundBytes += int64(ackedBytes)
+	}
+
+	roundDur := srtt
+	if roundDur < 25*time.Millisecond {
+		roundDur = 25 * time.Millisecond
+	}
+
+	// Zone B: Real physical queue congestion (rho > 1.65 with >=25ms queuing delta, or >=3 consecutive PTOs) -> smooth 0.80 backoff
+	queueDelta := srtt - minRTT
+	if (rho > 1.65 && queueDelta >= 25*time.Millisecond) || ptoCount >= 3 {
+		if now.Sub(c.lastBackoffAt) >= roundDur {
+			c.state = ccDrain
+			c.baseRate *= 0.80
+			if c.baseRate < ccMinRateBps {
+				c.baseRate = ccMinRateBps
+			}
+			if c.targetBps == 0 && c.bEst > c.baseRate*1.25 {
+				c.bEst = c.baseRate * 1.15
+			}
+			c.lastBackoffAt = now
+		}
+		return
+	}
+
+	// Recover out of Drain once queue clears cleanly (rho < 1.25 or queueDelta < 12ms)
+	if c.state == ccDrain {
+		if rho < 1.25 || queueDelta < 12*time.Millisecond {
+			c.state = ccCruise
+			if c.targetBps > 0 {
+				c.baseRate = c.targetBps * 0.90
+			} else {
+				c.baseRate = c.bEst * 0.95
+			}
+			c.lastRoundAt = now
+			c.roundStart = now
+			c.roundBytes = 0
+		}
+		return
+	}
+
+	// Explicit target mode: hold baseRate near targetBps when not physically congested
+	if c.targetBps > 0 {
+		if (rho <= 1.35 || queueDelta < 15*time.Millisecond) && c.baseRate < c.targetBps {
+			c.baseRate = c.targetBps
+		}
+		return
+	}
+
+	// Auto-Probe mode (targetBps == 0): advance RTT pacing state once per round
+	if now.Sub(c.lastRoundAt) < roundDur {
+		return
+	}
+	elapsedSec := now.Sub(c.roundStart).Seconds()
+	var deliveryBps float64
+	if elapsedSec > 0 && c.roundBytes > 0 {
+		// Reconstruct pre-loss send capacity smoothly up to 45% loss
+		lossCap := lossRate
+		if lossCap > 0.45 {
+			lossCap = 0.45
+		}
+		deliveryBps = (float64(c.roundBytes) / elapsedSec) / (1.0 - lossCap)
+		if deliveryBps > c.peakDelivery {
+			c.peakDelivery = deliveryBps
+		}
+	}
+	c.lastRoundAt = now
+	c.roundStart = now
+	c.roundBytes = 0
+
+	switch c.state {
+	case ccSlowStart:
+		if rho > 1.30 && queueDelta >= 12*time.Millisecond {
+			est := deliveryBps
+			if est < c.baseRate*0.85 {
+				est = c.baseRate * 0.85
+			}
+			c.bEst = est
+			c.baseRate = 0.95 * c.bEst
+			c.state = ccCruise
+			c.rttRounds = 0
+		} else {
+			// Only ramp +35% when actual delivery approached at least 25% of baseRate (avoid idle runaway)
+			if deliveryBps >= c.baseRate*0.25 || (deliveryBps == 0 && c.baseRate <= ccInitialAutoBps*1.4) {
+				c.baseRate *= 1.35
+				if c.baseRate > ccMaxAutoBps {
+					c.baseRate = ccMaxAutoBps
+				}
+				if c.baseRate > c.bEst {
+					c.bEst = c.baseRate
+				}
+			}
+		}
+
+	case ccCruise:
+		c.rttRounds++
+		if rho > 1.35 && queueDelta >= 15*time.Millisecond {
+			// Plateau zone: genuine queue buildup -> hold steady
+			return
+		}
+		if deliveryBps > c.bEst {
+			c.bEst = deliveryBps
+		}
+		c.baseRate = 0.95 * c.bEst
+		if c.rttRounds >= 8 {
+			c.rttRounds = 0
+			c.state = ccProbeUp
+			c.baseRate = 1.15 * c.bEst
+			if c.baseRate > ccMaxAutoBps {
+				c.baseRate = ccMaxAutoBps
+			}
+		}
+
+	case ccProbeUp:
+		if (rho <= 1.35 || queueDelta < 15*time.Millisecond) && deliveryBps > c.bEst {
+			c.bEst = deliveryBps
+		}
+		c.baseRate = 0.95 * c.bEst
+		c.state = ccCruise
+	}
+}
+
+func (c *SmartBrutalCC) effectiveRateLocked() float64 {
+	rate := c.baseRate
+	if rate < ccMinRateBps {
+		rate = ccMinRateBps
+	}
+	if c.lastRho <= 1.35 {
+		lossCap := c.lastLossRate
+		if lossCap > 0.45 {
+			lossCap = 0.45
+		}
+		if lossCap > 0 {
+			rate = rate / (1.0 - lossCap)
+			maxComp := c.baseRate * 1.8
+			if rate > maxComp {
+				rate = maxComp
+			}
+		}
+	}
+	return rate
+}
+
+func (c *SmartBrutalCC) refillFrameSliceLocked(now time.Time) {
+	rate := c.effectiveRateLocked()
+	slice := randomFrameSlice()
+	c.sliceDur = slice
+	c.sliceNextAt = now.Add(slice)
+	grant := rate * slice.Seconds()
+	if grant < float64(MaxUDPPayload*2) {
+		grant = float64(MaxUDPPayload * 2)
+	}
+	c.maxBurstCap = grant * 2.0
+	c.tokenBudget += grant
+	if c.tokenBudget > c.maxBurstCap {
+		c.tokenBudget = c.maxBurstCap
+	}
+}
+
+// PacingMbps returns the current loss-compensated pacing rate in Mbps.
+func (c *SmartBrutalCC) PacingMbps() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return (c.effectiveRateLocked() * 8.0) / 1_000_000.0
+}
+
+// DelayInflation returns the latest SRTT / minRTT ratio rho.
+func (c *SmartBrutalCC) DelayInflation() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastRho
+}
+
+// MaxInFlightBytes computes the BDP-safe unacknowledged byte ceiling.
+func (c *SmartBrutalCC) MaxInFlightBytes(srtt time.Duration) int {
+	c.mu.Lock()
+	rate := c.effectiveRateLocked()
+	c.mu.Unlock()
+	if srtt < 150*time.Millisecond {
+		srtt = 150 * time.Millisecond
+	}
+	lim := int(rate * srtt.Seconds() * 2.5)
+	if lim < 512*1024 {
+		lim = 512 * 1024
+	}
+	return lim
+}
+
+// CanSend checks 60fps slice budget & BDP in-flight ceiling without deducting bytes yet.
+func (c *SmartBrutalCC) CanSend(inFlightBytes int, srtt time.Duration, now time.Time) (allowed bool, waitDur time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if now.After(c.sliceNextAt) || now.Equal(c.sliceNextAt) {
+		c.refillFrameSliceLocked(now)
+	}
+	rate := c.effectiveRateLocked()
+	minRTTWin := srtt
+	if minRTTWin < 150*time.Millisecond {
+		minRTTWin = 150 * time.Millisecond
+	}
+	maxInFlight := int(rate * minRTTWin.Seconds() * 2.5)
+	if maxInFlight < 512*1024 {
+		maxInFlight = 512 * 1024
+	}
+	if inFlightBytes > maxInFlight {
+		return false, 4 * time.Millisecond
+	}
+	if c.tokenBudget >= float64(MaxUDPPayload) || c.tokenBudget > 0 {
+		return true, 0
+	}
+	w := c.sliceNextAt.Sub(now)
+	if w < time.Millisecond {
+		w = time.Millisecond
+	}
+	return false, w
+}
+
+// ConsumeBytes deducts actual sealed packet bytes and returns whether the current frame slice ended (RTP M=1).
+func (c *SmartBrutalCC) ConsumeBytes(pktBytes int) (sliceEndMarker bool) {
+	c.mu.Lock()
+	c.tokenBudget -= float64(pktBytes)
+	sliceEndMarker = c.tokenBudget < float64(MaxUDPPayload)
+	c.mu.Unlock()
+	return sliceEndMarker
+}
+
+// AcquireSendSlot checks 60fps micro-burst budget and in-flight cap for a packet of size pktBytes.
+// When allowed is true, sliceEndMarker indicates whether this packet finishes the current frame slice (RTP M=1).
+func (c *SmartBrutalCC) AcquireSendSlot(inFlightBytes, pktBytes int, srtt time.Duration, now time.Time) (allowed bool, sliceEndMarker bool, waitDur time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if now.After(c.sliceNextAt) || now.Equal(c.sliceNextAt) {
+		c.refillFrameSliceLocked(now)
+	}
+
+	rate := c.effectiveRateLocked()
+	minRTTWin := srtt
+	if minRTTWin < 150*time.Millisecond {
+		minRTTWin = 150 * time.Millisecond
+	}
+	maxInFlight := int(rate * minRTTWin.Seconds() * 2.5)
+	if maxInFlight < 512*1024 {
+		maxInFlight = 512 * 1024
+	}
+	if inFlightBytes > maxInFlight {
+		return false, false, 4 * time.Millisecond
+	}
+
+	need := float64(pktBytes)
+	if c.tokenBudget >= need {
+		c.tokenBudget -= need
+		return true, c.tokenBudget < float64(MaxUDPPayload), 0
+	}
+
+	w := c.sliceNextAt.Sub(now)
+	if w < time.Millisecond {
+		w = time.Millisecond
+	}
+	return false, false, w
+}

@@ -211,6 +211,15 @@ func TestEngineMultiNodeRouteTransportAndClashYAML(t *testing.T) {
 	if err := eng.SetTransport("quic"); err != nil {
 		t.Fatal(err)
 	}
+	if stT := eng.Status(); stT["transport_pref"] != "rtc" {
+		t.Fatalf("expected legacy quic normalized to rtc, got %v", stT["transport_pref"])
+	}
+	if err := eng.SetBandwidthLimits(30, 100); err != nil {
+		t.Fatal(err)
+	}
+	if stBW := eng.Status(); stBW["up_mbps"] != 30 || stBW["down_mbps"] != 100 {
+		t.Fatalf("expected up_mbps=30 down_mbps=100, got up=%v down=%v", stBW["up_mbps"], stBW["down_mbps"])
+	}
 	yb := eng.ClashYAML()
 	if !strings.Contains(yb, "type: socks5") || !strings.Contains(yb, "udp: true") || !strings.Contains(yb, "NodeTwo") {
 		t.Fatalf("unexpected Clash Meta YAML:\n%s", yb)

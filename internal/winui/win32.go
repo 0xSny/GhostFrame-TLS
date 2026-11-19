@@ -73,10 +73,10 @@ const (
 	cfUnicodeText = 13
 	gmemMoveable  = 0x0002
 
-	dwmwaUseImmersiveDarkMode    = 20
-	dwmwaWindowCornerPreference  = 33
-	dwmwcpRound                  = 2
-	dpiAwarenessPerMonitorV2     = ^uintptr(3) // -4
+	dwmwaUseImmersiveDarkMode   = 20
+	dwmwaWindowCornerPreference = 33
+	dwmwcpRound                 = 2
+	dpiAwarenessPerMonitorV2    = ^uintptr(3) // -4
 
 	nimAdd        = 0x00000000
 	nimModify     = 0x00000001
@@ -162,23 +162,23 @@ var (
 	pDwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute")
 	pShellNotifyIconW      = shell32.NewProc("Shell_NotifyIconW")
 
-	pGdiplusStartup                = gdiplus.NewProc("GdiplusStartup")
-	pGdiplusShutdown               = gdiplus.NewProc("GdiplusShutdown")
-	pGdipCreateFromHDC             = gdiplus.NewProc("GdipCreateFromHDC")
-	pGdipDeleteGraphics            = gdiplus.NewProc("GdipDeleteGraphics")
-	pGdipSetSmoothingMode          = gdiplus.NewProc("GdipSetSmoothingMode")
-	pGdipSetTextRenderingHint      = gdiplus.NewProc("GdipSetTextRenderingHint")
-	pGdipCreateSolidFill           = gdiplus.NewProc("GdipCreateSolidFill")
-	pGdipDeleteBrush               = gdiplus.NewProc("GdipDeleteBrush")
-	pGdipCreateFontFromLogfontW    = gdiplus.NewProc("GdipCreateFontFromLogfontW")
-	pGdipDeleteFont                = gdiplus.NewProc("GdipDeleteFont")
-	pGdipCreateStringFormat        = gdiplus.NewProc("GdipCreateStringFormat")
-	pGdipDeleteStringFormat        = gdiplus.NewProc("GdipDeleteStringFormat")
-	pGdipSetStringFormatAlign      = gdiplus.NewProc("GdipSetStringFormatAlign")
-	pGdipSetStringFormatLineAlign  = gdiplus.NewProc("GdipSetStringFormatLineAlign")
-	pGdipSetStringFormatTrimming   = gdiplus.NewProc("GdipSetStringFormatTrimming")
-	pGdipDrawString                = gdiplus.NewProc("GdipDrawString")
-	pGdipFlush                     = gdiplus.NewProc("GdipFlush")
+	pGdiplusStartup               = gdiplus.NewProc("GdiplusStartup")
+	pGdiplusShutdown              = gdiplus.NewProc("GdiplusShutdown")
+	pGdipCreateFromHDC            = gdiplus.NewProc("GdipCreateFromHDC")
+	pGdipDeleteGraphics           = gdiplus.NewProc("GdipDeleteGraphics")
+	pGdipSetSmoothingMode         = gdiplus.NewProc("GdipSetSmoothingMode")
+	pGdipSetTextRenderingHint     = gdiplus.NewProc("GdipSetTextRenderingHint")
+	pGdipCreateSolidFill          = gdiplus.NewProc("GdipCreateSolidFill")
+	pGdipDeleteBrush              = gdiplus.NewProc("GdipDeleteBrush")
+	pGdipCreateFontFromLogfontW   = gdiplus.NewProc("GdipCreateFontFromLogfontW")
+	pGdipDeleteFont               = gdiplus.NewProc("GdipDeleteFont")
+	pGdipCreateStringFormat       = gdiplus.NewProc("GdipCreateStringFormat")
+	pGdipDeleteStringFormat       = gdiplus.NewProc("GdipDeleteStringFormat")
+	pGdipSetStringFormatAlign     = gdiplus.NewProc("GdipSetStringFormatAlign")
+	pGdipSetStringFormatLineAlign = gdiplus.NewProc("GdipSetStringFormatLineAlign")
+	pGdipSetStringFormatTrimming  = gdiplus.NewProc("GdipSetStringFormatTrimming")
+	pGdipDrawString               = gdiplus.NewProc("GdipDrawString")
+	pGdipFlush                    = gdiplus.NewProc("GdipFlush")
 )
 
 type point struct {

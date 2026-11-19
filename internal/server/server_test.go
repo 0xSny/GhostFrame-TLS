@@ -454,8 +454,8 @@ func (m *srvMemPacketConn) Close() error {
 	return nil
 }
 
-func (m *srvMemPacketConn) LocalAddr() net.Addr              { return m.local }
-func (m *srvMemPacketConn) SetDeadline(t time.Time) error     { return m.SetReadDeadline(t) }
+func (m *srvMemPacketConn) LocalAddr() net.Addr                { return m.local }
+func (m *srvMemPacketConn) SetDeadline(t time.Time) error      { return m.SetReadDeadline(t) }
 func (m *srvMemPacketConn) SetWriteDeadline(t time.Time) error { return nil }
 func (m *srvMemPacketConn) SetReadDeadline(t time.Time) error {
 	m.mu.Lock()
@@ -464,7 +464,7 @@ func (m *srvMemPacketConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-func TestServerQUICStealthStreamAndInternalPanel(t *testing.T) {
+func TestServerRTCStealthStreamAndInternalPanel(t *testing.T) {
 	cRaw, sRaw := newSrvMemPair()
 	_, sec, _, stop := startTestServer(t, InitOptions{
 		SNI:          "ftp.jaist.ac.jp",
@@ -478,15 +478,15 @@ func TestServerQUICStealthStreamAndInternalPanel(t *testing.T) {
 		t.Fatal(err)
 	}
 	ps := gft.NewParamStore(gft.DefaultParams())
-	qs, _, err := gft.DialQUICWithPacketConn(context.Background(), cRaw, false, sRaw.LocalAddr(), 443, link, ps, 5*time.Second)
+	rs, _, err := gft.DialRTCWithPacketConn(context.Background(), cRaw, false, sRaw.LocalAddr(), 443, link, ps, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer qs.Close()
+	defer rs.Close()
 	defer cRaw.Close()
 	defer sRaw.Close()
 
-	st, err := qs.OpenStream(internalPanelHost, nil)
+	st, err := rs.OpenStream(internalPanelHost, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,11 +494,11 @@ func TestServerQUICStealthStreamAndInternalPanel(t *testing.T) {
 	_, _ = io.WriteString(st, "GET "+sec.PanelPath+"/?key="+sec.PanelPassword+" HTTP/1.1\r\nHost: gft.internal.panel\r\nConnection: close\r\n\r\n")
 	resp, err := http.ReadResponse(bufio.NewReader(st), nil)
 	if err != nil {
-		t.Fatalf("quic internal panel failed: %v", err)
+		t.Fatalf("rtc internal panel failed: %v", err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusFound {
-		t.Fatalf("expected 200 or 302 via QUIC internal panel, got %d", resp.StatusCode)
+		t.Fatalf("expected 200 or 302 via RTC internal panel, got %d", resp.StatusCode)
 	}
 }
 

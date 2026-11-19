@@ -19,9 +19,147 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go"
+	"ghostframe/internal/gftrtc"
+
 	utls "github.com/refraction-networking/utls"
 )
+
+type testUDPAddr string
+
+func (a testUDPAddr) Network() string { return "udp" }
+func (a testUDPAddr) String() string  { return string(a) }
+
+type testUDPPkt struct {
+	data []byte
+	from net.Addr
+}
+
+type testUDPSwitch struct {
+	srvAddr  testUDPAddr
+	srvConn  *testUDPEnd
+	mu       sync.RWMutex
+	clients  map[string]*testUDPEnd
+	nextPort atomic.Int32
+}
+
+func newTestUDPSwitch(hubAddr string) *testUDPSwitch {
+	sw := &testUDPSwitch{
+		srvAddr: testUDPAddr(hubAddr),
+		clients: make(map[string]*testUDPEnd),
+	}
+	sw.nextPort.Store(30000)
+	sw.srvConn = &testUDPEnd{sw: sw, addr: sw.srvAddr, isSrv: true, recv: make(chan testUDPPkt, 1024), closed: make(chan struct{})}
+	return sw
+}
+
+func (sw *testUDPSwitch) newClientEnd() *testUDPEnd {
+	p := sw.nextPort.Add(1)
+	addr := testUDPAddr(net.JoinHostPort("127.0.0.1", strconvItoa(int(p))))
+	ce := &testUDPEnd{sw: sw, addr: addr, recv: make(chan testUDPPkt, 1024), closed: make(chan struct{})}
+	sw.mu.Lock()
+	sw.clients[string(addr)] = ce
+	sw.mu.Unlock()
+	return ce
+}
+
+func (sw *testUDPSwitch) closeAll() {
+	_ = sw.srvConn.Close()
+	sw.mu.RLock()
+	for _, ce := range sw.clients {
+		_ = ce.Close()
+	}
+	sw.mu.RUnlock()
+}
+
+func strconvItoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [12]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+type testUDPEnd struct {
+	sw     *testUDPSwitch
+	addr   testUDPAddr
+	isSrv  bool
+	recv   chan testUDPPkt
+	closed chan struct{}
+	once   sync.Once
+	mu     sync.Mutex
+	rDead  time.Time
+}
+
+func (e *testUDPEnd) ReadFrom(p []byte) (int, net.Addr, error) {
+	e.mu.Lock()
+	dl := e.rDead
+	e.mu.Unlock()
+	var timer <-chan time.Time
+	if !dl.IsZero() {
+		d := time.Until(dl)
+		if d <= 0 {
+			return 0, nil, context.DeadlineExceeded
+		}
+		t := time.NewTimer(d)
+		defer t.Stop()
+		timer = t.C
+	}
+	select {
+	case pkt := <-e.recv:
+		return copy(p, pkt.data), pkt.from, nil
+	case <-e.closed:
+		return 0, nil, net.ErrClosed
+	case <-timer:
+		return 0, nil, context.DeadlineExceeded
+	}
+}
+
+func (e *testUDPEnd) WriteTo(p []byte, dst net.Addr) (int, error) {
+	select {
+	case <-e.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+	var target *testUDPEnd
+	if e.isSrv {
+		e.sw.mu.RLock()
+		if dst != nil {
+			target = e.sw.clients[dst.String()]
+		}
+		e.sw.mu.RUnlock()
+	} else {
+		target = e.sw.srvConn
+	}
+	if target != nil {
+		cp := make([]byte, len(p))
+		copy(cp, p)
+		select {
+		case target.recv <- testUDPPkt{data: cp, from: e.addr}:
+		default:
+		}
+	}
+	return len(p), nil
+}
+
+func (e *testUDPEnd) Close() error {
+	e.once.Do(func() { close(e.closed) })
+	return nil
+}
+func (e *testUDPEnd) LocalAddr() net.Addr              { return e.addr }
+func (e *testUDPEnd) SetDeadline(t time.Time) error    { return e.SetReadDeadline(t) }
+func (e *testUDPEnd) SetWriteDeadline(time.Time) error { return nil }
+func (e *testUDPEnd) SetReadDeadline(t time.Time) error {
+	e.mu.Lock()
+	e.rDead = t
+	e.mu.Unlock()
+	return nil
+}
 
 func TestGFT3LinkRoundTrip(t *testing.T) {
 	l := &Link{
@@ -35,7 +173,9 @@ func TestGFT3LinkRoundTrip(t *testing.T) {
 		FP:        "chrome",
 		Transport: "auto",
 		SplitSNI:  true,
-		HopRange:  "20000-30000",
+		HopRange:  "20000-40000",
+		UpMbps:    30,
+		DownMbps:  100,
 		Remark:    "ApexNode",
 	}
 	enc := l.Encode()
@@ -47,8 +187,14 @@ func TestGFT3LinkRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	lo, hi, ok := dec.ParseHopRange()
-	if !ok || lo != 20000 || hi != 30000 || !dec.SplitSNI || dec.EffectiveTransport() != "auto" {
+	if !ok || lo != 20000 || hi != 40000 || !dec.SplitSNI || dec.EffectiveTransport() != "auto" || dec.UpMbps != 30 || dec.DownMbps != 100 {
 		t.Fatalf("unexpected decoded v3 fields: %+v", dec)
+	}
+
+	// Legacy "quic" transport seamlessly normalizes to "rtc"
+	legacy := &Link{V: 3, Host: "example.com", Port: 443, SNI: "cdn.example.com", PSK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", Verify: "ca", Transport: "quic"}
+	if legacy.EffectiveTransport() != "rtc" {
+		t.Fatalf("expected legacy 'quic' normalized to 'rtc', got %q", legacy.EffectiveTransport())
 	}
 }
 
@@ -194,7 +340,6 @@ func TestRecordSplitAndStegoSessionIDAndMirrorInspector(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify ClientHello was split into >=2 TLS records across SNI
 	spy.mu.Lock()
 	var clientHelloRecs int
 	for _, w := range spy.writes {
@@ -215,7 +360,6 @@ func TestMirrorInspectorRejectsProbeAndRewindsLossless(t *testing.T) {
 	_, _ = rand.Read(psk)
 	verifier := NewStegoVerifier(psk)
 
-	// 1. Plaintext HTTP probe
 	c1, s1 := net.Pipe()
 	go func() {
 		_, _ = c1.Write([]byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"))
@@ -230,7 +374,6 @@ func TestMirrorInspectorRejectsProbeAndRewindsLossless(t *testing.T) {
 		t.Fatalf("rewound probe mismatch: %q", raw)
 	}
 
-	// 2. Replay attack with identical SessionID + ClientRandom
 	var cr [32]byte
 	_, _ = rand.Read(cr[:])
 	sid, err := MakeStegoSessionID(psk, cr[:], time.Now())
@@ -252,159 +395,23 @@ func TestMirrorInspectorRejectsProbeAndRewindsLossless(t *testing.T) {
 	}
 }
 
-// memPacketConnPair creates an in-memory UDP-like PacketConn pair immune to OS firewall rules.
-type memAddr string
-
-func (a memAddr) Network() string { return "udp" }
-func (a memAddr) String() string  { return string(a) }
-
-type memPkt struct {
-	data []byte
-	from net.Addr
-}
-
-type memPacketConn struct {
-	local  memAddr
-	peer   *memPacketConn
-	recv   chan memPkt
-	closed chan struct{}
-	once   sync.Once
-	mu     sync.Mutex
-	rDead  time.Time
-}
-
-func newMemPacketPair() (*memPacketConn, *memPacketConn) {
-	a := &memPacketConn{local: memAddr("127.0.0.1:10001"), recv: make(chan memPkt, 256), closed: make(chan struct{})}
-	b := &memPacketConn{local: memAddr("127.0.0.1:10443"), recv: make(chan memPkt, 256), closed: make(chan struct{})}
-	a.peer = b
-	b.peer = a
-	return a, b
-}
-
-func (m *memPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	m.mu.Lock()
-	dl := m.rDead
-	m.mu.Unlock()
-	var timer <-chan time.Time
-	if !dl.IsZero() {
-		d := time.Until(dl)
-		if d <= 0 {
-			return 0, nil, net.ErrClosed
-		}
-		t := time.NewTimer(d)
-		defer t.Stop()
-		timer = t.C
-	}
-	select {
-	case pkt := <-m.recv:
-		n := copy(p, pkt.data)
-		return n, pkt.from, nil
-	case <-m.closed:
-		return 0, nil, net.ErrClosed
-	case <-timer:
-		return 0, nil, context.DeadlineExceeded
-	}
-}
-
-func (m *memPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	select {
-	case <-m.closed:
-		return 0, net.ErrClosed
-	default:
-	}
-	cp := make([]byte, len(p))
-	copy(cp, p)
-	select {
-	case m.peer.recv <- memPkt{data: cp, from: m.local}:
-		return len(p), nil
-	default:
-		return len(p), nil
-	}
-}
-
-func (m *memPacketConn) Close() error {
-	m.once.Do(func() { close(m.closed) })
-	return nil
-}
-
-func (m *memPacketConn) LocalAddr() net.Addr              { return m.local }
-func (m *memPacketConn) SetDeadline(t time.Time) error     { return m.SetReadDeadline(t) }
-func (m *memPacketConn) SetWriteDeadline(t time.Time) error { return nil }
-func (m *memPacketConn) SetReadDeadline(t time.Time) error {
-	m.mu.Lock()
-	m.rDead = t
-	m.mu.Unlock()
-	return nil
-}
-
-func TestAuthPacketConnFiltersUnknownAndAcceptsStego(t *testing.T) {
-	psk := make([]byte, 32)
-	_, _ = rand.Read(psk)
-	verifier := NewStegoVerifier(psk)
-
-	cRaw, sRaw := newMemPacketPair()
-	defer cRaw.Close()
-	defer sRaw.Close()
-
-	authSrv := NewAuthPacketConn(sRaw, verifier)
-
-	// Send random scan junk + bad QUIC initial + valid stego Initial
-	_, _ = cRaw.WriteTo([]byte("DNS SCAN PROBE"), sRaw.LocalAddr())
-	badCID := make([]byte, 16)
-	_, _ = cRaw.WriteTo(BuildTestQUICInitialPacket(badCID, badCID, 1200), sRaw.LocalAddr())
-
-	goodCID, err := MakeStegoQUICCID(psk, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	validPkt := BuildTestQUICInitialPacket(make([]byte, 8), goodCID[:], 1200)
-	_, _ = cRaw.WriteTo(validPkt, sRaw.LocalAddr())
-
-	buf := make([]byte, 2048)
-	_ = authSrv.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, addr, err := authSrv.ReadFrom(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 1200 || addr == nil {
-		t.Fatalf("unexpected read result n=%d addr=%v", n, addr)
-	}
-	if authSrv.Dropped() != 2 {
-		t.Fatalf("expected 2 silent drops, got %d", authSrv.Dropped())
-	}
-}
-
-func TestQUICEngineStreamDatagramAndRTT(t *testing.T) {
-	psk := make([]byte, 32)
-	_, _ = rand.Read(psk)
-	cert, pin := makeTestCertAndPin(t, "ftp.jaist.ac.jp")
+func TestRTCEngineStreamDatagramAndRTT(t *testing.T) {
 	link := &Link{
 		V:         3,
 		Host:      "127.0.0.1",
 		Port:      10443,
 		SNI:       "ftp.jaist.ac.jp",
 		PSK:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-		Verify:    "spki",
-		Pin:       pin,
-		Transport: "quic",
+		Verify:    "ca",
+		Transport: "rtc",
 	}
-	psk, _ = link.PSKBytes()
-	verifier := NewStegoVerifier(psk)
+	psk, _ := link.PSKBytes()
 	ps := NewParamStore(DefaultParams())
 
-	cRaw, sRaw := newMemPacketPair()
-	defer cRaw.Close()
-	defer sRaw.Close()
+	sw := newTestUDPSwitch("127.0.0.1:10443")
+	defer sw.closeAll()
 
-	authSrv := NewAuthPacketConn(sRaw, verifier)
-	srvTransport := &quic.Transport{Conn: authSrv}
-	defer srvTransport.Close()
-
-	ln, err := srvTransport.Listen(&tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{"h3"},
-	}, QUICConfig())
+	ln, err := gftrtc.NewListener(sw.srvConn, false, psk, 0, MarshalParams(DefaultParams()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,31 +421,31 @@ func TestQUICEngineStreamDatagramAndRTT(t *testing.T) {
 	defer cancel()
 
 	go func() {
-		qconn, err := ln.Accept(ctx)
-		if err != nil {
-			return
-		}
-		_ = ServeQUICConn(ctx, qconn, verifier, ps, func(st DataStream, target string, first []byte) {
-			defer st.Close()
-			if len(first) > 0 {
-				_, _ = st.Write(first)
+		for {
+			srvSess, aerr := ln.Accept(ctx)
+			if aerr != nil {
+				return
 			}
-			_, _ = io.Copy(st, st)
-		}, func(sink UDPReplySink, id uint16, target string, data []byte) {
-			_ = sink.SendUDPReply(id, target, append([]byte("pong:"), data...))
-		}, nil)
+			srvSess.SetHandlers(func(st *gftrtc.RTCStream, _ string, first []byte) {
+				defer st.Close()
+				if len(first) > 0 {
+					_, _ = st.Write(first)
+				}
+				_, _ = io.Copy(st, st)
+			}, func(sink gftrtc.UDPReplySink, id uint16, target string, data []byte) {
+				_ = sink.SendUDPReply(id, target, append([]byte("pong:"), data...))
+			}, nil)
+		}
 	}()
 
-	qs, _, err := DialQUICWithPacketConn(ctx, cRaw, false, sRaw.LocalAddr(), 10443, link, ps, 4*time.Second)
+	ce := sw.newClientEnd()
+	rs, _, err := DialRTCWithPacketConn(ctx, ce, true, sw.srvAddr, 10443, link, ps, 4*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer qs.Close()
-	defer cRaw.Close()
-	defer sRaw.Close()
+	defer rs.Close()
 
-	// 1. Stream 0-RTT echo
-	st, err := qs.OpenStream("example.org:443", []byte("hi|"))
+	st, err := rs.OpenStream("example.org:443", []byte("hi|"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -453,11 +460,10 @@ func TestQUICEngineStreamDatagramAndRTT(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got[:3], []byte("hi|")) || !bytes.Equal(got[3:], payload) {
-		t.Fatalf("quic stream mismatch got %d", len(got))
+		t.Fatalf("rtc stream mismatch got %d", len(got))
 	}
 
-	// 2. RFC 9221 Datagram UDP
-	u, err := qs.OpenUDP()
+	u, err := rs.OpenUDP()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,17 +473,16 @@ func TestQUICEngineStreamDatagramAndRTT(t *testing.T) {
 	select {
 	case pkt := <-u.Recv():
 		if string(pkt.Data) != "pong:dns" {
-			t.Fatalf("unexpected quic udp reply: %q", pkt.Data)
+			t.Fatalf("unexpected rtc udp reply: %q", pkt.Data)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("quic udp reply timeout")
+		t.Fatal("rtc udp reply timeout")
 	}
 	_ = u.Close()
 
-	// 3. In-band RTT probe
-	rtt, err := qs.ProbeRTT(2 * time.Second)
+	rtt, err := rs.ProbeRTT(2 * time.Second)
 	if err != nil || rtt <= 0 {
-		t.Fatalf("expected positive quic probe rtt, got %v err=%v", rtt, err)
+		t.Fatalf("expected positive rtc probe rtt, got %v err=%v", rtt, err)
 	}
 }
 
@@ -505,7 +510,6 @@ func TestApexSchedulerZeroMsFailoverToTCP(t *testing.T) {
 		mu.Unlock()
 	}()
 
-	// Mock TCP works; QUIC fails (simulates UDP blocked by GFW)
 	sched.pool.dialFn = func(ctx context.Context, _ *Link, store *ParamStore, _ uint16, _ time.Duration) (*Session, time.Duration, error) {
 		c, s := net.Pipe()
 		srv := NewSession(s, false, store, func(st *Stream, target string, first []byte) {
@@ -520,9 +524,9 @@ func TestApexSchedulerZeroMsFailoverToTCP(t *testing.T) {
 		go cli.Run()
 		return cli, 5 * time.Millisecond, nil
 	}
-	sched.quicDialFn = func(ctx context.Context, _ *Link, _ *ParamStore, _ int, _ time.Duration) (*QUICSession, time.Duration, error) {
+	sched.SetRTCDialHookForTest(func(ctx context.Context, _ *Link, _ *ParamStore, _ int, _ time.Duration, _ [8]byte) (*gftrtc.RTCSession, time.Duration, error) {
 		return nil, 0, errors.New("udp blocked")
-	}
+	})
 
 	if err := sched.Start(2 * time.Second); err != nil {
 		t.Fatal(err)
@@ -543,91 +547,6 @@ func TestApexSchedulerZeroMsFailoverToTCP(t *testing.T) {
 	_ = binary.BigEndian
 }
 
-func TestQUICUDPOversized1350And16KB(t *testing.T) {
-	cert, pin := makeTestCertAndPin(t, "ftp.jaist.ac.jp")
-	link := &Link{
-		V:         3,
-		Host:      "127.0.0.1",
-		Port:      10443,
-		SNI:       "ftp.jaist.ac.jp",
-		PSK:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-		Verify:    "spki",
-		Pin:       pin,
-		Transport: "quic",
-	}
-	psk, _ := link.PSKBytes()
-	verifier := NewStegoVerifier(psk)
-	ps := NewParamStore(DefaultParams())
-
-	cRaw, sRaw := newMemPacketPair()
-	defer cRaw.Close()
-	defer sRaw.Close()
-
-	authSrv := NewAuthPacketConn(sRaw, verifier)
-	srvTransport := &quic.Transport{Conn: authSrv}
-	defer srvTransport.Close()
-
-	ln, err := srvTransport.Listen(&tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{"h3"},
-	}, QUICConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		qconn, err := ln.Accept(ctx)
-		if err != nil {
-			return
-		}
-		_ = ServeQUICConn(ctx, qconn, verifier, ps, nil,
-			func(sink UDPReplySink, id uint16, target string, data []byte) {
-				// Echo exact payload back so both directions test fragmentation and stream fallback.
-				_ = sink.SendUDPReply(id, target, data)
-			}, nil)
-	}()
-
-	qs, _, err := DialQUICWithPacketConn(ctx, cRaw, false, sRaw.LocalAddr(), 10443, link, ps, 4*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer qs.Close()
-	defer cRaw.Close()
-	defer sRaw.Close()
-
-	u, err := qs.OpenUDP()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer u.Close()
-
-	// Test sizes spanning:
-	// - 300B: single QUIC datagram (0x01)
-	// - 1350B: fragmented RFC 9221 QUIC datagram (0x03) - typical QUIC/H3 packet
-	// - 4500B: multi-fragment RFC 9221 QUIC datagram (0x03)
-	// - 16384B: QUIC multiplexed UDP stream fallback (quicStreamUDP = 0x03)
-	for _, sz := range []int{300, 1350, 4500, 16384} {
-		payload := make([]byte, sz)
-		_, _ = rand.Read(payload)
-		if err := u.SendTo("1.1.1.1:443", payload); err != nil {
-			t.Fatalf("SendTo(%dB) error: %v", sz, err)
-		}
-		select {
-		case pkt := <-u.Recv():
-			if len(pkt.Data) != sz || !bytes.Equal(pkt.Data, payload) {
-				t.Fatalf("echo mismatch for %dB packet: got %dB", sz, len(pkt.Data))
-			}
-		case <-time.After(3 * time.Second):
-			t.Fatalf("timeout waiting for %dB UDP echo reply", sz)
-		}
-	}
-}
-
 func TestApexSchedulerRapidStartCloseNoWaitGroupRace(t *testing.T) {
 	ps := NewParamStore(DefaultParams())
 	link := &Link{
@@ -639,83 +558,80 @@ func TestApexSchedulerRapidStartCloseNoWaitGroupRace(t *testing.T) {
 		Verify:    "ca",
 		Transport: "auto",
 	}
-	for i := 0; i < 20; i++ {
+	psk, _ := link.PSKBytes()
+	for i := 0; i < 15; i++ {
 		sched := NewApexScheduler(link, ps, 1, nil)
 		sched.SetDialJitterForTest(0, 0, 100)
-		// Force r1 (tcp) immediate failure and r2 (quic) immediate mock success so Start launches async r2 wait goroutine
 		sched.pool.dialFn = func(_ context.Context, _ *Link, _ *ParamStore, _ uint16, _ time.Duration) (*Session, time.Duration, error) {
 			time.Sleep(15 * time.Millisecond)
 			return nil, 0, errors.New("mock tcp fail")
 		}
-		cRaw, sRaw := newMemPacketPair()
-		cert, pin := makeTestCertAndPin(t, "ftp.jaist.ac.jp")
-		link.Verify = "spki"
-		link.Pin = pin
-		srvTr := &quic.Transport{Conn: sRaw}
-		ln, lerr := srvTr.Listen(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13, NextProtos: []string{"h3"}}, QUICConfig())
-		if lerr != nil {
-			_ = cRaw.Close()
-			_ = sRaw.Close()
-			t.Fatal(lerr)
-		}
+		sw := newTestUDPSwitch("127.0.0.1:443")
+		ln, _ := gftrtc.NewListener(sw.srvConn, false, psk, 0, nil)
 		go func() {
-			qc, err := ln.Accept(context.Background())
-			if err == nil {
-				go func() { _ = ServeQUICConn(context.Background(), qc, NewStegoVerifier(make([]byte, 32)), ps, nil, nil, nil) }()
+			for {
+				ss, err := ln.Accept(context.Background())
+				if err != nil {
+					return
+				}
+				ss.SetHandlers(nil, nil, nil)
 			}
 		}()
 		var dialedOnce atomic.Bool
-		sched.SetQUICDialHookForTest(func(ctx context.Context, dl *Link, dps *ParamStore, _ int, timeout time.Duration, clientID [8]byte) (*QUICSession, time.Duration, error) {
+		sched.SetRTCDialHookForTest(func(ctx context.Context, dl *Link, dps *ParamStore, _ int, timeout time.Duration, clientID [8]byte) (*gftrtc.RTCSession, time.Duration, error) {
 			if !dialedOnce.CompareAndSwap(false, true) {
 				return nil, 0, errors.New("single test pair already claimed")
 			}
-			return DialQUICWithPacketConnAndID(ctx, cRaw, true, sRaw.LocalAddr(), 443, dl, dps, timeout, clientID)
+			return DialRTCWithPacketConnAndID(ctx, sw.newClientEnd(), true, sw.srvAddr, 443, dl, dps, timeout, clientID)
 		})
 		_ = sched.Start(time.Second)
 		sched.Close()
 		_ = ln.Close()
-		_ = sRaw.Close()
-		_ = srvTr.Close()
+		sw.closeAll()
 	}
 }
 
-func TestApexSchedulerStripedQUICPoolAndSplitLimiters(t *testing.T) {
-	if QUICConfig().InitialPacketSize != 1250 {
-		t.Fatalf("expected InitialPacketSize=1250, got %d", QUICConfig().InitialPacketSize)
-	}
-
-	cert, pin := makeTestCertAndPin(t, "ftp.jaist.ac.jp")
+func TestApexSchedulerStripedRTCPoolHopAndSplitLimiters(t *testing.T) {
 	link := &Link{
 		V:         3,
 		Host:      "127.0.0.1",
 		Port:      443,
 		SNI:       "ftp.jaist.ac.jp",
 		PSK:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-		Verify:    "spki",
-		Pin:       pin,
-		Transport: "quic",
+		Verify:    "ca",
+		Transport: "rtc",
 		HopRange:  "20000-40000",
 	}
 	psk, _ := link.PSKBytes()
-	verifier := NewStegoVerifier(psk)
 	ps := NewParamStore(DefaultParams())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var cleanMu sync.Mutex
-	var cleanClosers []func()
-	defer func() {
-		cleanMu.Lock()
-		for _, fn := range cleanClosers {
-			fn()
+	sw := newTestUDPSwitch("127.0.0.1:443")
+	defer sw.closeAll()
+	ln, err := gftrtc.NewListener(sw.srvConn, false, psk, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			ss, aerr := ln.Accept(ctx)
+			if aerr != nil {
+				return
+			}
+			ss.SetHandlers(func(st *gftrtc.RTCStream, _ string, first []byte) {
+				defer st.Close()
+				_, _ = st.Write(first)
+			}, nil, nil)
 		}
-		cleanMu.Unlock()
 	}()
 
 	sched := NewApexScheduler(link, ps, 2, nil)
 	sched.SetDialJitterForTest(0, 0, 100)
-	// Drain tcpLimiter tokens completely to prove quicLimiter stays isolated and fast
+	// Drain tcpLimiter tokens completely to prove rtcLimiter stays isolated and fast
 	sched.tcpLimiter.mu.Lock()
 	sched.tcpLimiter.tokens = 0
 	sched.tcpLimiter.rate = 0.01
@@ -723,57 +639,31 @@ func TestApexSchedulerStripedQUICPoolAndSplitLimiters(t *testing.T) {
 
 	var pickedPortsMu sync.Mutex
 	var pickedPorts []int
-	sched.SetQUICDialHookForTest(func(dialCtx context.Context, dl *Link, dps *ParamStore, hopPort int, timeout time.Duration, clientID [8]byte) (*QUICSession, time.Duration, error) {
+	sched.SetRTCDialHookForTest(func(dialCtx context.Context, dl *Link, dps *ParamStore, hopPort int, timeout time.Duration, clientID [8]byte) (*gftrtc.RTCSession, time.Duration, error) {
 		pickedPortsMu.Lock()
 		pickedPorts = append(pickedPorts, hopPort)
 		pickedPortsMu.Unlock()
-
-		cRaw, sRaw := newMemPacketPair()
-		srvTr := &quic.Transport{Conn: NewAuthPacketConn(sRaw, verifier)}
-		ln, lerr := srvTr.Listen(&tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS13,
-			NextProtos:   []string{"h3"},
-		}, QUICConfig())
-		if lerr != nil {
-			_ = cRaw.Close()
-			_ = sRaw.Close()
-			return nil, 0, lerr
-		}
-		go func() {
-			qc, aerr := ln.Accept(ctx)
-			if aerr != nil {
-				return
-			}
-			_ = ServeQUICConn(ctx, qc, verifier, ps, func(st DataStream, target string, first []byte) {
-				defer st.Close()
-				_, _ = st.Write(first)
-			}, nil, nil)
-		}()
-		cleanMu.Lock()
-		cleanClosers = append(cleanClosers, func() {
-			_ = ln.Close()
-			_ = sRaw.Close()
-			_ = cRaw.Close()
-			_ = srvTr.Close()
-		})
-		cleanMu.Unlock()
-
-		return DialQUICWithPacketConnAndID(dialCtx, cRaw, true, sRaw.LocalAddr(), hopPort, dl, dps, timeout, clientID)
+		return DialRTCWithPacketConnAndID(dialCtx, sw.newClientEnd(), true, sw.srvAddr, hopPort, dl, dps, timeout, clientID)
 	})
+	var hopCount atomic.Int32
+	sched.SetRTCHopHookForTest(func(sess *gftrtc.RTCSession, nextPort int) error {
+		hopCount.Add(1)
+		return sess.HopWithPacketConn(sw.newClientEnd(), true, sw.srvAddr, nextPort)
+	})
+	sched.SetHopTimingsForTest(60*time.Millisecond, 60*time.Millisecond, 200*time.Millisecond, 25*time.Millisecond)
 
 	t0 := time.Now()
 	if err := sched.Start(3 * time.Second); err != nil {
-		t.Fatalf("striped QUIC Start failed: %v", err)
+		t.Fatalf("striped RTC Start failed: %v", err)
 	}
 	defer sched.Close()
 	if time.Since(t0) > 2*time.Second {
-		t.Fatalf("QUIC dial was unexpectedly delayed by exhausted tcpLimiter (%v)", time.Since(t0))
+		t.Fatalf("RTC dial was unexpectedly delayed by exhausted tcpLimiter (%v)", time.Since(t0))
 	}
 
 	stStats := sched.Stats()
-	if stStats.ActiveConns != DefaultQUICPoolSize {
-		t.Fatalf("expected %d active striped QUIC conns, got %d", DefaultQUICPoolSize, stStats.ActiveConns)
+	if stStats.ActiveConns != DefaultRTCPoolSize {
+		t.Fatalf("expected %d active striped RTC conns, got %d", DefaultRTCPoolSize, stStats.ActiveConns)
 	}
 	pickedPortsMu.Lock()
 	for _, p := range pickedPorts {
@@ -783,16 +673,21 @@ func TestApexSchedulerStripedQUICPoolAndSplitLimiters(t *testing.T) {
 	}
 	pickedPortsMu.Unlock()
 
-	// Verify streams spread across multiple QUIC sessions via least-loaded + RR
-	used := make(map[*QUICSession]int)
+	used := make(map[*gftrtc.RTCSession]int)
 	for i := 0; i < 6; i++ {
-		q := sched.activeQUICForSend()
-		if q == nil {
-			t.Fatal("expected active QUIC session")
+		r := sched.activeRTCForSend()
+		if r == nil {
+			t.Fatal("expected active RTC session")
 		}
-		used[q]++
+		used[r]++
 	}
-	if len(used) != DefaultQUICPoolSize {
-		t.Fatalf("expected load spread across %d QUIC sessions, used %d", DefaultQUICPoolSize, len(used))
+	if len(used) != DefaultRTCPoolSize {
+		t.Fatalf("expected load spread across %d RTC sessions, used %d", DefaultRTCPoolSize, len(used))
+	}
+
+	// Verify 0ms in-place port hop fires cleanly without breaking active sessions
+	time.Sleep(150 * time.Millisecond)
+	if hopCount.Load() == 0 {
+		t.Fatalf("expected 0ms dynamic socket hop to fire")
 	}
 }

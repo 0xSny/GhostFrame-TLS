@@ -20,23 +20,23 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/quic-go"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/net/http2"
 
 	"ghostframe/internal/gft"
+	"ghostframe/internal/gftrtc"
 )
 
 const (
-	maxUDPPerSession = 128
-	udpIdleTimeout   = 60 * time.Second
+	maxUDPPerSession  = 128
+	udpIdleTimeout    = 60 * time.Second
 	internalPanelHost = "gft.internal.panel:80"
 )
 
-// Server is the GhostFrame-TLS v3 Apex dual-stack server:
+// Server is the GhostFrame v3.4 Apex dual-stack server:
 //   - TCP: 0ms Pre-TLS MirrorInspector -> TLS 1.3 + ClientAuth -> Ghost Frame v3 Mux
 //     (probes/scanners are transparently mirrored to CamouflageTarget or fallback HTTP/H2)
-//   - UDP: Pre-QUIC AuthPacketConn (drops unknown packets silently) -> QUIC + RFC9221 UDP
+//   - UDP: GhostFrame-RTC (WebRTC STUN/SRTP mimicry + 0ms XOR-FEC + Smart-Brutal CC + 0ms migration)
 type Server struct {
 	cfg           *Config
 	psk           []byte
@@ -57,12 +57,12 @@ type Server struct {
 	tcpAddr   net.Addr
 	udpAddr   net.Addr
 
-	smu       sync.Mutex
-	sessions  map[uint64]*sessEntry
-	nextSess  atomic.Uint64
-	udpMgrMu  sync.Mutex
-	udpMgrs   map[[8]byte]*udpManager
-	logger    *log.Logger
+	smu      sync.Mutex
+	sessions map[uint64]*sessEntry
+	nextSess atomic.Uint64
+	udpMgrMu sync.Mutex
+	udpMgrs  map[[8]byte]*udpManager
+	logger   *log.Logger
 }
 
 type sessEntry struct {
@@ -295,22 +295,18 @@ func (s *Server) Run(ctx context.Context) error {
 	s.tcpAddr = ln.Addr()
 	s.tcpAddrMu.Unlock()
 
-	// Optional QUIC listener on matching UDP port (unless DisableQUIC).
-	var qLn *quic.Listener
-	var qTr *quic.Transport
+	// Optional GhostFrame-RTC listener on matching UDP port (unless DisableRTC/DisableQUIC).
+	var rtcLn *gftrtc.RTCListener
 	var rawUDP net.PacketConn
-	if !s.cfg.DisableQUIC {
+	if !s.cfg.IsRTCDisabled() {
 		pc := s.testUDPPC
 		if pc == nil {
 			udpBind := s.cfg.Listen
-			if host, _, err := net.SplitHostPort(ln.Addr().String()); err == nil {
+			if _, _, err := net.SplitHostPort(ln.Addr().String()); err == nil {
 				if ta, ok := ln.Addr().(*net.TCPAddr); ok {
-					// Keep configured bind host if any, or use resolved port
 					cfgHost, cfgPort, _ := net.SplitHostPort(s.cfg.Listen)
 					if cfgPort == "0" {
 						udpBind = net.JoinHostPort(cfgHost, strconv.Itoa(ta.Port))
-					} else {
-						_ = host
 					}
 				}
 			}
@@ -319,27 +315,25 @@ func (s *Server) Run(ctx context.Context) error {
 				_ = ln.Close()
 				return err
 			}
-			gft.TuneUDPSocketBuffers(pc)
+			gftrtc.TuneUDPSocketBuffers(pc)
 		}
 		rawUDP = pc
 		s.tcpAddrMu.Lock()
 		s.udpAddr = pc.LocalAddr()
 		s.tcpAddrMu.Unlock()
 
-		authPC := gft.NewAuthPacketConn(pc, s.stego)
-		qTr = &quic.Transport{Conn: authPC}
-		quicTLS := tlsCfg.Clone()
-		quicTLS.NextProtos = []string{"h3"}
-		qLn, err = qTr.Listen(quicTLS, gft.QUICConfig())
+		rtcLn, err = gftrtc.NewListener(pc, s.testUDPPC == nil, s.psk, s.cfg.TxMbps, gft.MarshalParams(s.params.Get()))
 		if err != nil {
-			_ = pc.Close()
+			if s.testUDPPC == nil {
+				_ = pc.Close()
+			}
 			_ = ln.Close()
 			return err
 		}
 	}
 
-	s.logger.Printf("GFT v3 Apex listening tcp=%s quic=%v (cert=%s fallback=%s target=%s)",
-		ln.Addr(), qLn != nil, s.cfg.CertMode, s.cfg.FallbackMode, s.cfg.CamouflageTarget)
+	s.logger.Printf("GhostFrame v3.4 Apex listening tcp=%s rtc=%v (cert=%s fallback=%s target=%s)",
+		ln.Addr(), rtcLn != nil, s.cfg.CertMode, s.cfg.FallbackMode, s.cfg.CamouflageTarget)
 
 	// Public HTTP/1.1 fallback server (reverse_proxy or builtin_blog)
 	hs := &http.Server{
@@ -392,14 +386,11 @@ func (s *Server) Run(ctx context.Context) error {
 		defer wg.Done()
 		<-ctx.Done()
 		_ = ln.Close()
-		if rawUDP != nil {
+		if rtcLn != nil {
+			_ = rtcLn.Close()
+		}
+		if rawUDP != nil && s.testUDPPC == nil {
 			_ = rawUDP.Close()
-		}
-		if qLn != nil {
-			_ = qLn.Close()
-		}
-		if qTr != nil {
-			_ = qTr.Close()
 		}
 		_ = hs.Close()
 		_ = panelSrv.Close()
@@ -408,16 +399,16 @@ func (s *Server) Run(ctx context.Context) error {
 		s.closeAllSessions()
 	}()
 
-	if qLn != nil {
+	if rtcLn != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for {
-				qc, err := qLn.Accept(ctx)
+				rs, err := rtcLn.Accept(ctx)
 				if err != nil {
 					return
 				}
-				go s.serveQUIC(ctx, qc)
+				go s.serveRTC(ctx, rs)
 			}
 		}()
 	}
@@ -441,52 +432,31 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) serveQUIC(ctx context.Context, qc *quic.Conn) {
-	ip := addrIP(qc.RemoteAddr())
-	if s.audit.IsBanned(ip) {
-		_ = qc.CloseWithError(0, "banned")
-		return
-	}
-	s.logger.Printf("quic session opened from %s", ip)
-	var mgrMu sync.Mutex
-	var mgr *udpManager
-	var mgrShared bool
-	var lastSink atomic.Pointer[gft.UDPReplySink]
-	getMgr := func(sink gft.UDPReplySink) *udpManager {
-		lastSink.Store(&sink)
-		mgrMu.Lock()
-		defer mgrMu.Unlock()
-		if mgr == nil {
-			mgr, mgrShared = s.getOrCreateUDPManager([8]byte{}, sink)
-		}
-		return mgr
-	}
-	onClientID := func(cid [8]byte) {
-		mgrMu.Lock()
-		defer mgrMu.Unlock()
-		if mgr != nil {
-			return
-		}
-		var sink gft.UDPReplySink
-		if sp := lastSink.Load(); sp != nil {
-			sink = *sp
-		}
-		mgr, mgrShared = s.getOrCreateUDPManager(cid, sink)
-	}
-	_ = gft.ServeQUICConnWithAuth(ctx, qc, s.stego, s.params, onClientID, s.handleDataStream,
-		func(sink gft.UDPReplySink, id uint16, target string, data []byte) {
-			getMgr(sink).handleDatagramSink(sink, id, target, data)
+func (s *Server) serveRTC(ctx context.Context, rs *gftrtc.RTCSession) {
+	cid := rs.ClientID()
+	s.logger.Printf("rtc session opened ssrc=%08x cipher=%s", rs.SSRC(), rs.Stats().Cipher)
+	rs.SetOnBytes(s.stats.Add)
+	mgr, shared := s.getOrCreateUDPManager(cid, rs)
+
+	rs.SetHandlers(
+		func(st *gftrtc.RTCStream, target string, first []byte) {
+			s.handleDataStream(st, target, first)
 		},
-		func(sink gft.UDPReplySink, id uint16) {
-			getMgr(sink).handleClose(id)
+		func(sink gft.UDPReplySink, id uint16, target string, data []byte) {
+			mgr.handleDatagramSink(sink, id, target, data)
+		},
+		func(_ gft.UDPReplySink, id uint16) {
+			mgr.handleClose(id)
 		},
 	)
-	mgrMu.Lock()
-	m := mgr
-	shared := mgrShared
-	mgrMu.Unlock()
-	if m != nil && !shared {
-		m.closeAll()
+
+	select {
+	case <-rs.Done():
+	case <-ctx.Done():
+		rs.Close()
+	}
+	if !shared {
+		mgr.closeAll()
 	}
 }
 

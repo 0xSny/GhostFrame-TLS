@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"ghostframe/internal/gftrtc"
 )
 
 // Ghost Frame v2 commands (8-byte header).
@@ -61,11 +63,8 @@ type UDPHandler func(s *Session, id uint16, target string, data []byte)
 // UDPCloseHandler is invoked when a client closes a UDP association (CmdUDPClose).
 type UDPCloseHandler func(s *Session, id uint16)
 
-// UDPPacket represents a decoded UDP payload received over CmdUDPDatagram.
-type UDPPacket struct {
-	Target string
-	Data   []byte
-}
+// UDPPacket represents a decoded UDP payload received over CmdUDPDatagram or GFT-RTC.
+type UDPPacket = gftrtc.UDPPacket
 
 // StreamInfo is a snapshot of a stream for monitoring.
 type StreamInfo struct {
@@ -142,8 +141,8 @@ func (s *Session) SetExpectedV3Ack(psk []byte, salt []byte) {
 	copy(s.ackSalt[:], salt)
 }
 
-func (s *Session) SetOnParam(f func(Params))               { s.onParam = f }
-func (s *Session) SetOnPing(f func(time.Duration))        { s.onPing = f }
+func (s *Session) SetOnParam(f func(Params))       { s.onParam = f }
+func (s *Session) SetOnPing(f func(time.Duration)) { s.onPing = f }
 func (s *Session) SetUDPHandler(h UDPHandler, c UDPCloseHandler) {
 	s.udpH = h
 	s.udpClose = c
@@ -673,9 +672,9 @@ type UDPStream struct {
 	closeOnce  sync.Once
 }
 
-func (u *UDPStream) ID() uint16               { return u.id }
-func (u *UDPStream) Recv() <-chan UDPPacket   { return u.recvCh }
-func (u *UDPStream) Done() <-chan struct{}    { return u.done }
+func (u *UDPStream) ID() uint16             { return u.id }
+func (u *UDPStream) Recv() <-chan UDPPacket { return u.recvCh }
+func (u *UDPStream) Done() <-chan struct{}  { return u.done }
 
 func (u *UDPStream) push(pkt UDPPacket) {
 	select {

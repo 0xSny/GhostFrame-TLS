@@ -56,12 +56,15 @@ const (
 	hitRouteGlobal
 	hitRouteCore
 	hitTransAuto
-	hitTransQUIC
+	hitTransRTC
 	hitTransTCP
 	hitPortCapsule
 	hitPortSocks
 	hitPortHTTP
 	hitPortSave
+	hitBWUp
+	hitBWDown
+	hitBWSave
 	hitCopyClash
 	hitCopyLink
 	hitClearLogs
@@ -97,9 +100,11 @@ type appUI struct {
 	autoScroll   bool
 	lastLogCount int
 
-	editFocus    int // 0=none, 1=socks5 port, 2=http port
+	editFocus    int // 0=none, 1=socks5 port, 2=http port, 3=bw up mbps, 4=bw down mbps
 	portSocksBuf string
 	portHTTPBuf  string
+	bwUpBuf      string
+	bwDownBuf    string
 
 	toastMu      sync.Mutex
 	toastText    string
@@ -178,7 +183,7 @@ func Run(eng *client.Engine) error {
 	sw, _, _ := pGetSystemMetrics.Call(0)
 	sh, _, _ := pGetSystemMetrics.Call(1)
 	winW := int32(920)
-	winH := int32(640)
+	winH := int32(690)
 	posX := uintptr(cwUseDefault)
 	posY := uintptr(cwUseDefault)
 	if sw > uintptr(winW) && sh > uintptr(winH) {
@@ -187,7 +192,7 @@ func Run(eng *client.Engine) error {
 	}
 	_ = sysDPI
 
-	titlePtr := utf16Ptr("GhostFrame-Pro v3.2.3")
+	titlePtr := utf16Ptr("GhostFrame-Pro v3.4")
 	hwnd, _, err := pCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(clsPtr)),
@@ -263,7 +268,7 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	case wmGetMinMaxInfo:
 		mmi := (*minMaxInfo)(osPtr(lParam))
 		mmi.MinTrackSize.X = a.s(780)
-		mmi.MinTrackSize.Y = a.s(560)
+		mmi.MinTrackSize.Y = a.s(620)
 		return 0
 
 	case wmDpiChanged:
@@ -339,7 +344,8 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 				a.nodeDropOpen = false
 				changed = true
 			}
-			if a.editFocus != 0 && hid != hitPortSocks && hid != hitPortHTTP && hid != hitPortSave && hid != hitPortCapsule {
+			if a.editFocus != 0 && hid != hitPortSocks && hid != hitPortHTTP && hid != hitPortSave && hid != hitPortCapsule &&
+				hid != hitBWUp && hid != hitBWDown && hid != hitBWSave {
 				a.cancelPortEdit()
 				changed = true
 			}
@@ -366,15 +372,24 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		if a.editFocus != 0 {
 			switch wParam {
 			case 0x09: // VK_TAB
-				if a.editFocus == 1 {
+				switch a.editFocus {
+				case 1:
 					a.editFocus = 2
-				} else {
+				case 2:
 					a.editFocus = 1
+				case 3:
+					a.editFocus = 4
+				case 4:
+					a.editFocus = 3
 				}
 				a.invalidate()
 				return 0
 			case 0x0D: // VK_RETURN
-				a.commitPortEdit()
+				if a.editFocus == 3 || a.editFocus == 4 {
+					a.commitBWEdit()
+				} else {
+					a.commitPortEdit()
+				}
 				return 0
 			case 0x1B: // VK_ESCAPE
 				a.cancelPortEdit()
@@ -540,17 +555,23 @@ func portDigits(addr, fallback string) string {
 }
 
 func (a *appUI) syncPortBuffers(st map[string]any) {
-	if a.editFocus != 0 {
+	if a.editFocus == 1 || a.editFocus == 2 {
 		return
 	}
 	a.portSocksBuf = portDigits(strVal(st["socks_addr"]), "10808")
 	a.portHTTPBuf = portDigits(strVal(st["http_addr"]), "10809")
+	if a.editFocus != 3 && a.editFocus != 4 {
+		a.bwUpBuf = strconv.Itoa(intVal(st["up_mbps"]))
+		a.bwDownBuf = strconv.Itoa(intVal(st["down_mbps"]))
+	}
 }
 
 func (a *appUI) beginPortEdit(focus int, st map[string]any) {
 	if a.editFocus == 0 {
 		a.portSocksBuf = portDigits(strVal(st["socks_addr"]), "10808")
 		a.portHTTPBuf = portDigits(strVal(st["http_addr"]), "10809")
+		a.bwUpBuf = strconv.Itoa(intVal(st["up_mbps"]))
+		a.bwDownBuf = strconv.Itoa(intVal(st["down_mbps"]))
 	}
 	a.editFocus = focus
 }
@@ -561,6 +582,8 @@ func (a *appUI) cancelPortEdit() {
 		st := a.eng.Status()
 		a.portSocksBuf = portDigits(strVal(st["socks_addr"]), "10808")
 		a.portHTTPBuf = portDigits(strVal(st["http_addr"]), "10809")
+		a.bwUpBuf = strconv.Itoa(intVal(st["up_mbps"]))
+		a.bwDownBuf = strconv.Itoa(intVal(st["down_mbps"]))
 	}
 }
 
@@ -573,6 +596,18 @@ func (a *appUI) appendPortDigit(d byte) {
 	case 2:
 		if len(a.portHTTPBuf) < 5 {
 			a.portHTTPBuf += string(d)
+		}
+	case 3:
+		if a.bwUpBuf == "0" {
+			a.bwUpBuf = string(d)
+		} else if len(a.bwUpBuf) < 5 {
+			a.bwUpBuf += string(d)
+		}
+	case 4:
+		if a.bwDownBuf == "0" {
+			a.bwDownBuf = string(d)
+		} else if len(a.bwDownBuf) < 5 {
+			a.bwDownBuf += string(d)
 		}
 	}
 }
@@ -587,6 +622,41 @@ func (a *appUI) backspacePortDigit() {
 		if len(a.portHTTPBuf) > 0 {
 			a.portHTTPBuf = a.portHTTPBuf[:len(a.portHTTPBuf)-1]
 		}
+	case 3:
+		if len(a.bwUpBuf) > 0 {
+			a.bwUpBuf = a.bwUpBuf[:len(a.bwUpBuf)-1]
+		}
+	case 4:
+		if len(a.bwDownBuf) > 0 {
+			a.bwDownBuf = a.bwDownBuf[:len(a.bwDownBuf)-1]
+		}
+	}
+}
+
+func (a *appUI) commitBWEdit() {
+	if a.bwUpBuf == "" {
+		a.bwUpBuf = "0"
+	}
+	if a.bwDownBuf == "" {
+		a.bwDownBuf = "0"
+	}
+	up, err1 := strconv.Atoi(a.bwUpBuf)
+	dn, err2 := strconv.Atoi(a.bwDownBuf)
+	if err1 != nil || err2 != nil || up < 0 || up > 65535 || dn < 0 || dn > 65535 {
+		a.setToast("Mbps 目标范围 0-65535 (0=自动)", true)
+		return
+	}
+	if err := a.eng.SetBandwidthLimits(up, dn); err != nil {
+		a.setToast("带宽设置失败: "+err.Error(), true)
+		return
+	}
+	a.editFocus = 0
+	a.bwUpBuf = strconv.Itoa(up)
+	a.bwDownBuf = strconv.Itoa(dn)
+	if up == 0 && dn == 0 {
+		a.setToastSuccess("Smart-Brutal 已设为全自动探测模式")
+	} else {
+		a.setToastSuccess(fmt.Sprintf("Smart-Brutal 目标已应用: ↑%d / ↓%d Mbps", up, dn))
 	}
 }
 
@@ -636,7 +706,8 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 	st := a.eng.Status()
 	state := client.ConnState(strVal(st["state"]))
 	activeIdx := intVal(st["active_node"])
-	if a.editFocus != 0 && k != hitPortSocks && k != hitPortHTTP && k != hitPortSave && k != hitPortCapsule {
+	if a.editFocus != 0 && k != hitPortSocks && k != hitPortHTTP && k != hitPortSave && k != hitPortCapsule &&
+		k != hitBWUp && k != hitBWDown && k != hitBWSave {
 		a.cancelPortEdit()
 	}
 
@@ -698,13 +769,13 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 	case hitTransAuto:
 		go func() {
 			_ = a.eng.SetTransport("auto")
-			a.setToast("传输通道: Auto (QUIC+TCP)", false)
+			a.setToast("传输通道: Auto (GFT-RTC+TCP)", false)
 			a.postRefresh()
 		}()
-	case hitTransQUIC:
+	case hitTransRTC:
 		go func() {
-			_ = a.eng.SetTransport("quic")
-			a.setToast("传输通道: QUIC (极速端口跳跃)", false)
+			_ = a.eng.SetTransport("rtc")
+			a.setToast("传输通道: GFT-RTC (WebRTC拟态/XOR-FEC)", false)
 			a.postRefresh()
 		}()
 	case hitTransTCP:
@@ -719,6 +790,12 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 		a.beginPortEdit(2, st)
 	case hitPortSave:
 		a.commitPortEdit()
+	case hitBWUp:
+		a.beginPortEdit(3, st)
+	case hitBWDown:
+		a.beginPortEdit(4, st)
+	case hitBWSave:
+		a.commitBWEdit()
 	case hitCopyClash:
 		yaml := a.eng.ClashYAML()
 		if SetClipboardText(a.hwnd, yaml) {
@@ -883,7 +960,7 @@ func (a *appUI) drawHeader(rc *rect, st map[string]any, pad int32) {
 	a.buf.fillRoundRect(badgeR.Left, badgeR.Top, badgeR.width(), badgeR.height(), s(12), colCardAlt)
 	a.buf.strokeRoundRect(badgeR.Left, badgeR.Top, badgeR.width(), badgeR.height(), s(12), 1, colBorderHi)
 	badgeCol := colSky
-	if state == client.StateConnected && strings.HasPrefix(mode, "QUIC") {
+	if state == client.StateConnected && strings.HasPrefix(mode, "RTC") {
 		badgeCol = colEmerald
 	}
 	f.drawText(f.fSmall, f.fmtCent, badgeR, badgeCol, mode)
@@ -934,7 +1011,7 @@ func (a *appUI) drawHeroCard(r rect, st map[string]any) {
 	state := client.ConnState(strVal(st["state"]))
 	lastErr := strVal(st["last_err"])
 	pingMs := intVal(st["ping_ms"])
-	quicPort := intVal(st["quic_port"])
+	rtcPort := intVal(st["rtc_port"])
 	conns := intVal(st["active_conns"])
 	verify := strings.ToUpper(strVal(st["verify_mode"]))
 	if verify == "" {
@@ -950,10 +1027,10 @@ func (a *appUI) drawHeroCard(r rect, st map[string]any) {
 		btnText = "●  已加密连接 — 点击断开"
 	case client.StateConnecting:
 		c0, c1 = colBtnWaitA, colBtnWaitB
-		btnText = "◌  正在建立双栈隐写通道..."
+		btnText = "◌  正在建立 GFT-RTC 双栈通道..."
 	default:
 		c0, c1 = colBtnIdleA, colBtnIdleB
-		btnText = "▶  连接安全隧道 (v3.2.3 Apex)"
+		btnText = "▶  连接安全隧道 (v3.4 GFT-RTC)"
 	}
 	if a.hoverID == hitConnect {
 		c0 = lerpColor(c0, 0xFFFFFFFF, 0.10)
@@ -981,8 +1058,8 @@ func (a *appUI) drawHeroCard(r rect, st map[string]any) {
 		rttCol = colEmerald
 	}
 	hopTxt := fmt.Sprintf("TLS %s", verify)
-	if quicPort > 0 {
-		hopTxt = fmt.Sprintf("UDP :%d", quicPort)
+	if rtcPort > 0 {
+		hopTxt = fmt.Sprintf("UDP :%d", rtcPort)
 	}
 	drawMiniStat(0, "通道延迟", rttTxt, rttCol)
 	drawMiniStat(1, "活跃出口", hopTxt, colSky)
@@ -1043,36 +1120,58 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 	)
 
 	// Segmented: Transport Preference
-	y += s(42)
+	y += s(40)
 	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Right - s(16), y + s(18)}, colTextSub, "传输内核")
-	y += s(20)
-	a.drawSeg3(rect{r.Left + s(16), y, r.Right - s(16), y + s(32)},
-		[3]string{"Auto 双栈", "QUIC 极速", "TCP uTLS"},
-		[3]bool{transPref == "auto", transPref == "quic", transPref == "tcp"},
-		[3]hitKind{hitTransAuto, hitTransQUIC, hitTransTCP},
+	y += s(19)
+	a.drawSeg3(rect{r.Left + s(16), y, r.Right - s(16), y + s(30)},
+		[3]string{"Auto 双栈", "RTC 极速", "TCP uTLS"},
+		[3]bool{transPref == "auto", transPref == "rtc" || transPref == "quic", transPref == "tcp"},
+		[3]hitKind{hitTransAuto, hitTransRTC, hitTransTCP},
 		colCyan,
 	)
 
 	// Local Port Custom Edit Row: SOCKS5 [ 10808 ]  HTTP [ 10809 ]  [保存]
-	y += s(42)
+	y += s(38)
 	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Right - s(16), y + s(18)}, colTextSub, "本地端口")
-	y += s(20)
+	y += s(19)
 	px := r.Left + s(16)
-	rowBot := y + s(30)
+	rowBot := y + s(28)
 	f.drawText(f.fSmall, f.fmtLeft, rect{px, y, px + s(48), rowBot}, colTextSub, "SOCKS5")
 	px += s(48)
-	sBox := rect{px, y, px + s(68), rowBot}
+	sBox := rect{px, y, px + s(66), rowBot}
 	a.drawPortBox(sBox, hitPortSocks, a.portSocksBuf, a.editFocus == 1)
 	px = sBox.Right + s(6)
 
 	f.drawText(f.fSmall, f.fmtLeft, rect{px, y, px + s(34), rowBot}, colTextSub, "HTTP")
 	px += s(34)
-	hBox := rect{px, y, px + s(68), rowBot}
+	hBox := rect{px, y, px + s(66), rowBot}
 	a.drawPortBox(hBox, hitPortHTTP, a.portHTTPBuf, a.editFocus == 2)
 	px = hBox.Right + s(6)
 
 	saveR := rect{px, y, r.Right - s(16), rowBot}
 	a.drawButton(saveR, hitPortSave, "保存", colCardAlt, colBorderHi, colCyan)
+
+	// Smart-Brutal Bandwidth Target Row: 上行 [ 0 ] 下行 [ 0 ] Mbps [应用]
+	y = rowBot + s(10)
+	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Right - s(16), y + s(18)}, colTextSub, "Smart-Brutal 带宽 Mbps (0=自动探测)")
+	y += s(19)
+	bx := r.Left + s(16)
+	bwBot := y + s(28)
+	f.drawText(f.fSmall, f.fmtLeft, rect{bx, y, bx + s(34), bwBot}, colTextSub, "上行")
+	bx += s(34)
+	upBox := rect{bx, y, bx + s(62), bwBot}
+	a.drawPortBox(upBox, hitBWUp, a.bwUpBuf, a.editFocus == 3)
+	bx = upBox.Right + s(8)
+
+	f.drawText(f.fSmall, f.fmtLeft, rect{bx, y, bx + s(34), bwBot}, colTextSub, "下行")
+	bx += s(34)
+	dnBox := rect{bx, y, bx + s(62), bwBot}
+	a.drawPortBox(dnBox, hitBWDown, a.bwDownBuf, a.editFocus == 4)
+	bx = dnBox.Right + s(8)
+
+	bwBtn := rect{bx, y, r.Right - s(16), bwBot}
+	a.drawButton(bwBtn, hitBWSave, "应用", colCardAlt, colBorderHi, colEmerald)
+	rowBot = bwBot
 
 	// Bottom Copy Action Row
 	btnY := r.Bottom - s(48)
@@ -1309,7 +1408,7 @@ func classifyLogColor(msg string) uint32 {
 		return colRed
 	case strings.Contains(low, "fallback") || strings.Contains(low, "warn") || strings.Contains(low, "disconnect"):
 		return colAmber
-	case strings.Contains(low, "connected") || strings.Contains(low, "ok") || strings.Contains(low, "quic"):
+	case strings.Contains(low, "connected") || strings.Contains(low, "ok") || strings.Contains(low, "rtc") || strings.Contains(low, "port-hop"):
 		return colEmerald
 	case strings.Contains(low, "utls") || strings.Contains(low, "proxy") || strings.Contains(low, "pool"):
 		return colSky

@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"sync/atomic"
 
+	"ghostframe/internal/gftrtc"
+
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/sys/cpu"
 )
@@ -16,6 +18,7 @@ var lowMemMode atomic.Bool
 // converges max per-stream window from 16MB -> 4MB and shrinks buffer pools.
 func SetLowMemMode(on bool) {
 	lowMemMode.Store(on)
+	gftrtc.SetLowMemMode(on)
 }
 
 // IsLowMemMode reports whether low-memory mode is enabled.
@@ -49,18 +52,9 @@ func EffectiveUDPSocketBuffer() int {
 }
 
 // TuneUDPSocketBuffers enlarges OS read/write buffers on UDP sockets to prevent
-// kernel buffer truncation on high-BDP QUIC links.
+// kernel buffer truncation on high-BDP links.
 func TuneUDPSocketBuffers(pc net.PacketConn) {
-	if pc == nil {
-		return
-	}
-	sz := EffectiveUDPSocketBuffer()
-	if rb, ok := pc.(interface{ SetReadBuffer(int) error }); ok {
-		_ = rb.SetReadBuffer(sz)
-	}
-	if wb, ok := pc.(interface{ SetWriteBuffer(int) error }); ok {
-		_ = wb.SetWriteBuffer(sz)
-	}
+	gftrtc.TuneUDPSocketBuffers(pc)
 }
 
 // PrioritizeChaCha20 returns true on ARM64 SoCs without ARMv8 Crypto/AES instructions
