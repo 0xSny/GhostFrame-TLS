@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# GhostFrame-RTC (GFT) v3.4 Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
+# GhostFrame-RTC (GFT) v3.4.1 Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
 REPO="Spittingjiu/GhostFrame-TLS"
 ROLE="server"
 UNATTENDED=0
@@ -21,7 +21,7 @@ die()  { printf "\033[1;31m[×]\033[0m %s\n" "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-GhostFrame-RTC (GFT) v3.4 Installer
+GhostFrame-RTC (GFT) v3.4.1 Installer
 
 Usage:
   install.sh [options]
@@ -232,19 +232,53 @@ apply_hop_firewall() {
   [[ -n "$range" ]] || return 0
   local lo="${range%-*}"
   local hi="${range#*-}"
+  local exempt_ports=()
+  if command -v ss >/dev/null 2>&1; then
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      if (( p >= lo && p <= hi && p != dst )); then
+        exempt_ports+=("$p")
+      fi
+    done < <(ss -ulnp 2>/dev/null | grep -v 'gft-server' | awk 'NR>1 {print $4}' | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | sort -nu)
+  fi
+
   if command -v nft >/dev/null 2>&1; then
     nft delete table inet gft_hop >/dev/null 2>&1 || true
-    nft -f - <<EOF
-add table inet gft_hop
-add chain inet gft_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }
-add rule inet gft_hop prerouting udp dport ${lo}-${hi} redirect to :${dst}
-EOF
+    {
+      echo "add table inet gft_hop"
+      echo "add chain inet gft_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }"
+      if (( ${#exempt_ports[@]} > 0 )); then
+        local port_set
+        port_set=$(IFS=,; echo "${exempt_ports[*]}")
+        echo "add rule inet gft_hop prerouting udp dport { ${port_set} } return"
+        ok "Preserved co-hosted UDP ports (${port_set}) with nft RETURN exemption"
+      fi
+      echo "add rule inet gft_hop prerouting udp dport ${lo}-${hi} redirect to :${dst}"
+    } | nft -f -
     ok "Configured isolated nftables table inet gft_hop (UDP ${lo}-${hi} -> :${dst})"
   elif command -v iptables >/dev/null 2>&1; then
     iptables -t nat -N GFT_HOP >/dev/null 2>&1 || true
     iptables -t nat -F GFT_HOP
     iptables -t nat -C PREROUTING -j GFT_HOP >/dev/null 2>&1 || iptables -t nat -A PREROUTING -j GFT_HOP
+    if (( ${#exempt_ports[@]} > 0 )); then
+      local i=0 chunk=""
+      for p in "${exempt_ports[@]}"; do
+        chunk="${chunk:+${chunk},}${p}"
+        i=$((i + 1))
+        if (( i % 15 == 0 )); then
+          iptables -t nat -A GFT_HOP -p udp -m multiport --dports "${chunk}" -j RETURN
+          chunk=""
+        fi
+      done
+      if [[ -n "$chunk" ]]; then
+        iptables -t nat -A GFT_HOP -p udp -m multiport --dports "${chunk}" -j RETURN
+      fi
+      ok "Preserved co-hosted UDP ports (${exempt_ports[*]}) with iptables RETURN exemption"
+    fi
     iptables -t nat -A GFT_HOP -p udp --dport "${lo}:${hi}" -j REDIRECT --to-ports "${dst}"
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save >/dev/null 2>&1 || true
+    fi
     ok "Configured isolated iptables chain GFT_HOP (UDP ${lo}:${hi} -> :${dst})"
   fi
 }

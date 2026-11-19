@@ -940,3 +940,171 @@ func TestPTOZeroAmplificationOnBlackhole(t *testing.T) {
 		}
 	}
 }
+
+func TestReplayWindow8192HighThroughputReorder(t *testing.T) {
+	var rw ReplayWindow
+	now := time.Now()
+	rw.Commit(10000, true, now)
+
+	if !rw.Allow(2500) {
+		t.Fatalf("expected pktNum=2500 (delta=7500 < 8192) to be allowed")
+	}
+	rw.Commit(2500, true, now)
+	if rw.Allow(2500) {
+		t.Fatalf("expected duplicate pktNum=2500 to be rejected")
+	}
+	if rw.Allow(1800) {
+		t.Fatalf("expected pktNum=1800 (delta=8200 >= 8192) to be rejected")
+	}
+
+	largest, _, blocks, ok := rw.BuildSACK(now)
+	if !ok || largest != 10000 || len(blocks) != 2 {
+		t.Fatalf("unexpected BuildSACK output: ok=%v largest=%d blocks=%+v", ok, largest, blocks)
+	}
+	if blocks[0] != (SACKBlock{Gap: 0, Len: 1}) || blocks[1] != (SACKBlock{Gap: 7499, Len: 1}) {
+		t.Fatalf("expected wide-gap SACK blocks [(0,1),(7499,1)], got %+v", blocks)
+	}
+}
+
+func TestLossTrackerDeadEntryReclamation(t *testing.T) {
+	lt := NewLossTracker()
+	t0 := time.Now()
+
+	// 1. Retransmitted pn1 resolved immediately when retransmitted pn2 receives SACK
+	lt.OnPacketSent(1, 1200, []ReliableFrame{{Bytes: []byte("f1")}}, t0)
+	lost, _, _, _, _ := lt.PollTimeouts(t0.Add(2 * time.Second))
+	if len(lost) != 1 || lost[0].OriginPN != 1 {
+		t.Fatalf("expected OriginPN=1 on PTO, got %+v", lost)
+	}
+	lt.OnPacketSent(2, 1200, lost, t0.Add(2*time.Second))
+	lt.OnSACK(2, 0, []SACKBlock{{Gap: 0, Len: 1}}, t0.Add(2100*time.Millisecond))
+
+	lt.mu.Lock()
+	_, hasPN1 := lt.sent[1]
+	lt.mu.Unlock()
+	if hasPN1 {
+		t.Fatalf("expected retired pn1 to be removed immediately once pn2 was SACKed")
+	}
+
+	// 2. Retired entry exceeding 2*max(SRTT, 500ms) gets reclaimed cleanly even without SACK
+	lt.OnPacketSent(3, 1200, []ReliableFrame{{Bytes: []byte("f3")}}, t0.Add(3*time.Second))
+	_, _, _, _, _ = lt.PollTimeouts(t0.Add(5 * time.Second))
+	_, _, _, _, _ = lt.PollTimeouts(t0.Add(6200 * time.Millisecond))
+	lt.mu.Lock()
+	_, hasPN3 := lt.sent[3]
+	lt.mu.Unlock()
+	if hasPN3 {
+		t.Fatalf("expected unacked retired pn3 to be swept after grace window")
+	}
+}
+
+type blackholePacketConn struct {
+	addr   lossyAddr
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (b *blackholePacketConn) ReadFrom(_ []byte) (int, net.Addr, error) {
+	<-b.closed
+	return 0, nil, net.ErrClosed
+}
+func (b *blackholePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
+func (b *blackholePacketConn) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+func (b *blackholePacketConn) LocalAddr() net.Addr                { return b.addr }
+func (b *blackholePacketConn) SetDeadline(_ time.Time) error      { return nil }
+func (b *blackholePacketConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (b *blackholePacketConn) SetWriteDeadline(_ time.Time) error { return nil }
+
+func TestMakeBeforeBreakHopRejectsBlackholeAndKeepsTrafficAlive(t *testing.T) {
+	psk := make([]byte, 32)
+	_, _ = rand.Read(psk)
+
+	sw := NewLossyUDPSwitch("127.0.0.1:443", 0, 0, 0, 2*time.Millisecond)
+	defer sw.CloseAll()
+
+	ln, err := NewListener(sw.srvConn, false, psk, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	go func() {
+		for {
+			ss, aerr := ln.Accept(ctx)
+			if aerr != nil {
+				return
+			}
+			ss.SetHandlers(func(st *RTCStream, _ string, first []byte) {
+				defer st.Close()
+				if len(first) > 0 {
+					_, _ = st.Write(first)
+				}
+				_, _ = io.Copy(st, st)
+			}, nil, nil)
+		}
+	}()
+
+	cli, _, err := DialWithPacketConn(ctx, sw.NewClientEnd(), true, sw.srvAddr, DialOptions{
+		Host: "127.0.0.1", Port: 443, PSK: psk, Timeout: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	st, err := cli.OpenStream("mbb.example:443", []byte("ping1:"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	bh := &blackholePacketConn{addr: lossyAddr("127.0.0.1:21423"), closed: make(chan struct{})}
+	if herr := cli.HopWithProbePC(bh, true, lossyAddr("127.0.0.1:21423"), 21423, 150*time.Millisecond); herr == nil {
+		t.Fatalf("expected blackholed candidate port to fail MBB probe")
+	}
+
+	// Original socket MUST remain 100% functional
+	if _, err := st.Write([]byte("alive")); err != nil {
+		t.Fatalf("original socket failed after rejected MBB probe: %v", err)
+	}
+	_ = st.CloseWrite()
+	got, err := io.ReadAll(st)
+	if err != nil || string(got) != "ping1:alive" {
+		t.Fatalf("expected 'ping1:alive' after rejected MBB probe, got %q err=%v", got, err)
+	}
+
+	// Valid MBB candidate MUST promote seamlessly
+	goodEnd := sw.NewClientEnd()
+	if herr := cli.HopWithProbePC(goodEnd, true, sw.srvAddr, 25555, 600*time.Millisecond); herr != nil {
+		t.Fatalf("expected reachable candidate port to pass MBB probe: %v", herr)
+	}
+	if cli.RemotePort() != 25555 {
+		t.Fatalf("expected RemotePort updated to 25555, got %d", cli.RemotePort())
+	}
+}
+
+func TestReplayGuardAndListenerIdleSweep(t *testing.T) {
+	rg := NewReplayGuard()
+	now := int64(1700000000)
+	var tx [12]byte
+	tx[0] = 1
+	pub := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	if !rg.checkAndRecord(tx, pub, now) {
+		t.Fatal("first check should pass")
+	}
+	if rg.Len() != 1 {
+		t.Fatalf("expected Len=1, got %d", rg.Len())
+	}
+	if rem := rg.Sweep(now + 100); rem != 1 {
+		t.Fatalf("expected entry retained at +100s, got rem=%d", rem)
+	}
+	if rem := rg.Sweep(now + stunReplayWindowSec + 1); rem != 0 || rg.Len() != 0 {
+		t.Fatalf("expected expired entry purged after 181s, got rem=%d len=%d", rem, rg.Len())
+	}
+}

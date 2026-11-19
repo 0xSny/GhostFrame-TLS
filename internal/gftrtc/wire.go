@@ -375,6 +375,34 @@ func (g *ReplayGuard) checkAndRecord(txID [12]byte, cliPubPrefix []byte, nowUnix
 	return true
 }
 
+// Sweep deletes all expired handshake entries (older than 180s) and returns remaining count.
+func (g *ReplayGuard) Sweep(nowUnix int64) int {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	g.lastGC = nowUnix
+	for k, exp := range g.seen {
+		if exp <= nowUnix {
+			delete(g.seen, k)
+		}
+	}
+	rem := len(g.seen)
+	g.mu.Unlock()
+	return rem
+}
+
+// Len returns current tracked anti-replay handshake entries.
+func (g *ReplayGuard) Len() int {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	n := len(g.seen)
+	g.mu.Unlock()
+	return n
+}
+
 // SessionKeys holds forward-secret bi-directional AEAD keys, packet-number masks, and IV prefixes.
 type SessionKeys struct {
 	C2SAEAD    cipher.AEAD

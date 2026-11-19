@@ -53,6 +53,9 @@ type Server struct {
 	started       time.Time
 
 	testUDPPC net.PacketConn // optional injection for tests
+	cfgMu     sync.RWMutex
+	cfgPath   string
+	rtcActive atomic.Int64
 	tcpAddrMu sync.RWMutex
 	tcpAddr   net.Addr
 	udpAddr   net.Addr
@@ -63,6 +66,14 @@ type Server struct {
 	udpMgrMu sync.Mutex
 	udpMgrs  map[[8]byte]*udpManager
 	logger   *log.Logger
+}
+
+// SetConfigPath records the path of the active server.json so web panel
+// updates to GFT-RTC settings can be atomically persisted to disk.
+func (s *Server) SetConfigPath(path string) {
+	s.cfgMu.Lock()
+	s.cfgPath = path
+	s.cfgMu.Unlock()
 }
 
 type sessEntry struct {
@@ -108,14 +119,14 @@ func (s *Server) TCPAddr() net.Addr {
 	return s.tcpAddr
 }
 
-// UDPAddr returns the active UDP QUIC listen address once Run has started (nil if QUIC disabled).
+// UDPAddr returns the active GhostFrame-RTC UDP listen address once Run has started (nil if disabled).
 func (s *Server) UDPAddr() net.Addr {
 	s.tcpAddrMu.RLock()
 	defer s.tcpAddrMu.RUnlock()
 	return s.udpAddr
 }
 
-// SetTestUDPConn injects a custom net.PacketConn for QUIC unit tests.
+// SetTestUDPConn injects a custom net.PacketConn for GhostFrame-RTC unit tests.
 func (s *Server) SetTestUDPConn(pc net.PacketConn) {
 	s.testUDPPC = pc
 }
@@ -433,6 +444,8 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) serveRTC(ctx context.Context, rs *gftrtc.RTCSession) {
+	s.rtcActive.Add(1)
+	defer s.rtcActive.Add(-1)
 	cid := rs.ClientID()
 	s.logger.Printf("rtc session opened ssrc=%08x cipher=%s", rs.SSRC(), rs.Stats().Cipher)
 	rs.SetOnBytes(s.stats.Add)

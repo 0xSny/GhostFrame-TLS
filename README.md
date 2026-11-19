@@ -5,18 +5,18 @@
 [![Platform](https://img.shields.io/badge/Platform-Linux%20(amd64%2Farm64)%20|%20Windows%20|%20OpenWrt-blue)](https://github.com/Spittingjiu/GhostFrame-TLS)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-GhostFrame-RTC (v3.4) is a dual-stack (custom `GFT-RTC` over UDP + `uTLS` over TCP) stealth transport proxy written in 100% pure Go (`CGO_ENABLED=0`, zero third-party QUIC dependencies). It features RFC 5389 ICE-STUN authentication, SRTP-mimicked AEAD packet encapsulation, `uint64` word-aligned adaptive XOR-FEC, zero-HOL-blocking SACK multiplexing, `Smart-Brutal` congestion control, zero-feature Pre-TLS origin mirroring, a terminal control center (`gft`), and a native Win32/GDI+ desktop client (`GhostFrame-Pro.exe`).
+GhostFrame-RTC (v3.4.1) is a dual-stack (custom `GFT-RTC` over UDP + `uTLS` over TCP) stealth transport proxy written in 100% pure Go (`CGO_ENABLED=0`, zero third-party QUIC dependencies). It features RFC 5389 ICE-STUN authentication, SRTP-mimicked AEAD packet encapsulation, `uint64` word-aligned adaptive XOR-FEC, zero-HOL-blocking SACK multiplexing, `Smart-Brutal` congestion control, Make-Before-Break port hopping, TCP `:443` circuit-breaker backoff, zero-feature Pre-TLS origin mirroring, a terminal control center (`gft`), a web management console, and a native Win32/GDI+ desktop client (`GhostFrame-Pro.exe`).
 
 ## Features
 
 - **Custom UDP Protocol Engine (`internal/gftrtc`)**:
-  - **WebRTC Wire Mimicry (`wire.go`)**: 1-RTT RFC 5389 ICE-STUN handshake (`Binding Request/Success` with CRC32 `FINGERPRINT` and 180s anti-replay guard) upgrading into RFC 3550 RTP/SRTP data frames (`PT=96/111`, 90kHz clock, AES-128-GCM / ChaCha20-Poly1305 AEAD, masked 8-byte sequence numbers, `sync.Pool` 1600B buffer reuse).
+  - **WebRTC Wire Mimicry (`wire.go`)**: 1-RTT RFC 5389 ICE-STUN handshake (`Binding Request/Success` with CRC32 `FINGERPRINT` and 180s swept anti-replay guard) upgrading into RFC 3550 RTP/SRTP data frames (`PT=96/111`, 90kHz clock, AES-128-GCM / ChaCha20-Poly1305 AEAD, masked 8-byte sequence numbers, `sync.Pool` 1600B buffer reuse).
   - **Adaptive Word-Aligned XOR-FEC (`fec.go`)**: `<1.5%` loss disabled, `1.5%–6%` K=10 parity, `>=6%` K=6 parity with `8 ms` early flush and 64-slot ring 0ms single-packet recovery.
-  - **Zero-HOL-Blocking SACK Mux (`ack_sack.go`, `stream.go`)**: 64-bit packet space, 512-bit sliding replay window, 32-interval SACK, RACK + PTO loss recovery, independent per-stream `4 MB -> 16 MB` flow windows (`1 MB -> 4 MB` in `-low-mem` mode), and fragmented `UDPAssociation` + reliable stream fallback (`> 16 KB`).
+  - **Zero-HOL-Blocking SACK Mux (`ack_sack.go`, `stream.go`)**: 64-bit packet space, `8192`-bit sliding replay window (`>500 ms` high-throughput reorder tolerance), 32-interval SACK, RACK + PTO loss recovery with immediate `OriginPN` dead-entry reclamation, independent per-stream `4 MB -> 16 MB` flow windows (`1 MB -> 4 MB` in `-low-mem` mode), and fragmented `UDPAssociation` + reliable stream fallback (`> 16 KB`).
   - **Smart-Brutal Congestion Control (`cc_smart_brutal.go`)**: Dual-zone latency-gradient controller distinguishing carrier UDP policing (`Zone A`: Auto-Probe `+35%/RTT` SlowStart, `0.95*B_est` Cruise, periodic `+15%` probe, `<=1.35x` compensation) from true queue buildup (`Zone B`: `0.80x` backoff gated on `rho > 1.65 && srtt-minRTT >= 25ms` or `ptoCount >= 3`) with 60fps (`12–16 ms`) micro-burst pacing.
-  - **0ms In-Place Port Hopping (`session.go`)**: Hot-swaps ephemeral UDP sockets (`8 MB` buffers) every `25–50 s` with 3s graceful drain while preserving session identity and outbound `ClientID` NAT bindings.
+  - **Make-Before-Break Port Hopping (`session.go`)**: Probes new candidate UDP sockets (`8 MB` buffers) with AEAD-authenticated `FramePing`/`FramePong` (`600 ms` budget, up to 4 candidates) every `25–50 s` before atomically shifting active traffic with `3 s` graceful drain—falling back seamlessly to the healthy socket if a candidate port is blocked or exempted.
 - **Dual-Stack Scheduler & uTLS Fallback (`internal/gft`)**:
-  - `ApexScheduler` runs `DefaultRTCPoolSize = 2` concurrent GFT-RTC sessions with least-loaded scheduling alongside Chrome PQ `uTLS` + `RecordSplitConn` SNI splitting and isolated `rtcLimiter` / `tcpLimiter` token buckets.
+  - `ApexScheduler` runs `DefaultRTCPoolSize = 2` concurrent GFT-RTC sessions with least-loaded scheduling, proportional manual bandwidth splitting (`max(1, Mbps/N)`), and Chrome PQ `uTLS` + `RecordSplitConn` SNI splitting with an adaptive TCP `:443` circuit breaker (`3` consecutive failures while RTC is healthy back off reconnects `5m -> 15m` with instant RTC failover wakeup).
 - **Active-Probe Immunity (`internal/server`, `internal/sni`)**:
   - Unauthenticated or malformed STUN/RTP packets are silently dropped with zero response bytes.
   - Pre-TLS `SessionID` HMAC verified before TLS completion via `MirrorInspector` and `RewindConn`; unauthorized TCP probes are transparently bridged to a probed non-CDN academic/research origin without key leakage.
@@ -36,10 +36,11 @@ GhostFrame-RTC (v3.4) is a dual-stack (custom `GFT-RTC` over UDP + `uTLS` over T
 ├── internal/
 │   ├── gftrtc/             # Pure-Go GFT-RTC UDP protocol (STUN/SRTP/FEC/SACK/Smart-Brutal)
 │   ├── gft/                # ApexScheduler, RTC bridge, uTLS, Mux, RewindConn, ClientID
+│   ├── qr/                 # Pure-Go offline ISO 18004 QR matrix & SVG generator
 │   ├── client/             # Engine, Rule/Global/Core router, SOCKS5/HTTP, sysproxy
 │   ├── server/             # Server runtime, outbound NAT, embedded stealth panel
 │   ├── sni/                # Non-CDN origin pool & concurrent 4-check prober
-│   ├── tui/                # `gft` interactive TUI, firewall manager, transactional rollback
+│   ├── tui/                # `gft` interactive TUI, co-hosted UDP exemptions, rollback
 │   └── winui/              # Pure-Go Win32/GDI+/DWM/Shell32 UI & system tray
 ├── configs/
 │   └── client.example.json # Sanitized client configuration template

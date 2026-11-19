@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"ghostframe/internal/gft"
+	"ghostframe/internal/qr"
 )
 
 const sessionCookieName = "gft_session"
@@ -216,6 +218,11 @@ func (p *Panel) serveAPI(w http.ResponseWriter, r *http.Request, action string) 
 	case "link":
 		p.handleLink(w, r)
 		return
+	case "rtc":
+		if r.Method == http.MethodGet || r.Method == http.MethodPut || r.Method == http.MethodPost {
+			p.handleRTC(w, r)
+			return
+		}
 	}
 
 	notFound(w)
@@ -285,10 +292,32 @@ func (p *Panel) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	snap := p.srv.stats.Snapshot()
 
+	p.srv.cfgMu.RLock()
+	hopRange := p.srv.cfg.HopRange
+	upMbps := p.srv.cfg.UpMbps
+	downMbps := p.srv.cfg.DownMbps
+	pubHost := p.srv.cfg.PublicHost
+	listen := p.srv.cfg.Listen
+	sni := p.srv.cfg.SNI
+	rtcCfgEnabled := !p.srv.cfg.DisableRTC && !p.srv.cfg.DisableQUIC
+	p.srv.cfgMu.RUnlock()
+
+	rtcEnabled := rtcCfgEnabled && p.srv.UDPAddr() != nil
+	rtcActive := p.srv.rtcActive.Load()
+
 	res := map[string]any{
-		"uptime_sec": int64(time.Since(p.srv.started).Seconds()),
-		"active":     activeCount,
-		"traffic":    snap,
+		"version":     "v3.4.1",
+		"uptime_sec":  int64(time.Since(p.srv.started).Seconds()),
+		"active":      activeCount,
+		"rtc_active":  rtcActive,
+		"rtc_enabled": rtcEnabled,
+		"hop_range":   hopRange,
+		"up_mbps":     upMbps,
+		"down_mbps":   downMbps,
+		"public_host": pubHost,
+		"listen":      listen,
+		"sni":         sni,
+		"traffic":     snap,
 		"system": map[string]any{
 			"alloc_mb":   m.Alloc / 1024 / 1024,
 			"sys_mb":     m.Sys / 1024 / 1024,
@@ -359,16 +388,116 @@ func (p *Panel) handleUpdateParams(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "params": q})
 }
 
+func parsePanelHopRange(spec string) (string, error) {
+	hr := strings.TrimSpace(spec)
+	if hr == "" {
+		return "", nil
+	}
+	parts := strings.Split(hr, "-")
+	if len(parts) != 2 {
+		return "", &jsonError{msg: "hop_range must be empty or min-max (1024 <= min < max <= 65535)"}
+	}
+	lo, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	hi, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || lo < 1024 || hi > 65535 || lo >= hi {
+		return "", &jsonError{msg: "hop_range must satisfy 1024 <= min < max <= 65535"}
+	}
+	return strconv.Itoa(lo) + "-" + strconv.Itoa(hi), nil
+}
+
+type jsonError struct{ msg string }
+
+func (e *jsonError) Error() string { return e.msg }
+
+func (p *Panel) handleRTC(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		p.srv.cfgMu.RLock()
+		res := map[string]any{
+			"rtc_enabled": !p.srv.cfg.DisableRTC && !p.srv.cfg.DisableQUIC && p.srv.UDPAddr() != nil,
+			"rtc_active":  p.srv.rtcActive.Load(),
+			"hop_range":   p.srv.cfg.HopRange,
+			"up_mbps":     p.srv.cfg.UpMbps,
+			"down_mbps":   p.srv.cfg.DownMbps,
+			"tx_mbps":     p.srv.cfg.TxMbps,
+		}
+		p.srv.cfgMu.RUnlock()
+		_ = json.NewEncoder(w).Encode(res)
+		return
+	}
+
+	var req struct {
+		HopRange string `json:"hop_range"`
+		UpMbps   int    `json:"up_mbps"`
+		DownMbps int    `json:"down_mbps"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "bad json"})
+		return
+	}
+	normHop, err := parsePanelHopRange(req.HopRange)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+		return
+	}
+	if req.UpMbps < 0 || req.UpMbps > 65535 || req.DownMbps < 0 || req.DownMbps > 65535 {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "up_mbps and down_mbps must be 0..65535"})
+		return
+	}
+
+	curParams := p.srv.params.Get()
+	p.srv.cfgMu.Lock()
+	oldHop := p.srv.cfg.HopRange
+	oldUp := p.srv.cfg.UpMbps
+	oldDown := p.srv.cfg.DownMbps
+	p.srv.cfg.HopRange = normHop
+	p.srv.cfg.UpMbps = req.UpMbps
+	p.srv.cfg.DownMbps = req.DownMbps
+	if p.srv.cfgPath != "" {
+		if err := SaveConfigAtomic(p.srv.cfgPath, p.srv.cfg); err != nil {
+			p.srv.cfg.HopRange = oldHop
+			p.srv.cfg.UpMbps = oldUp
+			p.srv.cfg.DownMbps = oldDown
+			p.srv.cfgMu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	linkObj := p.srv.cfg.Link(curParams)
+	p.srv.cfgMu.Unlock()
+
+	uri := linkObj.Encode()
+	qrSVG, _ := qr.RenderSVG(uri)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":        true,
+		"hop_range": normHop,
+		"up_mbps":   req.UpMbps,
+		"down_mbps": req.DownMbps,
+		"uri":       uri,
+		"qr_svg":    qrSVG,
+	})
+}
+
 func (p *Panel) handleLink(w http.ResponseWriter, r *http.Request) {
 	curParams := p.srv.params.Get()
+	p.srv.cfgMu.RLock()
 	linkObj := p.srv.cfg.Link(curParams)
+	rawPSK := p.srv.cfg.PSK
+	pin := p.srv.cfg.Pin
+	p.srv.cfgMu.RUnlock()
+
 	uri := linkObj.Encode()
+	qrSVG, _ := qr.RenderSVG(uri)
 
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"uri":     uri,
 		"link":    linkObj,
-		"raw_psk": p.srv.cfg.PSK,
-		"pin":     p.srv.cfg.Pin,
+		"qr_svg":  qrSVG,
+		"raw_psk": rawPSK,
+		"pin":     pin,
 	})
 }
 

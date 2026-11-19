@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -122,4 +123,109 @@ func TestTransactionRunnerAutomaticRollbackOnPortConflict(t *testing.T) {
 		t.Fatalf("expected firewall hop rule restored cleanly, history=%v", fwApplied)
 	}
 	_ = gft.DefaultParams()
+}
+
+func TestParseProcNetUDPPortsAndApplyHopExemptions(t *testing.T) {
+	procSample := `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+   0: 00000000:53AF 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 12345 2 00000000 0
+   1: 00000000:9C3F 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 12346 2 00000000 0
+   2: 00000000:01BB 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 12347 2 00000000 0
+   3: 00000000:7530 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 12348 2 00000000 0`
+	// 0x53AF = 21423, 0x9C3F = 39999, 0x01BB = 443, 0x7530 = 30000 (excluded self port)
+	ports := ParseProcNetUDPPorts(procSample, 20000, 40000, 30000)
+	if len(ports) != 2 || ports[0] != 21423 || ports[1] != 39999 {
+		t.Fatalf("unexpected parsed proc udp ports: %v", ports)
+	}
+
+	ssSample := `State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+UNCONN 0      0            0.0.0.0:21423      0.0.0.0:*    users:(("sing-box",pid=620,fd=12))
+UNCONN 0      0                  *:39999            *:*    users:(("smatrix",pid=619,fd=9))
+UNCONN 0      0                  *:25555            *:*    users:(("gft-server",pid=999,fd=5))`
+	ssPorts := ParseSSUDPOutput(ssSample, 20000, 40000, 443)
+	if len(ssPorts) != 2 || ssPorts[0] != 21423 || ssPorts[1] != 39999 {
+		t.Fatalf("unexpected parsed ss udp ports: %v", ssPorts)
+	}
+
+	// 1. Test iptables mode with >15 occupied ports (verifies multiport chunking <=15 AND RETURN before REDIRECT)
+	var iptCalls []string
+	manyPorts := make([]int, 17)
+	for i := range manyPorts {
+		manyPorts[i] = 21000 + i
+	}
+	fwIPT := &FirewallManager{
+		HasCmdFn: func(name string) bool {
+			return name == "iptables" || name == "netfilter-persistent"
+		},
+		DetectUDPFn: func(lo, hi, excludePort int) []int {
+			return manyPorts
+		},
+		RunCmd: func(name string, args ...string) ([]byte, error) {
+			line := name + " " + strings.Join(args, " ")
+			if name == "iptables" && len(args) >= 4 && args[2] == "-C" {
+				return nil, errors.New("not linked")
+			}
+			iptCalls = append(iptCalls, line)
+			return nil, nil
+		},
+	}
+	if err := fwIPT.ApplyHopRule("20000-40000", 443); err != nil {
+		t.Fatalf("iptables ApplyHopRule failed: %v", err)
+	}
+	joined := strings.Join(iptCalls, "\n")
+	retIdx := strings.Index(joined, "-m multiport --dports")
+	redirIdx := strings.Index(joined, "-j REDIRECT --to-ports 443")
+	if retIdx < 0 || redirIdx < 0 || retIdx >= redirIdx {
+		t.Fatalf("expected multiport RETURN rule strictly before REDIRECT:\n%s", joined)
+	}
+	if !strings.Contains(joined, "-p udp --dport 21015,21016") && !strings.Contains(joined, "-m multiport --dports 21015,21016 -j RETURN") {
+		t.Fatalf("expected second chunk for remaining 2 ports:\n%s", joined)
+	}
+	if !strings.Contains(joined, "netfilter-persistent save") {
+		t.Fatalf("expected netfilter-persistent save call:\n%s", joined)
+	}
+
+	// 2. Test nftables mode emits RETURN set strictly before redirect
+	var nftStdin string
+	fwNFT := &FirewallManager{
+		HasCmdFn: func(name string) bool { return name == "nft" },
+		DetectUDPFn: func(lo, hi, excludePort int) []int {
+			return []int{21423, 39999}
+		},
+		RunCmd: func(name string, args ...string) ([]byte, error) {
+			if name == "nft" && len(args) == 3 && args[0] == "-f" && args[1] == "-" {
+				nftStdin = args[2]
+			}
+			return nil, nil
+		},
+	}
+	if err := fwNFT.ApplyHopRule("20000-40000", 443); err != nil {
+		t.Fatalf("nft ApplyHopRule failed: %v", err)
+	}
+	nftRet := strings.Index(nftStdin, "udp dport { 21423, 39999 } return")
+	nftRedir := strings.Index(nftStdin, "udp dport 20000-40000 redirect to :443")
+	if nftRet < 0 || nftRedir < 0 || nftRet >= nftRedir {
+		t.Fatalf("expected nft RETURN rule before REDIRECT, got:\n%s", nftStdin)
+	}
+}
+
+func TestApplyKernelSysctlWritesAndExecutes(t *testing.T) {
+	confPath := filepath.Join(t.TempDir(), "99-gft-rtc.conf")
+	var cmds []string
+	err := ApplyKernelSysctl(confPath, func(name string, args ...string) ([]byte, error) {
+		cmds = append(cmds, name+" "+strings.Join(args, " "))
+		return []byte("ok"), nil
+	})
+	if err != nil {
+		t.Fatalf("ApplyKernelSysctl failed: %v", err)
+	}
+	raw, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "net.core.rmem_max = 33554432") || !strings.Contains(string(raw), "bbr") {
+		t.Fatalf("unexpected sysctl content:\n%s", string(raw))
+	}
+	if len(cmds) != 2 || !strings.Contains(cmds[0], "sysctl -p "+confPath) || cmds[1] != "sysctl --system" {
+		t.Fatalf("unexpected sysctl commands: %v", cmds)
+	}
 }

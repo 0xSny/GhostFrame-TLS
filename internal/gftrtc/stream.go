@@ -285,9 +285,7 @@ func (s *RTCStream) deliverChunk(seq uint32, data []byte) {
 		}
 		s.Down.Add(uint64(len(data)))
 		s.sess.DownBytes.Add(uint64(len(data)))
-		if s.sess.onBytes != nil {
-			s.sess.onBytes(0, len(data))
-		}
+		s.sess.emitBytes(0, len(data))
 	} else if seq == s.nextReadSeq {
 		s.nextReadSeq++
 	}
@@ -494,9 +492,7 @@ func (s *RTCStream) Write(p []byte) (int, error) {
 		total += writtenNow
 		s.Up.Add(uint64(writtenNow))
 		s.sess.UpBytes.Add(uint64(writtenNow))
-		if s.sess.onBytes != nil {
-			s.sess.onBytes(writtenNow, 0)
-		}
+		s.sess.emitBytes(writtenNow, 0)
 		s.sess.markStreamSendable(s)
 	}
 	return total, nil

@@ -42,12 +42,14 @@ type PoolStats struct {
 // SessionPool manages N concurrent GFT v2 sessions with least-loaded scheduling,
 // smooth connection rotation, in-band RTT measurement, and exponential backoff healing.
 type SessionPool struct {
-	link     *Link
-	ps       *ParamStore
-	size     int
-	dialFn   func(ctx context.Context, l *Link, ps *ParamStore, flags uint16, timeout time.Duration) (*Session, time.Duration, error)
-	onLog    func(string, ...any)
-	onStatus func(PoolStats)
+	link           *Link
+	ps             *ParamStore
+	size           int
+	dialFn         func(ctx context.Context, l *Link, ps *ParamStore, flags uint16, timeout time.Duration) (*Session, time.Duration, error)
+	onLog          func(string, ...any)
+	onStatus       func(PoolStats)
+	shouldCoolDown func() bool
+	wakeCh         chan struct{}
 
 	mu          sync.Mutex
 	entries     []*poolEntry
@@ -79,10 +81,30 @@ func NewSessionPool(l *Link, ps *ParamStore, size int, logf func(string, ...any)
 		size:   size,
 		dialFn: DialSession,
 		onLog:  logf,
+		wakeCh: make(chan struct{}, 1),
 		ctx:    ctx,
 		cancel: cancel,
 	}
 	return p
+}
+
+// SetCooldownGuard registers a predicate indicating whether long circuit-breaker cooldowns
+// should be used when repeated TCP reconnect attempts fail (e.g., while GFT-RTC is healthy).
+func (p *SessionPool) SetCooldownGuard(fn func() bool) {
+	p.mu.Lock()
+	p.shouldCoolDown = fn
+	p.mu.Unlock()
+}
+
+// WakeReconnect interrupts any cooldown sleep so maintainLoop retries TCP immediately.
+func (p *SessionPool) WakeReconnect() {
+	if p == nil || p.wakeCh == nil {
+		return
+	}
+	select {
+	case p.wakeCh <- struct{}{}:
+	default:
+	}
 }
 
 // Start connects the initial pool (waiting until at least 1 session is ready or ctx expires)
@@ -137,6 +159,7 @@ func (p *SessionPool) dialOne(timeout time.Duration) (*poolEntry, time.Duration,
 func (p *SessionPool) maintainLoop() {
 	defer p.wg.Done()
 	backoff := 250 * time.Millisecond
+	consecFails := 0
 	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
 
@@ -170,19 +193,37 @@ func (p *SessionPool) maintainLoop() {
 			dialWG.Wait()
 			if anyOK.Load() {
 				backoff = 250 * time.Millisecond
+				consecFails = 0
 			} else if p.ctx.Err() == nil {
+				consecFails++
+				waitDur := backoff
+				p.mu.Lock()
+				guard := p.shouldCoolDown
+				p.mu.Unlock()
+				if consecFails >= 3 && guard != nil && guard() {
+					waitDur = 5 * time.Minute
+					if consecFails >= 4 {
+						waitDur = 15 * time.Minute
+					}
+				}
 				if msg, ok := lastDialErr.Load().(string); ok {
 					p.mu.Lock()
 					p.lastErr = msg
 					p.mu.Unlock()
 					if p.onLog != nil {
-						p.onLog("Pool reconnect failed (%s), retrying in %v", msg, backoff)
+						p.onLog("Pool reconnect failed (%s), retrying in %v", msg, waitDur)
 					}
 				}
+				timer := time.NewTimer(waitDur)
 				select {
 				case <-p.ctx.Done():
+					timer.Stop()
 					return
-				case <-time.After(backoff):
+				case <-p.wakeCh:
+					timer.Stop()
+					consecFails = 0
+					backoff = 250 * time.Millisecond
+				case <-timer.C:
 				}
 				backoff *= 2
 				if backoff > 5*time.Second {
@@ -195,6 +236,9 @@ func (p *SessionPool) maintainLoop() {
 		select {
 		case <-p.ctx.Done():
 			return
+		case <-p.wakeCh:
+			consecFails = 0
+			backoff = 250 * time.Millisecond
 		case <-t.C:
 		}
 	}

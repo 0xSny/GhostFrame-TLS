@@ -30,6 +30,22 @@ type UDPAssociation interface {
 // UDPReplySink lets server outbound forward UDP responses back over TCP mux or GFT-RTC.
 type UDPReplySink = gftrtc.UDPReplySink
 
+// SplitBandwidthMbps divides total manual bandwidth target across poolSize concurrent
+// GFT-RTC sessions (floor 1 Mbps when totalMbps > 0; 0 preserves Auto-Probe mode).
+func SplitBandwidthMbps(totalMbps, poolSize int) int {
+	if totalMbps <= 0 {
+		return 0
+	}
+	if poolSize <= 1 {
+		return totalMbps
+	}
+	v := totalMbps / poolSize
+	if v < 1 {
+		v = 1
+	}
+	return v
+}
+
 // PickHopPort chooses an initial or hopped UDP port within HopRange or returns Link.Port.
 func PickHopPort(l *Link) int {
 	lo, hi, ok := l.ParseHopRange()

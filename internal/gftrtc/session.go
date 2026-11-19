@@ -18,11 +18,12 @@ import (
 const (
 	numSSRCShards      = 256
 	inboundQueueDepth  = 4096
-	sessionIdleTimeout = 120 * time.Second
+	sessionIdleTimeout = 180 * time.Second
 	keepaliveMinGap    = 18 * time.Second
 	keepaliveMaxGap    = 28 * time.Second
 	closedIDRingSize   = 2048
 	hopOldCloseDelay   = 3 * time.Second
+	hopProbeTimeout    = 600 * time.Millisecond
 )
 
 // StreamHandler handles an incoming reliable GFT-RTC stream.
@@ -53,6 +54,7 @@ type inboundPkt struct {
 	buf  *[]byte
 	n    int
 	addr net.Addr
+	pc   net.PacketConn
 	at   time.Time
 }
 
@@ -122,6 +124,10 @@ type RTCSession struct {
 	remotePort   atomic.Int32
 	oldConns     []net.PacketConn
 
+	probeMu   sync.Mutex
+	probeConn net.PacketConn
+	probeHit  chan struct{}
+
 	inboundCh chan inboundPkt
 	sendKick  chan struct{}
 	ackKick   chan struct{}
@@ -165,7 +171,7 @@ type RTCSession struct {
 	onStream      StreamHandler
 	onUDP         UDPHandler
 	onUDPClose    UDPCloseHandler
-	onBytes       func(up, down int)
+	onBytes       atomic.Pointer[func(up, down int)]
 	handlersReady chan struct{}
 	handlersOnce  sync.Once
 
@@ -278,11 +284,19 @@ func (s *RTCSession) SetHandlers(onStream StreamHandler, onUDP UDPHandler, onUDP
 	s.handlersOnce.Do(func() { close(s.handlersReady) })
 }
 
-// SetOnBytes installs a live byte counter hook (up, down).
+// SetOnBytes installs a live byte counter hook (up, down) lock-freely.
 func (s *RTCSession) SetOnBytes(fn func(up, down int)) {
-	s.mu.Lock()
-	s.onBytes = fn
-	s.mu.Unlock()
+	if fn == nil {
+		s.onBytes.Store(nil)
+		return
+	}
+	s.onBytes.Store(&fn)
+}
+
+func (s *RTCSession) emitBytes(up, down int) {
+	if p := s.onBytes.Load(); p != nil && *p != nil {
+		(*p)(up, down)
+	}
 }
 
 // UpdateBandwidth adjusts the Smart-Brutal pacing target at runtime (0 = Auto-Probe).
@@ -409,7 +423,10 @@ func (s *RTCSession) writeWirePacket(pkt []byte) error {
 	return err
 }
 
-func (s *RTCSession) sealAndWrite(plain []byte, pt uint8, marker bool) (pktNum uint64, wireLen int, err error) {
+func (s *RTCSession) sealAndWriteTo(pc net.PacketConn, raddr net.Addr, plain []byte, pt uint8, marker bool) (pktNum uint64, wireLen int, err error) {
+	if pc == nil || raddr == nil {
+		return 0, 0, ErrSessionClosed
+	}
 	bp := GetPktBuf()
 	defer PutPktBuf(bp)
 	pktNum = s.nextPktNum()
@@ -420,8 +437,18 @@ func (s *RTCSession) sealAndWrite(plain []byte, pt uint8, marker bool) (pktNum u
 		return 0, 0, serr
 	}
 	wireLen = len(sealed)
-	err = s.writeWirePacket(sealed)
+	if _, err = pc.WriteTo(sealed, raddr); err == nil {
+		s.lastSendNs.Store(time.Now().UnixNano())
+	}
 	return pktNum, wireLen, err
+}
+
+func (s *RTCSession) sealAndWrite(plain []byte, pt uint8, marker bool) (pktNum uint64, wireLen int, err error) {
+	s.connMu.RLock()
+	pc := s.curConn
+	raddr := s.curRemote
+	s.connMu.RUnlock()
+	return s.sealAndWriteTo(pc, raddr, plain, pt, marker)
 }
 
 func (s *RTCSession) sendSACKNow() {
@@ -779,6 +806,9 @@ func (s *RTCSession) handleInboundPacket(pkt inboundPkt, dst []byte) {
 	}
 
 	s.lastRecvNs.Store(pkt.at.UnixNano())
+	if s.isClient && pkt.pc != nil {
+		s.notifyProbeHit(pkt.pc)
+	}
 
 	// 0ms Seamless Client Migration on server: authenticated AEAD proved sender owns session keys.
 	if !s.isClient && pkt.addr != nil {
@@ -1042,9 +1072,7 @@ func (s *RTCSession) handleInboundStreamOpen(streamID uint32, target string, fir
 	s.streamCount.Add(1)
 	if len(first) > 0 {
 		s.DownBytes.Add(uint64(len(first)))
-		if s.onBytes != nil {
-			s.onBytes(0, len(first))
-		}
+		s.emitBytes(0, len(first))
 	}
 
 	if target == udpFallbackTarget {
@@ -1152,9 +1180,7 @@ func (s *RTCSession) deliverInboundUDP(assocID uint16, body []byte, now time.Tim
 	}
 	s.lastUDPNs.Store(now.UnixNano())
 	s.DownBytes.Add(uint64(len(data)))
-	if s.onBytes != nil {
-		s.onBytes(0, len(data))
-	}
+	s.emitBytes(0, len(data))
 	cp := make([]byte, len(data))
 	copy(cp, data)
 
@@ -1270,9 +1296,7 @@ func (s *RTCSession) OpenStream(target string, first []byte) (*RTCStream, error)
 	openFrame := encodeFrameStreamOpen(id, ab, inOpen)
 	if len(inOpen) > 0 {
 		s.UpBytes.Add(uint64(len(inOpen)))
-		if s.onBytes != nil {
-			s.onBytes(len(inOpen), 0)
-		}
+		s.emitBytes(len(inOpen), 0)
 	}
 	s.enqueueReliableFrame(openFrame)
 	if len(overflow) > 0 {
@@ -1358,9 +1382,7 @@ func (s *RTCSession) sendUDPPacket(id uint16, target string, data []byte) error 
 	}
 	s.lastUDPNs.Store(time.Now().UnixNano())
 	s.UpBytes.Add(uint64(len(data)))
-	if s.onBytes != nil {
-		s.onBytes(len(data), 0)
-	}
+	s.emitBytes(len(data), 0)
 	return nil
 }
 
@@ -1386,9 +1408,7 @@ func (s *RTCSession) sendUDPOnStream(id uint16, body []byte, origDataLen int) er
 	}
 	s.lastUDPNs.Store(time.Now().UnixNano())
 	s.UpBytes.Add(uint64(origDataLen))
-	if s.onBytes != nil {
-		s.onBytes(origDataLen, 0)
-	}
+	s.emitBytes(origDataLen, 0)
 	return nil
 }
 
@@ -1425,26 +1445,193 @@ send:
 	}
 }
 
-// Hop migrates this client session to a fresh local UDP socket targeting newRemotePort
+func (s *RTCSession) notifyProbeHit(pc net.PacketConn) {
+	s.probeMu.Lock()
+	if s.probeConn == pc && s.probeHit != nil {
+		select {
+		case s.probeHit <- struct{}{}:
+		default:
+		}
+	}
+	s.probeMu.Unlock()
+}
+
+// Hop validates and migrates this client session using Make-Before-Break to newRemotePort
 // with 0ms stream interruption (server auto-migrates remoteAddr upon AEAD verification).
 func (s *RTCSession) Hop(newRemotePort int) error {
-	if !s.isClient || s.host == "" || newRemotePort <= 0 {
-		return errors.New("gftrtc: invalid hop parameters")
+	_, err := s.HopValidated(func() int { return newRemotePort }, 1, hopProbeTimeout)
+	return err
+}
+
+// HopValidated probes candidate destination ports using Make-Before-Break before switching the
+// active socket. If a candidate port fails to respond within probeTimeout, the original healthy
+// socket remains completely uninterrupted and up to maxAttempts candidates are tried.
+func (s *RTCSession) HopValidated(pickPort func() int, maxAttempts int, probeTimeout time.Duration) (int, error) {
+	if !s.isClient || s.host == "" || pickPort == nil {
+		return 0, errors.New("gftrtc: invalid hop parameters")
 	}
-	raddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(s.host, strconv.Itoa(newRemotePort)))
-	if err != nil {
+	if maxAttempts <= 0 {
+		maxAttempts = 4
+	}
+	if probeTimeout <= 0 {
+		probeTimeout = hopProbeTimeout
+	}
+
+	tried := make(map[int]struct{}, maxAttempts)
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		port := pickPort()
+		if maxAttempts > 1 {
+			curPort := s.RemotePort()
+			for retry := 0; retry < 6; retry++ {
+				if _, seen := tried[port]; !seen && port != curPort {
+					break
+				}
+				port = pickPort()
+			}
+		}
+		if port <= 0 {
+			lastErr = errors.New("gftrtc: invalid candidate hop port")
+			continue
+		}
+		tried[port] = struct{}{}
+
+		raddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(s.host, strconv.Itoa(port)))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		network := "udp"
+		if raddr.IP != nil && raddr.IP.To4() != nil {
+			network = "udp4"
+		}
+		candPC, err := net.ListenUDP(network, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		TuneUDPSocketBuffers(candPC)
+		if perr := s.HopWithProbePC(candPC, true, raddr, port, probeTimeout); perr != nil {
+			lastErr = perr
+			continue
+		}
+		return port, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("gftrtc: hop probe exhausted all attempts")
+	}
+	return 0, lastErr
+}
+
+// HopWithProbePC executes Make-Before-Break probing on newPC targeting newRemoteAddr before
+// switching curConn. Active traffic continues on curConn until an AEAD-verified response
+// arrives on newPC within probeTimeout; otherwise newPC is discarded cleanly.
+func (s *RTCSession) HopWithProbePC(newPC net.PacketConn, ownPC bool, newRemoteAddr net.Addr, newRemotePort int, probeTimeout time.Duration) error {
+	if newPC == nil || newRemoteAddr == nil {
+		return errors.New("gftrtc: nil packet conn or remote addr")
+	}
+	if probeTimeout <= 0 {
+		probeTimeout = hopProbeTimeout
+	}
+	select {
+	case <-s.done:
+		if ownPC {
+			_ = newPC.Close()
+		}
+		return ErrSessionClosed
+	default:
+	}
+
+	hitCh := make(chan struct{}, 1)
+	s.probeMu.Lock()
+	s.probeConn = newPC
+	s.probeHit = hitCh
+	s.probeMu.Unlock()
+	defer func() {
+		s.probeMu.Lock()
+		if s.probeConn == newPC {
+			s.probeConn = nil
+			s.probeHit = nil
+		}
+		s.probeMu.Unlock()
+	}()
+
+	go s.clientReadLoop(newPC, ownPC)
+
+	sendProbePing := func() error {
+		pingFrame := encodeFramePingPong(FramePing, time.Now().UnixNano())
+		var plain [FECHeaderLen + 9]byte
+		copy(plain[FECHeaderLen:], pingFrame)
+		_, _, err := s.sealAndWriteTo(newPC, newRemoteAddr, plain[:], PTAudioCtrl, true)
 		return err
 	}
-	network := "udp"
-	if raddr.IP != nil && raddr.IP.To4() != nil {
-		network = "udp4"
-	}
-	newPC, err := net.ListenUDP(network, nil)
-	if err != nil {
+	if err := sendProbePing(); err != nil {
+		if ownPC {
+			_ = newPC.Close()
+		}
 		return err
 	}
-	TuneUDPSocketBuffers(newPC)
-	return s.HopWithPacketConn(newPC, true, raddr, newRemotePort)
+
+	retryAfter := probeTimeout / 3
+	if retryAfter < 40*time.Millisecond {
+		retryAfter = 40 * time.Millisecond
+	}
+	retryTimer := time.NewTimer(retryAfter)
+	timeoutTimer := time.NewTimer(probeTimeout)
+	defer retryTimer.Stop()
+	defer timeoutTimer.Stop()
+
+	for {
+		select {
+		case <-hitCh:
+			s.promoteMigratedSocket(newPC, ownPC, newRemoteAddr, newRemotePort)
+			return nil
+		case <-retryTimer.C:
+			_ = sendProbePing()
+		case <-timeoutTimer.C:
+			if ownPC {
+				_ = newPC.Close()
+			}
+			return errors.New("gftrtc: hop probe timeout")
+		case <-s.done:
+			if ownPC {
+				_ = newPC.Close()
+			}
+			return ErrSessionClosed
+		}
+	}
+}
+
+func (s *RTCSession) promoteMigratedSocket(newPC net.PacketConn, ownPC bool, newRemoteAddr net.Addr, newRemotePort int) {
+	s.connMu.Lock()
+	oldPC := s.curConn
+	oldOwn := s.curOwn
+	s.curConn = newPC
+	s.curOwn = ownPC
+	s.curRemote = newRemoteAddr
+	s.curRemoteStr = newRemoteAddr.String()
+	if ownPC && oldPC != nil && oldOwn && oldPC != newPC {
+		s.oldConns = append(s.oldConns, oldPC)
+	}
+	s.connMu.Unlock()
+	if newRemotePort > 0 {
+		s.remotePort.Store(int32(newRemotePort))
+	}
+	if oldOwn && oldPC != nil && oldPC != newPC {
+		time.AfterFunc(hopOldCloseDelay, func() {
+			s.connMu.Lock()
+			for i, c := range s.oldConns {
+				if c == oldPC {
+					last := len(s.oldConns) - 1
+					s.oldConns[i] = s.oldConns[last]
+					s.oldConns = s.oldConns[:last]
+					break
+				}
+			}
+			s.connMu.Unlock()
+			_ = oldPC.Close()
+		})
+	}
 }
 
 // HopWithPacketConn atomically switches the client session onto newPC targeting newRemoteAddr,
@@ -1462,41 +1649,11 @@ func (s *RTCSession) HopWithPacketConn(newPC net.PacketConn, ownPC bool, newRemo
 	default:
 	}
 
-	s.connMu.Lock()
-	oldPC := s.curConn
-	oldOwn := s.curOwn
-	s.curConn = newPC
-	s.curOwn = ownPC
-	s.curRemote = newRemoteAddr
-	s.curRemoteStr = newRemoteAddr.String()
-	if ownPC && oldPC != nil && oldOwn {
-		s.oldConns = append(s.oldConns, oldPC)
-	}
-	s.connMu.Unlock()
-	if newRemotePort > 0 {
-		s.remotePort.Store(int32(newRemotePort))
-	}
-
+	s.promoteMigratedSocket(newPC, ownPC, newRemoteAddr, newRemotePort)
 	go s.clientReadLoop(newPC, ownPC)
 
 	// Send lightweight Ping frame immediately so even an idle session updates its NAT path at server.
 	s.enqueueCtrlFrame(encodeFramePingPong(FramePing, time.Now().UnixNano()))
-
-	if oldOwn && oldPC != nil {
-		time.AfterFunc(hopOldCloseDelay, func() {
-			s.connMu.Lock()
-			for i, c := range s.oldConns {
-				if c == oldPC {
-					last := len(s.oldConns) - 1
-					s.oldConns[i] = s.oldConns[last]
-					s.oldConns = s.oldConns[:last]
-					break
-				}
-			}
-			s.connMu.Unlock()
-			_ = oldPC.Close()
-		})
-	}
 	return nil
 }
 
@@ -1523,6 +1680,7 @@ func (s *RTCSession) clientReadLoop(pc net.PacketConn, ownPC bool) {
 			buf:  bp,
 			n:    n,
 			addr: addr,
+			pc:   pc,
 			at:   time.Now(),
 		})
 	}
@@ -1752,7 +1910,48 @@ func NewListener(pc net.PacketConn, ownPC bool, psk []byte, serverTxMbps int, pa
 		ln.shards[i].m = make(map[uint32]*RTCSession)
 	}
 	go ln.readLoop()
+	go ln.sweepLoop()
 	return ln, nil
+}
+
+func (l *RTCListener) sweepLoop() {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-l.done:
+			return
+		case now := <-t.C:
+			l.guard.Sweep(now.Unix())
+			var stale []*RTCSession
+			for i := range l.shards {
+				sh := &l.shards[i]
+				sh.mu.RLock()
+				for _, s := range sh.m {
+					lastR := time.Unix(0, s.lastRecvNs.Load())
+					if !s.isClient && now.Sub(lastR) > sessionIdleTimeout {
+						stale = append(stale, s)
+					}
+				}
+				sh.mu.RUnlock()
+			}
+			for _, s := range stale {
+				s.fail(errors.New("gftrtc: listener idle sweep"))
+			}
+		}
+	}
+}
+
+// ActiveSessions returns the number of registered active server sessions across all SSRC shards.
+func (l *RTCListener) ActiveSessions() int {
+	total := 0
+	for i := range l.shards {
+		sh := &l.shards[i]
+		sh.mu.RLock()
+		total += len(sh.m)
+		sh.mu.RUnlock()
+	}
+	return total
 }
 
 func (l *RTCListener) allocSSRC() uint32 {

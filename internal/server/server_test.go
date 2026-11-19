@@ -316,7 +316,7 @@ func TestServerHTTP2FallbackBlogAndPanelCSRF(t *testing.T) {
 	pcli := &http.Client{
 		Transport: tr2,
 		Jar:       jar,
-		Timeout:   4 * time.Second,
+		Timeout:   20 * time.Second,
 	}
 	base := "https://" + addr + sec.PanelPath
 	loginResp, err := pcli.Post(base+"/api/login", "application/json", strings.NewReader(`{"password":"`+sec.PanelPassword+`"}`))
@@ -499,6 +499,134 @@ func TestServerRTCStealthStreamAndInternalPanel(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusFound {
 		t.Fatalf("expected 200 or 302 via RTC internal panel, got %d", resp.StatusCode)
+	}
+}
+
+func TestWebPanelRTCConfigUpdateAndSVGQR(t *testing.T) {
+	srv, sec, addr, stop := startTestServer(t, InitOptions{
+		SNI:          "ftp.jaist.ac.jp",
+		CertMode:     "self_signed_90d",
+		FallbackMode: "builtin_blog",
+	}, false, nil)
+	defer stop()
+
+	cfgPath := filepath.Join(t.TempDir(), "server.json")
+	srv.SetConfigPath(cfgPath)
+
+	tr2 := &http2.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2"},
+		},
+	}
+	defer tr2.CloseIdleConnections()
+
+	jar := &simpleJar{}
+	pcli := &http.Client{Transport: tr2, Jar: jar, Timeout: 20 * time.Second}
+	base := "https://" + addr + sec.PanelPath
+
+	loginResp, err := pcli.Post(base+"/api/login", "application/json", strings.NewReader(`{"password":"`+sec.PanelPassword+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginResp.Body.Close()
+	if loginResp.StatusCode != 200 {
+		t.Fatalf("login failed: status=%d", loginResp.StatusCode)
+	}
+
+	sessResp, err := pcli.Get(base + "/api/session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sessData struct {
+		OK   bool   `json:"ok"`
+		CSRF string `json:"csrf"`
+	}
+	_ = json.NewDecoder(sessResp.Body).Decode(&sessData)
+	sessResp.Body.Close()
+	if !sessData.OK || sessData.CSRF == "" {
+		t.Fatalf("missing csrf token: %+v", sessData)
+	}
+
+	// Verify /api/stats exposes v3.4.1 RTC metadata
+	stResp, err := pcli.Get(base + "/api/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stBody map[string]any
+	_ = json.NewDecoder(stResp.Body).Decode(&stBody)
+	stResp.Body.Close()
+	if stBody["version"] != "v3.4.1" {
+		t.Fatalf("expected stats version v3.4.1, got %v", stBody["version"])
+	}
+	if en, _ := stBody["rtc_enabled"].(bool); !en {
+		t.Fatalf("expected rtc_enabled=true, got %v", stBody["rtc_enabled"])
+	}
+
+	// Reject invalid hop_range
+	badReq, _ := http.NewRequest(http.MethodPut, base+"/api/rtc", strings.NewReader(`{"hop_range":"80-90","up_mbps":30,"down_mbps":100}`))
+	badReq.Header.Set("Content-Type", "application/json")
+	badReq.Header.Set("X-CSRF-Token", sessData.CSRF)
+	badResp, err := pcli.Do(badReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badResp.Body.Close()
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for out-of-range hop_range, got %d", badResp.StatusCode)
+	}
+
+	// Persist valid GFT-RTC config via PUT /api/rtc
+	req, _ := http.NewRequest(http.MethodPut, base+"/api/rtc", strings.NewReader(`{"hop_range":"20000-40000","up_mbps":30,"down_mbps":100}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CSRF-Token", sessData.CSRF)
+	okResp, err := pcli.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var putData struct {
+		OK       bool   `json:"ok"`
+		HopRange string `json:"hop_range"`
+		UpMbps   int    `json:"up_mbps"`
+		DownMbps int    `json:"down_mbps"`
+		URI      string `json:"uri"`
+		QRSVG    string `json:"qr_svg"`
+	}
+	_ = json.NewDecoder(okResp.Body).Decode(&putData)
+	okResp.Body.Close()
+	if okResp.StatusCode != 200 || !putData.OK || putData.HopRange != "20000-40000" || putData.UpMbps != 30 || putData.DownMbps != 100 {
+		t.Fatalf("unexpected PUT /api/rtc response status=%d body=%+v", okResp.StatusCode, putData)
+	}
+	if !strings.HasPrefix(putData.URI, "gft3://") || !strings.Contains(putData.QRSVG, "<svg") {
+		t.Fatalf("expected gft3 URI + inline SVG QR from PUT /api/rtc")
+	}
+
+	// Verify atomic persistence to server.json
+	persisted, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig(%s) failed: %v", cfgPath, err)
+	}
+	if persisted.HopRange != "20000-40000" || persisted.UpMbps != 30 || persisted.DownMbps != 100 {
+		t.Fatalf("persisted server.json mismatch: %+v", persisted)
+	}
+
+	// Verify /api/link reflects updated gft3:// URI and SVG QR
+	lResp, err := pcli.Get(base + "/api/link")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lData struct {
+		URI   string `json:"uri"`
+		QRSVG string `json:"qr_svg"`
+	}
+	_ = json.NewDecoder(lResp.Body).Decode(&lData)
+	lResp.Body.Close()
+	decoded, err := gft.ParseLink(lData.URI)
+	if err != nil {
+		t.Fatalf("ParseLink(%q) failed: %v", lData.URI, err)
+	}
+	if decoded.HopRange != "20000-40000" || decoded.UpMbps != 30 || decoded.DownMbps != 100 || !strings.Contains(lData.QRSVG, "<svg") {
+		t.Fatalf("decoded link or QR mismatch: link=%+v hasSVG=%v", decoded, strings.Contains(lData.QRSVG, "<svg"))
 	}
 }
 

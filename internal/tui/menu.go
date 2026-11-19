@@ -86,7 +86,7 @@ func (c *Controller) pause(sc *bufio.Scanner) {
 func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState string, snap server.RuntimeSnapshot, sniRTT time.Duration) string {
 	b := c.Box
 	var sb strings.Builder
-	sb.WriteString(b.Top("GhostFrame-RTC (GFT) v3.4 Apex 交互控制中心") + "\n")
+	sb.WriteString(b.Top("GhostFrame-RTC (GFT) v3.4.1 Apex 交互控制中心") + "\n")
 
 	svcBadge := b.c("\x1b[31m", "[○] 已停止")
 	if active {
@@ -106,9 +106,10 @@ func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState s
 	}
 
 	port := ConfigListenPort(cfg.Listen)
+	bwBadge := fmt.Sprintf("↑%d / ↓%d Mbps (0=自动)", cfg.UpMbps, cfg.DownMbps)
 	sb.WriteString(b.Line(fmt.Sprintf("服务状态: %s   |  内核拥塞: %s  |  监听端口: %d", svcBadge, bbrState, port)) + "\n")
 	sb.WriteString(b.Line(fmt.Sprintf("双栈传输: %s  |  UDP 跳跃: %s   |  校验模式: %s", rtcBadge, hopBadge, strings.ToUpper(cfg.CertMode))) + "\n")
-	sb.WriteString(b.Line(fmt.Sprintf("伪装域名: %s (本机握手: %s) | 回落: %s", cfg.SNI, rttTxt, cfg.FallbackMode)) + "\n")
+	sb.WriteString(b.Line(fmt.Sprintf("伪装域名: %s (本机握手: %s) | 回落: %s | 默认带宽: %s", cfg.SNI, rttTxt, cfg.FallbackMode, bwBadge)) + "\n")
 	sb.WriteString(b.Line(fmt.Sprintf("实时流量: ↑%s ↓%s (速率 ↑%s/s ↓%s/s) | 拦截探测: %d 次",
 		fmtBytes(snap.TotalUp), fmtBytes(snap.TotalDown),
 		fmtBytes(snap.UpBps), fmtBytes(snap.DownBps), snap.BlockedCount)) + "\n")
@@ -145,9 +146,9 @@ func ShowDeliveryCard(cfgPath string, out io.Writer) error {
 	qr, qerr := RenderTerminalQR(uri, c.Box.UTF8)
 
 	b := c.Box
-	c.printf("%s\n", b.Top("GhostFrame-RTC (GFT) v3.4 多端部署交付卡"))
-	c.printf("%s\n", b.Line(fmt.Sprintf("节点地址: %s:%d   SNI: %s   Hop: %s",
-		cfg.PublicHost, ConfigListenPort(cfg.Listen), cfg.SNI, nonEmpty(cfg.HopRange, "未开启"))))
+	c.printf("%s\n", b.Top("GhostFrame-RTC (GFT) v3.4.1 多端部署交付卡"))
+	c.printf("%s\n", b.Line(fmt.Sprintf("节点地址: %s:%d   SNI: %s   Hop: %s   Smart-Brutal: ↑%d/↓%d Mbps",
+		cfg.PublicHost, ConfigListenPort(cfg.Listen), cfg.SNI, nonEmpty(cfg.HopRange, "未开启"), cfg.UpMbps, cfg.DownMbps)))
 	c.printf("%s\n", b.Bottom())
 
 	c.printf("\n[1] 通用导入链接 (Windows GhostFrame-Pro.exe 按 Ctrl+V 直接导入):\n%s\n", uri)
@@ -412,9 +413,10 @@ func (c *Controller) handlePortAndQUICMenu(sc *bufio.Scanner, cfg *server.Config
 }
 
 func (c *Controller) handleHopMenu(sc *bufio.Scanner, cfg *server.Config) {
-	c.printf("\n--- UDP 动态端口跳跃 (当前: %s) ---\n", nonEmpty(cfg.HopRange, "未开启"))
+	c.printf("\n--- UDP 动态端口跳跃 (当前: %s | 默认导出带宽: ↑%d / ↓%d Mbps) ---\n", nonEmpty(cfg.HopRange, "未开启"), cfg.UpMbps, cfg.DownMbps)
 	c.printf("  [1] 开启 / 修改端口跳跃范围 (例 20000-30000)\n")
 	c.printf("  [2] 关闭 UDP 端口跳跃并清理独立防火墙链\n")
+	c.printf("  [3] 设置导出链接默认 Smart-Brutal 带宽 (up_mbps / down_mbps, 0=自动)\n")
 	sub := c.prompt(sc, "请选择:")
 	switch sub {
 	case "1":
@@ -443,6 +445,25 @@ func (c *Controller) handleHopMenu(sc *bufio.Scanner, cfg *server.Config) {
 			c.errMsg(err.Error())
 		} else {
 			c.okMsg("已关闭 UDP 端口跳跃并销毁 gft_hop 防火墙表")
+		}
+	case "3":
+		upStr := c.prompt(sc, "请输入默认客户端上行 Mbps (0=Auto-Probe, 0..65535):")
+		upVal, err1 := strconv.Atoi(strings.TrimSpace(upStr))
+		downStr := c.prompt(sc, "请输入默认客户端下行 Mbps (0=Auto-Probe, 0..65535):")
+		downVal, err2 := strconv.Atoi(strings.TrimSpace(downStr))
+		if err1 != nil || err2 != nil || upVal < 0 || upVal > 65535 || downVal < 0 || downVal > 65535 {
+			c.errMsg("带宽参数无效，必须为 0..65535 的整数")
+			c.pause(sc)
+			return
+		}
+		if err := c.Tx.Apply(func(nc *server.Config) error {
+			nc.UpMbps = upVal
+			nc.DownMbps = downVal
+			return nil
+		}); err != nil {
+			c.errMsg(err.Error())
+		} else {
+			c.okMsg(fmt.Sprintf("默认 Smart-Brutal 导出带宽已更新为 ↑%d / ↓%d Mbps（下次导出 gft3:// 生效）", upVal, downVal))
 		}
 	}
 	c.pause(sc)
@@ -626,24 +647,10 @@ func (c *Controller) handleSelfCheckMenu(sc *bufio.Scanner, cfg *server.Config) 
 	c.printf("  4. 本机监听套接字状态 (:%d): %v\n", port, CheckPortOccupied(port))
 
 	if strings.EqualFold(c.prompt(sc, "\n是否一键写入 /etc/sysctl.d/99-gft-rtc.conf 并应用 BBR + 32MB UDP 缓冲? [y/N]:"), "y") {
-		sysctlBody := "net.core.default_qdisc = fq\n" +
-			"net.ipv4.tcp_congestion_control = bbr\n" +
-			"net.core.rmem_max = 33554432\n" +
-			"net.core.wmem_max = 33554432\n" +
-			"net.core.rmem_default = 8388608\n" +
-			"net.core.wmem_default = 8388608\n" +
-			"net.ipv4.udp_rmem_min = 65536\n" +
-			"net.ipv4.udp_wmem_min = 65536\n" +
-			"net.core.netdev_max_backlog = 16384\n"
-		if err := server.WriteFileAtomic(SysctlConfPath, []byte(sysctlBody), 0o644); err != nil {
-			c.errMsg(err.Error())
+		if err := ApplyKernelSysctl(SysctlConfPath, nil); err != nil {
+			c.warnMsg(err.Error())
 		} else {
-			out, aerr := exec.Command("sysctl", "--system").CombinedOutput()
-			if aerr != nil {
-				c.warnMsg(string(out))
-			} else {
-				c.okMsg("BBR + fq 与 32MB GFT-RTC UDP 缓冲调优已持久化生效！")
-			}
+			c.okMsg("BBR + fq 与 32MB GFT-RTC UDP 缓冲调优已持久化生效！")
 		}
 	}
 	c.pause(sc)
@@ -691,7 +698,7 @@ func (c *Controller) performOTAUpdate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/"+ReleaseRepo+"/releases/latest", nil)
-	req.Header.Set("User-Agent", "GhostFrame-Updater/3.2")
+	req.Header.Set("User-Agent", "GhostFrame-Updater/3.4.1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err

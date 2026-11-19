@@ -14,7 +14,7 @@ import (
 	"ghostframe/internal/gft"
 )
 
-const version = "v3.4.0"
+const version = "v3.4.1"
 
 func main() {
 	cfgFlag := flag.String("config", "", "optional path to client.json (e.g. /etc/gft/client.json)")
@@ -23,6 +23,8 @@ func main() {
 	httpFlag := flag.String("http", "", "override HTTP proxy listen address (e.g. 127.0.0.1:10809)")
 	routeFlag := flag.String("route", "", "routing mode: rule, global, or direct")
 	transFlag := flag.String("transport", "", "transport preference: auto, rtc, or tcp")
+	upMbpsFlag := flag.Int("up-mbps", -1, "Smart-Brutal target upload Mbps override (>=0, 0=Auto-Probe)")
+	downMbpsFlag := flag.Int("down-mbps", -1, "Smart-Brutal target download Mbps override (>=0, 0=Auto-Probe)")
 	lowMem := flag.Bool("low-mem", false, "enable low-memory router mode (<35MB RSS, 4MB stream windows, ideal for Phicomm N1/S905D)")
 	noSysProxy := flag.Bool("no-sysproxy", false, "disable real system proxy modifications (sandbox mode)")
 	showVer := flag.Bool("version", false, "print gft-core version and hardware capabilities")
@@ -71,6 +73,21 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	if *upMbpsFlag >= 0 || *downMbpsFlag >= 0 {
+		cur := eng.Status()
+		upVal, _ := cur["up_mbps"].(int)
+		downVal, _ := cur["down_mbps"].(int)
+		if *upMbpsFlag >= 0 {
+			upVal = *upMbpsFlag
+		}
+		if *downMbpsFlag >= 0 {
+			downVal = *downMbpsFlag
+		}
+		if err := eng.SetBandwidthLimits(upVal, downVal); err != nil {
+			fmt.Fprintf(os.Stderr, "invalid bandwidth flags: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	if err := eng.StartServers(); err != nil {
 		fmt.Fprintf(os.Stderr, "gft-core start failed: %v\n", err)
@@ -78,14 +95,15 @@ func main() {
 	}
 
 	st := eng.Status()
-	fmt.Printf("gft-core %s started (arch=%s/%s chacha20=%v low_mem=%v socks=%v http=%v)\n",
-		version, runtime.GOOS, runtime.GOARCH, gft.PrioritizeChaCha20(), gft.IsLowMemMode(), st["socks_addr"], st["http_addr"])
+	fmt.Printf("gft-core %s started (arch=%s/%s chacha20=%v low_mem=%v socks=%v http=%v hop=%v up_mbps=%v down_mbps=%v)\n",
+		version, runtime.GOOS, runtime.GOARCH, gft.PrioritizeChaCha20(), gft.IsLowMemMode(), st["socks_addr"], st["http_addr"], st["hop_range"], st["up_mbps"], st["down_mbps"])
 
 	if err := eng.Connect(); err != nil {
 		fmt.Fprintf(os.Stderr, "gft-core initial connect error: %v (will continue running/retrying)\n", err)
 	} else {
 		st = eng.Status()
-		fmt.Printf("gft-core connected via %v (RTT=%vms)\n", st["active_transport"], st["ping_ms"])
+		fmt.Printf("gft-core connected via %v (rtc_port=%v ping=%vms pacing=%.1fMbps fec_recovered=%v)\n",
+			st["active_transport"], st["rtc_port"], st["ping_ms"], st["pacing_mbps"], st["fec_recovered"])
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -19,7 +19,7 @@ import (
 	"ghostframe/internal/tui"
 )
 
-const version = "v3.4.0"
+const version = "v3.4.1"
 
 func main() {
 	base := strings.TrimSuffix(filepath.Base(os.Args[0]), filepath.Ext(os.Args[0]))
@@ -73,6 +73,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		s.SetConfigPath(*conf)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		if err := s.Run(ctx); err != nil {

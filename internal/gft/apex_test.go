@@ -248,25 +248,145 @@ func (s *spyWriteConn) Write(p []byte) (int, error) {
 	return s.Conn.Write(p)
 }
 
+type memStreamConn struct {
+	mu     sync.Mutex
+	buf    []byte
+	closed bool
+	rDead  time.Time
+	sig    chan struct{}
+	done   chan struct{}
+	peer   *memStreamConn
+	local  net.Addr
+	remote net.Addr
+}
+
+func newMemStreamPair() (net.Conn, net.Conn) {
+	a := &memStreamConn{sig: make(chan struct{}, 1), done: make(chan struct{}), local: testTCPAddr("127.0.0.1:10001"), remote: testTCPAddr("127.0.0.1:10002")}
+	b := &memStreamConn{sig: make(chan struct{}, 1), done: make(chan struct{}), local: testTCPAddr("127.0.0.1:10002"), remote: testTCPAddr("127.0.0.1:10001")}
+	a.peer, b.peer = b, a
+	return a, b
+}
+
+type testTCPAddr string
+
+func (a testTCPAddr) Network() string { return "tcp" }
+func (a testTCPAddr) String() string  { return string(a) }
+
+func (m *memStreamConn) Read(p []byte) (int, error) {
+	for {
+		m.mu.Lock()
+		if len(m.buf) > 0 {
+			n := copy(p, m.buf)
+			m.buf = m.buf[n:]
+			m.mu.Unlock()
+			return n, nil
+		}
+		if m.closed {
+			m.mu.Unlock()
+			return 0, io.EOF
+		}
+		dead := m.rDead
+		m.mu.Unlock()
+
+		var timer <-chan time.Time
+		var tObj *time.Timer
+		if !dead.IsZero() {
+			d := time.Until(dead)
+			if d <= 0 {
+				return 0, osDeadlineErr{}
+			}
+			tObj = time.NewTimer(d)
+			timer = tObj.C
+		}
+		select {
+		case <-m.sig:
+			if tObj != nil {
+				tObj.Stop()
+			}
+		case <-m.done:
+			if tObj != nil {
+				tObj.Stop()
+			}
+		case <-timer:
+			return 0, osDeadlineErr{}
+		}
+	}
+}
+
+type osDeadlineErr struct{}
+
+func (osDeadlineErr) Error() string   { return "i/o timeout" }
+func (osDeadlineErr) Timeout() bool   { return true }
+func (osDeadlineErr) Temporary() bool { return true }
+
+func (m *memStreamConn) Write(p []byte) (int, error) {
+	m.mu.Lock()
+	c := m.closed
+	m.mu.Unlock()
+	if c {
+		return 0, net.ErrClosed
+	}
+	m.peer.mu.Lock()
+	if m.peer.closed {
+		m.peer.mu.Unlock()
+		return 0, net.ErrClosed
+	}
+	m.peer.buf = append(m.peer.buf, p...)
+	m.peer.mu.Unlock()
+	select {
+	case m.peer.sig <- struct{}{}:
+	default:
+	}
+	return len(p), nil
+}
+
+func (m *memStreamConn) Close() error {
+	m.mu.Lock()
+	already := m.closed
+	m.closed = true
+	m.mu.Unlock()
+	if !already {
+		close(m.done)
+		m.peer.mu.Lock()
+		m.peer.closed = true
+		m.peer.mu.Unlock()
+		select {
+		case m.peer.sig <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+func (m *memStreamConn) LocalAddr() net.Addr  { return m.local }
+func (m *memStreamConn) RemoteAddr() net.Addr { return m.remote }
+func (m *memStreamConn) SetDeadline(t time.Time) error {
+	return m.SetReadDeadline(t)
+}
+func (m *memStreamConn) SetReadDeadline(t time.Time) error {
+	m.mu.Lock()
+	m.rDead = t
+	m.mu.Unlock()
+	select {
+	case m.sig <- struct{}{}:
+	default:
+	}
+	return nil
+}
+func (m *memStreamConn) SetWriteDeadline(time.Time) error { return nil }
+
 func TestRecordSplitAndStegoSessionIDAndMirrorInspector(t *testing.T) {
 	cert, pin := makeTestCertAndPin(t, "ftp.jaist.ac.jp")
 	psk := make([]byte, 32)
 	_, _ = rand.Read(psk)
 	verifier := NewStegoVerifier(psk)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
+	a, b := newMemStreamPair()
+	defer a.Close()
+	defer b.Close()
 
 	doneSrv := make(chan error, 1)
 	go func() {
-		b, aerr := ln.Accept()
-		if aerr != nil {
-			doneSrv <- aerr
-			return
-		}
 		rc := NewRewindConn(b)
 		if !MirrorInspector(rc, verifier) {
 			doneSrv <- errors.New("mirror inspector failed valid client")
@@ -300,10 +420,6 @@ func TestRecordSplitAndStegoSessionIDAndMirrorInspector(t *testing.T) {
 		doneSrv <- nil
 	}()
 
-	a, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
 	spy := &spyWriteConn{Conn: a}
 	split := NewRecordSplitConn(spy)
 
@@ -319,7 +435,14 @@ func TestRecordSplitAndStegoSessionIDAndMirrorInspector(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := uc.Handshake(); err != nil {
-		t.Fatal(err)
+		_ = a.Close()
+		var srvErr error
+		select {
+		case srvErr = <-doneSrv:
+		case <-time.After(time.Second):
+			srvErr = errors.New("server goroutine timed out")
+		}
+		t.Fatalf("client handshake=%v (srvErr=%v)", err, srvErr)
 	}
 	authFrame, salt, err := BuildClientAuthFrame(psk, time.Now())
 	if err != nil {
@@ -689,5 +812,175 @@ func TestApexSchedulerStripedRTCPoolHopAndSplitLimiters(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	if hopCount.Load() == 0 {
 		t.Fatalf("expected 0ms dynamic socket hop to fire")
+	}
+}
+
+func TestSplitBandwidthAcrossDualRTCSessions(t *testing.T) {
+	if SplitBandwidthMbps(0, 2) != 0 {
+		t.Fatalf("expected 0 Mbps preserved for Auto-Probe")
+	}
+	if got := SplitBandwidthMbps(30, 2); got != 15 {
+		t.Fatalf("expected 30/2=15, got %d", got)
+	}
+	if got := SplitBandwidthMbps(1, 4); got != 1 {
+		t.Fatalf("expected min floor 1 Mbps, got %d", got)
+	}
+
+	sw := newTestUDPSwitch("127.0.0.1:443")
+	defer sw.closeAll()
+
+	link := &Link{
+		V:         3,
+		Host:      "127.0.0.1",
+		Port:      443,
+		SNI:       "ftp.jaist.ac.jp",
+		PSK:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		Verify:    "ca",
+		Transport: "rtc",
+		HopRange:  "20000-40000",
+		UpMbps:    30,
+		DownMbps:  100,
+	}
+	psk, _ := link.PSKBytes()
+
+	ln, err := gftrtc.NewListener(sw.srvConn, false, psk, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for {
+			ss, aerr := ln.Accept(ctx)
+			if aerr != nil {
+				return
+			}
+			go func() { <-ss.Done() }()
+		}
+	}()
+
+	ps := NewParamStore(DefaultParams())
+	sched := NewApexScheduler(link, ps, 1, nil)
+	sched.SetDialJitterForTest(0, 0, 100)
+
+	var seenUp, seenDown []int
+	var seenMu sync.Mutex
+	sched.SetRTCDialHookForTest(func(dialCtx context.Context, dl *Link, dps *ParamStore, hopPort int, timeout time.Duration, clientID [8]byte) (*gftrtc.RTCSession, time.Duration, error) {
+		seenMu.Lock()
+		seenUp = append(seenUp, dl.UpMbps)
+		seenDown = append(seenDown, dl.DownMbps)
+		seenMu.Unlock()
+		return DialRTCWithPacketConnAndID(dialCtx, sw.newClientEnd(), true, sw.srvAddr, hopPort, dl, dps, timeout, clientID)
+	})
+	defer sched.Close()
+
+	if err := sched.Start(3 * time.Second); err != nil {
+		t.Fatalf("sched.Start failed: %v", err)
+	}
+
+	seenMu.Lock()
+	if len(seenUp) != DefaultRTCPoolSize || seenUp[0] != 15 || seenDown[0] != 50 {
+		seenMu.Unlock()
+		t.Fatalf("expected split 15/50 Mbps per session, got up=%v down=%v", seenUp, seenDown)
+	}
+	seenMu.Unlock()
+
+	sched.UpdateBandwidth(40, 120)
+	sched.mu.Lock()
+	for i, sl := range sched.rtcSlots {
+		st := sl.sess.Stats()
+		if st.PacingMbps < 19.0 || st.PacingMbps > 21.0 {
+			sched.mu.Unlock()
+			t.Fatalf("slot %d expected ~20 Mbps pacing after UpdateBandwidth(40,120), got %.2f", i, st.PacingMbps)
+		}
+	}
+	sched.mu.Unlock()
+}
+
+func TestTCPCircuitBreakerCooldownAndInstantRTCFailoverWake(t *testing.T) {
+	sw := newTestUDPSwitch("127.0.0.1:443")
+	defer sw.closeAll()
+
+	link := &Link{
+		V:         3,
+		Host:      "127.0.0.1",
+		Port:      443,
+		SNI:       "ftp.jaist.ac.jp",
+		PSK:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		Verify:    "ca",
+		Transport: "auto",
+	}
+	psk, _ := link.PSKBytes()
+
+	ln, err := gftrtc.NewListener(sw.srvConn, false, psk, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for {
+			ss, aerr := ln.Accept(ctx)
+			if aerr != nil {
+				return
+			}
+			go func() { <-ss.Done() }()
+		}
+	}()
+
+	ps := NewParamStore(DefaultParams())
+	sched := NewApexScheduler(link, ps, 1, nil)
+	sched.SetDialJitterForTest(0, 0, 100)
+	sched.SetTCPBackoffForTest(15*time.Millisecond, 3*time.Second, 6*time.Second)
+	sched.SetHopTimingsForTest(10*time.Second, 10*time.Second, 10*time.Second, 30*time.Millisecond)
+
+	var tcpAttempts atomic.Int32
+	sched.pool.dialFn = func(ctx context.Context, _ *Link, _ *ParamStore, _ uint16, _ time.Duration) (*Session, time.Duration, error) {
+		tcpAttempts.Add(1)
+		return nil, 0, errors.New("tcp port 443 blocked")
+	}
+	sched.SetRTCDialHookForTest(func(dialCtx context.Context, dl *Link, dps *ParamStore, hopPort int, timeout time.Duration, clientID [8]byte) (*gftrtc.RTCSession, time.Duration, error) {
+		return DialRTCWithPacketConnAndID(dialCtx, sw.newClientEnd(), true, sw.srvAddr, hopPort, dl, dps, timeout, clientID)
+	})
+	defer sched.Close()
+
+	if err := sched.Start(time.Second); err != nil {
+		t.Fatalf("sched.Start failed: %v", err)
+	}
+
+	// Wait through 3 fast retries so circuit-breaker opens cooldown (3s)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && tcpAttempts.Load() < 3 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if tcpAttempts.Load() < 3 {
+		t.Fatalf("expected >=3 initial TCP attempts, got %d", tcpAttempts.Load())
+	}
+	countAtCooldown := tcpAttempts.Load()
+	time.Sleep(180 * time.Millisecond)
+	if tcpAttempts.Load() != countAtCooldown {
+		t.Fatalf("expected circuit breaker to pause TCP dials during 3s cooldown, grew %d -> %d", countAtCooldown, tcpAttempts.Load())
+	}
+
+	// Close all RTC sessions and replace dial hook with failing hook so maintainLoop sees 0 healthy RTC sessions
+	sched.SetRTCDialHookForTest(func(_ context.Context, _ *Link, _ *ParamStore, _ int, _ time.Duration, _ [8]byte) (*gftrtc.RTCSession, time.Duration, error) {
+		return nil, 0, errors.New("rtc dead")
+	})
+	sched.mu.Lock()
+	for _, sl := range sched.rtcSlots {
+		sl.sess.Close()
+	}
+	sched.mu.Unlock()
+
+	// TCP circuit breaker MUST wake up immediately (< 350ms, well before 3s cooldown!)
+	wakeDeadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(wakeDeadline) && tcpAttempts.Load() == countAtCooldown {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if tcpAttempts.Load() == countAtCooldown {
+		t.Fatalf("expected immediate TCP failover wakeup when all RTC sessions died")
 	}
 }

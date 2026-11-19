@@ -6,8 +6,8 @@ import (
 )
 
 const (
-	replayWindowBits  = 512
-	replayWindowWords = replayWindowBits / 64 // 8
+	replayWindowBits  = 8192
+	replayWindowWords = replayWindowBits / 64 // 128
 	MaxSACKBlocks     = 32
 	ackDelayMax       = 6 * time.Millisecond
 	lossWinBuckets    = 20
@@ -21,7 +21,7 @@ type SACKBlock struct {
 	Len uint16
 }
 
-// ReplayWindow provides 512-packet anti-replay validation and 32-interval SACK synthesis.
+// ReplayWindow provides 8192-packet anti-replay validation and 32-interval SACK synthesis.
 type ReplayWindow struct {
 	mu            sync.Mutex
 	init          bool
@@ -33,7 +33,7 @@ type ReplayWindow struct {
 	ackPending    bool
 }
 
-// Allow verifies pktNum against the 512-packet sliding anti-replay window WITHOUT mutating state.
+// Allow verifies pktNum against the 8192-packet sliding anti-replay window WITHOUT mutating state.
 // State is only updated by Commit after AEAD verification succeeds.
 func (w *ReplayWindow) Allow(pktNum uint64) bool {
 	if pktNum == 0 {
@@ -147,8 +147,13 @@ func (w *ReplayWindow) BuildSACK(now time.Time) (largest uint64, ackDelayUs uint
 	gap := 0
 	inBlock := false
 	blockLen := 0
-	// Walk from delta=0 (largest) downward
+	// Walk from delta=0 (largest) downward, skipping zero words when searching gaps.
 	for d := 0; d < limit; d++ {
+		if !inBlock && (d&63) == 0 && d+64 <= limit && w.words[d>>6] == 0 {
+			gap += 64
+			d += 63
+			continue
+		}
 		set := (w.words[d>>6] & (uint64(1) << (d & 63))) != 0
 		if set {
 			if !inBlock {
@@ -183,15 +188,18 @@ func (w *ReplayWindow) BuildSACK(now time.Time) (largest uint64, ackDelayUs uint
 
 // ReliableFrame holds serialized reliable payload bytes tied to an in-flight packet for RACK retransmission.
 type ReliableFrame struct {
-	Bytes []byte
+	Bytes    []byte
+	OriginPN uint64
 }
 
 type inFlightPkt struct {
-	pktNum    uint64
-	sentAt    time.Time
-	wireBytes int
-	frames    []ReliableFrame
-	retired   bool
+	pktNum      uint64
+	sentAt      time.Time
+	retiredAt   time.Time
+	wireBytes   int
+	frames      []ReliableFrame
+	retired     bool
+	pendingOrig int
 }
 
 type lossBucket struct {
@@ -421,6 +429,16 @@ func (lt *LossTracker) OnSACK(largestAcked uint64, ackDelayUs uint32, blocks []S
 			return
 		}
 		delete(lt.sent, pn)
+		for _, f := range p.frames {
+			if f.OriginPN != 0 && f.OriginPN != pn {
+				if orig, exists := lt.sent[f.OriginPN]; exists && orig.retired {
+					orig.pendingOrig--
+					if orig.pendingOrig <= 0 {
+						delete(lt.sent, f.OriginPN)
+					}
+				}
+			}
+		}
 		if !p.retired {
 			lt.inFlightBytes -= p.wireBytes
 			if lt.inFlightBytes < 0 {
@@ -470,8 +488,20 @@ func (lt *LossTracker) OnSACK(largestAcked uint64, ackDelayUs uint32, blocks []S
 		rackThresh = minAlt
 	}
 
+	originAgeLimit := lt.srtt
+	if originAgeLimit < 500*time.Millisecond {
+		originAgeLimit = 500 * time.Millisecond
+	}
+	originAgeLimit *= 2
+
 	var lostCount uint32
 	for pn, p := range lt.sent {
+		if p.retired {
+			if now.Sub(p.retiredAt) >= originAgeLimit {
+				delete(lt.sent, pn)
+			}
+			continue
+		}
 		if pn >= lt.largestAcked {
 			continue
 		}
@@ -479,15 +509,16 @@ func (lt *LossTracker) OnSACK(largestAcked uint64, ackDelayUs uint32, blocks []S
 		timeThreshold := now.Sub(p.sentAt) >= rackThresh
 		if pktThreshold || timeThreshold {
 			delete(lt.sent, pn)
-			if !p.retired {
-				lt.inFlightBytes -= p.wireBytes
-				if lt.inFlightBytes < 0 {
-					lt.inFlightBytes = 0
+			lt.inFlightBytes -= p.wireBytes
+			if lt.inFlightBytes < 0 {
+				lt.inFlightBytes = 0
+			}
+			lostCount++
+			for _, f := range p.frames {
+				if f.OriginPN == 0 {
+					f.OriginPN = pn
 				}
-				lostCount++
-				if len(p.frames) > 0 {
-					res.LostFrames = append(res.LostFrames, p.frames...)
-				}
+				res.LostFrames = append(res.LostFrames, f)
 			}
 		}
 	}
@@ -545,42 +576,59 @@ func (lt *LossTracker) PollTimeouts(now time.Time) (lostFrames []ReliableFrame, 
 		rto = 4 * time.Second
 	}
 
+	originAgeLimit := lt.srtt
+	if originAgeLimit < 500*time.Millisecond {
+		originAgeLimit = 500 * time.Millisecond
+	}
+	originAgeLimit *= 2
+
 	var lostCount uint32
 	var hitPTO bool
 	for pn, p := range lt.sent {
 		elapsed := now.Sub(p.sentAt)
+		if p.retired {
+			if now.Sub(p.retiredAt) >= originAgeLimit {
+				delete(lt.sent, pn)
+				lostCount++
+			}
+			continue
+		}
 		rackExpired := pn < lt.largestAcked && elapsed >= rackThresh
 		rtoExpired := elapsed >= rto
 		if rackExpired {
 			delete(lt.sent, pn)
-			if !p.retired {
-				lt.inFlightBytes -= p.wireBytes
-				if lt.inFlightBytes < 0 {
-					lt.inFlightBytes = 0
+			lt.inFlightBytes -= p.wireBytes
+			if lt.inFlightBytes < 0 {
+				lt.inFlightBytes = 0
+			}
+			lostCount++
+			for _, f := range p.frames {
+				if f.OriginPN == 0 {
+					f.OriginPN = pn
 				}
-				lostCount++
-				if len(p.frames) > 0 {
-					lostFrames = append(lostFrames, p.frames...)
-				}
+				lostFrames = append(lostFrames, f)
 			}
 		} else if rtoExpired {
-			if !p.retired {
-				// Retire in-flight credit and transfer frames once; keep pn through one grace RTO
-				// window so late SACKs for the original transmission still calibrate SRTT/minRTT.
-				p.retired = true
-				lt.inFlightBytes -= p.wireBytes
-				if lt.inFlightBytes < 0 {
-					lt.inFlightBytes = 0
+			// Retire in-flight credit and transfer frames once; keep pn briefly for late SACK RTT
+			// calibration or until retransmitted packet SACKs resolve OriginPN / age exceeds 2*max(SRTT,500ms).
+			p.retired = true
+			p.retiredAt = now
+			lt.inFlightBytes -= p.wireBytes
+			if lt.inFlightBytes < 0 {
+				lt.inFlightBytes = 0
+			}
+			hitPTO = true
+			if len(p.frames) > 0 {
+				pending := 0
+				for _, f := range p.frames {
+					if f.OriginPN == 0 {
+						f.OriginPN = pn
+						pending++
+					}
+					lostFrames = append(lostFrames, f)
 				}
-				p.sentAt = now
-				hitPTO = true
-				if len(p.frames) > 0 {
-					lostFrames = append(lostFrames, p.frames...)
-					p.frames = nil
-				}
-			} else {
-				delete(lt.sent, pn)
-				lostCount++
+				p.pendingOrig = pending
+				p.frames = nil
 			}
 		}
 	}

@@ -4,11 +4,13 @@
 *.dll
 *.so
 *.dylib
+*.syso
 *-linux-*
 /gft-client-gui
 /gft-server
 /gft-core
 dist/
+build/
 bin/
 
 # Go test & debug artifacts
@@ -21,6 +23,7 @@ client.json
 server.json
 sysproxy_backup.json
 deploy_record.json
+.gft/
 *.log
 
 # OS metadata

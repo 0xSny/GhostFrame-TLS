@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GhostFrame-TLS Pro &middot; Stealth Node Console</title>
+<title>GhostFrame-RTC v3.4.1 &middot; Stealth Node Console</title>
 <style>
 :root {
   --bg-dark: #0a0e17;
@@ -94,6 +94,26 @@ tr:hover td { background: var(--bg-card-hover); }
   padding: 12px; font-family: monospace; font-size: 12px; color: #38bdf8;
   word-break: break-all; margin-bottom: 12px; user-select: all;
 }
+.export-grid {
+  display: grid;
+  grid-template-columns: 1fr 196px;
+  gap: 20px;
+  align-items: start;
+}
+@media (max-width: 720px) {
+  .export-grid { grid-template-columns: 1fr; }
+}
+.qr-card {
+  background: #ffffff;
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid var(--border-color);
+}
+#qr-box svg { width: 168px; height: 168px; display: block; }
 </style>
 </head>
 <body>
@@ -102,8 +122,8 @@ tr:hover td { background: var(--bg-card-hover); }
     <div class="logo-box">
       <div class="logo-icon">G</div>
       <div>
-        <h1>GhostFrame-TLS Pro <span class="badge badge-green">Stealth Node Active</span></h1>
-        <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">Japan Tokyo VPS &middot; Port 8443 (TLS 1.3 + BBR)</div>
+        <h1>GhostFrame-RTC <span style="color: var(--primary-cyan);">v3.4.1</span> <span id="rtc-badge" class="badge badge-green">GFT-RTC Active</span></h1>
+        <div id="node-subtitle" style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">Loading node profile...</div>
       </div>
     </div>
     <div style="display: flex; gap: 10px; align-items: center;">
@@ -127,7 +147,7 @@ tr:hover td { background: var(--bg-card-hover); }
     <div class="card">
       <div class="card-title">Active Tunnels</div>
       <div class="card-val" id="val-conns" style="color: var(--primary-cyan);">0</div>
-      <div class="card-sub">Multiplexed client sessions</div>
+      <div class="card-sub" id="val-rtc-conns">GFT-RTC UDP: 0 &middot; TCP uTLS: 0</div>
     </div>
     <div class="card">
       <div class="card-title">System & Resources</div>
@@ -170,6 +190,28 @@ tr:hover td { background: var(--bg-card-hover); }
     </div>
   </div>
 
+  <!-- GFT-RTC & Smart-Brutal Configuration Center -->
+  <div class="section-box">
+    <div class="section-title">
+      <span>GFT-RTC &amp; Smart-Brutal Config (Persisted &amp; Reflected in Export Link)</span>
+      <button class="btn btn-primary" onclick="saveRTC()">Save GFT-RTC Settings</button>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>UDP Port Hopping Range (min-max or empty)</label>
+        <input type="text" id="rtc-hop" placeholder="e.g. 20000-40000">
+      </div>
+      <div class="form-group">
+        <label>Default Client Upload Mbps (0 = Auto-Probe)</label>
+        <input type="number" id="rtc-up" min="0" max="65535">
+      </div>
+      <div class="form-group">
+        <label>Default Client Download Mbps (0 = Auto-Probe)</label>
+        <input type="number" id="rtc-down" min="0" max="65535">
+      </div>
+    </div>
+  </div>
+
   <!-- Obfuscation Configuration Center -->
   <div class="section-box">
     <div class="section-title">
@@ -202,14 +244,22 @@ tr:hover td { background: var(--bg-card-hover); }
 
   <!-- Connection & Clash Config -->
   <div class="section-box">
-    <div class="section-title"><span>Node Export & Integration</span></div>
-    <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">Universal GFT v2 Import URI:</div>
-    <div class="code-box" id="link-box">Loading gft2:// link...</div>
-    <button class="btn" onclick="copyText('link-box')">Copy gft2:// Link</button>
-    
-    <div style="margin-top: 18px; font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">Clash Meta / Mihomo Proxy Configuration YAML:</div>
-    <pre class="code-box" id="clash-box" style="white-space: pre;">Loading YAML...</pre>
-    <button class="btn" onclick="copyText('clash-box')">Copy Clash YAML</button>
+    <div class="section-title"><span>Node Export &amp; Integration (GhostFrame-RTC v3.4)</span></div>
+    <div class="export-grid">
+      <div>
+        <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">Universal GhostFrame-RTC (gft3://) Import URI:</div>
+        <div class="code-box" id="link-box">Loading gft3:// link...</div>
+        <button class="btn" onclick="copyText('link-box')">Copy gft3:// Link</button>
+
+        <div style="margin-top: 18px; font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">Clash Meta / Mihomo Proxy Configuration YAML:</div>
+        <pre class="code-box" id="clash-box" style="white-space: pre;">Loading YAML...</pre>
+        <button class="btn" onclick="copyText('clash-box')">Copy Clash YAML</button>
+      </div>
+      <div class="qr-card">
+        <div id="qr-box" title="Offline SVG QR Code"></div>
+        <div style="font-size: 11px; color: #334155; font-weight: 600; margin-top: 8px;">Offline SVG QR &middot; gft3://</div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -251,17 +301,32 @@ async function fetchStats() {
     if (!res.ok) return;
     const data = await res.json();
     document.getElementById('uptime-tag').textContent = 'Uptime: ' + fmtSec(data.uptime_sec);
-    document.getElementById('val-conns').textContent = data.active;
-    
+    const totalActive = (data.active || 0) + (data.rtc_active || 0);
+    document.getElementById('val-conns').textContent = totalActive;
+    document.getElementById('val-rtc-conns').textContent =
+      `GFT-RTC UDP: ${data.rtc_active || 0} · TCP uTLS: ${data.active || 0}`;
+
+    const badge = document.getElementById('rtc-badge');
+    if (data.rtc_enabled) {
+      badge.className = 'badge badge-green';
+      badge.textContent = 'GFT-RTC Active';
+    } else {
+      badge.className = 'badge badge-amber';
+      badge.textContent = 'TCP uTLS Only';
+    }
+    const hopTxt = data.hop_range ? `Hop ${data.hop_range}` : 'Fixed UDP';
+    document.getElementById('node-subtitle').textContent =
+      `${data.public_host || '-'} · ${data.listen || ':443'} (SNI: ${data.sni || '-'} · ${hopTxt} · Up/Down: ${data.up_mbps || 0}/${data.down_mbps || 0} Mbps)`;
+
     const tf = data.traffic;
     document.getElementById('val-speed').textContent = fmtBytes(tf.up_rate + tf.down_rate) + '/s';
     document.getElementById('val-speed-sub').innerHTML = `&uarr; ${fmtBytes(tf.up_rate)}/s &nbsp;&middot;&nbsp; &darr; ${fmtBytes(tf.down_rate)}/s`;
     document.getElementById('val-total').textContent = fmtBytes(tf.up_total + tf.down_total);
     document.getElementById('val-total-sub').textContent = `Sent: ${fmtBytes(tf.down_total)} · Recv: ${fmtBytes(tf.up_total)}`;
-    
+
     document.getElementById('val-mem').textContent = data.system.alloc_mb + ' MB RAM';
     document.getElementById('val-goroutines').textContent = 'Goroutines: ' + data.system.goroutines;
-    
+
     drawChart(tf.hist_up, tf.hist_down);
   } catch (e) {}
 }
@@ -274,7 +339,6 @@ function drawChart(upArr, downArr) {
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
 
-  // Background grid
   ctx.strokeStyle = '#1e293b';
   ctx.lineWidth = 1;
   for (let y = 40; y < h; y += 40) {
@@ -306,8 +370,8 @@ function drawChart(upArr, downArr) {
     ctx.stroke();
   }
 
-  renderLine(upArr, '#a855f7'); // Upload
-  renderLine(downArr, '#00f0ff'); // Download
+  renderLine(upArr, '#a855f7');
+  renderLine(downArr, '#00f0ff');
 }
 
 async function fetchAudit() {
@@ -323,7 +387,7 @@ async function fetchAudit() {
     }
     tbody.innerHTML = list.map(item => {
       const reasons = Object.entries(item.reasons || {}).map(([r, c]) => `${r}(${c})`).join(', ') || 'probe';
-      const banBtn = item.banned 
+      const banBtn = item.banned
         ? `<button class="btn btn-primary" onclick="setBan('${item.ip}', false)">Unban</button>`
         : `<button class="btn btn-danger" onclick="setBan('${item.ip}', true)">Ban IP</button>`;
       return `<tr>
@@ -346,6 +410,39 @@ async function setBan(ip, banned) {
     body: JSON.stringify({ ip, banned })
   });
   fetchAudit();
+}
+
+async function fetchRTC() {
+  try {
+    const res = await fetch('api/rtc');
+    if (!res.ok) return;
+    const d = await res.json();
+    document.getElementById('rtc-hop').value = d.hop_range || '';
+    document.getElementById('rtc-up').value = d.up_mbps || 0;
+    document.getElementById('rtc-down').value = d.down_mbps || 0;
+  } catch (e) {}
+}
+
+async function saveRTC() {
+  const token = await ensureCSRF();
+  const payload = {
+    hop_range: (document.getElementById('rtc-hop').value || '').trim(),
+    up_mbps: parseInt(document.getElementById('rtc-up').value, 10) || 0,
+    down_mbps: parseInt(document.getElementById('rtc-down').value, 10) || 0,
+  };
+  const res = await fetch('api/rtc', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok && data.ok) {
+    await fetchLink();
+    await fetchStats();
+    alert('GFT-RTC settings saved and gft3:// link updated!');
+  } else {
+    alert('Failed to update GFT-RTC settings: ' + (data.error || res.status));
+  }
 }
 
 async function fetchParams() {
@@ -375,8 +472,33 @@ async function saveParams() {
     headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': token },
     body: JSON.stringify(p)
   });
-  if (res.ok) alert('Obfuscation parameters hot-updated successfully!');
-  else alert('Failed to update parameters.');
+  if (res.ok) {
+    await fetchLink();
+    alert('Obfuscation parameters hot-updated successfully!');
+  } else {
+    alert('Failed to update parameters.');
+  }
+}
+
+function renderLinkPayload(data) {
+  linkData = data;
+  document.getElementById('link-box').textContent = data.uri;
+  const qrBox = document.getElementById('qr-box');
+  if (data.qr_svg && data.qr_svg.startsWith('<svg')) {
+    qrBox.innerHTML = data.qr_svg;
+  } else {
+    qrBox.textContent = 'QR unavailable';
+  }
+  const lnk = data.link || {};
+  const hopLine = lnk.hop_range ? `\n  # UDP Hop Range: ${lnk.hop_range}` : '';
+  const bwLine = (lnk.up_mbps || lnk.down_mbps) ? `\n  # Smart-Brutal: up=${lnk.up_mbps || 0}Mbps down=${lnk.down_mbps || 0}Mbps` : '';
+  const clashYaml = `- name: "GhostFrame-RTC-v3.4"
+  type: socks5
+  server: 127.0.0.1
+  port: 10808
+  udp: true
+  # Remote Node: ${lnk.host || '-'}:${lnk.port || 443} (${lnk.verify || 'spki'} · gft3 GFT-RTC)${hopLine}${bwLine}`;
+  document.getElementById('clash-box').textContent = clashYaml;
 }
 
 async function fetchLink() {
@@ -384,16 +506,7 @@ async function fetchLink() {
     const res = await fetch('api/link');
     if (!res.ok) return;
     const data = await res.json();
-    linkData = data;
-    document.getElementById('link-box').textContent = data.uri;
-    
-    const clashYaml = `- name: "GhostFrame-v2-Node"
-  type: socks5
-  server: 127.0.0.1
-  port: 10808
-  udp: true
-  # Remote Node: ${data.link.host}:${data.link.port} (${data.link.verify || 'spki'})`;
-    document.getElementById('clash-box').textContent = clashYaml;
+    renderLinkPayload(data);
   } catch (e) {}
 }
 
@@ -414,6 +527,7 @@ async function logout() {
 ensureCSRF();
 fetchStats();
 fetchAudit();
+fetchRTC();
 fetchParams();
 fetchLink();
 setInterval(fetchStats, 1000);

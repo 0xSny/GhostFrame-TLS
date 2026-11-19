@@ -124,6 +124,12 @@ type ApexScheduler struct {
 	hopMaxAge    time.Duration
 	drainUDPIdle time.Duration
 	maintainTick time.Duration
+	tcpRetryBase time.Duration
+	tcpCoolMin   time.Duration
+	tcpCoolMax   time.Duration
+
+	upMbps   atomic.Int64
+	downMbps atomic.Int64
 
 	mu           sync.Mutex
 	rtcSlots     []*rtcSlot
@@ -137,7 +143,8 @@ type ApexScheduler struct {
 	udpMu       sync.Mutex
 	udpAssocs   map[uint16]*SchedulerUDPAssoc
 
-	rtcRTTMs atomic.Int64
+	rtcRTTMs  atomic.Int64
+	tcpWakeCh chan struct{}
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -172,8 +179,13 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 		minJitMs: 25,
 		maxJitMs: 120,
 	}
+	var schedLink *Link
+	if l != nil {
+		cp := *l
+		schedLink = &cp
+	}
 	a := &ApexScheduler{
-		link:         l,
+		link:         schedLink,
 		ps:           ps,
 		clientID:     cid,
 		limiter:      tcpLim,
@@ -184,11 +196,20 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 		hopMaxAge:    rtcHopMaxAge,
 		drainUDPIdle: rtcDrainUDPIdle,
 		maintainTick: 2 * time.Second,
+		tcpRetryBase: 4 * time.Second,
+		tcpCoolMin:   5 * time.Minute,
+		tcpCoolMax:   15 * time.Minute,
 		udpAssocs:    make(map[uint16]*SchedulerUDPAssoc),
+		tcpWakeCh:    make(chan struct{}, 1),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
-	pool := NewSessionPool(l, ps, tcpPoolSize, logf)
+	if schedLink != nil {
+		a.upMbps.Store(int64(schedLink.UpMbps))
+		a.downMbps.Store(int64(schedLink.DownMbps))
+	}
+	pool := NewSessionPool(schedLink, ps, tcpPoolSize, logf)
+	pool.SetCooldownGuard(a.hasHealthyRTC)
 	pool.dialFn = func(dialCtx context.Context, dl *Link, dps *ParamStore, flags uint16, timeout time.Duration) (*Session, time.Duration, error) {
 		if err := tcpLim.Wait(dialCtx); err != nil {
 			return nil, 0, err
@@ -199,8 +220,9 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 	a.rtcDialFn = func(dialCtx context.Context, dl *Link, dps *ParamStore, port int, timeout time.Duration) (*gftrtc.RTCSession, time.Duration, error) {
 		return DialRTCSessionWithID(dialCtx, dl, dps, port, timeout, a.clientID)
 	}
-	a.rtcHopFn = func(sess *gftrtc.RTCSession, nextPort int) error {
-		return sess.Hop(nextPort)
+	a.rtcHopFn = func(sess *gftrtc.RTCSession, _ int) error {
+		_, err := sess.HopValidated(func() int { return PickHopPort(a.link) }, 4, 600*time.Millisecond)
+		return err
 	}
 	return a
 }
@@ -255,17 +277,64 @@ func (a *ApexScheduler) SetRTCHopHookForTest(fn func(sess *gftrtc.RTCSession, ne
 	a.mu.Unlock()
 }
 
-// UpdateBandwidth updates pacing targets on active GFT-RTC sessions live.
-func (a *ApexScheduler) UpdateBandwidth(upMbps, downMbps int) {
+// SetTCPBackoffForTest overrides initial retry and circuit-breaker cooldown durations for tests.
+func (a *ApexScheduler) SetTCPBackoffForTest(base, coolMin, coolMax time.Duration) {
 	a.mu.Lock()
-	a.link.UpMbps = upMbps
-	a.link.DownMbps = downMbps
+	a.tcpRetryBase = base
+	a.tcpCoolMin = coolMin
+	a.tcpCoolMax = coolMax
+	a.mu.Unlock()
+}
+
+// UpdateBandwidth updates pacing targets on active GFT-RTC sessions live, dividing manual targets evenly.
+func (a *ApexScheduler) UpdateBandwidth(upMbps, downMbps int) {
+	a.upMbps.Store(int64(upMbps))
+	a.downMbps.Store(int64(downMbps))
+	a.mu.Lock()
+	n := len(a.rtcSlots)
+	if n < 1 {
+		n = 1
+	}
+	perUp := SplitBandwidthMbps(upMbps, n)
 	for _, sl := range a.rtcSlots {
 		if sl != nil && sl.sess != nil {
-			sl.sess.UpdateBandwidth(upMbps)
+			sl.sess.UpdateBandwidth(perUp)
 		}
 	}
 	a.mu.Unlock()
+}
+
+func (a *ApexScheduler) hasHealthyRTC() bool {
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, sl := range a.rtcSlots {
+		if sl == nil || sl.sess == nil {
+			continue
+		}
+		select {
+		case <-sl.sess.Done():
+			continue
+		default:
+		}
+		if !sl.degradedAt.IsZero() && now.Sub(sl.degradedAt) < 15*time.Second {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (a *ApexScheduler) wakeTCPTrack() {
+	if a.tcpWakeCh != nil {
+		select {
+		case a.tcpWakeCh <- struct{}{}:
+		default:
+		}
+	}
+	if a.pool != nil {
+		a.pool.WakeReconnect()
+	}
 }
 
 // Start connects initial tracks based on Link.EffectiveTransport ("auto", "rtc", "tcp").
@@ -339,13 +408,57 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 
 func (a *ApexScheduler) retryTCPStartLoop(timeout time.Duration) {
 	defer a.wg.Done()
-	backoff := 4 * time.Second
+	a.mu.Lock()
+	base := a.tcpRetryBase
+	coolMin := a.tcpCoolMin
+	coolMax := a.tcpCoolMax
+	a.mu.Unlock()
+	if base <= 0 {
+		base = 4 * time.Second
+	}
+	if coolMin <= 0 {
+		coolMin = 5 * time.Minute
+	}
+	if coolMax <= 0 {
+		coolMax = 15 * time.Minute
+	}
+
+	backoff := base
+	fails := 1 // Initial synchronous Start() attempt already failed.
+	trippedLogged := false
+
 	for {
-		jit := time.Duration(randRange(200, 1200)) * time.Millisecond
+		var waitDur time.Duration
+		if fails >= 3 && a.hasHealthyRTC() {
+			waitDur = coolMin
+			if fails >= 4 {
+				waitDur = coolMax
+			}
+			if !trippedLogged {
+				trippedLogged = true
+				if a.onLog != nil {
+					a.onLog("TCP :%d track circuit-breaker open after %d failures while RTC is healthy; cooling %v", a.link.Port, fails, waitDur)
+				}
+			}
+		} else {
+			jit := time.Duration(randRange(50, 400)) * time.Millisecond
+			if base < 200*time.Millisecond {
+				jit = 0
+			}
+			waitDur = backoff + jit
+		}
+
+		timer := time.NewTimer(waitDur)
 		select {
 		case <-a.ctx.Done():
+			timer.Stop()
 			return
-		case <-time.After(backoff + jit):
+		case <-a.tcpWakeCh:
+			timer.Stop()
+			fails = 0
+			backoff = base
+			trippedLogged = false
+		case <-timer.C:
 		}
 		if a.ctx.Err() != nil {
 			return
@@ -353,6 +466,7 @@ func (a *ApexScheduler) retryTCPStartLoop(timeout time.Duration) {
 		if err := a.pool.Start(timeout); err == nil {
 			return
 		}
+		fails++
 		backoff *= 2
 		if backoff > 60*time.Second {
 			backoff = 60 * time.Second
@@ -377,9 +491,14 @@ func (a *ApexScheduler) dialOneRTCSlot(timeout time.Duration) (*rtcSlot, error) 
 		return nil, err
 	}
 	port := PickHopPort(a.link)
+	poolN := a.rtcPoolTarget()
+	scaledLink := *a.link
+	scaledLink.UpMbps = SplitBandwidthMbps(int(a.upMbps.Load()), poolN)
+	scaledLink.DownMbps = SplitBandwidthMbps(int(a.downMbps.Load()), poolN)
+
 	dialCtx, cancel := context.WithTimeout(a.ctx, timeout)
 	defer cancel()
-	sess, hs, err := a.rtcDialFn(dialCtx, a.link, a.ps, port, timeout)
+	sess, hs, err := a.rtcDialFn(dialCtx, &scaledLink, a.ps, port, timeout)
 	if err != nil {
 		a.mu.Lock()
 		a.lastErr = err.Error()
@@ -508,22 +627,28 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 			a.rtcSlots = keepSlots
 			missing := target - len(keepSlots)
 			hopFn := a.rtcHopFn
+			allRTCDown := len(keepSlots) == 0
 			a.mu.Unlock()
 
-			// Execute 0ms in-place socket port-hop migration (zero stream interruption!)
+			if allRTCDown {
+				a.wakeTCPTrack()
+			}
+
+			// Execute Make-Before-Break 0ms socket port-hop migration (zero stream interruption!)
 			for _, sl := range dueHop {
 				oldPort := sl.sess.RemotePort()
 				nextPort := PickHopPort(a.link)
 				if err := hopFn(sl.sess, nextPort); err == nil {
+					actualPort := sl.sess.RemotePort()
 					a.mu.Lock()
 					sl.lastHopAt = time.Now()
 					sl.maxAge = a.randomHopAge()
 					a.mu.Unlock()
 					if a.onLog != nil {
-						a.onLog("RTC 0ms Port-Hop migrated (UDP :%d -> :%d)", oldPort, nextPort)
+						a.onLog("RTC Make-Before-Break Port-Hop migrated (UDP :%d -> :%d)", oldPort, actualPort)
 					}
 				} else if a.onLog != nil {
-					a.onLog("RTC Port-Hop notice: %v", err)
+					a.onLog("RTC Port-Hop notice (stayed on UDP :%d): %v", oldPort, err)
 				}
 			}
 
@@ -553,6 +678,19 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 					}()
 				}
 				wg.Wait()
+				if up := int(a.upMbps.Load()); up > 0 {
+					a.mu.Lock()
+					n := len(a.rtcSlots)
+					if n > 0 {
+						perUp := SplitBandwidthMbps(up, n)
+						for _, sl := range a.rtcSlots {
+							if sl != nil && sl.sess != nil {
+								sl.sess.UpdateBandwidth(perUp)
+							}
+						}
+					}
+					a.mu.Unlock()
+				}
 				if dialErr != nil {
 					a.mu.Lock()
 					curLen := len(a.rtcSlots)
@@ -635,6 +773,9 @@ func (a *ApexScheduler) markRTCDegraded(r *gftrtc.RTCSession, err error) {
 		}
 	}
 	a.mu.Unlock()
+	if !a.hasHealthyRTC() {
+		a.wakeTCPTrack()
+	}
 }
 
 // OpenStream routes a TCP tunnel stream over GFT-RTC striped pool when healthy,

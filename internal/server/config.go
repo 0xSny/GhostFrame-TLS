@@ -48,6 +48,8 @@ type Config struct {
 	DisableRTC       bool        `json:"disable_rtc,omitempty"`
 	DisableQUIC      bool        `json:"disable_quic,omitempty"` // legacy alias for DisableRTC
 	TxMbps           int         `json:"tx_mbps,omitempty"`      // optional server Smart-Brutal max TX Mbps (0 = Auto)
+	UpMbps           int         `json:"up_mbps,omitempty"`      // default exported client Smart-Brutal uplink Mbps (0 = Auto)
+	DownMbps         int         `json:"down_mbps,omitempty"`    // default exported client Smart-Brutal downlink Mbps (0 = Auto)
 	Params           *gft.Params `json:"params,omitempty"`
 	PanelPath        string      `json:"panel_path"` // e.g. /gft-panel-xxxxxxxx
 	PanelHash        string      `json:"panel_hash"` // bcrypt
@@ -476,8 +478,10 @@ func (c *Config) Link(p gft.Params) *gft.Link {
 		Transport: "auto",
 		SplitSNI:  true,
 		HopRange:  c.HopRange,
+		UpMbps:    c.UpMbps,
+		DownMbps:  c.DownMbps,
 		Params:    &p,
-		Remark:    "GhostFrame-v3-Apex",
+		Remark:    "GhostFrame-RTC-v3.4",
 	}
 }
 
