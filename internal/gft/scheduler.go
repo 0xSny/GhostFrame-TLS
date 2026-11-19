@@ -11,6 +11,7 @@ import (
 )
 
 const (
+	DefaultQUICPoolSize = 3
 	quicHopMinAge       = 35 * time.Second
 	quicHopMaxAge       = 65 * time.Second
 	quicDrainUDPIdle    = 15 * time.Second
@@ -94,38 +95,45 @@ type ApexStats struct {
 	LastErr       string `json:"last_err"`
 }
 
+type quicSlot struct {
+	sess       *QUICSession
+	createdAt  time.Time
+	maxAge     time.Duration
+	degradedAt time.Time
+}
+
 type drainingQUIC struct {
-	sess      *QUICSession
+	sess       *QUICSession
 	drainingAt time.Time
 }
 
-// ApexScheduler races and coordinates QUIC Dual-Track (with dynamic port hopping
-// and fragmented RFC 9221 Datagrams) alongside the uTLS SessionPool, providing 0ms
-// failover and cross-hop ClientID NAT port preservation.
+// ApexScheduler races and coordinates a Striped QUIC Dual-Track pool (with dynamic port
+// hopping and fragmented RFC 9221 Datagrams) alongside the uTLS SessionPool, providing
+// 0ms failover and cross-hop ClientID NAT port preservation.
 type ApexScheduler struct {
-	link       *Link
-	ps         *ParamStore
-	clientID   [8]byte
-	limiter    *DialLimiter
-	pool       *SessionPool
-	onLog      func(string, ...any)
-	quicDialFn func(ctx context.Context, l *Link, ps *ParamStore, port int, timeout time.Duration) (*QUICSession, time.Duration, error)
+	link        *Link
+	ps          *ParamStore
+	clientID    [8]byte
+	limiter     *DialLimiter // alias of tcpLimiter for test compatibility
+	tcpLimiter  *DialLimiter
+	quicLimiter *DialLimiter
+	pool        *SessionPool
+	onLog       func(string, ...any)
+	quicDialFn  func(ctx context.Context, l *Link, ps *ParamStore, port int, timeout time.Duration) (*QUICSession, time.Duration, error)
 
 	hopMinAge    time.Duration
 	hopMaxAge    time.Duration
 	drainUDPIdle time.Duration
 	maintainTick time.Duration
 
-	mu            sync.Mutex
-	quicActive    *QUICSession
-	quicCreatedAt time.Time
-	quicMaxAge    time.Duration
-	quicDrain     []*drainingQUIC
-	quicDegraded  time.Time
-	retiredQUp    uint64
-	retiredQDown  uint64
-	lastErr       string
+	mu           sync.Mutex
+	quicSlots    []*quicSlot
+	quicDrain    []*drainingQUIC
+	retiredQUp   uint64
+	retiredQDown uint64
+	lastErr      string
 
+	quicRR      atomic.Uint64
 	nextAssocID atomic.Uint32
 	udpMu       sync.Mutex
 	udpAssocs   map[uint16]*SchedulerUDPAssoc
@@ -156,12 +164,22 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 		cid = DefaultClientID
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	lim := NewDialLimiter()
+	tcpLim := NewDialLimiter()
+	quicLim := &DialLimiter{
+		tokens:   4,
+		cap:      4,
+		rate:     4,
+		last:     time.Now(),
+		minJitMs: 25,
+		maxJitMs: 120,
+	}
 	a := &ApexScheduler{
 		link:         l,
 		ps:           ps,
 		clientID:     cid,
-		limiter:      lim,
+		limiter:      tcpLim,
+		tcpLimiter:   tcpLim,
+		quicLimiter:  quicLim,
 		onLog:        logf,
 		hopMinAge:    quicHopMinAge,
 		hopMaxAge:    quicHopMaxAge,
@@ -173,7 +191,7 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 	}
 	pool := NewSessionPool(l, ps, tcpPoolSize, logf)
 	pool.dialFn = func(dialCtx context.Context, dl *Link, dps *ParamStore, flags uint16, timeout time.Duration) (*Session, time.Duration, error) {
-		if err := lim.Wait(dialCtx); err != nil {
+		if err := tcpLim.Wait(dialCtx); err != nil {
 			return nil, 0, err
 		}
 		return DialSessionWithID(dialCtx, dl, dps, flags, timeout, a.clientID)
@@ -183,6 +201,13 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 		return DialQUICSessionWithID(dialCtx, dl, dps, port, timeout, a.clientID)
 	}
 	return a
+}
+
+func (a *ApexScheduler) quicPoolTarget() int {
+	if _, _, hasHop := a.link.ParseHopRange(); hasHop {
+		return DefaultQUICPoolSize
+	}
+	return 2
 }
 
 // ClientID returns the 8-byte session-group identifier used for server NAT preservation.
@@ -200,17 +225,19 @@ func (a *ApexScheduler) SetHopTimingsForTest(minAge, maxAge, drainUDPIdle, tick 
 
 // SetDialJitterForTest overrides dial rate-limiter jitter and rate for tests.
 func (a *ApexScheduler) SetDialJitterForTest(minMs, maxMs int, rate float64) {
-	a.limiter.mu.Lock()
-	a.limiter.minJitMs = minMs
-	a.limiter.maxJitMs = maxMs
-	if rate > 0 {
-		a.limiter.rate = rate
-		if rate > a.limiter.cap {
-			a.limiter.cap = rate
-			a.limiter.tokens = rate
+	for _, lim := range []*DialLimiter{a.tcpLimiter, a.quicLimiter} {
+		lim.mu.Lock()
+		lim.minJitMs = minMs
+		lim.maxJitMs = maxMs
+		if rate > 0 {
+			lim.rate = rate
+			if rate > lim.cap {
+				lim.cap = rate
+				lim.tokens = rate
+			}
 		}
+		lim.mu.Unlock()
 	}
-	a.limiter.mu.Unlock()
 }
 
 // SetQUICDialHookForTest overrides the QUIC dial function used by the scheduler.
@@ -326,9 +353,9 @@ func (a *ApexScheduler) randomHopAge() time.Duration {
 	return time.Duration(randRange(minMs, maxMs)) * time.Millisecond
 }
 
-func (a *ApexScheduler) dialQUICNow(timeout time.Duration) error {
-	if err := a.limiter.Wait(a.ctx); err != nil {
-		return err
+func (a *ApexScheduler) dialOneQUICSlot(timeout time.Duration) (*quicSlot, error) {
+	if err := a.quicLimiter.Wait(a.ctx); err != nil {
+		return nil, err
 	}
 	port := PickHopPort(a.link)
 	dialCtx, cancel := context.WithTimeout(a.ctx, timeout)
@@ -338,7 +365,11 @@ func (a *ApexScheduler) dialQUICNow(timeout time.Duration) error {
 		a.mu.Lock()
 		a.lastErr = err.Error()
 		a.mu.Unlock()
-		return err
+		return nil, err
+	}
+	if a.ctx.Err() != nil {
+		qs.Close()
+		return nil, a.ctx.Err()
 	}
 	ms := hs.Milliseconds()
 	if ms <= 0 {
@@ -346,21 +377,61 @@ func (a *ApexScheduler) dialQUICNow(timeout time.Duration) error {
 	}
 	a.quicRTTMs.Store(ms)
 
-	hopAge := a.randomHopAge()
 	now := time.Now()
-	a.mu.Lock()
-	if a.quicActive != nil {
-		a.quicDrain = append(a.quicDrain, &drainingQUIC{sess: a.quicActive, drainingAt: now})
+	slot := &quicSlot{
+		sess:      qs,
+		createdAt: now,
+		maxAge:    a.randomHopAge(),
 	}
-	a.quicActive = qs
-	a.quicCreatedAt = now
-	a.quicMaxAge = hopAge
-	a.quicDegraded = time.Time{}
-	a.mu.Unlock()
-
 	if a.onLog != nil {
 		a.onLog("QUIC Dual-Track connected (UDP :%d, RTT=%dms)", port, ms)
 	}
+	return slot, nil
+}
+
+func (a *ApexScheduler) dialQUICNow(timeout time.Duration) error {
+	target := a.quicPoolTarget()
+	if target <= 1 {
+		target = 1
+	}
+
+	var wg sync.WaitGroup
+	var resMu sync.Mutex
+	var slots []*quicSlot
+	var lastErr error
+	for i := 0; i < target; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sl, err := a.dialOneQUICSlot(timeout)
+			resMu.Lock()
+			if err == nil && sl != nil {
+				slots = append(slots, sl)
+			} else if err != nil {
+				lastErr = err
+			}
+			resMu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	if len(slots) == 0 {
+		if lastErr == nil {
+			lastErr = errors.New("gft: quic pool dial failed")
+		}
+		return lastErr
+	}
+
+	a.mu.Lock()
+	if a.closed || a.ctx.Err() != nil {
+		a.mu.Unlock()
+		for _, sl := range slots {
+			sl.sess.Close()
+		}
+		return context.Canceled
+	}
+	a.quicSlots = append(a.quicSlots, slots...)
+	a.mu.Unlock()
 	return nil
 }
 
@@ -383,30 +454,24 @@ func (a *ApexScheduler) quicMaintainLoop() {
 		case <-a.ctx.Done():
 			return
 		case <-pingTicker.C:
-			a.mu.Lock()
-			q := a.quicActive
-			a.mu.Unlock()
+			q := a.activeQUICForSend()
 			if q != nil {
-				select {
-				case <-q.Done():
-				default:
-					if rtt, err := q.ProbeRTT(4 * time.Second); err == nil {
-						ms := rtt.Milliseconds()
-						if ms <= 0 {
-							ms = 1
-						}
-						a.quicRTTMs.Store(ms)
+				if rtt, err := q.ProbeRTT(4 * time.Second); err == nil {
+					ms := rtt.Milliseconds()
+					if ms <= 0 {
+						ms = 1
 					}
+					a.quicRTTMs.Store(ms)
 				}
 			}
 		case <-t.C:
 			now := time.Now()
+			target := a.quicPoolTarget()
+			_, _, hasHop := a.link.ParseHopRange()
+
 			a.mu.Lock()
-			q := a.quicActive
-			created := a.quicCreatedAt
-			maxAge := a.quicMaxAge
 			drainUDPIdle := a.drainUDPIdle
-			var alive []*drainingQUIC
+			var aliveDrain []*drainingQUIC
 			for _, dq := range a.quicDrain {
 				select {
 				case <-dq.sess.Done():
@@ -424,38 +489,85 @@ func (a *ApexScheduler) quicMaintainLoop() {
 						a.retiredQDown += dq.sess.DownBytes.Load()
 						dq.sess.Close()
 					} else {
-						alive = append(alive, dq)
+						aliveDrain = append(aliveDrain, dq)
 					}
 				}
 			}
-			a.quicDrain = alive
+			a.quicDrain = aliveDrain
+
+			var keepSlots []*quicSlot
+			var expiredHopSlots []*quicSlot
+			for _, sl := range a.quicSlots {
+				select {
+				case <-sl.sess.Done():
+					a.retiredQUp += sl.sess.UpBytes.Load()
+					a.retiredQDown += sl.sess.DownBytes.Load()
+				default:
+					if hasHop && now.Sub(sl.createdAt) >= sl.maxAge {
+						expiredHopSlots = append(expiredHopSlots, sl)
+					} else {
+						keepSlots = append(keepSlots, sl)
+					}
+				}
+			}
+			a.quicSlots = keepSlots
+			missing := target - len(keepSlots)
 			a.mu.Unlock()
 
-			needDial := false
-			isHop := false
-			if q == nil {
-				needDial = true
-			} else {
-				select {
-				case <-q.Done():
-					a.mu.Lock()
-					a.retiredQUp += q.UpBytes.Load()
-					a.retiredQDown += q.DownBytes.Load()
-					if a.quicActive == q {
-						a.quicActive = nil
+			// Rotate expired hop slots seamlessly: dial replacement before draining old slot
+			for _, oldSl := range expiredHopSlots {
+				newSl, err := a.dialOneQUICSlot(6 * time.Second)
+				a.mu.Lock()
+				if err == nil && newSl != nil && !a.closed {
+					a.quicSlots = append(a.quicSlots, newSl)
+					a.quicDrain = append(a.quicDrain, &drainingQUIC{sess: oldSl.sess, drainingAt: time.Now()})
+				} else {
+					if newSl != nil {
+						newSl.sess.Close()
 					}
-					a.mu.Unlock()
-					needDial = true
-				default:
-					if _, _, hasHop := a.link.ParseHopRange(); hasHop && time.Since(created) >= maxAge {
-						needDial = true
-						isHop = true
+					// Keep old slot alive if hop dial failed unless already closed
+					select {
+					case <-oldSl.sess.Done():
+						a.retiredQUp += oldSl.sess.UpBytes.Load()
+						a.retiredQDown += oldSl.sess.DownBytes.Load()
+					default:
+						a.quicSlots = append(a.quicSlots, oldSl)
 					}
 				}
+				a.mu.Unlock()
 			}
-			if needDial {
-				if err := a.dialQUICNow(6 * time.Second); err != nil {
-					if !isHop {
+
+			// Top up any missing slots in parallel
+			if missing > 0 {
+				var dialErr error
+				var wg sync.WaitGroup
+				var dMu sync.Mutex
+				for i := 0; i < missing; i++ {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						sl, err := a.dialOneQUICSlot(6 * time.Second)
+						if err != nil {
+							dMu.Lock()
+							dialErr = err
+							dMu.Unlock()
+							return
+						}
+						a.mu.Lock()
+						if !a.closed && a.ctx.Err() == nil {
+							a.quicSlots = append(a.quicSlots, sl)
+						} else {
+							sl.sess.Close()
+						}
+						a.mu.Unlock()
+					}()
+				}
+				wg.Wait()
+				if dialErr != nil {
+					a.mu.Lock()
+					curLen := len(a.quicSlots)
+					a.mu.Unlock()
+					if curLen == 0 {
 						select {
 						case <-a.ctx.Done():
 							return
@@ -478,19 +590,36 @@ func (a *ApexScheduler) activeQUICForSend() *QUICSession {
 	if a.link.EffectiveTransport() == "tcp" {
 		return nil
 	}
+	now := time.Now()
 	a.mu.Lock()
-	q := a.quicActive
-	degraded := a.quicDegraded
+	var best *QUICSession
+	bestStreams := int(^uint(0) >> 1)
+	n := len(a.quicSlots)
+	start := 0
+	if n > 1 {
+		start = int(a.quicRR.Add(1)-1) % n
+	}
+	for i := 0; i < n; i++ {
+		sl := a.quicSlots[(start+i)%n]
+		if sl == nil || sl.sess == nil {
+			continue
+		}
+		select {
+		case <-sl.sess.Done():
+			continue
+		default:
+		}
+		if !sl.degradedAt.IsZero() && now.Sub(sl.degradedAt) < 15*time.Second {
+			continue
+		}
+		sc := sl.sess.NumStreams()
+		if best == nil || sc < bestStreams {
+			best = sl.sess
+			bestStreams = sc
+		}
+	}
 	a.mu.Unlock()
-	if q == nil {
-		return nil
-	}
-	select {
-	case <-q.Done():
-		return nil
-	default:
-	}
-	if !degraded.IsZero() && time.Since(degraded) < 15*time.Second {
+	if best == nil {
 		return nil
 	}
 	if a.link.EffectiveTransport() == "auto" {
@@ -500,15 +629,19 @@ func (a *ApexScheduler) activeQUICForSend() *QUICSession {
 			return nil
 		}
 	}
-	return q
+	return best
 }
 
 func (a *ApexScheduler) markQUICDegraded(q *QUICSession, err error) {
+	now := time.Now()
 	a.mu.Lock()
-	if a.quicActive == q {
-		a.quicDegraded = time.Now()
-		if err != nil {
-			a.lastErr = err.Error()
+	for _, sl := range a.quicSlots {
+		if sl != nil && sl.sess == q {
+			sl.degradedAt = now
+			if err != nil {
+				a.lastErr = err.Error()
+			}
+			break
 		}
 	}
 	a.mu.Unlock()
@@ -748,20 +881,23 @@ func (u *SchedulerUDPAssoc) Close() error {
 func (a *ApexScheduler) Stats() ApexStats {
 	ps := a.pool.Stats()
 	a.mu.Lock()
-	q := a.quicActive
 	qUp, qDown := a.retiredQUp, a.retiredQDown
-	var qPort, qStreams int
-	qAlive := false
-	if q != nil {
-		select {
-		case <-q.Done():
-		default:
-			qAlive = true
-			qPort = q.RemotePort()
-			qStreams = q.NumStreams()
+	var qPort, qStreams, qAliveCount int
+	for _, sl := range a.quicSlots {
+		if sl == nil || sl.sess == nil {
+			continue
 		}
-		qUp += q.UpBytes.Load()
-		qDown += q.DownBytes.Load()
+		select {
+		case <-sl.sess.Done():
+		default:
+			qAliveCount++
+			if qPort == 0 {
+				qPort = sl.sess.RemotePort()
+			}
+			qStreams += sl.sess.NumStreams()
+		}
+		qUp += sl.sess.UpBytes.Load()
+		qDown += sl.sess.DownBytes.Load()
 	}
 	for _, dq := range a.quicDrain {
 		qUp += dq.sess.UpBytes.Load()
@@ -778,9 +914,9 @@ func (a *ApexScheduler) Stats() ApexStats {
 	tRTT := ps.RTTMs
 	mode := "Starting"
 	bestRTT := tRTT
-	conns := ps.ActiveConns + ps.DrainingConns
+	conns := ps.ActiveConns + ps.DrainingConns + qAliveCount
+	qAlive := qAliveCount > 0
 	if qAlive {
-		conns++
 		if a.activeQUICForSend() != nil {
 			mode = "QUIC"
 			if qRTT > 0 {
@@ -830,10 +966,12 @@ func (a *ApexScheduler) Close() {
 	}
 
 	a.mu.Lock()
-	if a.quicActive != nil {
-		a.quicActive.Close()
-		a.quicActive = nil
+	for _, sl := range a.quicSlots {
+		if sl != nil && sl.sess != nil {
+			sl.sess.Close()
+		}
 	}
+	a.quicSlots = nil
 	for _, dq := range a.quicDrain {
 		dq.sess.Close()
 	}

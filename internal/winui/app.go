@@ -5,6 +5,7 @@ package winui
 import (
 	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -57,6 +58,10 @@ const (
 	hitTransAuto
 	hitTransQUIC
 	hitTransTCP
+	hitPortCapsule
+	hitPortSocks
+	hitPortHTTP
+	hitPortSave
 	hitCopyClash
 	hitCopyLink
 	hitClearLogs
@@ -92,10 +97,15 @@ type appUI struct {
 	autoScroll   bool
 	lastLogCount int
 
-	toastMu    sync.Mutex
-	toastText  string
-	toastErr   bool
-	toastUntil time.Time
+	editFocus    int // 0=none, 1=socks5 port, 2=http port
+	portSocksBuf string
+	portHTTPBuf  string
+
+	toastMu      sync.Mutex
+	toastText    string
+	toastErr     bool
+	toastSuccess bool
+	toastUntil   time.Time
 
 	shutOnce sync.Once
 }
@@ -177,7 +187,7 @@ func Run(eng *client.Engine) error {
 	}
 	_ = sysDPI
 
-	titlePtr := utf16Ptr("GhostFrame-Pro v3.2.1")
+	titlePtr := utf16Ptr("GhostFrame-Pro v3.2.3")
 	hwnd, _, err := pCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(clsPtr)),
@@ -323,9 +333,19 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		a.pressed = hitNone
 		if hid != hitNone && hid == wasPressed {
 			a.handleClick(hid, hidx)
-		} else if a.nodeDropOpen && hid != hitNodeDrop && hid != hitNodeOption {
-			a.nodeDropOpen = false
-			a.invalidate()
+		} else {
+			changed := false
+			if a.nodeDropOpen && hid != hitNodeDrop && hid != hitNodeOption {
+				a.nodeDropOpen = false
+				changed = true
+			}
+			if a.editFocus != 0 && hid != hitPortSocks && hid != hitPortHTTP && hid != hitPortSave && hid != hitPortCapsule {
+				a.cancelPortEdit()
+				changed = true
+			}
+			if changed {
+				a.invalidate()
+			}
 		}
 		return 0
 
@@ -343,6 +363,29 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		return 0
 
 	case wmKeyDown:
+		if a.editFocus != 0 {
+			switch wParam {
+			case 0x09: // VK_TAB
+				if a.editFocus == 1 {
+					a.editFocus = 2
+				} else {
+					a.editFocus = 1
+				}
+				a.invalidate()
+				return 0
+			case 0x0D: // VK_RETURN
+				a.commitPortEdit()
+				return 0
+			case 0x1B: // VK_ESCAPE
+				a.cancelPortEdit()
+				a.invalidate()
+				return 0
+			case 0x08: // VK_BACK
+				a.backspacePortDigit()
+				a.invalidate()
+				return 0
+			}
+		}
 		if wParam == 'V' {
 			ctrl, _, _ := pGetKeyState.Call(0x11)
 			if (uint16(ctrl) & 0x8000) != 0 {
@@ -353,6 +396,17 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		if wParam == 0x1B && a.nodeDropOpen { // Escape closes dropdown
 			a.nodeDropOpen = false
 			a.invalidate()
+			return 0
+		}
+		return 0
+
+	case wmChar:
+		if a.editFocus != 0 {
+			ch := rune(wParam)
+			if ch >= '0' && ch <= '9' {
+				a.appendPortDigit(byte(ch))
+				a.invalidate()
+			}
 			return 0
 		}
 		return 0
@@ -462,9 +516,110 @@ func (a *appUI) setToast(msg string, isErr bool) {
 	a.toastMu.Lock()
 	a.toastText = msg
 	a.toastErr = isErr
+	a.toastSuccess = false
 	a.toastUntil = time.Now().Add(2600 * time.Millisecond)
 	a.toastMu.Unlock()
 	a.postRefresh()
+}
+
+func (a *appUI) setToastSuccess(msg string) {
+	a.toastMu.Lock()
+	a.toastText = msg
+	a.toastErr = false
+	a.toastSuccess = true
+	a.toastUntil = time.Now().Add(2800 * time.Millisecond)
+	a.toastMu.Unlock()
+	a.postRefresh()
+}
+
+func portDigits(addr, fallback string) string {
+	if idx := strings.LastIndex(addr, ":"); idx >= 0 && idx+1 < len(addr) {
+		return addr[idx+1:]
+	}
+	return fallback
+}
+
+func (a *appUI) syncPortBuffers(st map[string]any) {
+	if a.editFocus != 0 {
+		return
+	}
+	a.portSocksBuf = portDigits(strVal(st["socks_addr"]), "10808")
+	a.portHTTPBuf = portDigits(strVal(st["http_addr"]), "10809")
+}
+
+func (a *appUI) beginPortEdit(focus int, st map[string]any) {
+	if a.editFocus == 0 {
+		a.portSocksBuf = portDigits(strVal(st["socks_addr"]), "10808")
+		a.portHTTPBuf = portDigits(strVal(st["http_addr"]), "10809")
+	}
+	a.editFocus = focus
+}
+
+func (a *appUI) cancelPortEdit() {
+	a.editFocus = 0
+	if a.eng != nil {
+		st := a.eng.Status()
+		a.portSocksBuf = portDigits(strVal(st["socks_addr"]), "10808")
+		a.portHTTPBuf = portDigits(strVal(st["http_addr"]), "10809")
+	}
+}
+
+func (a *appUI) appendPortDigit(d byte) {
+	switch a.editFocus {
+	case 1:
+		if len(a.portSocksBuf) < 5 {
+			a.portSocksBuf += string(d)
+		}
+	case 2:
+		if len(a.portHTTPBuf) < 5 {
+			a.portHTTPBuf += string(d)
+		}
+	}
+}
+
+func (a *appUI) backspacePortDigit() {
+	switch a.editFocus {
+	case 1:
+		if len(a.portSocksBuf) > 0 {
+			a.portSocksBuf = a.portSocksBuf[:len(a.portSocksBuf)-1]
+		}
+	case 2:
+		if len(a.portHTTPBuf) > 0 {
+			a.portHTTPBuf = a.portHTTPBuf[:len(a.portHTTPBuf)-1]
+		}
+	}
+}
+
+func (a *appUI) commitPortEdit() {
+	st := a.eng.Status()
+	if a.portSocksBuf == "" {
+		a.portSocksBuf = portDigits(strVal(st["socks_addr"]), "10808")
+	}
+	if a.portHTTPBuf == "" {
+		a.portHTTPBuf = portDigits(strVal(st["http_addr"]), "10809")
+	}
+	sPort, err1 := strconv.Atoi(a.portSocksBuf)
+	hPort, err2 := strconv.Atoi(a.portHTTPBuf)
+	if err1 != nil || sPort < 1024 || sPort > 65535 {
+		a.setToast("SOCKS5 端口非法，请输入 1024-65535", true)
+		return
+	}
+	if err2 != nil || hPort < 1024 || hPort > 65535 {
+		a.setToast("HTTP 端口非法，请输入 1024-65535", true)
+		return
+	}
+	if sPort == hPort {
+		a.setToast(fmt.Sprintf("SOCKS5 与 HTTP 端口不能相同 (%d)", sPort), true)
+		return
+	}
+	if err := a.eng.SetProxyPorts(sPort, hPort); err != nil {
+		a.setToast("端口切换失败: "+err.Error(), true)
+		return
+	}
+	a.editFocus = 0
+	a.portSocksBuf = strconv.Itoa(sPort)
+	a.portHTTPBuf = strconv.Itoa(hPort)
+	a.setToastSuccess(fmt.Sprintf("本地端口已切换: S5 :%d / HTTP :%d", sPort, hPort))
 }
 
 func (a *appUI) hitTest(x, y int32) (hitKind, int) {
@@ -481,6 +636,9 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 	st := a.eng.Status()
 	state := client.ConnState(strVal(st["state"]))
 	activeIdx := intVal(st["active_node"])
+	if a.editFocus != 0 && k != hitPortSocks && k != hitPortHTTP && k != hitPortSave && k != hitPortCapsule {
+		a.cancelPortEdit()
+	}
 
 	switch k {
 	case hitConnect:
@@ -555,6 +713,12 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 			a.setToast("传输通道: TCP (uTLS 强稳健)", false)
 			a.postRefresh()
 		}()
+	case hitPortCapsule, hitPortSocks:
+		a.beginPortEdit(1, st)
+	case hitPortHTTP:
+		a.beginPortEdit(2, st)
+	case hitPortSave:
+		a.commitPortEdit()
 	case hitCopyClash:
 		yaml := a.eng.ClashYAML()
 		if SetClipboardText(a.hwnd, yaml) {
@@ -741,9 +905,24 @@ func (a *appUI) drawHeader(rc *rect, st map[string]any, pad int32) {
 	}
 	a.drawButton(pingR, hitPing, pingLabel, colCardAlt, colBorderHi, pingTextCol)
 
-	portText := fmt.Sprintf("S5 %s  ·  HTTP %s", shortPort(socksAddr), shortPort(httpAddr))
-	if rc.width() >= s(820) {
-		f.drawText(f.fMono, f.fmtRight, rect{badgeR.Right + s(10), s(20), pingR.Left - s(12), s(50)}, colTextSub, portText)
+	portText := fmt.Sprintf("S5 %s · HTTP %s", shortPort(socksAddr), shortPort(httpAddr))
+	if rc.width() >= s(760) {
+		pillR := rect{badgeR.Right + s(10), s(21), pingR.Left - s(10), s(49)}
+		if pillR.width() > s(182) {
+			pillR.Left = pillR.Right - s(182)
+		}
+		pillBg := colCardAlt
+		pillBorder := colBorderHi
+		pillTxt := colTextSub
+		if a.hoverID == hitPortCapsule || a.editFocus != 0 {
+			pillBg = colCard
+			pillBorder = colCyan
+			pillTxt = colTextMain
+		}
+		a.buf.fillRoundRect(pillR.Left, pillR.Top, pillR.width(), pillR.height(), s(14), pillBg)
+		a.buf.strokeRoundRect(pillR.Left, pillR.Top, pillR.width(), pillR.height(), s(14), 1.1, pillBorder)
+		f.drawText(f.fMono, f.fmtCent, pillR, pillTxt, portText)
+		a.hits = append(a.hits, hitBox{id: hitPortCapsule, rect: pillR})
 	}
 }
 
@@ -774,7 +953,7 @@ func (a *appUI) drawHeroCard(r rect, st map[string]any) {
 		btnText = "◌  正在建立双栈隐写通道..."
 	default:
 		c0, c1 = colBtnIdleA, colBtnIdleB
-		btnText = "▶  连接安全隧道 (v3.2.1 Apex)"
+		btnText = "▶  连接安全隧道 (v3.2.3 Apex)"
 	}
 	if a.hoverID == hitConnect {
 		c0 = lerpColor(c0, 0xFFFFFFFF, 0.10)
@@ -818,20 +997,23 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 	s := a.s
 	f := a.fonts
 	a.drawCard(r)
+	a.syncPortBuffers(st)
 
 	routeMode := strVal(st["route_mode"])
 	transPref := strVal(st["transport_pref"])
+	socksAddr := strVal(st["socks_addr"])
+	httpAddr := strVal(st["http_addr"])
 	nodeName := strVal(st["node_name"])
 	if nodeName == "" {
 		nodeName = "未选择节点 (Ctrl+V 粘贴导入)"
 	}
 
-	y := r.Top + s(16)
-	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Left + s(140), y + s(20)}, colTextSub, "当前节点")
-	y += s(26)
+	y := r.Top + s(12)
+	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Left + s(140), y + s(18)}, colTextSub, "当前节点")
+	y += s(20)
 
-	delR := rect{r.Right - s(66), y, r.Right - s(16), y + s(34)}
-	dropR := rect{r.Left + s(16), y, delR.Left - s(8), y + s(34)}
+	delR := rect{r.Right - s(66), y, r.Right - s(16), y + s(32)}
+	dropR := rect{r.Left + s(16), y, delR.Left - s(8), y + s(32)}
 	dropBg := colBg
 	if a.hoverID == hitNodeDrop || a.nodeDropOpen {
 		dropBg = colCardAlt
@@ -849,11 +1031,11 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 	a.drawButton(delR, hitNodeDelete, "删除", colBg, colBorderHi, colRed)
 
 	// Segmented: Unified Route + System Proxy Mode
-	y += s(52)
-	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Right - s(16), y + s(20)}, colTextSub, "运行模式 (连接自动联动)")
-	y += s(26)
+	y += s(42)
+	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Right - s(16), y + s(18)}, colTextSub, "运行模式 (连接自动联动)")
+	y += s(20)
 	isCore := routeMode == "core" || routeMode == "direct"
-	a.drawSeg3(rect{r.Left + s(16), y, r.Right - s(16), y + s(34)},
+	a.drawSeg3(rect{r.Left + s(16), y, r.Right - s(16), y + s(32)},
 		[3]string{"Rule 智能", "Global 全局", "Core 仅端口"},
 		[3]bool{routeMode == "rule" || routeMode == "", routeMode == "global", isCore},
 		[3]hitKind{hitRouteRule, hitRouteGlobal, hitRouteCore},
@@ -861,35 +1043,83 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 	)
 
 	// Segmented: Transport Preference
-	y += s(52)
-	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Right - s(16), y + s(20)}, colTextSub, "传输内核")
-	y += s(26)
-	a.drawSeg3(rect{r.Left + s(16), y, r.Right - s(16), y + s(34)},
+	y += s(42)
+	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Right - s(16), y + s(18)}, colTextSub, "传输内核")
+	y += s(20)
+	a.drawSeg3(rect{r.Left + s(16), y, r.Right - s(16), y + s(32)},
 		[3]string{"Auto 双栈", "QUIC 极速", "TCP uTLS"},
 		[3]bool{transPref == "auto", transPref == "quic", transPref == "tcp"},
 		[3]hitKind{hitTransAuto, hitTransQUIC, hitTransTCP},
 		colCyan,
 	)
 
-	// Unified Mode Status Hint
-	modeHint := "已启用联动：连接后自动接管系统代理并支持 CN 直连"
-	if routeMode == "global" {
-		modeHint = "已启用联动：连接后自动全局代理所有非本地流量"
-	} else if isCore {
-		modeHint = "仅开放本地 10808 / 10809 端口，不修改系统代理"
-	}
-	f.drawText(f.fSmall, f.fmtLeft, rect{r.Left + s(16), y + s(46), r.Right - s(16), y + s(68)}, colTextMuted, modeHint)
+	// Local Port Custom Edit Row: SOCKS5 [ 10808 ]  HTTP [ 10809 ]  [保存]
+	y += s(42)
+	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Right - s(16), y + s(18)}, colTextSub, "本地端口")
+	y += s(20)
+	px := r.Left + s(16)
+	rowBot := y + s(30)
+	f.drawText(f.fSmall, f.fmtLeft, rect{px, y, px + s(48), rowBot}, colTextSub, "SOCKS5")
+	px += s(48)
+	sBox := rect{px, y, px + s(68), rowBot}
+	a.drawPortBox(sBox, hitPortSocks, a.portSocksBuf, a.editFocus == 1)
+	px = sBox.Right + s(6)
+
+	f.drawText(f.fSmall, f.fmtLeft, rect{px, y, px + s(34), rowBot}, colTextSub, "HTTP")
+	px += s(34)
+	hBox := rect{px, y, px + s(68), rowBot}
+	a.drawPortBox(hBox, hitPortHTTP, a.portHTTPBuf, a.editFocus == 2)
+	px = hBox.Right + s(6)
+
+	saveR := rect{px, y, r.Right - s(16), rowBot}
+	a.drawButton(saveR, hitPortSave, "保存", colCardAlt, colBorderHi, colCyan)
 
 	// Bottom Copy Action Row
-	btnY := r.Bottom - s(52)
-	if btnY < y+s(74) {
-		btnY = y + s(74)
+	btnY := r.Bottom - s(48)
+	if btnY < rowBot+s(8) {
+		btnY = rowBot + s(8)
 	}
+
+	// Unified Mode Status Hint (rendered when vertical space permits)
+	if btnY-(rowBot+s(6)) >= s(20) {
+		modeHint := "已启用联动：连接后自动接管系统代理并支持 CN 直连"
+		if routeMode == "global" {
+			modeHint = "已启用联动：连接后自动全局代理所有非本地流量"
+		} else if isCore {
+			modeHint = fmt.Sprintf("仅开放本地 %s / %s 端口，不修改系统代理",
+				portDigits(socksAddr, "10808"), portDigits(httpAddr, "10809"))
+		}
+		f.drawText(f.fSmall, f.fmtLeft, rect{r.Left + s(16), rowBot + s(6), r.Right - s(16), btnY - s(4)}, colTextMuted, modeHint)
+	}
+
 	halfW := (r.width() - s(40)) / 2
-	c1R := rect{r.Left + s(16), btnY, r.Left + s(16) + halfW, btnY + s(36)}
-	c2R := rect{c1R.Right + s(8), btnY, r.Right - s(16), btnY + s(36)}
+	c1R := rect{r.Left + s(16), btnY, r.Left + s(16) + halfW, btnY + s(34)}
+	c2R := rect{c1R.Right + s(8), btnY, r.Right - s(16), btnY + s(34)}
 	a.drawButton(c1R, hitCopyClash, "复制 Clash YAML", colCardAlt, colBorderHi, colSky)
 	a.drawButton(c2R, hitCopyLink, "复制 gft3://", colCardAlt, colBorderHi, colEmerald)
+}
+
+func (a *appUI) drawPortBox(r rect, id hitKind, val string, focused bool) {
+	s := a.s
+	bg := colBg
+	border := colBorderHi
+	if focused {
+		bg = colCardAlt
+		border = colCyan
+	} else if a.hoverID == id {
+		border = colSky
+	}
+	a.buf.fillRoundRect(r.Left, r.Top, r.width(), r.height(), s(7), bg)
+	a.buf.strokeRoundRect(r.Left, r.Top, r.width(), r.height(), s(7), 1.2, border)
+	a.fonts.drawText(a.fonts.fMono, a.fonts.fmtLeft, rect{r.Left + s(8), r.Top, r.Right - s(6), r.Bottom}, colTextMain, val)
+	if focused && (time.Now().UnixMilli()/450)%2 == 0 {
+		caretX := r.Left + s(8) + int32(float32(len(val))*float32(s(12))*0.56)
+		if caretX > r.Right-s(6) {
+			caretX = r.Right - s(6)
+		}
+		a.buf.fillRoundRect(caretX, r.Top+s(6), maxI32(1, s(2)), r.height()-s(12), 1, colCyan)
+	}
+	a.hits = append(a.hits, hitBox{id: id, rect: r})
 }
 
 func (a *appUI) drawNodeDropdownOverlay(card rect, st map[string]any) {
@@ -1092,6 +1322,7 @@ func (a *appUI) drawToast(w, h int32) {
 	a.toastMu.Lock()
 	msg := a.toastText
 	isErr := a.toastErr
+	isSuccess := a.toastSuccess
 	until := a.toastUntil
 	a.toastMu.Unlock()
 	if msg == "" || time.Now().After(until) {
@@ -1105,6 +1336,9 @@ func (a *appUI) drawToast(w, h int32) {
 	if isErr {
 		border = colRed
 		txtCol = 0xFFFCA5A5
+	} else if isSuccess {
+		border = colEmerald
+		txtCol = 0xFFA7F3D0
 	}
 	a.buf.fillRoundRect(tr.Left, tr.Top, tr.width(), tr.height(), s(18), 0xEE0B1324)
 	a.buf.strokeRoundRect(tr.Left, tr.Top, tr.width(), tr.height(), s(18), 1.2, border)

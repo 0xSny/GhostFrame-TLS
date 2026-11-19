@@ -173,7 +173,7 @@ download_verified_asset() {
 
   log "Downloading ${asset_name} (${TARGET_VER})..."
   if ! curl -fsSL --retry 2 -o "${tmp_dir}/checksums.txt" "$sum_url"; then
-    die "Failed to fetch checksums.txt from ${sum_url}. Verify network connectivity or build from source in 02_Source_Code/."
+    die "Failed to fetch checksums.txt from ${sum_url}. Verify network connectivity or build from source with 'go build ./cmd/gft-server'."
   fi
   if ! curl -fsSL --retry 2 -o "${tmp_dir}/${asset_name}" "$bin_url"; then
     die "Failed to download ${asset_name} from ${bin_url}."

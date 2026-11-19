@@ -23,12 +23,44 @@ func IsLowMemMode() bool {
 	return lowMemMode.Load()
 }
 
+// EffectiveInitStreamWindow returns 1MB in low-memory mode or 4MB by default.
+func EffectiveInitStreamWindow() int {
+	if lowMemMode.Load() {
+		return 1024 * 1024
+	}
+	return streamWindow
+}
+
 // EffectiveMaxStreamWindow returns 4MB in low-memory mode or 16MB by default.
 func EffectiveMaxStreamWindow() int {
 	if lowMemMode.Load() {
 		return 4 * 1024 * 1024
 	}
 	return maxStreamWindow
+}
+
+// EffectiveUDPSocketBuffer returns the OS UDP socket receive/send buffer target
+// (1MB in low-memory mode or 8MB by default).
+func EffectiveUDPSocketBuffer() int {
+	if lowMemMode.Load() {
+		return 1024 * 1024
+	}
+	return 8 * 1024 * 1024
+}
+
+// TuneUDPSocketBuffers enlarges OS read/write buffers on UDP sockets to prevent
+// kernel buffer truncation on high-BDP QUIC links.
+func TuneUDPSocketBuffers(pc net.PacketConn) {
+	if pc == nil {
+		return
+	}
+	sz := EffectiveUDPSocketBuffer()
+	if rb, ok := pc.(interface{ SetReadBuffer(int) error }); ok {
+		_ = rb.SetReadBuffer(sz)
+	}
+	if wb, ok := pc.(interface{ SetWriteBuffer(int) error }); ok {
+		_ = wb.SetWriteBuffer(sz)
+	}
 }
 
 // PrioritizeChaCha20 returns true on ARM64 SoCs without ARMv8 Crypto/AES instructions

@@ -25,8 +25,8 @@ const (
 
 	HeaderLen       = 8
 	MaxPayload      = 65535
-	maxChunk        = 32 * 1024        // 32 KB bulk framing chunk
-	streamWindow    = 1024 * 1024      // 1 MB initial BDP window
+	maxChunk        = 63 * 1024        // 63 KB bulk framing chunk (fits within MaxPayload=65535)
+	streamWindow    = 4 * 1024 * 1024  // 4 MB initial BDP window
 	maxStreamWindow = 16 * 1024 * 1024 // 16 MB max dynamic BDP window
 	windowUpdateN   = 256 * 1024       // minimum replenish step
 	visionPhaseN    = 8                // first 8 data frames of each sub-stream get strong padding
@@ -744,11 +744,12 @@ type Stream struct {
 }
 
 func newStream(s *Session, id uint16) *Stream {
+	initWin := EffectiveInitStreamWindow()
 	st := &Stream{
 		s:            s,
 		id:           id,
-		sendWin:      streamWindow,
-		curWindow:    streamWindow,
+		sendWin:      int64(initWin),
+		curWindow:    initWin,
 		lastWinCheck: time.Now().UnixNano(),
 	}
 	st.rcond = sync.NewCond(&st.mu)
@@ -850,7 +851,7 @@ func (st *Stream) Read(p []byte) (int, error) {
 		maxWin := EffectiveMaxStreamWindow()
 		now := time.Now().UnixNano()
 		if st.curWindow < maxWin && st.winConsumed >= st.curWindow/2 {
-			if now-st.lastWinCheck <= int64(350*time.Millisecond) {
+			if now-st.lastWinCheck <= int64(1500*time.Millisecond) {
 				old := st.curWindow
 				st.curWindow *= 2
 				if st.curWindow > maxWin {
@@ -860,7 +861,7 @@ func (st *Stream) Read(p []byte) (int, error) {
 			}
 			st.winConsumed = 0
 			st.lastWinCheck = now
-		} else if now-st.lastWinCheck > int64(time.Second) {
+		} else if now-st.lastWinCheck > int64(1500*time.Millisecond) {
 			st.winConsumed = 0
 			st.lastWinCheck = now
 		}

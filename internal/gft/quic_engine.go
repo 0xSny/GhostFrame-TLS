@@ -78,12 +78,12 @@ func (g *StegoCIDGenerator) GenerateConnectionID() (quic.ConnectionID, error) {
 	return quic.ConnectionIDFromBytes(b), nil
 }
 
-// QUICConfig returns the BDP-tuned RFC9221 QUIC config (4MB stream / 8MB conn in LowMemMode,
-// 16MB stream / 32MB conn by default).
+// QUICConfig returns the BDP-tuned RFC9221 QUIC config (4MB/8MB init, 16MB/32MB max by default;
+// 512KB/1MB init, 4MB/8MB max in LowMemMode).
 func QUICConfig() *quic.Config {
-	initStreamWin := uint64(2 * 1024 * 1024)
+	initStreamWin := uint64(4 * 1024 * 1024)
 	maxStreamWin := uint64(16 * 1024 * 1024)
-	initConnWin := uint64(4 * 1024 * 1024)
+	initConnWin := uint64(8 * 1024 * 1024)
 	maxConnWin := uint64(32 * 1024 * 1024)
 	if IsLowMemMode() {
 		initStreamWin = 512 * 1024
@@ -102,6 +102,7 @@ func QUICConfig() *quic.Config {
 		KeepAlivePeriod:                20 * time.Second,
 		MaxIdleTimeout:                 90 * time.Second,
 		HandshakeIdleTimeout:           6 * time.Second,
+		InitialPacketSize:              1250,
 		EnableDatagrams:                true,
 	}
 }
@@ -323,10 +324,15 @@ func DialQUICSessionWithID(ctx context.Context, l *Link, ps *ParamStore, port in
 	if err != nil {
 		return nil, 0, err
 	}
-	pc, err := net.ListenUDP("udp", nil)
+	network := "udp"
+	if addr.IP != nil && addr.IP.To4() != nil {
+		network = "udp4"
+	}
+	pc, err := net.ListenUDP(network, nil)
 	if err != nil {
 		return nil, 0, err
 	}
+	TuneUDPSocketBuffers(pc)
 	return DialQUICWithPacketConnAndID(ctx, pc, true, addr, port, l, ps, timeout, clientID)
 }
 

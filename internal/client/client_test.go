@@ -333,6 +333,139 @@ func TestHTTPProxyThrottledDisconnectLogAndSilentDirectFailure(t *testing.T) {
 	}
 }
 
+func freeTestPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+func TestSetProxyPortsHotSwapAndAtomicRollback(t *testing.T) {
+	if !IsMockSysProxy() {
+		t.Fatal("IsMockSysProxy() must be true under go test")
+	}
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "client.json")
+
+	eng, err := NewEngine(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	// Seed a dummy node so ClashYAML() outputs full YAML
+	_ = eng.SetLink(&gft.Link{V: 3, Host: "198.51.100.10", Port: 443, PSK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Verify: "spki", Pin: strings.Repeat("a", 64), Remark: "TestNode"})
+
+	s1 := freeTestPort(t)
+	h1 := freeTestPort(t)
+	for h1 == s1 {
+		h1 = freeTestPort(t)
+	}
+	eng.OverrideListenAddrs(fmt.Sprintf("127.0.0.1:%d", s1), fmt.Sprintf("127.0.0.1:%d", h1))
+	if err := eng.StartServers(); err != nil {
+		t.Fatal(err)
+	}
+	_ = eng.SaveConfig()
+
+	// 1. Validation rejections
+	if err := eng.SetProxyPorts(80, h1); err == nil {
+		t.Fatal("expected error for port < 1024")
+	}
+	if err := eng.SetProxyPorts(s1, s1); err == nil {
+		t.Fatal("expected error for identical ports")
+	}
+
+	// 2. Atomic rollback when target HTTP port is already occupied
+	busyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busyLn.Close()
+	busyPort := busyLn.Addr().(*net.TCPAddr).Port
+
+	freeS := freeTestPort(t)
+	if err := eng.SetProxyPorts(freeS, busyPort); err == nil {
+		t.Fatalf("expected conflict error when HTTP port %d is occupied", busyPort)
+	}
+	// Verify freeS was rolled back (not leaked listening) and original s1/h1 still work
+	if probe, perr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", freeS)); perr != nil {
+		t.Fatalf("expected pre-bound SOCKS5 port %d to be closed on rollback: %v", freeS, perr)
+	} else {
+		_ = probe.Close()
+	}
+	if c, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", h1), time.Second); derr != nil {
+		t.Fatalf("original HTTP listener %d must remain intact on failed swap: %v", h1, derr)
+	} else {
+		_ = c.Close()
+	}
+
+	// 3. Hot swap while connected must update listeners, config, ClashYAML, and mock sysproxy
+	//    without overwriting sysproxy_backup.json
+	backupPath := filepath.Join(dir, "sysproxy_backup.json")
+	origBackup := `{"enabled":false,"server":"127.0.0.1:9999","override":"orig","applied":"127.0.0.1:10809"}`
+	if err := os.WriteFile(backupPath, []byte(origBackup), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eng.mu.Lock()
+	eng.state = StateConnected
+	eng.config.RouteMode = RouteRule
+	eng.sysProxyApplied = true
+	eng.mu.Unlock()
+
+	s2 := freeTestPort(t)
+	h2 := freeTestPort(t)
+	for h2 == s2 || h2 == busyPort || s2 == busyPort {
+		h2 = freeTestPort(t)
+	}
+	if err := eng.SetProxyPorts(s2, h2); err != nil {
+		t.Fatalf("SetProxyPorts(%d, %d) failed: %v", s2, h2, err)
+	}
+
+	// Verify new ports accept TCP connections & old ports closed
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", h2), time.Second)
+	if err != nil {
+		t.Fatalf("new HTTP port %d not accepting: %v", h2, err)
+	}
+	_ = c.Close()
+	cs, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", s2), time.Second)
+	if err != nil {
+		t.Fatalf("new SOCKS5 port %d not accepting: %v", s2, err)
+	}
+	_ = cs.Close()
+
+	// Check ClashYAML updated
+	if !strings.Contains(eng.ClashYAML(), fmt.Sprintf("port: %d", s2)) {
+		t.Fatalf("ClashYAML did not reflect new port %d:\n%s", s2, eng.ClashYAML())
+	}
+
+	// Check mock sysproxy pointed to h2 and backup untouched
+	en, srv, err := GetSystemProxy()
+	if err != nil || !en || srv != fmt.Sprintf("127.0.0.1:%d", h2) {
+		t.Fatalf("expected sysproxy updated to %d, got enabled=%v server=%q err=%v", h2, en, srv, err)
+	}
+	gotBackup, err := os.ReadFile(backupPath)
+	if err != nil || string(gotBackup) != origBackup {
+		t.Fatalf("sysproxy_backup.json was modified! got=%q", string(gotBackup))
+	}
+
+	// Check persisted client.json
+	rawCfg, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved ClientConfig
+	if err := json.Unmarshal(rawCfg, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.SocksAddr != fmt.Sprintf("127.0.0.1:%d", s2) || saved.HTTPAddr != fmt.Sprintf("127.0.0.1:%d", h2) {
+		t.Fatalf("saved config mismatch: socks=%q http=%q", saved.SocksAddr, saved.HTTPAddr)
+	}
+}
+
 var _ = time.Now
 var _ = fmt.Sprintf
 var _ = context.Background

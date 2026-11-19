@@ -1,39 +1,29 @@
-# Binaries
+# Binaries & release outputs
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 *-linux-*
-gft-server-linux-amd64
-dist/
 /gft-client-gui
 /gft-server
-/02_Source_Code/gft-client-gui
-/02_Source_Code/gft-server
+/gft-core
+dist/
 bin/
 
-# Go build & test artifacts
+# Go test & debug artifacts
 *.test
 __debug_bin*
 *.out
 
-# Python cache & deployment artifacts with private credentials
-__pycache__/
-*.pyc
-deploy_japan.py
-verify_test.py
-deploy_record.json
-test_results.json
-egress_result.json
-
-# Live private configs & node access credentials (use *.example.* instead)
+# Runtime configs & sensitive credentials (use configs/client.example.json)
 client.json
 server.json
-03_Delivery_and_Audit/VPS_ACCESS_INFO.md
+sysproxy_backup.json
+deploy_record.json
+*.log
 
-# Operating System files
+# OS metadata
 .DS_Store
 Thumbs.db
 desktop.ini
-*.log

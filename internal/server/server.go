@@ -319,6 +319,7 @@ func (s *Server) Run(ctx context.Context) error {
 				_ = ln.Close()
 				return err
 			}
+			gft.TuneUDPSocketBuffers(pc)
 		}
 		rawUDP = pc
 		s.tcpAddrMu.Lock()

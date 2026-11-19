@@ -22,13 +22,12 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: 02_Source_Code/go.mod
-          cache-dependency-path: 02_Source_Code/go.sum
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       - name: Vet and Test (with Race Detector)
         shell: bash
         run: |
-          cd 02_Source_Code
           go vet ./...
           go test -race -v ./...
 

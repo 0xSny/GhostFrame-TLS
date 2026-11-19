@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -492,8 +493,7 @@ func TestApexSchedulerZeroMsFailoverToTCP(t *testing.T) {
 		Transport: "auto",
 	}
 	sched := NewApexScheduler(link, ps, 2, nil)
-	sched.limiter.minJitMs = 0
-	sched.limiter.maxJitMs = 0
+	sched.SetDialJitterForTest(0, 0, 100)
 	var mu sync.Mutex
 	var srvConns []net.Conn
 	defer func() {
@@ -641,8 +641,7 @@ func TestApexSchedulerRapidStartCloseNoWaitGroupRace(t *testing.T) {
 	}
 	for i := 0; i < 20; i++ {
 		sched := NewApexScheduler(link, ps, 1, nil)
-		sched.limiter.minJitMs = 0
-		sched.limiter.maxJitMs = 0
+		sched.SetDialJitterForTest(0, 0, 100)
 		// Force r1 (tcp) immediate failure and r2 (quic) immediate mock success so Start launches async r2 wait goroutine
 		sched.pool.dialFn = func(_ context.Context, _ *Link, _ *ParamStore, _ uint16, _ time.Duration) (*Session, time.Duration, error) {
 			time.Sleep(15 * time.Millisecond)
@@ -665,7 +664,11 @@ func TestApexSchedulerRapidStartCloseNoWaitGroupRace(t *testing.T) {
 				go func() { _ = ServeQUICConn(context.Background(), qc, NewStegoVerifier(make([]byte, 32)), ps, nil, nil, nil) }()
 			}
 		}()
+		var dialedOnce atomic.Bool
 		sched.SetQUICDialHookForTest(func(ctx context.Context, dl *Link, dps *ParamStore, _ int, timeout time.Duration, clientID [8]byte) (*QUICSession, time.Duration, error) {
+			if !dialedOnce.CompareAndSwap(false, true) {
+				return nil, 0, errors.New("single test pair already claimed")
+			}
 			return DialQUICWithPacketConnAndID(ctx, cRaw, true, sRaw.LocalAddr(), 443, dl, dps, timeout, clientID)
 		})
 		_ = sched.Start(time.Second)
@@ -673,5 +676,123 @@ func TestApexSchedulerRapidStartCloseNoWaitGroupRace(t *testing.T) {
 		_ = ln.Close()
 		_ = sRaw.Close()
 		_ = srvTr.Close()
+	}
+}
+
+func TestApexSchedulerStripedQUICPoolAndSplitLimiters(t *testing.T) {
+	if QUICConfig().InitialPacketSize != 1250 {
+		t.Fatalf("expected InitialPacketSize=1250, got %d", QUICConfig().InitialPacketSize)
+	}
+
+	cert, pin := makeTestCertAndPin(t, "ftp.jaist.ac.jp")
+	link := &Link{
+		V:         3,
+		Host:      "127.0.0.1",
+		Port:      443,
+		SNI:       "ftp.jaist.ac.jp",
+		PSK:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		Verify:    "spki",
+		Pin:       pin,
+		Transport: "quic",
+		HopRange:  "20000-40000",
+	}
+	psk, _ := link.PSKBytes()
+	verifier := NewStegoVerifier(psk)
+	ps := NewParamStore(DefaultParams())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var cleanMu sync.Mutex
+	var cleanClosers []func()
+	defer func() {
+		cleanMu.Lock()
+		for _, fn := range cleanClosers {
+			fn()
+		}
+		cleanMu.Unlock()
+	}()
+
+	sched := NewApexScheduler(link, ps, 2, nil)
+	sched.SetDialJitterForTest(0, 0, 100)
+	// Drain tcpLimiter tokens completely to prove quicLimiter stays isolated and fast
+	sched.tcpLimiter.mu.Lock()
+	sched.tcpLimiter.tokens = 0
+	sched.tcpLimiter.rate = 0.01
+	sched.tcpLimiter.mu.Unlock()
+
+	var pickedPortsMu sync.Mutex
+	var pickedPorts []int
+	sched.SetQUICDialHookForTest(func(dialCtx context.Context, dl *Link, dps *ParamStore, hopPort int, timeout time.Duration, clientID [8]byte) (*QUICSession, time.Duration, error) {
+		pickedPortsMu.Lock()
+		pickedPorts = append(pickedPorts, hopPort)
+		pickedPortsMu.Unlock()
+
+		cRaw, sRaw := newMemPacketPair()
+		srvTr := &quic.Transport{Conn: NewAuthPacketConn(sRaw, verifier)}
+		ln, lerr := srvTr.Listen(&tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS13,
+			NextProtos:   []string{"h3"},
+		}, QUICConfig())
+		if lerr != nil {
+			_ = cRaw.Close()
+			_ = sRaw.Close()
+			return nil, 0, lerr
+		}
+		go func() {
+			qc, aerr := ln.Accept(ctx)
+			if aerr != nil {
+				return
+			}
+			_ = ServeQUICConn(ctx, qc, verifier, ps, func(st DataStream, target string, first []byte) {
+				defer st.Close()
+				_, _ = st.Write(first)
+			}, nil, nil)
+		}()
+		cleanMu.Lock()
+		cleanClosers = append(cleanClosers, func() {
+			_ = ln.Close()
+			_ = sRaw.Close()
+			_ = cRaw.Close()
+			_ = srvTr.Close()
+		})
+		cleanMu.Unlock()
+
+		return DialQUICWithPacketConnAndID(dialCtx, cRaw, true, sRaw.LocalAddr(), hopPort, dl, dps, timeout, clientID)
+	})
+
+	t0 := time.Now()
+	if err := sched.Start(3 * time.Second); err != nil {
+		t.Fatalf("striped QUIC Start failed: %v", err)
+	}
+	defer sched.Close()
+	if time.Since(t0) > 2*time.Second {
+		t.Fatalf("QUIC dial was unexpectedly delayed by exhausted tcpLimiter (%v)", time.Since(t0))
+	}
+
+	stStats := sched.Stats()
+	if stStats.ActiveConns != DefaultQUICPoolSize {
+		t.Fatalf("expected %d active striped QUIC conns, got %d", DefaultQUICPoolSize, stStats.ActiveConns)
+	}
+	pickedPortsMu.Lock()
+	for _, p := range pickedPorts {
+		if p < 20000 || p > 40000 {
+			t.Fatalf("picked hop port %d outside 20000-40000", p)
+		}
+	}
+	pickedPortsMu.Unlock()
+
+	// Verify streams spread across multiple QUIC sessions via least-loaded + RR
+	used := make(map[*QUICSession]int)
+	for i := 0; i < 6; i++ {
+		q := sched.activeQUICForSend()
+		if q == nil {
+			t.Fatal("expected active QUIC session")
+		}
+		used[q]++
+	}
+	if len(used) != DefaultQUICPoolSize {
+		t.Fatalf("expected load spread across %d QUIC sessions, used %d", DefaultQUICPoolSize, len(used))
 	}
 }

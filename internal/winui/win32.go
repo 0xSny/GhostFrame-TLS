@@ -34,6 +34,7 @@ const (
 	wmGetMinMaxInfo   = 0x0024
 	wmSetIcon         = 0x0080
 	wmKeyDown         = 0x0100
+	wmChar            = 0x0102
 	wmCommand         = 0x0111
 	wmTimer           = 0x0113
 	wmMouseMove       = 0x0200

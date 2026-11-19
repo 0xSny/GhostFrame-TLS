@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -58,12 +59,15 @@ type PingSummary struct {
 // HTTP proxy, and crash-safe Windows system proxy.
 type Engine struct {
 	mu               sync.RWMutex
+	portSwapMu       sync.Mutex
 	cfgPath          string
 	proxyBackupPath  string
 	config           ClientConfig
 	state            ConnState
 	lastErr          string
 	sched            *gft.ApexScheduler
+	connectingSched  *gft.ApexScheduler
+	connectGen       uint64
 	paramStore       *gft.ParamStore
 	router           *Router
 	socksSrv         *SOCKS5Server
@@ -127,6 +131,7 @@ func NewEngine(cfgPath string) (*Engine, error) {
 
 	if cfgPath != "" {
 		if data, err := os.ReadFile(cfgPath); err == nil {
+			data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 			_ = json.Unmarshal(data, &e.config)
 		}
 	}
@@ -200,6 +205,103 @@ func (e *Engine) StartServers() error {
 	e.Logf("HTTP proxy listening on %s", e.config.HTTPAddr)
 
 	go e.statsLoop()
+	return nil
+}
+
+func splitHostOrDefault(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return "127.0.0.1"
+	}
+	return host
+}
+
+// SetProxyPorts validates socksPort and httpPort, atomically pre-binds any changed
+// listeners before closing old ones, persists client.json, and updates active
+// Windows system proxy without overwriting sysproxy_backup.json.
+func (e *Engine) SetProxyPorts(socksPort, httpPort int) error {
+	if socksPort < 1024 || socksPort > 65535 {
+		return fmt.Errorf("SOCKS5 端口必须在 1024-65535 之间 (%d)", socksPort)
+	}
+	if httpPort < 1024 || httpPort > 65535 {
+		return fmt.Errorf("HTTP 端口必须在 1024-65535 之间 (%d)", httpPort)
+	}
+	if socksPort == httpPort {
+		return fmt.Errorf("SOCKS5 与 HTTP 端口不能相同 (%d)", socksPort)
+	}
+
+	e.portSwapMu.Lock()
+	defer e.portSwapMu.Unlock()
+
+	e.mu.RLock()
+	oldSocksAddr := e.config.SocksAddr
+	oldHTTPAddr := e.config.HTTPAddr
+	e.mu.RUnlock()
+
+	socksHost := splitHostOrDefault(oldSocksAddr)
+	httpHost := splitHostOrDefault(oldHTTPAddr)
+	newSocksAddr := net.JoinHostPort(socksHost, strconv.Itoa(socksPort))
+	newHTTPAddr := net.JoinHostPort(httpHost, strconv.Itoa(httpPort))
+
+	var newSocksSrv *SOCKS5Server
+	var newHTTPSrv *HTTPProxyServer
+
+	if newSocksAddr != oldSocksAddr || e.socksSrv == nil {
+		newSocksSrv = NewSOCKS5Server(newSocksAddr, e)
+		if err := newSocksSrv.Start(); err != nil {
+			return fmt.Errorf("SOCKS5 端口 %d 已被占用或无法监听: %w", socksPort, err)
+		}
+	}
+	if newHTTPAddr != oldHTTPAddr || e.httpSrv == nil {
+		newHTTPSrv = NewHTTPProxyServer(newHTTPAddr, e)
+		if err := newHTTPSrv.Start(); err != nil {
+			if newSocksSrv != nil {
+				_ = newSocksSrv.Close()
+			}
+			return fmt.Errorf("HTTP 端口 %d 已被占用或无法监听: %w", httpPort, err)
+		}
+	}
+
+	e.mu.Lock()
+	var oldSocks *SOCKS5Server
+	var oldHTTP *HTTPProxyServer
+	if newSocksSrv != nil {
+		oldSocks = e.socksSrv
+		e.socksSrv = newSocksSrv
+		e.config.SocksAddr = newSocksAddr
+	}
+	if newHTTPSrv != nil {
+		oldHTTP = e.httpSrv
+		e.httpSrv = newHTTPSrv
+		e.config.HTTPAddr = newHTTPAddr
+	}
+	connected := e.state == StateConnected
+	routeMode := e.config.RouteMode
+	e.mu.Unlock()
+
+	if oldSocks != nil {
+		_ = oldSocks.Close()
+	}
+	if oldHTTP != nil {
+		_ = oldHTTP.Close()
+	}
+
+	if err := e.SaveConfig(); err != nil {
+		e.Logf("SaveConfig warning after port swap: %v", err)
+	}
+
+	if connected && routeMode != RouteCore {
+		if err := SetSystemProxy(newHTTPAddr, true); err != nil {
+			e.Logf("Failed to refresh system proxy to %s: %v", newHTTPAddr, err)
+		} else {
+			e.mu.Lock()
+			e.sysProxyApplied = true
+			e.mu.Unlock()
+			e.Logf("System proxy smoothly switched to %s", newHTTPAddr)
+		}
+	}
+
+	e.Logf("Proxy ports hot-swapped cleanly: SOCKS5 %s / HTTP %s", newSocksAddr, newHTTPAddr)
 	return nil
 }
 
@@ -441,15 +543,25 @@ func (e *Engine) Connect() error {
 	}
 	e.state = StateConnecting
 	e.lastErr = ""
+	e.connectGen++
+	gen := e.connectGen
+	sched := gft.NewApexScheduler(l, e.paramStore, gft.DefaultPoolSize, e.Logf)
+	e.connectingSched = sched
 	e.mu.Unlock()
 
 	e.Logf("Connecting to %s:%d (transport=%s, route=%s, Apex Dual-Track)...",
 		l.Host, l.Port, l.EffectiveTransport(), e.config.RouteMode)
 
-	sched := gft.NewApexScheduler(l, e.paramStore, gft.DefaultPoolSize, e.Logf)
 	if err := sched.Start(8 * time.Second); err != nil {
 		sched.Close()
 		e.mu.Lock()
+		if e.connectingSched == sched {
+			e.connectingSched = nil
+		}
+		if e.connectGen != gen || e.state != StateConnecting {
+			e.mu.Unlock()
+			return nil
+		}
 		e.state = StateError
 		e.lastErr = err.Error()
 		e.mu.Unlock()
@@ -459,6 +571,14 @@ func (e *Engine) Connect() error {
 
 	st := sched.Stats()
 	e.mu.Lock()
+	if e.connectingSched == sched {
+		e.connectingSched = nil
+	}
+	if e.connectGen != gen || e.state != StateConnecting {
+		e.mu.Unlock()
+		sched.Close()
+		return nil
+	}
 	e.sched = sched
 	e.state = StateConnected
 	e.lastErr = ""
@@ -494,12 +614,18 @@ func (e *Engine) Disconnect() {
 		return
 	}
 	e.state = StateDisconnected
+	e.connectGen++
+	connSched := e.connectingSched
+	e.connectingSched = nil
 	sched := e.sched
 	e.sched = nil
 	wasApplied := e.sysProxyApplied
 	e.sysProxyApplied = false
 	e.mu.Unlock()
 
+	if connSched != nil {
+		connSched.Close()
+	}
 	if sched != nil {
 		sched.Close()
 	}
@@ -639,11 +765,11 @@ func (e *Engine) SetTransport(mode string) error {
 	if l := e.activeLinkLocked(); l != nil {
 		l.Transport = mode
 	}
-	wasConnected := e.state == StateConnected
+	shouldReconnect := e.state == StateConnected || e.state == StateConnecting || e.state == StateError
 	e.mu.Unlock()
 	_ = e.SaveConfig()
 	e.Logf("Transport preference updated to: %s", mode)
-	if wasConnected {
+	if shouldReconnect {
 		e.Disconnect()
 		go func() { _ = e.Connect() }()
 	}
@@ -829,7 +955,17 @@ func (e *Engine) ClashYAML() string {
 func (e *Engine) Close() {
 	e.stopOnce.Do(func() { close(e.stopStats) })
 	e.Disconnect()
-	_ = e.socksSrv.Close()
-	_ = e.httpSrv.Close()
+	e.mu.Lock()
+	socksSrv := e.socksSrv
+	httpSrv := e.httpSrv
+	e.socksSrv = nil
+	e.httpSrv = nil
+	e.mu.Unlock()
+	if socksSrv != nil {
+		_ = socksSrv.Close()
+	}
+	if httpSrv != nil {
+		_ = httpSrv.Close()
+	}
 	_, _ = RecoverSystemProxyIfDirty(e.proxyBackupPath)
 }

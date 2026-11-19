@@ -69,6 +69,22 @@ func (c *AuthPacketConn) Dropped() uint64 {
 	return c.dropped.Load()
 }
 
+// SetReadBuffer forwards SO_RCVBUF sizing to the underlying PacketConn when supported.
+func (c *AuthPacketConn) SetReadBuffer(bytes int) error {
+	if sb, ok := c.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
+		return sb.SetReadBuffer(bytes)
+	}
+	return nil
+}
+
+// SetWriteBuffer forwards SO_SNDBUF sizing to the underlying PacketConn when supported.
+func (c *AuthPacketConn) SetWriteBuffer(bytes int) error {
+	if sb, ok := c.PacketConn.(interface{ SetWriteBuffer(int) error }); ok {
+		return sb.SetWriteBuffer(bytes)
+	}
+	return nil
+}
+
 // MarkPeer registers an address as already authenticated (useful in tests or migration).
 func (c *AuthPacketConn) MarkPeer(addr net.Addr) {
 	if addr == nil {
