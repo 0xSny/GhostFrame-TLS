@@ -88,6 +88,7 @@ type Engine struct {
 
 	stopStats chan struct{}
 	stopOnce  sync.Once
+	statsOnce sync.Once
 }
 
 // directStreamConn adapts a direct net.Conn to gft.DataStream for Rule/Direct routing.
@@ -204,8 +205,70 @@ func (e *Engine) StartServers() error {
 	}
 	e.Logf("HTTP proxy listening on %s", e.config.HTTPAddr)
 
-	go e.statsLoop()
+	e.statsOnce.Do(func() { go e.statsLoop() })
 	return nil
+}
+
+// StartServersAutoFallback starts local proxy listeners, automatically switching to an
+// available idle port pair if the configured ports are already occupied by another process.
+func (e *Engine) StartServersAutoFallback() error {
+	firstErr := e.StartServers()
+	if firstErr == nil {
+		return nil
+	}
+
+	e.mu.RLock()
+	origSocks := e.config.SocksAddr
+	origHTTP := e.config.HTTPAddr
+	e.mu.RUnlock()
+
+	sHost := splitHostOrDefault(origSocks)
+	hHost := splitHostOrDefault(origHTTP)
+	candidates := [][2]int{{10808, 10809}, {10818, 10819}, {17890, 17891}, {20808, 20809}, {27890, 27891}}
+
+	tryPair := func(sAddr, hAddr string) bool {
+		if sAddr == origSocks && hAddr == origHTTP {
+			return false
+		}
+		e.OverrideListenAddrs(sAddr, hAddr)
+		if err := e.StartServers(); err == nil {
+			e.Logf("端口 %s / %s 已被占用，已自动切换至空闲端口 %s / %s", origSocks, origHTTP, sAddr, hAddr)
+			_ = e.SaveConfig()
+			return true
+		}
+		return false
+	}
+
+	for _, pair := range candidates {
+		sAddr := net.JoinHostPort(sHost, strconv.Itoa(pair[0]))
+		hAddr := net.JoinHostPort(hHost, strconv.Itoa(pair[1]))
+		if tryPair(sAddr, hAddr) {
+			return nil
+		}
+	}
+
+	// Ephemeral port fallback if all preset pairs are occupied
+	l1, e1 := net.Listen("tcp", net.JoinHostPort(sHost, "0"))
+	l2, e2 := net.Listen("tcp", net.JoinHostPort(hHost, "0"))
+	if e1 == nil && e2 == nil {
+		p1 := l1.Addr().(*net.TCPAddr).Port
+		p2 := l2.Addr().(*net.TCPAddr).Port
+		_ = l1.Close()
+		_ = l2.Close()
+		if p1 != p2 && tryPair(net.JoinHostPort(sHost, strconv.Itoa(p1)), net.JoinHostPort(hHost, strconv.Itoa(p2))) {
+			return nil
+		}
+	} else {
+		if l1 != nil {
+			_ = l1.Close()
+		}
+		if l2 != nil {
+			_ = l2.Close()
+		}
+	}
+
+	e.OverrideListenAddrs(origSocks, origHTTP)
+	return firstErr
 }
 
 func splitHostOrDefault(addr string) string {
@@ -246,13 +309,13 @@ func (e *Engine) SetProxyPorts(socksPort, httpPort int) error {
 	var newSocksSrv *SOCKS5Server
 	var newHTTPSrv *HTTPProxyServer
 
-	if newSocksAddr != oldSocksAddr || e.socksSrv == nil {
+	if newSocksAddr != oldSocksAddr || e.socksSrv == nil || e.socksSrv.Addr() == nil {
 		newSocksSrv = NewSOCKS5Server(newSocksAddr, e)
 		if err := newSocksSrv.Start(); err != nil {
 			return fmt.Errorf("SOCKS5 端口 %d 已被占用或无法监听: %w", socksPort, err)
 		}
 	}
-	if newHTTPAddr != oldHTTPAddr || e.httpSrv == nil {
+	if newHTTPAddr != oldHTTPAddr || e.httpSrv == nil || e.httpSrv.Addr() == nil {
 		newHTTPSrv = NewHTTPProxyServer(newHTTPAddr, e)
 		if err := newHTTPSrv.Start(); err != nil {
 			if newSocksSrv != nil {

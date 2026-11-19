@@ -475,6 +475,38 @@ func TestSetProxyPortsHotSwapAndAtomicRollback(t *testing.T) {
 	}
 }
 
+func TestStartServersAutoFallbackWhenPortsOccupied(t *testing.T) {
+	ln1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln1.Close()
+
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln2.Close()
+
+	eng, err := NewEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	occSocks := ln1.Addr().String()
+	occHTTP := ln2.Addr().String()
+	eng.OverrideListenAddrs(occSocks, occHTTP)
+
+	if err := eng.StartServersAutoFallback(); err != nil {
+		t.Fatalf("expected auto fallback to succeed when configured ports are occupied: %v", err)
+	}
+	st := eng.Status()
+	if st["socks_addr"] == occSocks || st["http_addr"] == occHTTP {
+		t.Fatalf("expected fallback to new addresses, still got socks=%v http=%v", st["socks_addr"], st["http_addr"])
+	}
+}
+
 var _ = time.Now
 var _ = fmt.Sprintf
 var _ = context.Background
