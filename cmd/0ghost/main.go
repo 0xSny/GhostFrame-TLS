@@ -148,9 +148,10 @@ func (s *GatewayService) Start() {
 		s.engine.Logf("[0Ghost] 局域网代理已监听 SOCKS5 0.0.0.0:10808 / HTTP 0.0.0.0:10809")
 	}
 
-	// 3. Start Split-DNS (:7853), TPROXY TCP (:10880), and TPROXY UDP (:10881).
+	// 3. Start Split-DNS (:7853 dual-stack so both LAN nft redirect and local host queries succeed),
+	// TPROXY TCP (:10880), and TPROXY UDP (:10881).
 	dnsSrv := tproxy.NewSplitDNSServer(
-		fmt.Sprintf("127.0.0.1:%d", cfg.DNSPort),
+		fmt.Sprintf(":%d", cfg.DNSPort),
 		s.engine,
 		s.effectiveDirectDNS(cfg),
 		cfg.FilterAAAA,
@@ -159,7 +160,7 @@ func (s *GatewayService) Start() {
 	if err := dnsSrv.Start(); err != nil {
 		s.engine.Logf("[0Ghost] Split-DNS 启动失败: %v", err)
 	} else {
-		s.engine.Logf("[0Ghost] Split-DNS 已监听 127.0.0.1:%d", cfg.DNSPort)
+		s.engine.Logf("[0Ghost] Split-DNS 已监听 :%d", cfg.DNSPort)
 	}
 
 	tcpSrv, err := tproxy.NewTCPServer(
@@ -287,6 +288,7 @@ func (s *GatewayService) SyncFirewall() {
 		TProxyMark:   1,
 		RouteTable:   100,
 		PreferTProxy: true,
+		FilterAAAA:   cfg.FilterAAAA,
 	}
 
 	backend, err := tproxy.ApplyFirewall(spec)

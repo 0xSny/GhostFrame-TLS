@@ -205,6 +205,23 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 		b.WriteString("  }\n")
 	}
 
+	// 8. Optional IPv6 leak guard in forward hook when FilterAAAA is enabled.
+	if spec.FilterAAAA {
+		b.WriteString("  chain forward_v6_guard {\n")
+		b.WriteString("    type filter hook forward priority filter - 5; policy accept;\n")
+		b.WriteString(fmt.Sprintf("    meta mark %s return\n", markHex))
+		b.WriteString("    meta nfproto ipv6 ip6 daddr { ::1/128, fe80::/10, fc00::/7 } return\n")
+		if hasDevFilter {
+			if spec.DeviceMode == DeviceOnly {
+				b.WriteString("    ip saddr != @device_filter_v4 return\n")
+			} else if spec.DeviceMode == DeviceBypass {
+				b.WriteString("    ip saddr @device_filter_v4 return\n")
+			}
+		}
+		b.WriteString("    meta nfproto ipv6 reject with icmpv6 port-unreachable\n")
+		b.WriteString("  }\n")
+	}
+
 	b.WriteString("}\n")
 	return b.String()
 }

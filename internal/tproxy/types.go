@@ -111,6 +111,7 @@ type FirewallSpec struct {
 	TProxyMark  int
 	RouteTable  int
 	PreferTProxy bool
+	FilterAAAA   bool
 }
 
 // Stats reports live transparent gateway counters for telemetry and UI dashboards.

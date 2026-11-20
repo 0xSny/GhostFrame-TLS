@@ -104,15 +104,15 @@ func (s *SplitDNSServer) UpdateConfig(directDNS []string, filterAAAA bool) {
 
 // Start begins serving both UDP and TCP DNS queries on s.addr.
 func (s *SplitDNSServer) Start() error {
-	uAddr, err := net.ResolveUDPAddr("udp4", s.addr)
+	uAddr, err := net.ResolveUDPAddr("udp", s.addr)
 	if err != nil {
 		return err
 	}
-	uc, err := net.ListenUDP("udp4", uAddr)
+	uc, err := net.ListenUDP("udp", uAddr)
 	if err != nil {
 		return err
 	}
-	ln, err := net.Listen("tcp4", s.addr)
+	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		_ = uc.Close()
 		return err

@@ -115,6 +115,7 @@ func TestBuildNFTablesScriptOrderingAndSafety(t *testing.T) {
 		TProxyMark:   0x1,
 		RouteTable:   100,
 		PreferTProxy: true,
+		FilterAAAA:   true,
 	}
 	script := BuildNFTablesScript(spec)
 
@@ -135,6 +136,8 @@ func TestBuildNFTablesScriptOrderingAndSafety(t *testing.T) {
 		"tproxy ip to 127.0.0.1:10880 meta mark set 0x1 accept",
 		"tproxy ip to 127.0.0.1:10881 meta mark set 0x1 accept",
 		"redirect to :7853",
+		"chain forward_v6_guard",
+		"meta nfproto ipv6 reject with icmpv6 port-unreachable",
 	}
 	for _, needle := range required {
 		if !strings.Contains(script, needle) {
