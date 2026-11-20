@@ -693,8 +693,20 @@ func blockedIP(ip net.IP) bool {
 	if ip == nil {
 		return true
 	}
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified() || ip.IsMulticast()
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		// Block RFC 2544 benchmark / client Fake-IP (198.18.0.0/15) & RFC 6598 CGNAT (100.64.0.0/10).
+		if ip4[0] == 198 && (ip4[1]&0xfe) == 18 {
+			return true
+		}
+		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleDataStream(st gft.DataStream, target string, first []byte) {

@@ -100,32 +100,69 @@ type inboundPkt struct {
 	at   time.Time
 }
 
+const closedChunkRingSize = 4096
+
 type closedIDSet struct {
-	mu   sync.Mutex
-	ring []uint32
-	pos  int
-	m    map[uint32]struct{}
+	mu       sync.Mutex
+	ring     []uint32
+	pos      int
+	m        map[uint32]struct{}
+	baseSeq  map[uint32]uint32
+	cRing    []uint64
+	cPos     int
+	cSet     map[uint64]struct{}
 }
 
 func newClosedIDSet() *closedIDSet {
 	return &closedIDSet{
-		ring: make([]uint32, closedIDRingSize),
-		m:    make(map[uint32]struct{}, 256),
+		ring:    make([]uint32, closedIDRingSize),
+		m:       make(map[uint32]struct{}, 256),
+		baseSeq: make(map[uint32]uint32, 256),
+		cRing:   make([]uint64, closedChunkRingSize),
+		cSet:    make(map[uint64]struct{}, 512),
 	}
 }
 
-func (c *closedIDSet) add(id uint32) {
+func (c *closedIDSet) addWithSeqs(id uint32, base uint32, extraSeqs []uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, exists := c.m[id]; exists {
-		return
+	if _, exists := c.m[id]; !exists {
+		if old := c.ring[c.pos]; old != 0 {
+			delete(c.m, old)
+			delete(c.baseSeq, old)
+		}
+		c.ring[c.pos] = id
+		c.m[id] = struct{}{}
+		c.pos = (c.pos + 1) % len(c.ring)
 	}
-	if old := c.ring[c.pos]; old != 0 {
-		delete(c.m, old)
+	if prev, hasBase := c.baseSeq[id]; !hasBase || base > prev {
+		c.baseSeq[id] = base
 	}
-	c.ring[c.pos] = id
-	c.m[id] = struct{}{}
-	c.pos = (c.pos + 1) % len(c.ring)
+	for _, seq := range extraSeqs {
+		c.insertChunkLocked((uint64(id) << 32) | uint64(seq))
+	}
+}
+
+func (c *closedIDSet) insertChunkLocked(key uint64) bool {
+	if _, dup := c.cSet[key]; dup {
+		return false
+	}
+	if old := c.cRing[c.cPos]; old != 0 {
+		delete(c.cSet, old)
+	}
+	c.cRing[c.cPos] = key
+	c.cSet[key] = struct{}{}
+	c.cPos = (c.cPos + 1) % len(c.cRing)
+	return true
+}
+
+func (c *closedIDSet) markChunkAccounted(id, seq uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if base, ok := c.baseSeq[id]; ok && seq < base {
+		return false
+	}
+	return c.insertChunkLocked((uint64(id) << 32) | uint64(seq))
 }
 
 func (c *closedIDSet) has(id uint32) bool {
@@ -232,11 +269,13 @@ type RTCSession struct {
 
 	streamCount atomic.Int64
 	rttNs       atomic.Int64
-	lastRecvNs       atomic.Int64
-	lastSendNs       atomic.Int64
-	lastDataTxNs     atomic.Int64
-	unackedTxSinceNs atomic.Int64
-	lastUDPNs        atomic.Int64
+	lastRecvNs        atomic.Int64
+	lastSendNs        atomic.Int64
+	lastDataTxNs      atomic.Int64
+	unackedTxSinceNs  atomic.Int64
+	winBlockedSinceNs atomic.Int64
+	winProbeSentAtNs  atomic.Int64
+	lastUDPNs         atomic.Int64
 	UpBytes          atomic.Uint64
 	DownBytes        atomic.Uint64
 
@@ -616,7 +655,11 @@ func (s *RTCSession) enqueueUDPFrame(frame []byte) {
 }
 
 func (s *RTCSession) removeStream(id uint32) {
-	s.closedIDs.add(id)
+	s.removeStreamWithSeqs(id, 0, nil)
+}
+
+func (s *RTCSession) removeStreamWithSeqs(id uint32, baseSeq uint32, extraSeqs []uint32) {
+	s.closedIDs.addWithSeqs(id, baseSeq, extraSeqs)
 	s.mu.Lock()
 	delete(s.streams, id)
 	delete(s.pendingStreams, id)
@@ -1108,15 +1151,45 @@ func (s *RTCSession) timerLoop() {
 				s.fail(errors.New("gftrtc: peer unresponsive"))
 				return
 			}
-			// Dead-session watchdog: if client has active outbound data for >4s with zero server RX, trip & rebuild.
+			// Dead-session watchdog: only trigger when outbound bytes are genuinely in-flight or queued
+			// and zero valid packets arrived from peer for >= 4s.
 			if s.isClient {
 				if u := s.unackedTxSinceNs.Load(); u > 0 {
-					lastR := time.Unix(0, s.lastRecvNs.Load())
-					if now.Sub(time.Unix(0, u)) >= 4*time.Second && now.Sub(lastR) >= 4*time.Second {
-						s.fail(errors.New("gftrtc: dead-session watchdog (tx >4s with zero rx)"))
+					if s.loss.InFlightBytes() > 0 || s.hasPendingData() {
+						lastR := time.Unix(0, s.lastRecvNs.Load())
+						if now.Sub(time.Unix(0, u)) >= 4*time.Second && now.Sub(lastR) >= 4*time.Second {
+							s.fail(errors.New("gftrtc: dead-session watchdog (tx >4s with zero rx)"))
+							return
+						}
+					} else {
+						s.unackedTxSinceNs.Store(0)
+					}
+				}
+			}
+
+			// Session flow-control anti-deadlock patrol: recover if txQueuedBytes >= peerSessMax
+			// persists >= 3s while no packets remain in-flight.
+			if (s.txQueuedBytes.Load() >= s.peerSessMax.Load() || s.txStreamBytes.Load() >= s.peerSessMax.Load()) &&
+				s.loss.InFlightBytes() == 0 && s.hasPendingData() {
+				nowNs := now.UnixNano()
+				s.winBlockedSinceNs.CompareAndSwap(0, nowNs)
+				blockedSince := s.winBlockedSinceNs.Load()
+				if blockedSince > 0 {
+					blockedDur := now.Sub(time.Unix(0, blockedSince))
+					if blockedDur >= 3*time.Second {
+						lastProbe := s.winProbeSentAtNs.Load()
+						if lastProbe == 0 || now.Sub(time.Unix(0, lastProbe)) >= 1500*time.Millisecond {
+							s.winProbeSentAtNs.Store(nowNs)
+							s.enqueueCtrlFrame(encodeFramePingPong(FramePing, nowNs))
+						}
+					}
+					if s.isClient && blockedDur >= 5*time.Second {
+						s.fail(errors.New("gftrtc: session flow-control window stalled"))
 						return
 					}
 				}
+			} else {
+				s.winBlockedSinceNs.Store(0)
 			}
 
 			// Rekey maintenance, 30s grace key shredding, and RTCP-Mux mimic scheduling.
@@ -1329,6 +1402,12 @@ func (s *RTCSession) handleInboundPacket(pkt inboundPkt, dst []byte) {
 	if s.replay.Commit(pktNum, ackEliciting, pkt.at) {
 		s.kickACK()
 	}
+
+	if s.loss.InFlightBytes() == 0 {
+		s.unackedTxSinceNs.Store(0)
+	} else {
+		s.unackedTxSinceNs.Store(pkt.at.UnixNano())
+	}
 }
 
 func (s *RTCSession) maybePromotePeerPhase(phase uint8, now time.Time) {
@@ -1532,6 +1611,8 @@ func (s *RTCSession) dispatchFrames(b []byte, now time.Time) (ackEliciting bool)
 			st := s.getOrCreatePendingStream(streamID)
 			if st != nil {
 				st.deliverChunk(seq, payload)
+			} else if len(payload) > 0 && s.closedIDs.markChunkAccounted(streamID, seq) {
+				s.onStreamBytesConsumed(len(payload))
 			}
 
 		case FrameStreamFIN:

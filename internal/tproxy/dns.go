@@ -158,6 +158,7 @@ func (s *SplitDNSServer) Counters() (uint64, uint64, uint64, uint64) {
 
 func (s *SplitDNSServer) serveUDP(uc *net.UDPConn) {
 	buf := make([]byte, 4096)
+	sem := make(chan struct{}, 128)
 	for {
 		n, raddr, err := uc.ReadFromUDP(buf)
 		if err != nil {
@@ -168,9 +169,15 @@ func (s *SplitDNSServer) serveUDP(uc *net.UDPConn) {
 				continue
 			}
 		}
+		select {
+		case sem <- struct{}{}:
+		default:
+			continue
+		}
 		req := make([]byte, n)
 		copy(req, buf[:n])
 		go func(pkt []byte, peer *net.UDPAddr) {
+			defer func() { <-sem }()
 			resp := s.HandlePacket(pkt)
 			if len(resp) > 0 {
 				_, _ = uc.WriteToUDP(resp, peer)

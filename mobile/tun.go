@@ -40,7 +40,7 @@ func StartTUN(writer TunPacketWriter, mtu int) error {
 	eng.SetDirectDNSBypass(true)
 	cachePath := ""
 	if dataDir != "" {
-		cachePath = filepath.Join(dataDir, "fakeip_cache.bin")
+		cachePath = filepath.Join(dataDir, "fakeip_cache.json")
 	}
 	st, err := tunstack.NewWithOptions(eng, writer, mtu, isTunnel, cachePath)
 	if err != nil {

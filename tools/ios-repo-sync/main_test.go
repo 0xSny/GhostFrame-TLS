@@ -110,4 +110,11 @@ func TestExtractIPAFromZipAndRedirectHeaderStrip(t *testing.T) {
 	if !isVirtualInterfaceName("VMware Network Adapter VMnet8") || isVirtualInterfaceName("网线") {
 		t.Fatalf("unexpected virtual interface classification")
 	}
+
+	if got := parseGitHubRepoFromRemoteURL("https://github.com/Spittingjiu/GhostFrame-iOS.git\n"); got != "Spittingjiu/GhostFrame-iOS" {
+		t.Fatalf("unexpected HTTPS remote slug: %q", got)
+	}
+	if got := parseGitHubRepoFromRemoteURL("git@github.com:Spittingjiu/GhostFrame-TLS.git"); got != "Spittingjiu/GhostFrame-TLS" {
+		t.Fatalf("unexpected SSH remote slug: %q", got)
+	}
 }

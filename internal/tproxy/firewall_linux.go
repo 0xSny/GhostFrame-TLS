@@ -118,18 +118,20 @@ func CheckFirewallHealthy(mode GatewayMode, tproxyMark, routeTable int) bool {
 		if err := exec.Command("nft", "list", "table", "inet", "ghost0").Run(); err != nil {
 			return false
 		}
-	}
-	if HasNFTTProxy() {
-		out, err := exec.Command("ip", "rule", "show").Output()
-		if err != nil {
-			return false
+		if HasNFTTProxy() {
+			out, err := exec.Command("ip", "rule", "show").Output()
+			if err != nil {
+				return false
+			}
+			needle := fmt.Sprintf("lookup %d", routeTable)
+			if !strings.Contains(string(out), needle) {
+				return false
+			}
 		}
-		needle := fmt.Sprintf("lookup %d", routeTable)
-		if !strings.Contains(string(out), needle) {
-			return false
-		}
+		return true
 	}
-	return true
+	return exec.Command("iptables", "-t", "nat", "-L", "GHOST0_TCP").Run() == nil &&
+		exec.Command("iptables", "-t", "nat", "-L", "GHOST0_DNS").Run() == nil
 }
 
 func writeSysctl(path, val string) {

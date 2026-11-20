@@ -12,6 +12,9 @@ on:
       - "internal/gft/**"
       - "internal/client/**"
       - "internal/tunstack/**"
+      - "tools/gen-ios-icon/**"
+      - "go.mod"
+      - "go.sum"
       - ".github/workflows/ios-dual-ipa.yml"
 
 jobs:

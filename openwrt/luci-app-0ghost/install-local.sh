@@ -27,6 +27,11 @@ chmod 0644 /usr/share/rpcd/acl.d/luci-app-0ghost.json
 cp -f "$BASE_DIR/www/luci-static/resources/view/0ghost/index.js" /www/luci-static/resources/view/0ghost/index.js
 chmod 0644 /www/luci-static/resources/view/0ghost/index.js
 
+# Optional non-blocking installation of nft_tproxy + nft_socket kernel modules if missing.
+if command -v opkg >/dev/null 2>&1 && [ ! -d /sys/module/nft_tproxy ]; then
+	(opkg update >/dev/null 2>&1 && opkg install kmod-nft-tproxy kmod-nft-socket >/dev/null 2>&1) || true
+fi
+
 # Strip any accidental CRLF line endings on shell scripts
 sed -i 's/\r$//' /etc/init.d/0ghost
 

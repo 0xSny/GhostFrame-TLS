@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -209,33 +210,115 @@ func (p *FakeIPPool) Flush() error {
 	rawBytes := raw.Bytes()
 	binary.BigEndian.PutUint32(rawBytes[entriesStart:entriesStart+4], uint32(written))
 
-	var comp bytes.Buffer
-	zw := zlib.NewWriter(&comp)
-	if _, err := zw.Write(rawBytes); err != nil {
-		_ = zw.Close()
-		return err
-	}
-	if err := zw.Close(); err != nil {
-		return err
-	}
-
 	dir := filepath.Dir(p.cachePath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	var payload []byte
+	if strings.HasSuffix(strings.ToLower(p.cachePath), ".json") {
+		type jsonCacheEntry struct {
+			IP     string `json:"ip"`
+			Domain string `json:"domain"`
+		}
+		type jsonCacheFile struct {
+			NextOff uint32           `json:"next_off"`
+			Entries []jsonCacheEntry `json:"entries"`
+		}
+		var recs []jsonCacheEntry
+		pos := 17
+		cnt := int(binary.BigEndian.Uint32(rawBytes[13:17]))
+		for i := 0; i < cnt && pos+6 <= len(rawBytes); i++ {
+			u := binary.BigEndian.Uint32(rawBytes[pos : pos+4])
+			hl := int(binary.BigEndian.Uint16(rawBytes[pos+4 : pos+6]))
+			pos += 6
+			if hl <= 0 || pos+hl > len(rawBytes) {
+				break
+			}
+			b4 := uint32ToIPv4(u)
+			recs = append(recs, jsonCacheEntry{
+				IP:     net.IPv4(b4[0], b4[1], b4[2], b4[3]).String(),
+				Domain: string(rawBytes[pos : pos+hl]),
+			})
+			pos += hl
+		}
+		b, merr := json.Marshal(jsonCacheFile{
+			NextOff: binary.BigEndian.Uint32(rawBytes[5:9]),
+			Entries: recs,
+		})
+		if merr != nil {
+			return merr
+		}
+		payload = b
+	} else {
+		var comp bytes.Buffer
+		zw := zlib.NewWriter(&comp)
+		if _, err := zw.Write(rawBytes); err != nil {
+			_ = zw.Close()
+			return err
+		}
+		if err := zw.Close(); err != nil {
+			return err
+		}
+		payload = comp.Bytes()
+	}
+
 	tmp := p.cachePath + ".tmp"
-	if err := os.WriteFile(tmp, comp.Bytes(), 0o600); err != nil {
+	if err := os.WriteFile(tmp, payload, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, p.cachePath)
 }
 
 func (p *FakeIPPool) loadFromFile(path string) error {
-	comp, err := os.ReadFile(path)
+	rawFile, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	zr, err := zlib.NewReader(bytes.NewReader(comp))
+	if strings.HasSuffix(strings.ToLower(path), ".json") {
+		var jc struct {
+			NextOff uint32 `json:"next_off"`
+			Entries []struct {
+				IP     string `json:"ip"`
+				Domain string `json:"domain"`
+			} `json:"entries"`
+		}
+		if jerr := json.Unmarshal(rawFile, &jc); jerr == nil && len(jc.Entries) > 0 {
+			p.mu.Lock()
+			p.nextOff = jc.NextOff
+			p.ipToHost = make(map[uint32]string, p.cap/4)
+			p.hostToIP = make(map[string]uint32, p.cap/4)
+			p.ring = make([]uint32, p.cap)
+			p.ringPos = 0
+			for _, ent := range jc.Entries {
+				ip4 := net.ParseIP(ent.IP).To4()
+				host := normalizeDomain(ent.Domain)
+				if ip4 == nil || host == "" {
+					continue
+				}
+				ipU32 := binary.BigEndian.Uint32(ip4)
+				if ipU32 < fakeIPStart || ipU32 > fakeIPEnd {
+					continue
+				}
+				if oldIP := p.ring[p.ringPos]; oldIP != 0 {
+					if oh, exists := p.ipToHost[oldIP]; exists {
+						delete(p.hostToIP, oh)
+						delete(p.ipToHost, oldIP)
+					}
+				}
+				if prevHost, exists := p.ipToHost[ipU32]; exists {
+					delete(p.hostToIP, prevHost)
+				}
+				p.ipToHost[ipU32] = host
+				p.hostToIP[host] = ipU32
+				p.ring[p.ringPos] = ipU32
+				p.ringPos = (p.ringPos + 1) % p.cap
+			}
+			p.dirty = false
+			p.mu.Unlock()
+			return nil
+		}
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(rawFile))
 	if err != nil {
 		return err
 	}

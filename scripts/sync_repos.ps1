@@ -171,8 +171,8 @@ $tlsCount = Sync-ProductWorkspace -Label "GhostFrame-TLS-main" -DstRoot $TlsWork
         "configs",
         "docs"
     ) `
-    -Files @("install.sh", "scripts\sync_all_repos.ps1", "go.mod", "go.sum", "LICENSE") `
-    -ReservedFiles @(".gitignore", "README.md", "Makefile", ".github\workflows\ci.yml", ".github\workflows\release.yml") `
+    -Files @("install.sh", "scripts\sync_all_repos.ps1", "LICENSE") `
+    -ReservedFiles @(".gitignore", "README.md", "Makefile", "go.mod", "go.sum", ".github\workflows\ci.yml", ".github\workflows\release.yml") `
     -DisallowedPrefixes @(
         "cmd\gft-client-gui", "cmd\0ghost",
         "internal\winui", "internal\tproxy", "internal\tunstack",
@@ -190,8 +190,8 @@ $proCount = Sync-ProductWorkspace -Label "GhostFrame-Pro-Source" -DstRoot $ProWo
         "internal\gftrtc",
         "internal\netbind"
     ) `
-    -Files @("configs\client.example.json", "go.mod", "go.sum", "LICENSE") `
-    -ReservedFiles @(".gitignore", "README.md", ".github\workflows\build-client.yml") `
+    -Files @("configs\client.example.json", "LICENSE") `
+    -ReservedFiles @(".gitignore", "README.md", "go.mod", "go.sum", ".github\workflows\build-client.yml") `
     -DisallowedPrefixes @(
         "cmd\gft-server", "cmd\gft-core", "cmd\0ghost",
         "internal\server", "internal\tui", "internal\sni", "internal\qr", "internal\tproxy", "internal\tunstack",
@@ -210,8 +210,8 @@ $zgCount = Sync-ProductWorkspace -Label "0Ghost-Source" -DstRoot $ZeroGhostWork 
         "internal\netbind",
         "openwrt\luci-app-0ghost"
     ) `
-    -Files @("scripts\build_0ghost.ps1", "configs\client.example.json", "go.mod", "go.sum", "LICENSE") `
-    -ReservedFiles @(".gitignore", "README.md", "Makefile", ".github\workflows\build-0ghost.yml") `
+    -Files @("scripts\build_0ghost.ps1", "configs\client.example.json", "LICENSE") `
+    -ReservedFiles @(".gitignore", "README.md", "Makefile", "go.mod", "go.sum", ".github\workflows\build-0ghost.yml") `
     -DisallowedPrefixes @(
         "cmd\gft-server", "cmd\gft-core", "cmd\gft-client-gui",
         "internal\server", "internal\tui", "internal\sni", "internal\qr", "internal\winui", "internal\tunstack",

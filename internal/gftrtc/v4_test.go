@@ -881,3 +881,80 @@ func TestDialLegacyV3Fallback(t *testing.T) {
 		t.Fatalf("echo mismatch: got %q want %q", echoed, payload)
 	}
 }
+
+func TestEarlyCloseStreamReleasesSessionWindowAndDedup(t *testing.T) {
+	keys, _, err := deriveSessionKeys([]byte("shared-secret-32bytes-0123456789"), []byte("test-psk-0123456789abcdef012345"), [12]byte{1, 2, 3}, false)
+	if err != nil {
+		t.Fatalf("deriveSessionKeys failed: %v", err)
+	}
+	s := newRTCSession(false, 0x11223344, [8]byte{}, "127.0.0.1", 0, keys, 0, nil, nil)
+	s.startLoops()
+	defer s.Close()
+
+	st := s.getOrCreatePendingStream(77)
+	if st == nil {
+		t.Fatal("expected pending stream 77")
+	}
+	chunk := bytes.Repeat([]byte("A"), 1024)
+	st.deliverChunk(0, chunk)
+	// Simulate immediate abort/early close with unread bytes in readyBuf.
+	st.abort(ErrStreamReset, false)
+	afterAbort := s.rxConsumedBytes.Load()
+	if afterAbort != 1024 {
+		t.Fatalf("expected 1024 consumed after abort, got %d", afterAbort)
+	}
+
+	// Duplicate retransmit of seq=0 MUST NOT over-credit session window.
+	dupFrame := encodeFrameStreamData(77, 0, chunk)
+	s.dispatchFrames(dupFrame, time.Now())
+	if got := s.rxConsumedBytes.Load(); got != 1024 {
+		t.Fatalf("duplicate retransmit over-credited rxConsumedBytes: got %d want 1024", got)
+	}
+
+	// Brand-new in-flight seq=1 & seq=2 arriving after close MUST credit session window once each.
+	late1 := encodeFrameStreamData(77, 1, chunk)
+	late2 := encodeFrameStreamData(77, 2, chunk)
+	s.dispatchFrames(append(late1, late2...), time.Now())
+	// Retransmit late1 again — still deduplicated.
+	s.dispatchFrames(encodeFrameStreamData(77, 1, chunk), time.Now())
+	if got := s.rxConsumedBytes.Load(); got != 3072 {
+		t.Fatalf("expected 3072 consumed after late in-flight frames + dedup, got %d", got)
+	}
+}
+
+func TestWatchdogDoesNotKillIdleSessionAndClearsOnInbound(t *testing.T) {
+	keys, _, err := deriveSessionKeys([]byte("shared-secret-32bytes-0123456789"), []byte("test-psk-0123456789abcdef012345"), [12]byte{4, 5, 6}, false)
+	if err != nil {
+		t.Fatalf("deriveSessionKeys failed: %v", err)
+	}
+	s := newRTCSession(true, 0x55667788, [8]byte{}, "127.0.0.1", 0, keys, 0, nil, nil)
+	defer s.Close()
+
+	oldNs := time.Now().Add(-10 * time.Second).UnixNano()
+	s.lastRecvNs.Store(oldNs)
+	s.unackedTxSinceNs.Store(oldNs)
+
+	// Idle session (InFlightBytes == 0 && !hasPendingData()) must clear unackedTxSinceNs, not trip watchdog.
+	if s.loss.InFlightBytes() != 0 || s.hasPendingData() {
+		t.Fatal("expected idle session")
+	}
+	s.unackedTxSinceNs.CompareAndSwap(oldNs, 0)
+	// Also test handleInboundPacket clears unackedTxSinceNs on valid RTP frame (with no in-flight bytes).
+	s.unackedTxSinceNs.Store(time.Now().UnixNano())
+	var area [64]byte
+	ping := encodeFramePingPong(FramePing, time.Now().UnixNano())
+	copy(area[FECHeaderLen:], ping)
+	srvTX, _ := newDirKeyStates(false, keys)
+	var wire [256]byte
+	sealed, err := SealRTPPhase(wire[:], srvTX.aead, srvTX.iv, srvTX.mask, srvTX.phase, 0x55667788, 1, 1000, PTAudioCtrl, true, 1, area[:FECHeaderLen+len(ping)])
+	if err != nil {
+		t.Fatalf("SealRTPPhase failed: %v", err)
+	}
+	pktBuf := make([]byte, len(sealed))
+	copy(pktBuf, sealed)
+	var plain [512]byte
+	s.handleInboundPacket(inboundPkt{buf: &pktBuf, n: len(pktBuf), at: time.Now()}, plain[:0])
+	if got := s.unackedTxSinceNs.Load(); got != 0 {
+		t.Fatalf("expected valid inbound RTP packet with 0 in-flight bytes to clear unackedTxSinceNs, got %d", got)
+	}
+}

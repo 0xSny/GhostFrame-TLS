@@ -130,7 +130,7 @@ type ghArtifactsResp struct {
 }
 
 func main() {
-	repo := flag.String("repo", defaultRepo, "GitHub repository (owner/name)")
+	repoFlag := flag.String("repo", "", "GitHub repository (owner/name, auto-detected from git remote origin if empty)")
 	workflow := flag.String("workflow", defaultWorkflow, "GitHub Actions workflow filename")
 	dir := flag.String("dir", defaultDistDir, "Local directory storing synced IPAs and source.json")
 	listen := flag.String("listen", defaultListenAddr, "HTTP listen address")
@@ -141,6 +141,12 @@ func main() {
 	once := flag.Bool("once", false, "Sync once and exit without starting HTTP server")
 	runID := flag.Int64("run-id", 0, "Optional specific GitHub Actions run ID to download")
 	flag.Parse()
+
+	resolvedRepo := strings.TrimSpace(*repoFlag)
+	if resolvedRepo == "" {
+		resolvedRepo = detectRepoFromGitOrigin()
+	}
+	repo := &resolvedRepo
 
 	doSync := *syncOnly
 	doServe := *serveOnly
@@ -1143,4 +1149,37 @@ func serveRepo(distDir, listenAddr, lanHost, port string) error {
 		return nil
 	}
 	return err
+}
+
+func detectRepoFromGitOrigin() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, resolveGitBinary(), "remote", "get-url", "origin").Output()
+	if err == nil {
+		if slug := parseGitHubRepoFromRemoteURL(string(out)); slug != "" {
+			return slug
+		}
+	}
+	return defaultRepo
+}
+
+func parseGitHubRepoFromRemoteURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	s = strings.TrimSuffix(s, ".git")
+	if strings.HasPrefix(s, "git@github.com:") {
+		slug := strings.TrimPrefix(s, "git@github.com:")
+		if parts := strings.Split(slug, "/"); len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+			return slug
+		}
+	}
+	if u, err := url.Parse(s); err == nil && strings.EqualFold(u.Hostname(), "github.com") {
+		trimmed := strings.Trim(u.Path, "/")
+		if parts := strings.Split(trimmed, "/"); len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+			return trimmed
+		}
+	}
+	return ""
 }

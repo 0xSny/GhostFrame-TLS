@@ -275,16 +275,16 @@ func (s *RTCStream) deliverChunk(seq uint32, data []byte) {
 	var winFrame []byte
 
 	s.mu.Lock()
-	if s.aborted != nil || s.rEOF {
-		s.mu.Unlock()
-		return
-	}
-	if s.hasFIN && seq >= s.finSeq {
-		s.mu.Unlock()
-		return
-	}
 	if seq < s.nextReadSeq {
 		s.mu.Unlock()
+		return
+	}
+	if s.aborted != nil || s.rEOF || (s.hasFIN && seq >= s.finSeq) {
+		_, dup := s.reorderBuf[seq]
+		s.mu.Unlock()
+		if !dup && len(data) > 0 && s.sess.closedIDs.markChunkAccounted(s.id, seq) {
+			s.sess.onStreamBytesConsumed(len(data))
+		}
 		return
 	}
 	if len(data) > 0 {
@@ -347,7 +347,21 @@ func (s *RTCStream) deliverChunk(seq uint32, data []byte) {
 	}
 }
 
+func (s *RTCStream) collectAccountedSeqsLocked() (uint32, []uint32) {
+	base := s.nextReadSeq
+	if len(s.reorderBuf) == 0 {
+		return base, nil
+	}
+	extra := make([]uint32, 0, len(s.reorderBuf))
+	for seq := range s.reorderBuf {
+		extra = append(extra, seq)
+	}
+	return base, extra
+}
+
 func (s *RTCStream) deliverFIN(finalSeq uint32) {
+	var baseSeq uint32
+	var extraSeqs []uint32
 	s.mu.Lock()
 	if !s.hasFIN {
 		s.hasFIN = true
@@ -357,10 +371,13 @@ func (s *RTCStream) deliverFIN(finalSeq uint32) {
 		s.rEOF = true
 	}
 	bothDone := s.rEOF && s.wClosed && len(s.sendQ) == 0 && !s.finQueued
+	if bothDone {
+		baseSeq, extraSeqs = s.collectAccountedSeqsLocked()
+	}
 	s.rcond.Broadcast()
 	s.mu.Unlock()
 	if bothDone {
-		s.sess.removeStream(s.id)
+		s.sess.removeStreamWithSeqs(s.id, baseSeq, extraSeqs)
 	}
 }
 
@@ -393,6 +410,7 @@ func (s *RTCStream) abort(err error, sendRST bool) {
 	}
 	s.sendQ = nil
 	s.finQueued = false
+	baseSeq, extraSeqs := s.collectAccountedSeqsLocked()
 	unread := (len(s.readyBuf) - s.readyOff) + s.reorderBytes
 	s.readyBuf = nil
 	s.readyOff = 0
@@ -415,7 +433,7 @@ func (s *RTCStream) abort(err error, sendRST bool) {
 	if s.closed.CompareAndSwap(false, true) {
 		s.sess.decStreams()
 	}
-	s.sess.removeStream(s.id)
+	s.sess.removeStreamWithSeqs(s.id, baseSeq, extraSeqs)
 }
 
 // Read reads contiguous in-order stream bytes.
@@ -620,6 +638,9 @@ func (s *RTCStream) Close() error {
 	var sendRST bool
 	s.closeOnce.Do(func() {
 		s.writeDone.Store(true)
+		var unread int
+		var baseSeq uint32
+		var extraSeqs []uint32
 		s.mu.Lock()
 		hadEOF := s.rEOF
 		wasWClosed := s.wClosed
@@ -629,8 +650,8 @@ func (s *RTCStream) Close() error {
 			s.wClosed = true
 			s.finQueued = true
 		}
-		var unread int
 		if !alreadyAborted {
+			baseSeq, extraSeqs = s.collectAccountedSeqsLocked()
 			unread = (len(s.readyBuf) - s.readyOff) + s.reorderBytes
 			s.readyBuf = nil
 			s.readyOff = 0
@@ -647,6 +668,8 @@ func (s *RTCStream) Close() error {
 					s.finQueued = false
 				}
 			}
+		} else {
+			baseSeq = s.nextReadSeq
 		}
 		s.rcond.Broadcast()
 		s.wcond.Broadcast()
@@ -667,7 +690,7 @@ func (s *RTCStream) Close() error {
 		if s.closed.CompareAndSwap(false, true) {
 			s.sess.decStreams()
 		}
-		s.sess.removeStream(s.id)
+		s.sess.removeStreamWithSeqs(s.id, baseSeq, extraSeqs)
 	})
 	return nil
 }

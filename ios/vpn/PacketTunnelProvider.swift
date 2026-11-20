@@ -55,6 +55,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pathDebounceWorkItem: DispatchWorkItem?
     private var currentHTTPPort: Int = 10809
     private var currentServerHost: String = ""
+    private var currentRouteMode: String = "rule"
     private var tunWriter: PacketFlowTunWriter?
     private let tunLock = NSLock()
     private var tunReading: Bool = false
@@ -83,6 +84,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         let httpPort = (providerCfg?["httpPort"] as? Int) ?? decodedCfg?.httpPort ?? 10809
+        let routeMode = (decodedCfg?.routeMode ?? "rule").lowercased()
 
         let startConfigJSON: String
         if var cfg = decodedCfg {
@@ -110,8 +112,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         currentHTTPPort = httpPort
         currentServerHost = serverHost
+        currentRouteMode = routeMode
 
-        let settings = buildNetworkSettings(httpPort: httpPort, serverHost: serverHost)
+        let settings = buildNetworkSettings(httpPort: httpPort, serverHost: serverHost, routeMode: routeMode)
         setTunnelNetworkSettings(settings) { [weak self] error in
             if let error = error {
                 _ = GhostMobileBridge.stopEngine()
@@ -120,11 +123,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             if let self = self {
-                if case .failure(let tunErr) = self.startTUNForwarding(mtu: 1400) {
-                    _ = GhostMobileBridge.stopEngine()
-                    self.stopNetworkMonitor()
-                    completionHandler(tunErr)
-                    return
+                if routeMode != "core" {
+                    if case .failure(let tunErr) = self.startTUNForwarding(mtu: 1400) {
+                        _ = GhostMobileBridge.stopEngine()
+                        self.stopNetworkMonitor()
+                        completionHandler(tunErr)
+                        return
+                    }
                 }
                 self.notifyControlCenterReload()
             }
@@ -262,6 +267,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     serverHost = node.host
                 }
                 let newHTTPPort = decodedCfg?.httpPort ?? self.currentHTTPPort
+                let newRouteMode = (decodedCfg?.routeMode ?? self.currentRouteMode).lowercased()
                 let startConfigJSON: String
                 if var cfg = decodedCfg {
                     cfg.asyncConnect = true
@@ -276,21 +282,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 case .failure(let err):
                     self.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
                 case .success:
-                    if newHTTPPort != self.currentHTTPPort || serverHost != self.currentServerHost {
+                    if newHTTPPort != self.currentHTTPPort || serverHost != self.currentServerHost || newRouteMode != self.currentRouteMode {
                         self.currentHTTPPort = newHTTPPort
                         self.currentServerHost = serverHost
-                        let settings = self.buildNetworkSettings(httpPort: newHTTPPort, serverHost: serverHost)
+                        self.currentRouteMode = newRouteMode
+                        let settings = self.buildNetworkSettings(httpPort: newHTTPPort, serverHost: serverHost, routeMode: newRouteMode)
                         self.setTunnelNetworkSettings(settings) { [weak self] err in
                             if let err = err {
                                 self?.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
                             } else {
-                                _ = self?.startTUNForwarding(mtu: 1400)
+                                if newRouteMode != "core" {
+                                    _ = self?.startTUNForwarding(mtu: 1400)
+                                }
                                 self?.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
                             }
                         }
                         return
                     }
-                    _ = self.startTUNForwarding(mtu: 1400)
+                    if newRouteMode != "core" {
+                        _ = self.startTUNForwarding(mtu: 1400)
+                    }
                     self.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
                 }
 
@@ -305,13 +316,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         completionHandler?(data)
     }
 
-    private func buildNetworkSettings(httpPort: Int, serverHost: String) -> NEPacketTunnelNetworkSettings {
+    private func buildNetworkSettings(httpPort: Int, serverHost: String, routeMode: String) -> NEPacketTunnelNetworkSettings {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "198.18.0.1")
         settings.mtu = 1400
 
+        let ipv4 = NEIPv4Settings(addresses: ["198.18.0.2"], subnetMasks: ["255.255.255.0"])
+        if routeMode == "core" {
+            // Port-only mode: keep local SOCKS5/HTTP listeners without system-wide TUN/proxy interception.
+            ipv4.includedRoutes = []
+            ipv4.excludedRoutes = [NEIPv4Route.default()]
+            settings.ipv4Settings = ipv4
+            return settings
+        }
+
         // True TUN L3/L4 intercept (0.0.0.0/0) so Telegram MTProto, raw TCP/UDP apps & games
         // are captured automatically alongside the hybrid HTTP proxy fast-path.
-        let ipv4 = NEIPv4Settings(addresses: ["198.18.0.2"], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
 
         var excluded: [NEIPv4Route] = [
@@ -323,8 +342,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             NEIPv4Route(destinationAddress: "224.0.0.0", subnetMask: "240.0.0.0"),
             NEIPv4Route(destinationAddress: "255.255.255.255", subnetMask: "255.255.255.255")
         ]
-        if !serverHost.isEmpty && isValidIPv4(serverHost) {
-            excluded.append(NEIPv4Route(destinationAddress: serverHost, subnetMask: "255.255.255.255"))
+        if !serverHost.isEmpty {
+            if isValidIPv4(serverHost) {
+                excluded.append(NEIPv4Route(destinationAddress: serverHost, subnetMask: "255.255.255.255"))
+            } else {
+                for resolvedIP in resolveIPv4Addresses(serverHost) {
+                    excluded.append(NEIPv4Route(destinationAddress: resolvedIP, subnetMask: "255.255.255.255"))
+                }
+            }
         }
         ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4
@@ -359,6 +384,36 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         settings.proxySettings = proxy
 
         return settings
+    }
+
+    private func resolveIPv4Addresses(_ host: String) -> [String] {
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_STREAM
+        var res: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &res) == 0, let first = res else {
+            return []
+        }
+        defer { freeaddrinfo(res) }
+
+        var ips: [String] = []
+        var cursor: UnsafeMutablePointer<addrinfo>? = first
+        while let cur = cursor {
+            if let sa = cur.pointee.ai_addr, sa.pointee.sa_family == sa_family_t(AF_INET) {
+                var sin = sockaddr_in()
+                memcpy(&sin, sa, MemoryLayout<sockaddr_in>.size)
+                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                var addrCopy = sin.sin_addr
+                if inet_ntop(AF_INET, &addrCopy, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    let s = String(cString: buf)
+                    if !ips.contains(s) {
+                        ips.append(s)
+                    }
+                }
+            }
+            cursor = cur.pointee.ai_next
+        }
+        return ips
     }
 
     private func isValidIPv4(_ host: String) -> Bool {

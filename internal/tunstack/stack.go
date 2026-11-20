@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -58,13 +57,6 @@ type Stats struct {
 	PacketsIn   uint64 `json:"packets_in"`
 	PacketsOut  uint64 `json:"packets_out"`
 	FakeIPEntry int    `json:"fakeip_entries"`
-}
-
-var copyBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 16*1024)
-		return &b
-	},
 }
 
 var udpBufPool = sync.Pool{
@@ -346,15 +338,16 @@ func (s *Stack) outboundPump() {
 	}
 }
 
-func (s *Stack) resolveDestination(dstAddr tcpip.Address, dstPort uint16) (dialTarget, routeTarget string, isFake bool) {
+func (s *Stack) resolveDestination(dstAddr tcpip.Address, dstPort uint16) (dialTarget, routeTarget string, isFake, hitFakeRange bool) {
 	ip := net.IP(dstAddr.AsSlice())
 	portStr := strconv.Itoa(int(dstPort))
+	hitFakeRange = IsFakeIP(ip)
 	if host, ok := s.fakeIP.Lookup(ip); ok && host != "" {
 		hp := net.JoinHostPort(host, portStr)
-		return hp, hp, true
+		return hp, hp, true, true
 	}
 	hp := net.JoinHostPort(ip.String(), portStr)
-	return hp, hp, false
+	return hp, hp, false, hitFakeRange
 }
 
 func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
@@ -389,16 +382,23 @@ func (s *Stack) relayTCP(conn *gonet.TCPConn, dstAddr tcpip.Address, dstPort uin
 	defer s.activeTCP.Add(-1)
 	defer conn.Close()
 
-	dialTarget, routeTarget, isFake := s.resolveDestination(dstAddr, dstPort)
+	dialTarget, routeTarget, isFake, hitFakeRange := s.resolveDestination(dstAddr, dstPort)
 	var clientConn net.Conn = conn
 
-	// For raw public IPs (non-FakeIP) on TLS ports, perform 30ms ClientHello SNI sniff
-	// so RuleSet can classify by domain name even when an app bypassed DNS.
-	if !isFake && s.engine.ShouldSniffSNI(dialTarget) {
+	// For raw public IPs (non-FakeIP) OR orphaned 198.18.x.x Fake-IPs missing after restart,
+	// perform 30ms ClientHello SNI sniff to recover the true hostname.
+	if (!isFake && s.engine.ShouldSniffSNI(dialTarget)) || (hitFakeRange && !isFake) {
 		var sni string
 		sni, clientConn = gft.SniffTLSSNI(conn, 30*time.Millisecond)
 		if sni != "" {
-			routeTarget = net.JoinHostPort(sni, strconv.Itoa(int(dstPort)))
+			hp := net.JoinHostPort(sni, strconv.Itoa(int(dstPort)))
+			routeTarget = hp
+			if hitFakeRange && !isFake {
+				dialTarget = hp
+			}
+		} else if hitFakeRange && !isFake {
+			// Drop orphaned unmapped 198.18.x.x immediately (TCP RST/close) so the app re-queries DNS at 0ms.
+			return
 		}
 	}
 
@@ -408,21 +408,7 @@ func (s *Stack) relayTCP(conn *gonet.TCPConn, dstAddr tcpip.Address, dstPort uin
 	}
 	defer st.Close()
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		bufPtr := copyBufPool.Get().(*[]byte)
-		_, _ = io.CopyBuffer(st, clientConn, *bufPtr)
-		copyBufPool.Put(bufPtr)
-		_ = st.CloseWrite()
-	}()
-
-	bufPtr := copyBufPool.Get().(*[]byte)
-	_, _ = io.CopyBuffer(conn, st, *bufPtr)
-	copyBufPool.Put(bufPtr)
-	_ = conn.CloseWrite()
-	wg.Wait()
+	gft.Relay(st, clientConn, 2*time.Minute)
 }
 
 func (s *Stack) handleUDP(r *udp.ForwarderRequest) bool {
@@ -482,7 +468,11 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 	defer s.activeUDP.Add(-1)
 	defer conn.Close()
 
-	dialTarget, routeTarget, _ := s.resolveDestination(dstAddr, dstPort)
+	dialTarget, routeTarget, isFake, hitFakeRange := s.resolveDestination(dstAddr, dstPort)
+	if hitFakeRange && !isFake {
+		// Unmapped 198.18.x.x UDP cannot be routed externally; drop immediately so app re-resolves DNS.
+		return
+	}
 	act := s.engine.RouteDecision(routeTarget)
 	if act == client.ActionReject {
 		return
@@ -519,7 +509,7 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 		}
 	}()
 
-	bufPtr := udpBufPool.Get().(*[]byte)
+	bufPtr := dnsBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(idle))
@@ -531,7 +521,7 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 			break
 		}
 	}
-	udpBufPool.Put(bufPtr)
+	dnsBufPool.Put(bufPtr)
 	_ = assoc.Close()
 	<-done
 }
@@ -564,7 +554,7 @@ func (s *Stack) relayUDPDirect(conn *gonet.UDPConn, dialTarget string) {
 		}
 	}()
 
-	bufPtr := udpBufPool.Get().(*[]byte)
+	bufPtr := dnsBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(idle))
@@ -577,7 +567,7 @@ func (s *Stack) relayUDPDirect(conn *gonet.UDPConn, dialTarget string) {
 			break
 		}
 	}
-	udpBufPool.Put(bufPtr)
+	dnsBufPool.Put(bufPtr)
 	_ = remote.Close()
 	<-done
 }

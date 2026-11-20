@@ -57,14 +57,16 @@ type jsonEnvelope struct {
 }
 
 var (
-	mu             sync.Mutex
-	initialized    bool
-	dataDirState   string
-	tunnelExtState bool
-	engineInst     *client.Engine
-	lastConfigRaw  string
-	lastConnectErr string
-	scrubberStopCh chan struct{}
+	mu              sync.Mutex
+	initialized     bool
+	dataDirState    string
+	tunnelExtState  bool
+	engineInst      *client.Engine
+	lastConfigRaw   string
+	lastConnectErr  string
+	scrubberStopCh  chan struct{}
+	reconnectStopCh chan struct{}
+	reconnectWakeCh chan struct{}
 )
 
 func init() {
@@ -90,7 +92,9 @@ func stopMemScrubberLocked() {
 }
 
 func startMemScrubberLocked() {
-	stopMemScrubberLocked()
+	if scrubberStopCh != nil {
+		return
+	}
 	ch := make(chan struct{})
 	scrubberStopCh = ch
 	go func(stop <-chan struct{}) {
@@ -109,6 +113,14 @@ func startMemScrubberLocked() {
 			}
 		}
 	}(ch)
+}
+
+func stopReconnectLoopLocked() {
+	if reconnectStopCh != nil {
+		close(reconnectStopCh)
+		reconnectStopCh = nil
+	}
+	reconnectWakeCh = nil
 }
 
 func initCoreLocked(dataDir string, isTunnelExt bool) {
@@ -189,6 +201,10 @@ func StartEngine(configJSON string) error {
 	if !initialized {
 		initCoreLocked("", false)
 	}
+	if tunnelExtState {
+		startMemScrubberLocked()
+	}
+	stopReconnectLoopLocked()
 	oldEngine := engineInst
 	engineInst = nil
 	dir := dataDirState
@@ -226,12 +242,16 @@ func StartEngine(configJSON string) error {
 	mu.Lock()
 	engineInst = eng
 	lastConnectErr = ""
-	mu.Unlock()
-
 	if cfg.AsyncConnect {
-		go connectWithRetryAsync(eng)
+		stopCh := make(chan struct{})
+		wakeCh := make(chan struct{}, 1)
+		reconnectStopCh = stopCh
+		reconnectWakeCh = wakeCh
+		mu.Unlock()
+		go connectWithRetryAsync(eng, stopCh, wakeCh)
 		return nil
 	}
+	mu.Unlock()
 
 	if err := eng.Connect(); err != nil {
 		mu.Lock()
@@ -246,33 +266,50 @@ func StartEngine(configJSON string) error {
 	return nil
 }
 
-func connectWithRetryAsync(eng *client.Engine) {
-	backoffs := []time.Duration{0, 2 * time.Second, 4 * time.Second, 6 * time.Second}
-	for attempt, wait := range backoffs {
-		if wait > 0 {
-			time.Sleep(wait)
-		}
+func connectWithRetryAsync(eng *client.Engine, stopCh <-chan struct{}, wakeCh <-chan struct{}) {
+	backoff := 2 * time.Second
+	const maxBackoff = 15 * time.Second
+	attempt := 0
+
+	for {
+		attempt++
 		mu.Lock()
 		stillActive := (engineInst == eng)
 		mu.Unlock()
 		if !stillActive {
 			return
 		}
-		err := eng.Connect()
-		if err == nil {
+
+		if err := eng.Connect(); err == nil {
 			mu.Lock()
 			if engineInst == eng {
 				lastConnectErr = ""
 			}
 			mu.Unlock()
 			return
+		} else {
+			mu.Lock()
+			if engineInst == eng {
+				lastConnectErr = err.Error()
+			}
+			mu.Unlock()
+			eng.Logf("[Mobile] Connect attempt %d failed (retry in %s): %v", attempt, backoff, err)
 		}
-		mu.Lock()
-		if engineInst == eng {
-			lastConnectErr = err.Error()
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-stopCh:
+			timer.Stop()
+			return
+		case <-wakeCh:
+			timer.Stop()
+			backoff = 2 * time.Second
+		case <-timer.C:
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 		}
-		mu.Unlock()
-		eng.Logf("[Mobile] Connect attempt %d/%d failed: %v", attempt+1, len(backoffs), err)
 	}
 }
 
@@ -290,6 +327,7 @@ func StopEngine() error {
 	engineInst = nil
 	lastConnectErr = ""
 	isTunnel := tunnelExtState
+	stopReconnectLoopLocked()
 	stopMemScrubberLocked()
 	mu.Unlock()
 
@@ -314,9 +352,17 @@ func OnNetworkChanged(ifaceName string) {
 	netbind.ResetNAT64Cache()
 	mu.Lock()
 	eng := engineInst
+	wakeCh := reconnectWakeCh
 	mu.Unlock()
 	if eng != nil {
-		eng.OnSystemWake()
+		if eng.IsConnected() {
+			eng.OnSystemWake()
+		} else if wakeCh != nil {
+			select {
+			case wakeCh <- struct{}{}:
+			default:
+			}
+		}
 	}
 }
 

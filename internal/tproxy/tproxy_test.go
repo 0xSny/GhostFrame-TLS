@@ -178,4 +178,22 @@ func TestEffectiveCNIPv4CIDRsAndOverride(t *testing.T) {
 	if len(ov) != 2 || ov[0] != "223.5.5.5/32" || ov[1] != "119.29.0.0/16" {
 		t.Fatalf("unexpected override CIDRs: %v", ov)
 	}
+
+	// 3. Verify !PreferTProxy (REDIRECT fallback) never emits tproxy or socket transparent statements.
+	redirSpec := FirewallSpec{
+		Mode:         ModeRule,
+		PreferTProxy: false,
+		TCPPort:      10880,
+		UDPPort:      10881,
+		DNSPort:      7853,
+	}
+	redirScript := BuildNFTablesScript(redirSpec)
+	for _, forbidden := range []string{"tproxy ip to", "socket transparent", "meta mark set 0x1"} {
+		if strings.Contains(redirScript, forbidden) {
+			t.Fatalf("unexpected TPROXY syntax %q inside PreferTProxy=false fallback script", forbidden)
+		}
+	}
+	if !strings.Contains(redirScript, "chain tcp_redir_nat") || !strings.Contains(redirScript, "meta l4proto tcp redirect to :10880") {
+		t.Fatalf("expected REDIRECT fallback chain in PreferTProxy=false script")
+	}
 }

@@ -449,9 +449,9 @@ function refresh(){
     document.getElementById('nodeCount').textContent = `${nodes.length} 节点`;
     const nl = document.getElementById('nodeList');
     nl.innerHTML = nodes.length === 0 ? '<div style="color:var(--muted);font-size:12px">暂无节点，请在上方粘贴 gft3:// 链接导入</div>' :
-      nodes.map(n => `<div class="node-item ${n.index===s.active_index?'active':''}">
+      nodes.map(n => `<div class="node-item ${n.index===s.active_node?'active':''}">
         <div><div style="font-weight:700">${n.name}</div><div style="font-size:11px;color:var(--muted)">${n.host}:${n.port} · ${n.transport} ${n.hop_range?('· '+n.hop_range):''}</div></div>
-        <div style="display:flex;gap:6px">${n.index===s.active_index?'<span class="pill" style="border-color:var(--emerald);color:#6ee7b7">当前</span>':`<button class="btn sm" onclick="selectNode(${n.index})">切换</button>`}<button class="btn sm danger" onclick="deleteNode(${n.index})">删</button></div>
+        <div style="display:flex;gap:6px">${n.index===s.active_node?'<span class="pill" style="border-color:var(--emerald);color:#6ee7b7">当前</span>':`<button class="btn sm" onclick="selectNode(${n.index})">切换</button>`}<button class="btn sm danger" onclick="deleteNode(${n.index})">删</button></div>
       </div>`).join('');
 
     drawSpark(s.history || []);

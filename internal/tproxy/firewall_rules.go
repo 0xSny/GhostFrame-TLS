@@ -166,36 +166,31 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 	b.WriteString(fmt.Sprintf("    meta l4proto { tcp, udp } th dport 53 redirect to :%d\n", spec.DNSPort))
 	b.WriteString("  }\n")
 
-	// 6. Prerouting transparent forwarding chain with strict top-priority management whitelist.
-	b.WriteString("  chain mangle_prerouting {\n")
-	b.WriteString("    type filter hook prerouting priority mangle; policy accept;\n")
-	b.WriteString(fmt.Sprintf("    meta mark %s return\n", markHex))
-	b.WriteString(fmt.Sprintf("    fib daddr type local meta l4proto { tcp, udp } th dport { 22, 80, 443, 7681, %d, %d, %d } return\n",
-		spec.WebPort, spec.SocksPort, spec.HTTPPort))
-	b.WriteString("    fib daddr type local return\n")
-	b.WriteString("    ip daddr @lan_bypass_v4 return\n")
-	b.WriteString("    ip6 daddr { ::1/128, fe80::/10, fc00::/7 } return\n")
-	if len(vpsIPs) > 0 {
-		b.WriteString("    ip daddr @vps_bypass_v4 return\n")
-	}
-	if devMatchRule != "" {
-		b.WriteString(devMatchRule)
-	}
-	b.WriteString("    meta l4proto { tcp, udp } th dport 53 return\n")
-	if spec.Mode == ModeRule {
-		b.WriteString("    ip daddr @cn_ipv4 return\n")
-	}
+	// 6. Prerouting transparent forwarding chain (TPROXY when supported; otherwise pure TCP REDIRECT nat chain).
 	if spec.PreferTProxy {
+		b.WriteString("  chain mangle_prerouting {\n")
+		b.WriteString("    type filter hook prerouting priority mangle; policy accept;\n")
+		b.WriteString(fmt.Sprintf("    meta mark %s return\n", markHex))
+		b.WriteString(fmt.Sprintf("    fib daddr type local meta l4proto { tcp, udp } th dport { 22, 80, 443, 7681, %d, %d, %d } return\n",
+			spec.WebPort, spec.SocksPort, spec.HTTPPort))
+		b.WriteString("    fib daddr type local return\n")
+		b.WriteString("    ip daddr @lan_bypass_v4 return\n")
+		b.WriteString("    ip6 daddr { ::1/128, fe80::/10, fc00::/7 } return\n")
+		if len(vpsIPs) > 0 {
+			b.WriteString("    ip daddr @vps_bypass_v4 return\n")
+		}
+		if devMatchRule != "" {
+			b.WriteString(devMatchRule)
+		}
+		b.WriteString("    meta l4proto { tcp, udp } th dport 53 return\n")
+		if spec.Mode == ModeRule {
+			b.WriteString("    ip daddr @cn_ipv4 return\n")
+		}
 		b.WriteString(fmt.Sprintf("    meta l4proto tcp socket transparent 1 meta mark set %s accept\n", tproxyMarkHex))
 		b.WriteString(fmt.Sprintf("    meta l4proto tcp tproxy ip to 127.0.0.1:%d meta mark set %s accept\n", spec.TCPPort, tproxyMarkHex))
 		b.WriteString(fmt.Sprintf("    meta l4proto udp tproxy ip to 127.0.0.1:%d meta mark set %s accept\n", spec.UDPPort, tproxyMarkHex))
+		b.WriteString("  }\n")
 	} else {
-		b.WriteString(fmt.Sprintf("    meta l4proto udp tproxy ip to 127.0.0.1:%d meta mark set %s accept\n", spec.UDPPort, tproxyMarkHex))
-	}
-	b.WriteString("  }\n")
-
-	// Optional TCP REDIRECT fallback chain when nft_tproxy is unavailable.
-	if !spec.PreferTProxy {
 		b.WriteString("  chain tcp_redir_nat {\n")
 		b.WriteString("    type nat hook prerouting priority dstnat; policy accept;\n")
 		b.WriteString(fmt.Sprintf("    meta mark %s return\n", markHex))
@@ -217,8 +212,8 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 		b.WriteString("  }\n")
 	}
 
-	// 7. Local router output marking (skipped if DeviceMode restricts to specific LAN IPs).
-	if spec.DeviceMode == DeviceAll {
+	// 7. Local router output marking (TPROXY only; omitted in pure REDIRECT fallback to avoid dangling fwmark).
+	if spec.PreferTProxy && spec.DeviceMode == DeviceAll {
 		b.WriteString("  chain mangle_output {\n")
 		b.WriteString("    type route hook output priority mangle; policy accept;\n")
 		b.WriteString(fmt.Sprintf("    meta mark %s return\n", markHex))
@@ -233,11 +228,7 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 		if spec.Mode == ModeRule {
 			b.WriteString("    ip daddr @cn_ipv4 return\n")
 		}
-		if spec.PreferTProxy {
-			b.WriteString(fmt.Sprintf("    meta l4proto { tcp, udp } meta mark set %s accept\n", tproxyMarkHex))
-		} else {
-			b.WriteString(fmt.Sprintf("    meta l4proto udp meta mark set %s accept\n", tproxyMarkHex))
-		}
+		b.WriteString(fmt.Sprintf("    meta l4proto { tcp, udp } meta mark set %s accept\n", tproxyMarkHex))
 		b.WriteString("  }\n")
 	}
 

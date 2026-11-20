@@ -153,3 +153,18 @@ func TestPanelBruteForceLockoutAndOriginCSRF(t *testing.T) {
 		t.Fatalf("expected 200 for same-origin CSRF POST, got %d", goodResp.StatusCode)
 	}
 }
+
+func TestSSRFBlockedSpecialRanges(t *testing.T) {
+	blocked := []string{"198.18.0.1", "198.19.255.254", "100.64.0.1", "100.127.255.254", "127.0.0.1", "10.0.0.1"}
+	for _, ipStr := range blocked {
+		if !blockedIP(net.ParseIP(ipStr)) {
+			t.Fatalf("expected SSRF filter to block %s", ipStr)
+		}
+	}
+	allowed := []string{"1.1.1.1", "8.8.8.8", "198.20.0.1", "100.128.0.1"}
+	for _, ipStr := range allowed {
+		if blockedIP(net.ParseIP(ipStr)) {
+			t.Fatalf("expected SSRF filter to allow public IP %s", ipStr)
+		}
+	}
+}

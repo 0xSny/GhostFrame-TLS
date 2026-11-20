@@ -83,21 +83,20 @@ enum GhostVPNControlBridge {
         if let mgr = try? await loadPreferredManager() {
             return isActiveStatus(mgr.connection.status)
         }
-        guard let url = URL(string: "http://127.0.0.1:10809/_gft/ping") else {
-            return false
-        }
         let cfg = URLSessionConfiguration.ephemeral
         cfg.connectionProxyDictionary = [:]
         cfg.timeoutIntervalForRequest = 0.4
         cfg.timeoutIntervalForResource = 0.6
         let session = URLSession(configuration: cfg)
         defer { session.invalidateAndCancel() }
-        do {
-            let (_, resp) = try await session.data(from: url)
-            return (resp as? HTTPURLResponse)?.statusCode == 200
-        } catch {
-            return false
+        for port in [10809, 7891, 10819] {
+            guard let url = URL(string: "http://127.0.0.1:\(port)/_gft/ping") else { continue }
+            if let (_, resp) = try? await session.data(from: url),
+               (resp as? HTTPURLResponse)?.statusCode == 200 {
+                return true
+            }
         }
+        return false
     }
 
     static func reloadControls() {
@@ -158,7 +157,7 @@ enum GhostVPNControlBridge {
 }
 
 @available(iOS 18.0, *)
-struct ToggleGhostVPNIntent: SetValueIntent {
+struct ToggleGhostVPNIntent: SetValueIntent, AudioPlaybackIntent {
     static var title: LocalizedStringResource = "切换 GhostFrame VPN"
     static var description = IntentDescription("快速开启或关闭 GhostFrame VPN 安全隧道。")
     static var openAppWhenRun: Bool = false
@@ -180,7 +179,7 @@ struct ToggleGhostVPNIntent: SetValueIntent {
 }
 
 @available(iOS 16.0, *)
-struct ConnectGhostVPNIntent: AppIntent {
+struct ConnectGhostVPNIntent: AudioPlaybackIntent {
     static var title: LocalizedStringResource = "开启 GhostFrame VPN"
     static var description = IntentDescription("在后台连接 GhostFrame VPN 安全隧道。")
     static var openAppWhenRun: Bool = false
@@ -193,7 +192,7 @@ struct ConnectGhostVPNIntent: AppIntent {
 }
 
 @available(iOS 16.0, *)
-struct DisconnectGhostVPNIntent: AppIntent {
+struct DisconnectGhostVPNIntent: AudioPlaybackIntent {
     static var title: LocalizedStringResource = "关闭 GhostFrame VPN"
     static var description = IntentDescription("断开 GhostFrame VPN 安全隧道。")
     static var openAppWhenRun: Bool = false

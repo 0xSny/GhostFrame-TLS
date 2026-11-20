@@ -117,3 +117,19 @@ func TestGatewayWebSecurityHardening(t *testing.T) {
 		t.Fatalf("expected authenticated /api/status 200, got %d", recAuth.Code)
 	}
 }
+
+func TestProbeDualConnectivityConcurrentSafe(t *testing.T) {
+	svc, err := NewGatewayService("", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewGatewayService failed: %v", err)
+	}
+	defer svc.Stop()
+
+	res := svc.ProbeDualConnectivity()
+	if res["tunnel_info"] != "隧道未连接" {
+		t.Fatalf("expected disconnected tunnel_info message, got %v", res["tunnel_info"])
+	}
+	if _, ok := res["direct_ok"].(bool); !ok {
+		t.Fatalf("expected boolean direct_ok in probe result: %v", res)
+	}
+}

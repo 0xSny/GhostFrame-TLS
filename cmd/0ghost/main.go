@@ -234,12 +234,15 @@ func (s *GatewayService) watchLoop() {
 				continue
 			}
 			healthTick++
-			if healthTick >= 5 { // Every 20s verify fw4/ip-rule integrity
+			if healthTick >= 3 { // Every 12s verify fw4/iptables & ip-rule integrity
 				healthTick = 0
 				cfg := s.getGatewayConfig()
-				if connected && cfg.GatewayMode != tproxy.ModePort {
+				s.mu.RLock()
+				active := s.fwActive
+				s.mu.RUnlock()
+				if active && connected && cfg.GatewayMode != tproxy.ModePort {
 					if !tproxy.CheckFirewallHealthy(cfg.GatewayMode, 1, 100) {
-						s.engine.Logf("[0Ghost] 巡检发现 nftables 或策略路由异常脱落，立即自动修复...")
+						s.engine.Logf("[0Ghost] 巡检发现防火墙规则或策略路由异常脱落，立即自动修复...")
 						s.SyncFirewall()
 					}
 				}
@@ -359,15 +362,16 @@ func (streamAsNetConn) SetReadDeadline(time.Time) error    { return nil }
 func (streamAsNetConn) SetWriteDeadline(time.Time) error   { return nil }
 
 func (s *GatewayService) ProbeDualConnectivity() map[string]any {
-	out := map[string]any{
-		"direct_ok":    false,
-		"direct_ms":    int64(0),
-		"direct_info":  "",
-		"tunnel_ok":    false,
-		"tunnel_ms":    int64(0),
-		"tunnel_info":  "",
-		"tunnel_code":  0,
-	}
+	var (
+		directOK   bool
+		directMs   int64
+		directInfo string
+
+		tunnelOK   bool
+		tunnelMs   int64
+		tunnelCode int
+		tunnelInfo string
+	)
 
 	// 1. Direct CN connectivity check via SO_MARK=0xff dialer.
 	var wg sync.WaitGroup
@@ -401,37 +405,37 @@ func (s *GatewayService) ProbeDualConnectivity() map[string]any {
 					ms = 1
 				}
 				line := strings.SplitN(string(buf[:n]), "\r\n", 2)[0]
-				out["direct_ok"] = true
-				out["direct_ms"] = ms
-				out["direct_info"] = line
+				directOK = true
+				directMs = ms
+				directInfo = line
 				return
 			}
 		}
-		out["direct_info"] = "直连探测超时"
+		directInfo = "直连探测超时"
 	}()
 
 	go func() {
 		defer wg.Done()
 		if !s.engine.IsConnected() {
-			out["tunnel_info"] = "隧道未连接"
+			tunnelInfo = "隧道未连接"
 			return
 		}
 		t0 := time.Now()
 		st, err := s.engine.TunnelStream("cp.cloudflare.com:443")
 		if err != nil {
-			out["tunnel_info"] = err.Error()
+			tunnelInfo = err.Error()
 			return
 		}
 		defer st.Close()
 		tc := tls.Client(streamAsNetConn{DataStream: st}, &tls.Config{ServerName: "cp.cloudflare.com", MinVersion: tls.VersionTLS12})
 		_ = tc.SetDeadline(time.Now().Add(6 * time.Second))
 		if err := tc.Handshake(); err != nil {
-			out["tunnel_info"] = "TLS: " + err.Error()
+			tunnelInfo = "TLS: " + err.Error()
 			return
 		}
 		req := "GET /generate_204 HTTP/1.1\r\nHost: cp.cloudflare.com\r\nUser-Agent: 0Ghost-Probe\r\nConnection: close\r\n\r\n"
 		if _, err := tc.Write([]byte(req)); err != nil {
-			out["tunnel_info"] = err.Error()
+			tunnelInfo = err.Error()
 			return
 		}
 		respBytes, _ := io.ReadAll(io.LimitReader(tc, 1024))
@@ -445,14 +449,22 @@ func (s *GatewayService) ProbeDualConnectivity() map[string]any {
 		if parts := strings.Fields(firstLine); len(parts) >= 2 {
 			code, _ = strconv.Atoi(parts[1])
 		}
-		out["tunnel_ms"] = ms
-		out["tunnel_code"] = code
-		out["tunnel_info"] = firstLine
-		out["tunnel_ok"] = code >= 200 && code < 400
+		tunnelMs = ms
+		tunnelCode = code
+		tunnelInfo = firstLine
+		tunnelOK = code >= 200 && code < 400
 	}()
 
 	wg.Wait()
-	return out
+	return map[string]any{
+		"direct_ok":   directOK,
+		"direct_ms":   directMs,
+		"direct_info": directInfo,
+		"tunnel_ok":   tunnelOK,
+		"tunnel_ms":   tunnelMs,
+		"tunnel_info": tunnelInfo,
+		"tunnel_code": tunnelCode,
+	}
 }
 
 func (s *GatewayService) Snapshot() map[string]any {
