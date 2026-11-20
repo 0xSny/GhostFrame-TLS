@@ -536,15 +536,24 @@ func (s *GatewayService) Snapshot() map[string]any {
 }
 
 func main() {
-	cfgPath := flag.String("config", "/etc/0ghost/config.json", "path to 0Ghost unified config file")
+	cfgPath := flag.String("config", "/etc/kbox/config.json", "path to KestrelBox unified config file")
 	webAddr := flag.String("web", "", "override Web console listen address (default 0.0.0.0:19080)")
-	cleanupOnly := flag.Bool("cleanup", false, "atomically clean 0Ghost firewall tables/routes and exit")
+	cleanupOnly := flag.Bool("cleanup", false, "atomically clean KestrelBox firewall tables/routes and exit")
 	flag.Parse()
 
 	if *cleanupOnly {
 		tproxy.CleanupFirewall(1, 100)
-		fmt.Println("0Ghost firewall rules cleaned.")
+		fmt.Println("KestrelBox firewall rules cleaned.")
 		return
+	}
+
+	resolvedCfg := *cfgPath
+	if resolvedCfg == "/etc/kbox/config.json" {
+		if _, err := os.Stat(resolvedCfg); err != nil {
+			if _, err2 := os.Stat("/etc/0ghost/config.json"); err2 == nil {
+				resolvedCfg = "/etc/0ghost/config.json"
+			}
+		}
 	}
 
 	// N1 S905D (2GB RAM) side-router memory tuning + full v4.0 LTS dual-track RTC.
@@ -552,9 +561,9 @@ func main() {
 	debug.SetGCPercent(40)
 	gft.SetLowMemMode(false)
 
-	svc, err := NewGatewayService(*cfgPath, *webAddr)
+	svc, err := NewGatewayService(resolvedCfg, *webAddr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "0Ghost init error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "KestrelBox init error: %v\n", err)
 		os.Exit(1)
 	}
 	defer svc.Stop()
@@ -568,9 +577,9 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
-		svc.engine.Logf("[0Ghost] Web 控制台已监听 http://%s", srv.Addr)
+		svc.engine.Logf("[KestrelBox] Web 控制台已监听 http://%s", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			svc.engine.Logf("[0Ghost] Web 控制台异常退出: %v", err)
+			svc.engine.Logf("[KestrelBox] Web 控制台异常退出: %v", err)
 		}
 	}()
 
