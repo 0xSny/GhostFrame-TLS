@@ -15,6 +15,13 @@ var excludedPrefixes = []string{
 	"llw",
 	"bridge",
 	"ap",
+	"anpi",
+	"xhc",
+	"pktap",
+	"stf",
+	"gif",
+	"feth",
+	"vmenet",
 }
 
 var (
@@ -121,6 +128,16 @@ func SelectBestInterface(candidates []InterfaceCandidate, preferred string) stri
 	return ""
 }
 
+func isRoutableUnicastIP(ip net.IP) bool {
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() {
+		return false
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return false
+	}
+	return true
+}
+
 func interfaceHasValidUnicast(iface net.Interface) bool {
 	addrs, err := iface.Addrs()
 	if err != nil {
@@ -134,10 +151,7 @@ func interfaceHasValidUnicast(iface net.Interface) bool {
 		case *net.IPAddr:
 			ip = v.IP
 		}
-		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() {
-			continue
-		}
-		if ip.To4() != nil || !ip.IsLinkLocalUnicast() {
+		if isRoutableUnicastIP(ip) {
 			return true
 		}
 	}

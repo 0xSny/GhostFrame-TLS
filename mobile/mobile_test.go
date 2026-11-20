@@ -140,4 +140,32 @@ func TestIdleLifecycleAndStatusJSON(t *testing.T) {
 	if err := StopEngine(); err != nil {
 		t.Fatalf("StopEngine while idle failed: %v", err)
 	}
+
+	link := &gft.Link{
+		V:         3,
+		Host:      "127.0.0.1",
+		Port:      1,
+		SNI:       "cdn.example.net",
+		PSK:       strings.Repeat("cd", 32),
+		Verify:    "ca",
+		FP:        "ios",
+		Transport: "tcp",
+		Remark:    "AsyncStartTest",
+	}
+	asyncCfg, err := json.Marshal(mobileStartConfig{
+		LinkURI:      link.Encode(),
+		SocksPort:    29081,
+		HTTPPort:     29082,
+		RouteMode:    "rule",
+		AsyncConnect: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal async config failed: %v", err)
+	}
+	if err := StartEngine(string(asyncCfg)); err != nil {
+		t.Fatalf("expected async StartEngine to bind local servers without blocking on tunnel dial, got: %v", err)
+	}
+	if err := StopEngine(); err != nil {
+		t.Fatalf("StopEngine after async StartEngine failed: %v", err)
+	}
 }

@@ -34,11 +34,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         let httpPort = (providerCfg?["httpPort"] as? Int) ?? decodedCfg?.httpPort ?? 10809
 
+        let startConfigJSON: String
+        if var cfg = decodedCfg {
+            cfg.asyncConnect = true
+            startConfigJSON = cfg.toJSONString()
+        } else {
+            startConfigJSON = configJSON
+        }
+
         let supportDir = GhostNetworkHelper.appSupportDirectory(subdir: "GhostFrameTunnel")
         GhostMobileBridge.initCore(dataDir: supportDir, isTunnelExt: true)
-        startNetworkMonitor()
+        let initialIface = startNetworkMonitorAndDetectInitialInterface(timeout: 0.35)
+        if !initialIface.isEmpty {
+            GhostMobileBridge.onNetworkChanged(ifaceName: initialIface)
+        }
 
-        switch GhostMobileBridge.startEngine(configJSON: configJSON) {
+        switch GhostMobileBridge.startEngine(configJSON: startConfigJSON) {
         case .failure(let err):
             stopNetworkMonitor()
             completionHandler(err)
@@ -181,12 +192,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return host.withCString { inet_pton(AF_INET, $0, &addr) == 1 }
     }
 
-    private func startNetworkMonitor() {
+    private func startNetworkMonitorAndDetectInitialInterface(timeout: TimeInterval) -> String {
         stopNetworkMonitor()
         let monitor = NWPathMonitor()
+        let sem = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var initialIface = ""
+        var signaled = false
+
         monitor.pathUpdateHandler = { [weak self] path in
-            guard let self = self else { return }
             let iface = GhostNetworkHelper.preferredPhysicalInterface(from: path)
+            lock.lock()
+            if !signaled {
+                initialIface = iface
+                signaled = true
+                lock.unlock()
+                sem.signal()
+            } else {
+                lock.unlock()
+            }
+
+            guard let self = self else { return }
             if !iface.isEmpty && iface != self.lastPhysicalIface {
                 self.lastPhysicalIface = iface
                 GhostMobileBridge.onNetworkChanged(ifaceName: iface)
@@ -194,6 +220,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         monitor.start(queue: monitorQueue)
         pathMonitor = monitor
+        _ = sem.wait(timeout: .now() + timeout)
+        lock.lock()
+        let resolved = initialIface
+        if !resolved.isEmpty {
+            lastPhysicalIface = resolved
+        }
+        lock.unlock()
+        return resolved
     }
 
     private func stopNetworkMonitor() {

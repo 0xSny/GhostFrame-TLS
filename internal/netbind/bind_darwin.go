@@ -31,6 +31,26 @@ func DetectPhysicalInterface() string {
 	return SelectBestInterface(candidates, PreferredInterface())
 }
 
+func resolveTargetInterface() (*net.Interface, bool) {
+	if pref := PreferredInterface(); pref != "" && !IsExcludedInterfaceName(pref) {
+		if iface, err := net.InterfaceByName(pref); err == nil &&
+			iface.Index > 0 &&
+			iface.Flags&net.FlagUp != 0 &&
+			iface.Flags&net.FlagLoopback == 0 {
+			return iface, true
+		}
+	}
+	ifName := DetectPhysicalInterface()
+	if ifName == "" {
+		return nil, false
+	}
+	iface, err := net.InterfaceByName(ifName)
+	if err != nil || iface.Index <= 0 {
+		return nil, false
+	}
+	return iface, true
+}
+
 // Control implements net.Dialer.Control and net.ListenConfig.Control on Darwin/iOS.
 // It pins outbound sockets directly to the physical interface via IP_BOUND_IF / IPV6_BOUND_IF
 // so traffic inside PacketTunnel / utun never loops back into the virtual VPN interface.
@@ -38,12 +58,8 @@ func Control(network, address string, c syscall.RawConn) error {
 	if isLoopbackAddress(address) {
 		return nil
 	}
-	ifName := DetectPhysicalInterface()
-	if ifName == "" {
-		return nil
-	}
-	iface, err := net.InterfaceByName(ifName)
-	if err != nil || iface.Index <= 0 {
+	iface, ok := resolveTargetInterface()
+	if !ok {
 		return nil
 	}
 

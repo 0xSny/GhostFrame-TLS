@@ -77,6 +77,8 @@ jobs:
           APPEX="$VPN_APP/PlugIns/GhostPacketTunnel.appex"
           test -d "$APPEX"
 
+          echo "=== Verifying GhostPacketTunnel Info.plist ==="
+          plutil -p "$APPEX/Info.plist"
           plutil -p "$APPEX/Info.plist" | grep -q "com.apple.networkextension.packet-tunnel"
           plutil -p "$APPEX/Info.plist" | grep -q "PacketTunnelProvider"
 

@@ -109,10 +109,19 @@ final class GhostAppViewModel: ObservableObject {
     }
 
     var combinedLogs: [GhostLogEntry] {
-        if !status.logs.isEmpty {
-            return status.logs
+        if status.logs.isEmpty {
+            return localLogs
         }
-        return localLogs
+        var merged = localLogs
+        var seen = Set(localLogs.map(\.id))
+        for entry in status.logs where !seen.contains(entry.id) {
+            seen.insert(entry.id)
+            merged.append(entry)
+        }
+        if merged.count > 120 {
+            merged.removeFirst(merged.count - 120)
+        }
+        return merged
     }
 
     func toggleConnection() {
@@ -263,7 +272,8 @@ final class GhostAppViewModel: ObservableObject {
             routeMode: routeMode.rawValue,
             transport: transportMode.rawValue,
             upMbps: effectiveUpMbps,
-            downMbps: effectiveDownMbps
+            downMbps: effectiveDownMbps,
+            asyncConnect: true
         )
     }
 

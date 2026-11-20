@@ -1,9 +1,12 @@
 package netbind
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 func TestIsExcludedInterfaceName(t *testing.T) {
-	excluded := []string{"lo0", "utun0", "utun4", "ipsec0", "ppp0", "awdl0", "llw0", "bridge100", "ap1", ""}
+	excluded := []string{"lo0", "utun0", "utun4", "ipsec0", "ppp0", "awdl0", "llw0", "bridge100", "ap1", "anpi0", "xhc0", "pktap0", "stf0", "gif0", "feth0", "vmenet0", ""}
 	for _, name := range excluded {
 		if !IsExcludedInterfaceName(name) {
 			t.Fatalf("expected %q to be excluded", name)
@@ -69,5 +72,26 @@ func TestPreferredInterfaceRoundTrip(t *testing.T) {
 	t.Cleanup(func() { SetPreferredInterface("") })
 	if got := PreferredInterface(); got != "pdp_ip0" {
 		t.Fatalf("expected pdp_ip0, got %q", got)
+	}
+}
+
+func TestIsRoutableUnicastIP(t *testing.T) {
+	if isRoutableUnicastIP(net.ParseIP("169.254.12.34")) {
+		t.Fatal("expected IPv4 link-local 169.254.x.x to be rejected")
+	}
+	if isRoutableUnicastIP(net.ParseIP("fe80::1")) {
+		t.Fatal("expected IPv6 link-local fe80::1 to be rejected")
+	}
+	if isRoutableUnicastIP(net.ParseIP("127.0.0.1")) {
+		t.Fatal("expected loopback 127.0.0.1 to be rejected")
+	}
+	if !isRoutableUnicastIP(net.ParseIP("10.123.45.6")) {
+		t.Fatal("expected cellular/NAT IPv4 10.x to be accepted")
+	}
+	if !isRoutableUnicastIP(net.ParseIP("192.168.1.50")) {
+		t.Fatal("expected LAN IPv4 192.168.x.x to be accepted")
+	}
+	if !isRoutableUnicastIP(net.ParseIP("2409:8900::1")) {
+		t.Fatal("expected global unicast IPv6 to be accepted")
 	}
 }

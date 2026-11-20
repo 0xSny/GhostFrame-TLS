@@ -134,6 +134,7 @@ struct GhostEngineConfig: Codable, Equatable {
     var transport: String
     var upMbps: Int
     var downMbps: Int
+    var asyncConnect: Bool = true
 
     enum CodingKeys: String, CodingKey {
         case linkURI = "link_uri"
@@ -143,6 +144,39 @@ struct GhostEngineConfig: Codable, Equatable {
         case transport
         case upMbps = "up_mbps"
         case downMbps = "down_mbps"
+        case asyncConnect = "async_connect"
+    }
+
+    init(
+        linkURI: String,
+        socksPort: Int,
+        httpPort: Int,
+        routeMode: String,
+        transport: String,
+        upMbps: Int,
+        downMbps: Int,
+        asyncConnect: Bool = true
+    ) {
+        self.linkURI = linkURI
+        self.socksPort = socksPort
+        self.httpPort = httpPort
+        self.routeMode = routeMode
+        self.transport = transport
+        self.upMbps = upMbps
+        self.downMbps = downMbps
+        self.asyncConnect = asyncConnect
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        linkURI = (try? c.decode(String.self, forKey: .linkURI)) ?? ""
+        socksPort = (try? c.decode(Int.self, forKey: .socksPort)) ?? 10808
+        httpPort = (try? c.decode(Int.self, forKey: .httpPort)) ?? 10809
+        routeMode = (try? c.decode(String.self, forKey: .routeMode)) ?? "rule"
+        transport = (try? c.decode(String.self, forKey: .transport)) ?? "auto"
+        upMbps = (try? c.decode(Int.self, forKey: .upMbps)) ?? 0
+        downMbps = (try? c.decode(Int.self, forKey: .downMbps)) ?? 0
+        asyncConnect = (try? c.decode(Bool.self, forKey: .asyncConnect)) ?? true
     }
 
     func toJSONString() -> String {

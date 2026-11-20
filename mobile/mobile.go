@@ -26,13 +26,14 @@ const (
 )
 
 type mobileStartConfig struct {
-	LinkURI   string `json:"link_uri"`
-	SocksPort int    `json:"socks_port"`
-	HTTPPort  int    `json:"http_port"`
-	RouteMode string `json:"route_mode"`
-	Transport string `json:"transport,omitempty"`
-	UpMbps    *int   `json:"up_mbps,omitempty"`
-	DownMbps  *int   `json:"down_mbps,omitempty"`
+	LinkURI      string `json:"link_uri"`
+	SocksPort    int    `json:"socks_port"`
+	HTTPPort     int    `json:"http_port"`
+	RouteMode    string `json:"route_mode"`
+	Transport    string `json:"transport,omitempty"`
+	UpMbps       *int   `json:"up_mbps,omitempty"`
+	DownMbps     *int   `json:"down_mbps,omitempty"`
+	AsyncConnect bool   `json:"async_connect,omitempty"`
 }
 
 type parsedLinkInfo struct {
@@ -179,14 +180,27 @@ func StartEngine(configJSON string) error {
 		eng.Close()
 		return fmt.Errorf("mobile: start local proxy failed: %w", err)
 	}
-	if err := eng.Connect(); err != nil {
-		eng.Close()
-		return fmt.Errorf("mobile: tunnel connect failed: %w", err)
-	}
 
 	mu.Lock()
 	engineInst = eng
 	mu.Unlock()
+
+	if cfg.AsyncConnect {
+		go func() {
+			_ = eng.Connect()
+		}()
+		return nil
+	}
+
+	if err := eng.Connect(); err != nil {
+		mu.Lock()
+		if engineInst == eng {
+			engineInst = nil
+		}
+		mu.Unlock()
+		eng.Close()
+		return fmt.Errorf("mobile: tunnel connect failed: %w", err)
+	}
 	return nil
 }
 
