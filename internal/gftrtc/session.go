@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	mrand "math/rand/v2"
 	"net"
@@ -2599,7 +2600,7 @@ func DialWithPacketConn(ctx context.Context, pc net.PacketConn, ownPC bool, radd
 		}
 		t0 := time.Now()
 		if _, err := pc.WriteTo(reqPkt, raddr); err != nil {
-			return nil, 0, err
+			return nil, 0, fmt.Errorf("gftrtc: write stun to %s: %w", raddr.String(), err)
 		}
 
 		deadline := time.Now().Add(wait)
@@ -2608,7 +2609,7 @@ func DialWithPacketConn(ctx context.Context, pc net.PacketConn, ownPC bool, radd
 		}
 		for {
 			if dialCtx.Err() != nil {
-				return nil, 0, dialCtx.Err()
+				return nil, 0, fmt.Errorf("gftrtc: stun dial %s: %w", raddr.String(), dialCtx.Err())
 			}
 			_ = pc.SetReadDeadline(deadline)
 			n, _, rerr := pc.ReadFrom(buf)
@@ -2643,7 +2644,7 @@ func DialWithPacketConn(ctx context.Context, pc net.PacketConn, ownPC bool, radd
 		}
 		_ = attempt
 	}
-	return nil, 0, errors.New("gftrtc: stun handshake timeout")
+	return nil, 0, fmt.Errorf("gftrtc: stun handshake timeout (%s)", raddr.String())
 }
 
 // ---- Server Multi-Session Sharded Listener ------------------------------------

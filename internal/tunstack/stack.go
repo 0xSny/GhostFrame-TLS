@@ -13,6 +13,7 @@ import (
 
 	"ghostframe/internal/client"
 	"ghostframe/internal/gft"
+	"ghostframe/internal/netbind"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -527,6 +528,11 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 }
 
 func (s *Stack) relayUDPDirect(conn *gonet.UDPConn, dialTarget string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if ua, rerr := netbind.ResolveUDPTarget(ctx, dialTarget); rerr == nil && ua != nil {
+		dialTarget = ua.String()
+	}
+	cancel()
 	d := s.engine.DirectDialer(5 * time.Second)
 	remote, err := d.Dial("udp", dialTarget)
 	if err != nil {

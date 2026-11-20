@@ -20,7 +20,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const udpSessionIdle = 45 * time.Second
+const (
+	udpSessionIdle    = 45 * time.Second
+	maxUDPNatSessions = 1024
+)
+
+var directReplyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64*1024)
+		return &b
+	},
+}
 
 type udpTuple struct {
 	srcIP   [4]byte
@@ -257,14 +267,35 @@ func (s *UDPServer) getOrCreateSession(tup udpTuple) *udpNatEntry {
 		go s.pumpTunnelReplies(ent)
 	}
 
+	var evicted *udpNatEntry
 	s.mu.Lock()
 	if existing, ok := s.sessions[tup]; ok {
 		s.mu.Unlock()
 		ent.closeFn()
 		return existing
 	}
+	if len(s.sessions) >= maxUDPNatSessions {
+		var oldestKey udpTuple
+		var oldestTS int64
+		first := true
+		for k, candidate := range s.sessions {
+			ts := candidate.lastUsed.Load()
+			if first || ts < oldestTS {
+				first = false
+				oldestTS = ts
+				oldestKey = k
+				evicted = candidate
+			}
+		}
+		if evicted != nil {
+			delete(s.sessions, oldestKey)
+		}
+	}
 	s.sessions[tup] = ent
 	s.mu.Unlock()
+	if evicted != nil && evicted.closeFn != nil {
+		evicted.closeFn()
+	}
 	s.conns.Add(1)
 	return ent
 }
@@ -295,14 +326,47 @@ func (s *UDPServer) pumpDirectReplies(ent *udpNatEntry) {
 	var dstSA unix.SockaddrInet4
 	dstSA.Addr = ent.tuple.srcIP
 	dstSA.Port = int(ent.tuple.srcPort)
-	buf := make([]byte, 64*1024)
+
+	sc, ok := ent.direct.(syscall.Conn)
+	if !ok {
+		for {
+			bp := directReplyBufPool.Get().(*[]byte)
+			n, _, err := ent.direct.ReadFrom(*bp)
+			if err != nil {
+				directReplyBufPool.Put(bp)
+				return
+			}
+			ent.lastUsed.Store(time.Now().UnixNano())
+			_ = unix.Sendto(ent.replyFD, (*bp)[:n], 0, &dstSA)
+			directReplyBufPool.Put(bp)
+		}
+	}
+	rawConn, err := sc.SyscallConn()
+	if err != nil {
+		return
+	}
 	for {
-		n, _, err := ent.direct.ReadFrom(buf)
-		if err != nil {
+		var readErr error
+		ctrlErr := rawConn.Read(func(rfd uintptr) bool {
+			bp := directReplyBufPool.Get().(*[]byte)
+			buf := *bp
+			n, _, rerr := unix.Recvfrom(int(rfd), buf, unix.MSG_DONTWAIT)
+			if rerr != nil {
+				directReplyBufPool.Put(bp)
+				if rerr == unix.EAGAIN || rerr == unix.EWOULDBLOCK || rerr == unix.EINTR {
+					return false
+				}
+				readErr = rerr
+				return true
+			}
+			ent.lastUsed.Store(time.Now().UnixNano())
+			_ = unix.Sendto(ent.replyFD, buf[:n], 0, &dstSA)
+			directReplyBufPool.Put(bp)
+			return true
+		})
+		if ctrlErr != nil || readErr != nil {
 			return
 		}
-		ent.lastUsed.Store(time.Now().UnixNano())
-		_ = unix.Sendto(ent.replyFD, buf[:n], 0, &dstSA)
 	}
 }
 

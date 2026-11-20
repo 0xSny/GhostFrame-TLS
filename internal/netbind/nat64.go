@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-const nat64CacheTTL = 30 * time.Second
+const (
+	nat64CacheTTL         = 30 * time.Second
+	nat64FallbackCacheTTL = 2 * time.Second
+)
 
 var (
 	// Well-Known NAT64 Prefix (RFC 6052: 64:ff9b::/96).
@@ -18,7 +21,7 @@ var (
 	nat64Mu        sync.RWMutex
 	nat64HasPrefix bool
 	nat64Prefix    [12]byte
-	nat64CheckedAt time.Time
+	nat64ExpiresAt time.Time
 
 	// Overridable hooks for platform-specific detection (bind_darwin.go) and unit tests.
 	isPureIPv6PhysicalFn = func() bool { return false }
@@ -50,8 +53,49 @@ func ResetNAT64Cache() {
 	nat64Mu.Lock()
 	nat64HasPrefix = false
 	nat64Prefix = [12]byte{}
-	nat64CheckedAt = time.Time{}
+	nat64ExpiresAt = time.Time{}
 	nat64Mu.Unlock()
+}
+
+// IsPureIPv6Physical reports whether the active physical interface is pure-IPv6.
+func IsPureIPv6Physical() bool {
+	return isPureIPv6PhysicalFn()
+}
+
+// SetNAT64TestHooks overrides NAT64 detection/DNS64 hooks for cross-package tests
+// and returns a restore callback that also clears the NAT64 cache.
+func SetNAT64TestHooks(
+	isPureIPv6 func() bool,
+	lookupIPv6 func(context.Context, string) ([]net.IP, error),
+	lookupHost func(context.Context, string) ([]net.IP, error),
+) func() {
+	nat64Mu.Lock()
+	origPure := isPureIPv6PhysicalFn
+	origV6 := lookupIPv6Fn
+	origHost := lookupHostIPsFn
+	if isPureIPv6 != nil {
+		isPureIPv6PhysicalFn = isPureIPv6
+	}
+	if lookupIPv6 != nil {
+		lookupIPv6Fn = lookupIPv6
+	}
+	if lookupHost != nil {
+		lookupHostIPsFn = lookupHost
+	}
+	nat64HasPrefix = false
+	nat64Prefix = [12]byte{}
+	nat64ExpiresAt = time.Time{}
+	nat64Mu.Unlock()
+	return func() {
+		nat64Mu.Lock()
+		isPureIPv6PhysicalFn = origPure
+		lookupIPv6Fn = origV6
+		lookupHostIPsFn = origHost
+		nat64HasPrefix = false
+		nat64Prefix = [12]byte{}
+		nat64ExpiresAt = time.Time{}
+		nat64Mu.Unlock()
+	}
 }
 
 // ExtractNAT64Prefix extracts the /96 NAT64 prefix from an AAAA answer to RFC 7050 ipv4only.arpa
@@ -88,10 +132,11 @@ func SynthesizeNAT64IPv4(prefix [12]byte, ip4 net.IP) net.IP {
 }
 
 // DiscoverNAT64Prefix queries RFC 7050 ipv4only.arpa to discover the active /96 NAT64 prefix.
-// Cached for nat64CacheTTL and cleared on ResetNAT64Cache().
+// Operator-discovered prefixes are cached for 30s; transient fallback to wellKnownNAT64Prefix
+// is cached only for 2s so handoffs retry quickly. Cleared on ResetNAT64Cache().
 func DiscoverNAT64Prefix(ctx context.Context) ([12]byte, bool) {
 	nat64Mu.RLock()
-	if nat64HasPrefix && time.Since(nat64CheckedAt) < nat64CacheTTL {
+	if nat64HasPrefix && time.Now().Before(nat64ExpiresAt) {
 		p := nat64Prefix
 		nat64Mu.RUnlock()
 		return p, true
@@ -116,14 +161,16 @@ func DiscoverNAT64Prefix(ctx context.Context) ([12]byte, bool) {
 			}
 		}
 	}
+	ttl := nat64CacheTTL
 	if !found {
 		discovered = wellKnownNAT64Prefix
+		ttl = nat64FallbackCacheTTL
 	}
 
 	nat64Mu.Lock()
 	nat64Prefix = discovered
 	nat64HasPrefix = true
-	nat64CheckedAt = time.Now()
+	nat64ExpiresAt = time.Now().Add(ttl)
 	nat64Mu.Unlock()
 	return discovered, true
 }
@@ -176,4 +223,32 @@ func ResolveTCPHostPort(ctx context.Context, host string, port int) string {
 func ResolveUDPAddr(ctx context.Context, host string, port int) (*net.UDPAddr, error) {
 	resolved := ResolveTargetHost(ctx, host)
 	return net.ResolveUDPAddr("udp", net.JoinHostPort(resolved, strconv.Itoa(port)))
+}
+
+// ResolveTCPTarget translates a "host:port" string for outbound TCP dialing,
+// synthesizing NAT64 IPv6 addresses automatically on pure-IPv6 networks.
+func ResolveTCPTarget(ctx context.Context, hostport string) string {
+	h, p, err := net.SplitHostPort(strings.TrimSpace(hostport))
+	if err != nil {
+		return hostport
+	}
+	port, err := strconv.Atoi(p)
+	if err != nil || port <= 0 || port > 65535 {
+		return hostport
+	}
+	return ResolveTCPHostPort(ctx, h, port)
+}
+
+// ResolveUDPTarget resolves a "host:port" string into a *net.UDPAddr with automatic
+// NAT64 IPv6 synthesis on pure-IPv6 networks.
+func ResolveUDPTarget(ctx context.Context, hostport string) (*net.UDPAddr, error) {
+	h, p, err := net.SplitHostPort(strings.TrimSpace(hostport))
+	if err != nil {
+		return net.ResolveUDPAddr("udp", hostport)
+	}
+	port, err := strconv.Atoi(p)
+	if err != nil || port <= 0 || port > 65535 {
+		return net.ResolveUDPAddr("udp", hostport)
+	}
+	return ResolveUDPAddr(ctx, h, port)
 }

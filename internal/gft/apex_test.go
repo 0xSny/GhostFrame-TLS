@@ -14,12 +14,14 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"ghostframe/internal/gftrtc"
+	"ghostframe/internal/netbind"
 
 	utls "github.com/refraction-networking/utls"
 )
@@ -985,5 +987,102 @@ func TestTCPCircuitBreakerCooldownAndInstantRTCFailoverWake(t *testing.T) {
 	}
 	if tcpAttempts.Load() == countAtCooldown {
 		t.Fatalf("expected immediate TCP failover wakeup when all RTC sessions died")
+	}
+}
+
+func TestNAT64DialV3StealthSynthesizes64ff9b(t *testing.T) {
+	restore := netbind.SetNAT64TestHooks(
+		func() bool { return true },
+		func(ctx context.Context, host string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("64:ff9b::192.0.0.170")}, nil
+		},
+		nil,
+	)
+	defer restore()
+
+	l := &Link{
+		V:      4,
+		Host:   "198.51.100.42",
+		Port:   443,
+		SNI:    "mirrors.mit.edu",
+		PSK:    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		Verify: "ca",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	_, _, _, err := DialV3StealthWithID(ctx, l, 120*time.Millisecond, DefaultClientID)
+	if err == nil {
+		t.Fatalf("expected dial to unroutable test NAT64 target to fail")
+	}
+	if !strings.Contains(err.Error(), "64:ff9b::c633:642a") {
+		t.Fatalf("expected DialV3StealthWithID to dial synthesized 64:ff9b::c633:642a, got err=%v", err)
+	}
+}
+
+func TestEmergencyProbeFixedPortRebind(t *testing.T) {
+	link := &Link{
+		V:         4,
+		Host:      "127.0.0.1",
+		Port:      443,
+		SNI:       "cdn.example.com",
+		PSK:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		Verify:    "ca",
+		Transport: "auto",
+		HopRange:  "", // fixed port, no hopping range
+	}
+	// Create a live local RTC pair whose ProbeRTT will fail after closing server side
+	cPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cPC.Close()
+	sPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sPort := sPC.LocalAddr().(*net.UDPAddr).Port
+	link.Port = sPort
+
+	ps := NewParamStore(DefaultParams())
+	sched := NewApexScheduler(link, ps, 1, nil)
+	defer sched.Close()
+
+	psk, _ := link.PSKBytes()
+	ln, err := gftrtc.NewListener(sPC, true, psk, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		if srvSess, aerr := ln.Accept(context.Background()); aerr == nil && srvSess != nil {
+			t.Cleanup(func() { srvSess.Close() })
+		}
+	}()
+	sess, _, err := gftrtc.DialWithPacketConn(context.Background(), cPC, false, sPC.LocalAddr(), gftrtc.DialOptions{
+		Host:    "127.0.0.1",
+		Port:    sPort,
+		PSK:     psk,
+		Timeout: time.Second,
+	})
+	if err != nil {
+		ln.Close()
+		t.Fatalf("DialWithPacketConn failed: %v", err)
+	}
+	defer sess.Close()
+	ln.Close() // now ProbeRTT will time out cleanly
+
+	sched.mu.Lock()
+	sched.rtcSlots = []*rtcSlot{{sess: sess, channelIdx: 0}}
+	var hoppedPort atomic.Int32
+	sched.rtcHopFn = func(_ *gftrtc.RTCSession, newPort int) error {
+		hoppedPort.Store(int32(newPort))
+		return nil
+	}
+	sched.mu.Unlock()
+
+	if closedAny := sched.handleEmergencyProbeAndHop(40*time.Millisecond, true); closedAny {
+		t.Fatalf("expected fixed-port MBB rebind to recover without closing session")
+	}
+	if int(hoppedPort.Load()) != sPort {
+		t.Fatalf("expected emergency rebind on fixed port %d, got %d", sPort, hoppedPort.Load())
 	}
 }

@@ -266,6 +266,9 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 
 		if req.HasCustomRules {
 			_ = s.engine.SetCustomRules(req.CustomRules)
+			if dnsSrv != nil {
+				dnsSrv.ClearCache()
+			}
 		}
 		if req.UpMbps != nil && req.DownMbps != nil {
 			if err := s.engine.SetBandwidthLimits(*req.UpMbps, *req.DownMbps); err != nil {

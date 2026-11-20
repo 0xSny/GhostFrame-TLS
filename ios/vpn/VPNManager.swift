@@ -359,6 +359,7 @@ final class VPNManager: GhostBackend {
     }
 
     private func updateVPNStatus(_ status: NEVPNStatus, connection: NEVPNConnection?) {
+        let prevStatus = lastObservedStatus
         if lastObservedStatus != status {
             lastObservedStatus = status
             onLogMessage?("VPN status -> \(Self.statusName(status))")
@@ -388,7 +389,7 @@ final class VPNManager: GhostBackend {
             backendStateLabel = (status == .invalid) ? "隧道配置无效" : "隧道待机"
             stopPolling()
             if hasAttemptedConnect && !userInitiatedDisconnect {
-                let triggerPopup = (status == .invalid || lastObservedStatus == .disconnected)
+                let triggerPopup = (status == .invalid || prevStatus == .disconnected)
                 hasAttemptedConnect = false
                 inspectDisconnectError(connection: connection, triggerReport: triggerPopup)
             }

@@ -166,7 +166,7 @@ download_verified_asset() {
   fi
 
   tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' RETURN
+  trap 'rm -rf "${tmp_dir:-}"' RETURN
 
   local sum_url bin_url expected got
   sum_url="$(dl_url "${base_url}/checksums.txt")"

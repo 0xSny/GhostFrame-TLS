@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -208,5 +209,108 @@ func TestEffectiveCNIPv4CIDRsAndOverride(t *testing.T) {
 	}
 	if !strings.Contains(redirScript, "chain tcp_redir_nat") || !strings.Contains(redirScript, "meta l4proto tcp redirect to :10880") {
 		t.Fatalf("expected REDIRECT fallback chain in PreferTProxy=false script")
+	}
+}
+
+func TestSplitDNSCacheBeforeSmartRouteAndClear(t *testing.T) {
+	client.SetNoSysProxy(true)
+	eng, err := client.NewEngine("")
+	if err != nil {
+		t.Fatalf("NewEngine failed: %v", err)
+	}
+	defer eng.Close()
+
+	// Spin up local UDP responder for direct CN DNS queries
+	dnsPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dnsPC.Close()
+	var upstreamHits atomic.Int32
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		buf := make([]byte, 2048)
+		for {
+			n, addr, rerr := dnsPC.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			if n < 12 {
+				_, _ = dnsPC.WriteTo(buf[:n], addr)
+				continue
+			}
+			upstreamHits.Add(1)
+			// Minimal NOERROR response mirroring question with 1 answer
+			resp := make([]byte, n+16)
+			copy(resp, buf[:n])
+			resp[2] = 0x81
+			resp[3] = 0x80
+			binary.BigEndian.PutUint16(resp[6:8], 1)
+			off := n
+			binary.BigEndian.PutUint16(resp[off:off+2], 0xc00c)
+			binary.BigEndian.PutUint16(resp[off+2:off+4], 1)
+			binary.BigEndian.PutUint16(resp[off+4:off+6], 1)
+			binary.BigEndian.PutUint32(resp[off+6:off+10], 60)
+			binary.BigEndian.PutUint16(resp[off+10:off+12], 4)
+			copy(resp[off+12:off+16], []byte{113, 108, 81, 189})
+			_, _ = dnsPC.WriteTo(resp, addr)
+		}
+	}()
+
+	if err := eng.SetCustomRules([]string{"DOMAIN-SUFFIX,direct.example,DIRECT"}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := NewSplitDNSServer("127.0.0.1:0", eng, []string{dnsPC.LocalAddr().String()}, true, func() GatewayMode { return ModeRule })
+	// Pin directDNS strictly to our local test socket so public 223.5.5.5/119.29.29.29 aren't raced in unit test.
+	srv.directMu.Lock()
+	srv.directDNS = []string{dnsPC.LocalAddr().String()}
+	srv.directMu.Unlock()
+	<-started
+	// Warm up host UDP loopback path once (Windows WFP/AV can drop the very first UDP packet of a fresh test binary).
+	for attempt := 0; attempt < 3; attempt++ {
+		if wc, werr := net.Dial("udp4", dnsPC.LocalAddr().String()); werr == nil {
+			_ = wc.SetDeadline(time.Now().Add(80 * time.Millisecond))
+			_, _ = wc.Write([]byte("ping"))
+			var pong [8]byte
+			rn, _ := wc.Read(pong[:])
+			_ = wc.Close()
+			if rn > 0 {
+				break
+			}
+		}
+	}
+	q1, err := client.BuildDNSQuery(0x1111, "www.direct.example", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1 := srv.HandlePacket(q1)
+	if len(r1) < 12 || binary.BigEndian.Uint16(r1[0:2]) != 0x1111 || (r1[3]&0x0F) != 0 {
+		t.Fatalf("unexpected first DNS response (len=%d)", len(r1))
+	}
+	_, d1, _, _ := srv.Counters()
+	if d1 != 1 || upstreamHits.Load() != 1 {
+		t.Fatalf("expected 1 direct hit & 1 upstream hit, got direct=%d upstream=%d", d1, upstreamHits.Load())
+	}
+
+	// Second query must hit SplitDNSServer cache BEFORE ResolveSmartDNS (directHits & upstreamHits unchanged, txID patched)
+	q2, _ := client.BuildDNSQuery(0x2222, "www.direct.example", 1)
+	r2 := srv.HandlePacket(q2)
+	if len(r2) < 12 || binary.BigEndian.Uint16(r2[0:2]) != 0x2222 {
+		t.Fatalf("expected cached response with patched txID 0x2222, got %x", r2[:2])
+	}
+	_, d2, _, _ := srv.Counters()
+	if d2 != 1 || upstreamHits.Load() != 1 {
+		t.Fatalf("expected cache hit before ResolveSmartDNS (directHits=%d, upstreamHits=%d)", d2, upstreamHits.Load())
+	}
+
+	// ClearCache invalidates cached DNS response
+	srv.ClearCache()
+	q3, _ := client.BuildDNSQuery(0x3333, "www.direct.example", 1)
+	_ = srv.HandlePacket(q3)
+	_, d3, _, _ := srv.Counters()
+	if d3 != 2 || upstreamHits.Load() != 2 {
+		t.Fatalf("expected cache miss after ClearCache, got direct=%d upstream=%d", d3, upstreamHits.Load())
 	}
 }

@@ -888,8 +888,14 @@ func (a *ApexScheduler) handleEmergencyProbeAndHop(probeTimeout time.Duration, f
 				return
 			}
 			oldPort := slot.sess.RemotePort()
-			if hasHop && hopFn != nil {
-				if herr := hopFn(slot.sess, PickHopPort(a.link)); herr == nil {
+			if hopFn != nil {
+				targetPort := a.link.Port
+				if hasHop {
+					targetPort = PickHopPort(a.link)
+				} else if targetPort <= 0 {
+					targetPort = oldPort
+				}
+				if herr := hopFn(slot.sess, targetPort); herr == nil {
 					st := slot.sess.Stats()
 					a.mu.Lock()
 					slot.lastHopAt = time.Now()
@@ -900,7 +906,11 @@ func (a *ApexScheduler) handleEmergencyProbeAndHop(probeTimeout time.Duration, f
 					a.mu.Unlock()
 					slot.streamFails.Store(0)
 					if a.onLog != nil {
-						a.onLog("[RTC#%d] Emergency MBB hop recovered path (UDP :%d -> :%d)", chIdx, oldPort, slot.sess.RemotePort())
+						if hasHop {
+							a.onLog("[RTC#%d] Emergency MBB hop recovered path (UDP :%d -> :%d)", chIdx, oldPort, slot.sess.RemotePort())
+						} else {
+							a.onLog("[RTC#%d] Emergency MBB fixed-port rebind recovered path (UDP :%d)", chIdx, slot.sess.RemotePort())
+						}
 					}
 					return
 				}

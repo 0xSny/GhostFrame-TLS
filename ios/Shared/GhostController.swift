@@ -80,7 +80,7 @@ final class GhostAppViewModel: ObservableObject {
         loadPreferences()
         bindBackend()
         syncFromBackendState()
-        appendLocalLog("Kestrel \(edition.title) v4.0.25-LTS initialized")
+        appendLocalLog("Kestrel \(edition.title) v4.0.26-LTS initialized")
     }
 
     var activeNode: GhostNode? {

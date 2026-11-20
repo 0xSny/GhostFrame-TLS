@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.0.25-LTS"
+var Version = "v4.0.26-LTS"
 
 type ConnState string
 
@@ -648,10 +648,26 @@ func (e *Engine) DirectDialer(timeout time.Duration) net.Dialer {
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				nd := net.Dialer{Timeout: 3 * time.Second, Control: netbind.Control}
-				if c, err := nd.DialContext(ctx, "udp", "223.5.5.5:53"); err == nil {
-					return c, nil
+				candidates := make([]string, 0, 3)
+				for _, host := range []string{"223.5.5.5", "119.29.29.29"} {
+					if ua, err := netbind.ResolveUDPAddr(ctx, host, 53); err == nil && ua != nil {
+						candidates = append(candidates, ua.String())
+					} else {
+						candidates = append(candidates, net.JoinHostPort(host, "53"))
+					}
 				}
-				return nd.DialContext(ctx, "udp", "119.29.29.29:53")
+				if netbind.IsPureIPv6Physical() {
+					candidates = append(candidates, "[2400:3200::1]:53", "[2402:4e00::]:53")
+				}
+				var lastErr error
+				for _, addr := range candidates {
+					if c, err := nd.DialContext(ctx, "udp", addr); err == nil {
+						return c, nil
+					} else {
+						lastErr = err
+					}
+				}
+				return nil, lastErr
 			},
 		}
 	}
@@ -674,8 +690,11 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 		return nil, ActionReject, errRouteRejected
 	}
 	if act == ActionDirect {
+		dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		dialTargetDirect := netbind.ResolveTCPTarget(dctx, resolvedDial)
+		dcancel()
 		d := e.DirectDialer(8 * time.Second)
-		c, err := d.Dial("tcp", resolvedDial)
+		c, err := d.Dial("tcp", dialTargetDirect)
 		if err != nil {
 			return nil, ActionDirect, err
 		}

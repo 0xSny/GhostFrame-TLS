@@ -607,7 +607,7 @@ func apiGetJSON(ctx context.Context, client *http.Client, u, token string, out a
 		return err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "GhostFrame-iOS-Repo-Sync/1.0")
+	req.Header.Set("User-Agent", "Kestrel-Repo-Sync/1.0")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -629,7 +629,7 @@ func apiDownloadBytes(ctx context.Context, client *http.Client, u, token string)
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "GhostFrame-iOS-Repo-Sync/1.0")
+	req.Header.Set("User-Agent", "Kestrel-Repo-Sync/1.0")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

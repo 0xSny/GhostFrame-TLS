@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestExtractAndSynthesizeNAT64(t *testing.T) {
@@ -112,10 +113,57 @@ func TestNAT64DialAndHopResolutionLoop(t *testing.T) {
 		t.Fatalf("unexpected domain NAT64 target: %s", domTCP)
 	}
 
-	// 4. Transition back to IPv4 Wi-Fi + ResetNAT64Cache must immediately restore IPv4 dialing.
+	// 4. Transition back to IPv4 Wi-Fi + SetPreferredInterface must immediately reset NAT64 cache.
 	pureIPv6.Store(false)
-	ResetNAT64Cache()
+	SetPreferredInterface("en0")
 	if got := ResolveTCPHostPort(context.Background(), "198.51.100.42", 443); got != "198.51.100.42:443" {
 		t.Fatalf("expected IPv4 target after Wi-Fi handoff, got %s", got)
+	}
+}
+
+func TestNAT64SetPreferredInterfaceAndFallbackShortTTL(t *testing.T) {
+	restore := SetNAT64TestHooks(
+		func() bool { return true },
+		func(ctx context.Context, host string) ([]net.IP, error) {
+			return nil, context.DeadlineExceeded
+		},
+		nil,
+	)
+	defer restore()
+
+	// When ipv4only.arpa lookup fails, DiscoverNAT64Prefix falls back to 64:ff9b::/96 with short 2s TTL.
+	pref, ok := DiscoverNAT64Prefix(context.Background())
+	if !ok || pref != wellKnownNAT64Prefix {
+		t.Fatalf("expected fallback 64:ff9b:: prefix, got ok=%v pref=%v", ok, pref)
+	}
+	nat64Mu.RLock()
+	rem := time.Until(nat64ExpiresAt)
+	nat64Mu.RUnlock()
+	if rem <= 0 || rem > 2*time.Second+100*time.Millisecond {
+		t.Fatalf("expected short <=2s TTL on fallback prefix, got remaining=%v", rem)
+	}
+
+	// Now simulate operator prefix appearing; SetPreferredInterface must clear cache immediately.
+	var calls atomic.Int32
+	restore2 := SetNAT64TestHooks(
+		func() bool { return true },
+		func(ctx context.Context, host string) ([]net.IP, error) {
+			calls.Add(1)
+			return []net.IP{net.ParseIP("2001:db8:64:2::192.0.0.171")}, nil
+		},
+		nil,
+	)
+	defer restore2()
+
+	SetPreferredInterface("pdp_ip0")
+	pref2, ok2 := DiscoverNAT64Prefix(context.Background())
+	if !ok2 || pref2 == wellKnownNAT64Prefix || calls.Load() != 1 {
+		t.Fatalf("expected SetPreferredInterface to reset NAT64 cache and re-discover prefix: ok=%v calls=%d pref=%v", ok2, calls.Load(), pref2)
+	}
+	nat64Mu.RLock()
+	rem2 := time.Until(nat64ExpiresAt)
+	nat64Mu.RUnlock()
+	if rem2 < 25*time.Second {
+		t.Fatalf("expected ~30s TTL on discovered operator prefix, got remaining=%v", rem2)
 	}
 }

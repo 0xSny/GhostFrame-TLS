@@ -94,12 +94,21 @@ func normalizeDNSServers(listIn []string) []string {
 	return out
 }
 
+// ClearCache flushes all cached DNS responses (called on config or routing rule changes).
+func (s *SplitDNSServer) ClearCache() {
+	s.cacheMu.Lock()
+	s.lru.Init()
+	s.entries = make(map[string]*list.Element, 64)
+	s.cacheMu.Unlock()
+}
+
 // UpdateConfig hot-updates direct upstream resolvers and AAAA filtering.
 func (s *SplitDNSServer) UpdateConfig(directDNS []string, filterAAAA bool) {
 	s.directMu.Lock()
 	s.directDNS = normalizeDNSServers(directDNS)
 	s.directMu.Unlock()
 	s.filterAAAA.Store(filterAAAA)
+	s.ClearCache()
 }
 
 // Start begins serving both UDP and TCP DNS queries on s.addr.
@@ -244,6 +253,11 @@ func (s *SplitDNSServer) HandlePacket(req []byte) []byte {
 		gwMode = s.modeFn()
 	}
 
+	cacheKey := fmt.Sprintf("%s:%d:%s", gwMode, qtype, qname)
+	if cached, hit := s.cacheGet(cacheKey, req[:2]); hit {
+		return cached
+	}
+
 	var act client.RouteAction
 	var smartWireResp []byte
 	if gwMode == ModeGlobal {
@@ -263,10 +277,6 @@ func (s *SplitDNSServer) HandlePacket(req []byte) []byte {
 
 	case client.ActionDirect:
 		s.directHits.Add(1)
-		cacheKey := fmt.Sprintf("D:%d:%s", qtype, qname)
-		if cached, hit := s.cacheGet(cacheKey, req[:2]); hit {
-			return cached
-		}
 		if qtype == 1 && len(smartWireResp) >= 12 {
 			s.cachePut(cacheKey, smartWireResp, dnsCacheMinTTL)
 			return smartWireResp
@@ -282,10 +292,6 @@ func (s *SplitDNSServer) HandlePacket(req []byte) []byte {
 
 	default:
 		s.tunnelHits.Add(1)
-		cacheKey := fmt.Sprintf("P:%d:%s", qtype, qname)
-		if cached, hit := s.cacheGet(cacheKey, req[:2]); hit {
-			return cached
-		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		resp, err := s.engine.ForwardRawDNSThroughTunnel(ctx, req)
 		cancel()

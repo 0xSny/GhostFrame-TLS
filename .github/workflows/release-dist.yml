@@ -230,13 +230,14 @@ jobs:
           mkdir -p release-out
           cp dist-stage/release-linux-windows-router/* release-out/
           cp dist-stage/release-ios-ipas/*.ipa release-out/
+          cp ios/Shared/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png release-out/icon-kestrel.png
 
           if [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
           elif [ "$REF_TYPE" = "tag" ]; then
             TAG="$REF_NAME"
           else
-            TAG="v4.0.2-lts-r${RUN_NUM}"
+            TAG="v4.0.$((15 + RUN_NUM))-LTS"
           fi
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
 
@@ -264,7 +265,8 @@ jobs:
           manifest = {
               "name": "Kestrel Official Release Source",
               "identifier": "com.kestrel.official.source",
-              "sourceURL": f"${BASE_DL}/source.json",
+              "sourceURL": f"https://github.com/${TARGET_REPO}/releases/latest/download/source.json",
+              "iconURL": f"${BASE_DL}/icon-kestrel.png",
               "apps": [
                   {
                       "name": "Kestrel Duo",
@@ -272,7 +274,8 @@ jobs:
                       "developerName": "Kestrel Project",
                       "subtitle": "Kestrel-RTC v4.0 LTS (System Tunnel + Control Center)",
                       "localizedDescription": "Kestrel Duo iOS system tunnel edition built from ${TAG}.",
-                      "tintColor": "#0F62FE",
+                      "iconURL": f"${BASE_DL}/icon-kestrel.png",
+                      "tintColor": "0F62FE",
                       "version": "${APP_VER}",
                       "versionDate": "${NOW_ISO}",
                       "versionDescription": "Release ${TAG}",
@@ -292,7 +295,8 @@ jobs:
                       "developerName": "Kestrel Project",
                       "subtitle": "Portable Single-Process Proxy Edition",
                       "localizedDescription": "Kestrel Air portable proxy edition built from ${TAG}.",
-                      "tintColor": "#10B981",
+                      "iconURL": f"${BASE_DL}/icon-kestrel.png",
+                      "tintColor": "10B981",
                       "version": "${APP_VER}",
                       "versionDate": "${NOW_ISO}",
                       "versionDescription": "Release ${TAG}",
@@ -312,7 +316,7 @@ jobs:
               json.dump(manifest, f, indent=2, ensure_ascii=False)
           PY
 
-          (cd release-out && sha256sum * > checksums.txt && cat checksums.txt)
+          (cd release-out && sha256sum * > /tmp/checksums.txt && mv /tmp/checksums.txt checksums.txt && cat checksums.txt)
 
       - name: Upload Unified Release Bundle Artifact
         uses: actions/upload-artifact@v4

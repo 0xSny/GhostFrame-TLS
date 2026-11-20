@@ -91,6 +91,7 @@ type smartRouteEntry struct {
 	reason   string
 	directIP string
 	wireResp []byte
+	wireAt   time.Time
 	expires  time.Time
 }
 
@@ -246,6 +247,17 @@ func (e *Engine) SetDirectCNResolverForTest(fn DirectCNDNSFunc) {
 	}
 }
 
+var (
+	cnProbeTargetMu   sync.Mutex
+	cnProbeTargetHook func(network, addr string)
+)
+
+func setCNProbeTargetHook(fn func(network, addr string)) {
+	cnProbeTargetMu.Lock()
+	cnProbeTargetHook = fn
+	cnProbeTargetMu.Unlock()
+}
+
 func defaultDirectCNProbe(ctx context.Context, host string) ([]net.IP, []byte, error) {
 	var idBuf [2]byte
 	_, _ = rand.Read(idBuf[:])
@@ -255,7 +267,18 @@ func defaultDirectCNProbe(ctx context.Context, host string) ([]net.IP, []byte, e
 		return nil, nil, err
 	}
 
-	servers := []string{"223.5.5.5:53", "119.29.29.29:53"}
+	baseHosts := []string{"223.5.5.5", "119.29.29.29"}
+	servers := make([]string, 0, 4)
+	for _, h := range baseHosts {
+		if ua, rerr := netbind.ResolveUDPAddr(ctx, h, 53); rerr == nil && ua != nil {
+			servers = append(servers, ua.String())
+		} else {
+			servers = append(servers, net.JoinHostPort(h, "53"))
+		}
+	}
+	if netbind.IsPureIPv6Physical() {
+		servers = append(servers, "[2400:3200::1]:53", "[2402:4e00::]:53")
+	}
 	type probeRes struct {
 		ips  []net.IP
 		wire []byte
@@ -265,8 +288,14 @@ func defaultDirectCNProbe(ctx context.Context, host string) ([]net.IP, []byte, e
 
 	for _, srv := range servers {
 		go func(target string) {
+			cnProbeTargetMu.Lock()
+			hook := cnProbeTargetHook
+			cnProbeTargetMu.Unlock()
+			if hook != nil {
+				hook("udp", target)
+			}
 			d := net.Dialer{Timeout: smartDNSProbeTimeout, Control: netbind.Control}
-			c, dialErr := d.DialContext(ctx, "udp4", target)
+			c, dialErr := d.DialContext(ctx, "udp", target)
 			if dialErr != nil {
 				ch <- probeRes{err: dialErr}
 				return
@@ -370,6 +399,7 @@ func (e *Engine) probeUnknownDomainSmart(hostLower string) smartRouteEntry {
 				ent.reason = "direct:cn-dns"
 				ent.directIP = ip4.String()
 				ent.wireResp = wireResp
+				ent.wireAt = time.Now()
 				break
 			}
 		}
@@ -443,7 +473,7 @@ func (e *Engine) ResolveSmartDNS(mode RouteMode, qname string, txID []byte) (act
 		ent := e.probeUnknownDomainSmart(hostLower)
 		act = ent.act
 		reason = ent.reason
-		if act == ActionDirect && len(ent.wireResp) >= 12 {
+		if act == ActionDirect && len(ent.wireResp) >= 12 && time.Since(ent.wireAt) <= 30*time.Second {
 			wireResp = append([]byte(nil), ent.wireResp...)
 			if len(txID) >= 2 {
 				wireResp[0], wireResp[1] = txID[0], txID[1]

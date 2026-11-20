@@ -69,6 +69,7 @@ func SetPreferredInterface(name string) {
 	preferredMu.Lock()
 	preferredIface = strings.TrimSpace(name)
 	preferredMu.Unlock()
+	ResetNAT64Cache()
 }
 
 // PreferredInterface returns the currently configured preferred physical interface name, if any.

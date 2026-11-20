@@ -11,10 +11,13 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"ghostframe/internal/netbind"
 )
 
 func TestPreScreenZeroAllocAndAntiAmplification(t *testing.T) {
@@ -956,5 +959,34 @@ func TestWatchdogDoesNotKillIdleSessionAndClearsOnInbound(t *testing.T) {
 	s.handleInboundPacket(inboundPkt{buf: &pktBuf, n: len(pktBuf), at: time.Now()}, plain[:0])
 	if got := s.unackedTxSinceNs.Load(); got != 0 {
 		t.Fatalf("expected valid inbound RTP packet with 0 in-flight bytes to clear unackedTxSinceNs, got %d", got)
+	}
+}
+
+func TestNAT64DialSynthesizes64ff9b(t *testing.T) {
+	restore := netbind.SetNAT64TestHooks(
+		func() bool { return true },
+		func(ctx context.Context, host string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("64:ff9b::192.0.0.170")}, nil
+		},
+		nil,
+	)
+	defer restore()
+
+	psk := make([]byte, 32)
+	_, _ = rand.Read(psk)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+
+	_, _, err := Dial(ctx, DialOptions{
+		Host:    "198.51.100.42",
+		Port:    443,
+		PSK:     psk,
+		Timeout: 120 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatalf("expected dial to unroutable test IPv4 NAT64 target to fail")
+	}
+	if !strings.Contains(err.Error(), "64:ff9b::c633:642a") {
+		t.Fatalf("expected gftrtc.Dial to synthesize 64:ff9b::c633:642a, got err=%v", err)
 	}
 }

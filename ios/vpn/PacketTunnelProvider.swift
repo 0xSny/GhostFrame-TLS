@@ -405,6 +405,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
                 var addrCopy = sin.sin_addr
                 if inet_ntop(AF_INET, &addrCopy, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    let ipU32 = UInt32(bigEndian: sin.sin_addr.s_addr)
+                    if (ipU32 & 0xFFFE_0000) == 0xC612_0000 { // Exclude 198.18.0.0/15 Fake-IP pool
+                        cursor = cur.pointee.ai_next
+                        continue
+                    }
                     let s = String(cString: buf)
                     if !ips.contains(s) {
                         ips.append(s)

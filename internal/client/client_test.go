@@ -11,10 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"ghostframe/internal/gft"
+	"ghostframe/internal/netbind"
 )
 
 // mockServer creates an in-memory GFT server loop over a pipe.
@@ -526,6 +528,67 @@ func TestStartServersAutoFallbackWhenPortsOccupied(t *testing.T) {
 	st := eng.Status()
 	if st["socks_addr"] == occSocks || st["http_addr"] == occHTTP {
 		t.Fatalf("expected fallback to new addresses, still got socks=%v http=%v", st["socks_addr"], st["http_addr"])
+	}
+}
+
+func TestNAT64DirectCNProbeAndWireRespTTL(t *testing.T) {
+	restore := netbind.SetNAT64TestHooks(
+		func() bool { return true },
+		func(ctx context.Context, host string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("64:ff9b::192.0.0.170")}, nil
+		},
+		nil,
+	)
+	defer restore()
+
+	var mu sync.Mutex
+	var dialed []string
+	setCNProbeTargetHook(func(network, addr string) {
+		mu.Lock()
+		dialed = append(dialed, network+"|"+addr)
+		mu.Unlock()
+	})
+	defer setCNProbeTargetHook(nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	_, _, _ = defaultDirectCNProbe(ctx, "example.cn")
+
+	mu.Lock()
+	joined := strings.Join(dialed, ",")
+	mu.Unlock()
+	if !strings.Contains(joined, "udp|[64:ff9b::df05:505]:53") ||
+		!strings.Contains(joined, "udp|[64:ff9b::771d:1d1d]:53") ||
+		!strings.Contains(joined, "udp|[2400:3200::1]:53") ||
+		!strings.Contains(joined, "udp|[2402:4e00::]:53") {
+		t.Fatalf("expected defaultDirectCNProbe to dial NAT64 64:ff9b + native IPv6 CN DNS over udp, got %q", joined)
+	}
+	if strings.Contains(joined, "udp4|") {
+		t.Fatalf("unexpected hardcoded udp4 dial in defaultDirectCNProbe: %q", joined)
+	}
+
+	// Verify wireResp expires after 30s while ActionDirect stays cached for 10m.
+	eng, err := NewEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	wire := []byte{0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0}
+	eng.smartCache.Put(smartRouteEntry{
+		host:     "fresh-test.example",
+		act:      ActionDirect,
+		reason:   "direct:cn-dns",
+		directIP: "223.5.5.5",
+		wireResp: wire,
+		wireAt:   time.Now().Add(-31 * time.Second),
+	})
+	act, gotWire, _ := eng.ResolveSmartDNS(RouteRule, "fresh-test.example", []byte{0xab, 0xcd})
+	if act != ActionDirect {
+		t.Fatalf("expected cached ActionDirect, got %v", act)
+	}
+	if gotWire != nil {
+		t.Fatalf("expected stale wireResp (>30s) to be withheld so SplitDNSServer fetches fresh A record, got len=%d", len(gotWire))
 	}
 }
 

@@ -364,7 +364,7 @@ func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
 			if err != nil {
 				continue
 			}
-			uaDst, err := net.ResolveUDPAddr("udp", resolvedTarget)
+			uaDst, err := netbind.ResolveUDPTarget(context.Background(), resolvedTarget)
 			if err != nil {
 				continue
 			}
