@@ -298,11 +298,21 @@ install_server() {
 
   # Lossless migration from legacy GhostFrame (/etc/gft) if present
   if [[ ! -f /etc/kestrel/server.json ]] && [[ -f /etc/gft/server.json ]]; then
-    cp -a /etc/gft/server.json /etc/kestrel/server.json
+    cp -an /etc/gft/. /etc/kestrel/ 2>/dev/null || cp -a /etc/gft/server.json /etc/kestrel/server.json
     if [[ -d /var/lib/gft ]]; then
       cp -an /var/lib/gft/. /var/lib/kestrel/ 2>/dev/null || true
     fi
-    log "Migrated existing node configuration /etc/gft/server.json -> /etc/kestrel/server.json"
+    log "Migrated existing node configuration /etc/gft -> /etc/kestrel"
+  fi
+  if [[ -f /etc/kestrel/server.json ]]; then
+    # Ensure cert.pem/key.pem are also present under /etc/kestrel if server.json was migrated earlier
+    if [[ -f /etc/gft/cert.pem ]] && [[ ! -f /etc/kestrel/cert.pem ]]; then
+      cp -a /etc/gft/cert.pem /etc/kestrel/cert.pem
+    fi
+    if [[ -f /etc/gft/key.pem ]] && [[ ! -f /etc/kestrel/key.pem ]]; then
+      cp -a /etc/gft/key.pem /etc/kestrel/key.pem
+    fi
+    sed -i -e 's|"/etc/gft/|"/etc/kestrel/|g' -e 's|"/var/lib/gft"|"/var/lib/kestrel"|g' -e 's|"/var/lib/gft/|"/var/lib/kestrel/|g' /etc/kestrel/server.json
   fi
 
   if [[ -f /etc/kestrel/server.json ]]; then
@@ -331,11 +341,13 @@ install_server() {
 
   chown -R gft:gft /etc/kestrel /var/lib/kestrel
   chmod 0750 /etc/kestrel /var/lib/kestrel
+  if [[ -f /etc/kestrel/key.pem ]]; then chmod 0600 /etc/kestrel/key.pem; fi
 
-  if systemctl list-unit-files 2>/dev/null | grep -q '^ghostframe\.service'; then
-    systemctl stop ghostframe >/dev/null 2>&1 || true
-    systemctl disable ghostframe >/dev/null 2>&1 || true
-  fi
+  # Unconditionally stop legacy ghostframe service/process before binding port
+  systemctl stop ghostframe >/dev/null 2>&1 || true
+  systemctl disable ghostframe >/dev/null 2>&1 || true
+  pkill -x gft-server >/dev/null 2>&1 || true
+  sleep 0.5
 
   cat > /etc/systemd/system/kestrel.service <<'EOF'
 [Unit]
