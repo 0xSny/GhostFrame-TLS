@@ -26,6 +26,11 @@
 	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>NSCameraUsageDescription</key>
 	<string>GhostFrame Companion 需要相机权限以扫描节点分享二维码（gft3://）。</string>
 	<key>NSLocalNetworkUsageDescription</key>

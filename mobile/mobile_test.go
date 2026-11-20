@@ -3,9 +3,12 @@ package mobile
 import (
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"ghostframe/internal/gft"
 	"ghostframe/internal/netbind"
@@ -172,6 +175,39 @@ func TestIdleLifecycleAndStatusJSON(t *testing.T) {
 	if err := StartEngine(string(asyncCfg)); err != nil {
 		t.Fatalf("expected async StartEngine to bind local servers without blocking on tunnel dial, got: %v", err)
 	}
+	t.Cleanup(func() { _ = StopEngine() })
+
+	hc := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
+	}
+	pingResp, err := hc.Get("http://127.0.0.1:29082/_gft/ping")
+	if err != nil {
+		t.Fatalf("GET /_gft/ping failed: %v", err)
+	}
+	pingBody, _ := io.ReadAll(pingResp.Body)
+	pingResp.Body.Close()
+	if pingResp.StatusCode != http.StatusOK || !strings.Contains(string(pingBody), `"pong":true`) {
+		t.Fatalf("unexpected /_gft/ping response (%d): %s", pingResp.StatusCode, string(pingBody))
+	}
+
+	statusResp, err := hc.Get("http://127.0.0.1:29082/_gft/status")
+	if err != nil {
+		t.Fatalf("GET /_gft/status failed: %v", err)
+	}
+	statusBody, _ := io.ReadAll(statusResp.Body)
+	statusResp.Body.Close()
+	if statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected /_gft/status status code %d: %s", statusResp.StatusCode, string(statusBody))
+	}
+	var snap map[string]any
+	if err := json.Unmarshal(statusBody, &snap); err != nil {
+		t.Fatalf("invalid JSON from /_gft/status: %v (%s)", err, string(statusBody))
+	}
+	if _, ok := snap["netbind_enabled"]; !ok {
+		t.Fatalf("expected netbind_enabled in /_gft/status payload, got: %v", snap)
+	}
+
 	if err := StopEngine(); err != nil {
 		t.Fatalf("StopEngine after async StartEngine failed: %v", err)
 	}

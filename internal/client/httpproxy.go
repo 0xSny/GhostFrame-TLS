@@ -3,8 +3,11 @@ package client
 import (
 	"bufio"
 	"bytes"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +15,21 @@ import (
 
 	"ghostframe/internal/gft"
 )
+
+// LocalMgmtHandler handles loopback-only management API calls under /_gft/* routes.
+type LocalMgmtHandler func(method, path string, body []byte) (statusCode int, contentType string, respBody []byte)
+
+var (
+	localMgmtMu      sync.RWMutex
+	localMgmtHandler LocalMgmtHandler
+)
+
+// SetLocalMgmtHandler registers an in-process management handler for loopback /_gft/* requests.
+func SetLocalMgmtHandler(fn LocalMgmtHandler) {
+	localMgmtMu.Lock()
+	localMgmtHandler = fn
+	localMgmtMu.Unlock()
+}
 
 // HTTPProxyServer handles incoming HTTP and HTTPS (CONNECT) proxy requests.
 type HTTPProxyServer struct {
@@ -27,7 +45,17 @@ func (s *HTTPProxyServer) logDisconnectedThrottled() {
 	now := time.Now().UnixNano()
 	prev := s.lastDisLogNs.Load()
 	if now-prev >= int64(5*time.Second) && s.lastDisLogNs.CompareAndSwap(prev, now) {
-		s.engine.Logf("[HTTP Proxy] Waiting for connection: local requests paused until connected")
+		st := s.engine.Status()
+		stateStr, _ := st["state"].(string)
+		errStr, _ := st["last_err"].(string)
+		if len(errStr) > 120 {
+			errStr = errStr[:120] + "..."
+		}
+		if errStr != "" {
+			s.engine.Logf("[HTTP Proxy] Request rejected (state=%s, err=%s)", stateStr, errStr)
+		} else {
+			s.engine.Logf("[HTTP Proxy] Waiting for connection (state=%s): local requests paused until connected", stateStr)
+		}
 	}
 }
 
@@ -107,6 +135,16 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		return
 	}
 
+	if req.Method != http.MethodConnect && req.URL.Scheme == "" && req.URL.Host == "" && strings.HasPrefix(req.URL.Path, "/_gft/") {
+		localMgmtMu.RLock()
+		fn := localMgmtHandler
+		localMgmtMu.RUnlock()
+		if fn != nil && isLoopbackRemote(c.RemoteAddr()) {
+			s.serveLocalMgmt(c, req, fn)
+			return
+		}
+	}
+
 	if !s.engine.IsConnected() {
 		s.logDisconnectedThrottled()
 		resp := "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nGhostFrame not connected to server\r\n"
@@ -180,6 +218,48 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 
 	_ = c.SetDeadline(time.Time{})
 	gft.Relay(st, c, 15*time.Minute)
+}
+
+func isLoopbackRemote(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	host := addr.String()
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (s *HTTPProxyServer) serveLocalMgmt(c net.Conn, req *http.Request, fn LocalMgmtHandler) {
+	var body []byte
+	if req.Body != nil {
+		body, _ = io.ReadAll(io.LimitReader(req.Body, 64*1024))
+		_ = req.Body.Close()
+	}
+	status, contentType, respBody := fn(req.Method, req.URL.Path, body)
+	if status <= 0 {
+		status = http.StatusOK
+	}
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/json; charset=utf-8"
+	}
+	statusText := http.StatusText(status)
+	if statusText == "" {
+		statusText = "OK"
+	}
+	var hdr strings.Builder
+	hdr.WriteString(fmt.Sprintf("HTTP/1.1 %d %s\r\n", status, statusText))
+	hdr.WriteString("Content-Type: " + contentType + "\r\n")
+	hdr.WriteString("Content-Length: " + strconv.Itoa(len(respBody)) + "\r\n")
+	hdr.WriteString("Cache-Control: no-store\r\n")
+	hdr.WriteString("Connection: close\r\n\r\n")
+	_, _ = c.Write([]byte(hdr.String()))
+	if len(respBody) > 0 {
+		_, _ = c.Write(respBody)
+	}
 }
 
 type bufferedConn struct {

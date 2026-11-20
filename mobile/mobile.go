@@ -66,6 +66,10 @@ var (
 	lastConnectErr string
 )
 
+func init() {
+	client.SetLocalMgmtHandler(handleLocalMgmt)
+}
+
 // InitCore configures mobile runtime guardrails before starting the engine.
 // When isTunnelExt is true (50MB iOS PacketTunnel extension cap), memory is tightly
 // bounded (26MB limit, GCPercent=25, LowMemMode=true -> 4MB/8MB windows, 512KB UDP
@@ -79,6 +83,7 @@ func InitCore(dataDir string, isTunnelExt bool) {
 
 func initCoreLocked(dataDir string, isTunnelExt bool) {
 	client.SetNoSysProxy(true)
+	client.SetLocalMgmtHandler(handleLocalMgmt)
 
 	dir := strings.TrimSpace(dataDir)
 	if dir == "" {
@@ -445,6 +450,27 @@ func BuildBypassRule(serverHost string) string {
 		return fmt.Sprintf("IP-CIDR6,%s/128,DIRECT", ip.String())
 	}
 	return fmt.Sprintf("DOMAIN,%s,DIRECT", host)
+}
+
+func handleLocalMgmt(method, path string, body []byte) (int, string, []byte) {
+	switch path {
+	case "/_gft/ping":
+		return 200, "application/json; charset=utf-8", []byte(`{"ok":true,"pong":true}`)
+	case "/_gft/status":
+		return 200, "application/json; charset=utf-8", []byte(GetStatusJSON())
+	case "/_gft/diag":
+		return 200, "text/plain; charset=utf-8", []byte(GetDiagnosticSnapshot())
+	case "/_gft/clear-logs":
+		ClearLogs()
+		return 200, "application/json; charset=utf-8", []byte(`{"ok":true}`)
+	case "/_gft/reload":
+		if strings.ToUpper(strings.TrimSpace(method)) != "POST" {
+			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
+		}
+		return 200, "application/json; charset=utf-8", []byte(StartEngineJSON(string(body)))
+	default:
+		return 404, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"not found"}`)
+	}
 }
 
 func marshalEnvelope(err error, data any) string {

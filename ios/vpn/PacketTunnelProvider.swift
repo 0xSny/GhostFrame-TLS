@@ -93,56 +93,75 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        switch req.action {
-        case "status":
-            replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
+        if req.action == "ping" {
+            replyIPC(TunnelIPCResponse(ok: true, payload: "pong", error: nil), completionHandler: completionHandler)
+            return
+        }
 
-        case "diag":
-            replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getDiagnosticSnapshot(), error: nil), completionHandler: completionHandler)
-
-        case "clearLogs":
-            GhostMobileBridge.clearLogs()
-            replyIPC(TunnelIPCResponse(ok: true, payload: nil, error: nil), completionHandler: completionHandler)
-
-        case "networkWake":
-            GhostMobileBridge.onNetworkChanged(ifaceName: req.iface ?? lastPhysicalIface)
-            replyIPC(TunnelIPCResponse(ok: true, payload: nil, error: nil), completionHandler: completionHandler)
-
-        case "reload":
-            guard let cfgJSON = req.configJSON, !cfgJSON.isEmpty else {
-                replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: "Missing configJSON for reload"), completionHandler: completionHandler)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else {
+                completionHandler?(nil)
                 return
             }
-            let decodedCfg = GhostEngineConfig.decode(from: cfgJSON)
-            var serverHost = ""
-            if let linkURI = decodedCfg?.linkURI, case .success(let node) = GhostMobileBridge.parseLink(uri: linkURI) {
-                serverHost = node.host
-            }
-            let newHTTPPort = decodedCfg?.httpPort ?? currentHTTPPort
 
-            _ = GhostMobileBridge.stopEngine()
-            switch GhostMobileBridge.startEngine(configJSON: cfgJSON) {
-            case .failure(let err):
-                replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
-            case .success:
-                if newHTTPPort != currentHTTPPort || serverHost != currentServerHost {
-                    currentHTTPPort = newHTTPPort
-                    currentServerHost = serverHost
-                    let settings = buildNetworkSettings(httpPort: newHTTPPort, serverHost: serverHost)
-                    setTunnelNetworkSettings(settings) { [weak self] err in
-                        if let err = err {
-                            self?.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
-                        } else {
-                            self?.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
-                        }
-                    }
+            switch req.action {
+            case "status":
+                self.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
+
+            case "diag":
+                self.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getDiagnosticSnapshot(), error: nil), completionHandler: completionHandler)
+
+            case "clearLogs":
+                GhostMobileBridge.clearLogs()
+                self.replyIPC(TunnelIPCResponse(ok: true, payload: nil, error: nil), completionHandler: completionHandler)
+
+            case "networkWake":
+                GhostMobileBridge.onNetworkChanged(ifaceName: req.iface ?? self.lastPhysicalIface)
+                self.replyIPC(TunnelIPCResponse(ok: true, payload: nil, error: nil), completionHandler: completionHandler)
+
+            case "reload":
+                guard let cfgJSON = req.configJSON, !cfgJSON.isEmpty else {
+                    self.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: "Missing configJSON for reload"), completionHandler: completionHandler)
                     return
                 }
-                replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
-            }
+                let decodedCfg = GhostEngineConfig.decode(from: cfgJSON)
+                var serverHost = ""
+                if let linkURI = decodedCfg?.linkURI, case .success(let node) = GhostMobileBridge.parseLink(uri: linkURI) {
+                    serverHost = node.host
+                }
+                let newHTTPPort = decodedCfg?.httpPort ?? self.currentHTTPPort
+                let startConfigJSON: String
+                if var cfg = decodedCfg {
+                    cfg.asyncConnect = true
+                    startConfigJSON = cfg.toJSONString()
+                } else {
+                    startConfigJSON = cfgJSON
+                }
 
-        default:
-            replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: "Unknown IPC action: \(req.action)"), completionHandler: completionHandler)
+                _ = GhostMobileBridge.stopEngine()
+                switch GhostMobileBridge.startEngine(configJSON: startConfigJSON) {
+                case .failure(let err):
+                    self.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
+                case .success:
+                    if newHTTPPort != self.currentHTTPPort || serverHost != self.currentServerHost {
+                        self.currentHTTPPort = newHTTPPort
+                        self.currentServerHost = serverHost
+                        let settings = self.buildNetworkSettings(httpPort: newHTTPPort, serverHost: serverHost)
+                        self.setTunnelNetworkSettings(settings) { [weak self] err in
+                            if let err = err {
+                                self?.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
+                            } else {
+                                self?.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
+                            }
+                        }
+                        return
+                    }
+                    self.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
+                }
+
+            default:
+                self.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: "Unknown IPC action: \(req.action)"), completionHandler: completionHandler)
+            }
         }
     }
 

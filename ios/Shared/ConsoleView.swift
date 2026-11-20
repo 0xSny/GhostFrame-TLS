@@ -14,48 +14,84 @@ private enum GhostPalette {
     static let textMuted = Color(red: 0.580, green: 0.639, blue: 0.722)
 }
 
+private enum ActivePanelSheet: String, Identifiable {
+    case nodes
+    case settings
+    case logs
+    case diagnostic
+
+    var id: String { rawValue }
+}
+
 struct ConsoleView: View {
     @ObservedObject var viewModel: GhostAppViewModel
 
+    @State private var showDrawer = false
+    @State private var activeSheet: ActivePanelSheet?
     @State private var showImportSheet = false
     @State private var showQRScanner = false
     @State private var importURIText = ""
-    @State private var showDiagnosticSheet = false
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack(alignment: .leading) {
             GhostPalette.background.ignoresSafeArea()
 
             VStack(spacing: 0) {
-                headerCard
+                topBar
                     .padding(.horizontal, 14)
                     .padding(.top, 8)
                     .padding(.bottom, 10)
-                    .background(GhostPalette.background)
 
                 ScrollView {
-                    VStack(spacing: 14) {
+                    VStack(spacing: 12) {
                         connectionHeroCard
-                        editionSpecificCard
-                        waveformCard
-                        nodesCard
-                        controlsCard
-                        logsCard
+                        quickModeCard
+                        quickNavRow
                     }
                     .padding(.horizontal, 14)
                     .padding(.top, 4)
-                    .padding(.bottom, 16)
+                    .padding(.bottom, 20)
                 }
                 .clipped()
             }
 
             if !viewModel.toastMessage.isEmpty {
-                toastOverlay(viewModel.toastMessage)
-                    .padding(.bottom, 18)
-                    .transition(.opacity)
+                VStack {
+                    Spacer()
+                    toastOverlay(viewModel.toastMessage)
+                        .padding(.bottom, 22)
+                }
+                .frame(maxWidth: .infinity)
+                .allowsHitTesting(false)
+                .transition(.opacity)
+            }
+
+            if showDrawer {
+                Color.black.opacity(0.58)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.easeOut(duration: 0.22)) {
+                            showDrawer = false
+                        }
+                    }
+
+                drawerMenu
+                    .transition(.move(edge: .leading))
             }
         }
         .preferredColorScheme(.dark)
+        .sheet(item: $activeSheet) { sheet in
+            switch sheet {
+            case .nodes:
+                nodesSheet
+            case .settings:
+                settingsSheet
+            case .logs:
+                logsAndWaveformSheet
+            case .diagnostic:
+                diagnosticSheet
+            }
+        }
         .sheet(isPresented: $showImportSheet) {
             importNodeSheet
         }
@@ -72,63 +108,56 @@ struct ConsoleView: View {
             }
             .preferredColorScheme(.dark)
         }
-        .sheet(isPresented: $showDiagnosticSheet) {
-            diagnosticSheet
-        }
         .sheet(item: $viewModel.tunnelErrorReport) { report in
             tunnelErrorSheet(report)
         }
     }
 
-    private var headerCard: some View {
+    private var topBar: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Button(action: {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                        showDrawer.toggle()
+                    }
+                }) {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundColor(GhostPalette.textPrimary)
+                        .frame(width: 34, height: 34)
+                        .background(GhostPalette.cardAlt)
+                        .overlay(RoundedRectangle(cornerRadius: 9).stroke(GhostPalette.border, lineWidth: 1))
+                        .cornerRadius(9)
+                }
+
                 Circle()
                     .fill(statusColor)
-                    .frame(width: 11, height: 11)
+                    .frame(width: 10, height: 10)
 
-                Text(viewModel.edition.title)
+                Text("GhostFrame")
                     .font(.system(size: 17, weight: .bold))
                     .foregroundColor(GhostPalette.textPrimary)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.8)
 
-                Text("v4.0-LTS")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                Text(viewModel.edition == .vpn ? "VPN" : "伴侣")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundColor(GhostPalette.cyan)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
                     .background(GhostPalette.cyan.opacity(0.15))
-                    .cornerRadius(6)
+                    .cornerRadius(5)
+                    .fixedSize()
 
                 Spacer()
 
                 Button(action: { showQRScanner = true }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "qrcode.viewfinder")
-                        Text("扫码")
-                    }
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(GhostPalette.textPrimary)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 6)
-                    .background(GhostPalette.cardAlt)
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(GhostPalette.border, lineWidth: 1))
-                    .cornerRadius(8)
-                }
-
-                Button(action: {
-                    viewModel.refreshDiagnostic()
-                    showDiagnosticSheet = true
-                }) {
-                    Text("诊断")
-                        .font(.system(size: 12, weight: .semibold))
+                    Image(systemName: "qrcode.viewfinder")
+                        .font(.system(size: 15, weight: .semibold))
                         .foregroundColor(GhostPalette.textPrimary)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 6)
+                        .frame(width: 34, height: 34)
                         .background(GhostPalette.cardAlt)
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(GhostPalette.border, lineWidth: 1))
-                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 9).stroke(GhostPalette.border, lineWidth: 1))
+                        .cornerRadius(9)
                 }
 
                 Button(action: {
@@ -137,18 +166,22 @@ struct ConsoleView: View {
                     }
                     showImportSheet = true
                 }) {
-                    Text("导入")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(.black)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(GhostPalette.cyan)
-                        .cornerRadius(8)
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus")
+                        Text("导入")
+                    }
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 11)
+                    .frame(height: 34)
+                    .background(GhostPalette.cyan)
+                    .cornerRadius(9)
+                    .fixedSize()
                 }
             }
 
             HStack(spacing: 8) {
-                Text("S5 :\(viewModel.effectiveSocksPort) · HTTP :\(viewModel.effectiveHttpPort) · \(viewModel.backendStateLabel)")
+                Text("S5 :\(String(viewModel.effectiveSocksPort)) · HTTP :\(String(viewModel.effectiveHttpPort)) · \(viewModel.backendStateLabel)")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(GhostPalette.textMuted)
                     .lineLimit(1)
@@ -156,14 +189,15 @@ struct ConsoleView: View {
 
                 Spacer()
 
-                if viewModel.isConnected || viewModel.isTransitioning {
+                if viewModel.isConnected || viewModel.isTransitioning || viewModel.status.state != "disconnected" {
                     Text("内核:\(viewModel.status.state)")
                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundColor(viewModel.status.state == "connected" ? GhostPalette.emerald : GhostPalette.amber)
+                        .foregroundColor(kernelStateColor)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background((viewModel.status.state == "connected" ? GhostPalette.emerald : GhostPalette.amber).opacity(0.14))
+                        .background(kernelStateColor.opacity(0.14))
                         .cornerRadius(5)
+                        .fixedSize()
                 }
             }
         }
@@ -175,35 +209,64 @@ struct ConsoleView: View {
 
     private var connectionHeroCard: some View {
         VStack(spacing: 12) {
+            Button(action: { activeSheet = .nodes }) {
+                HStack(spacing: 10) {
+                    Image(systemName: "server.rack")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(viewModel.activeNode == nil ? GhostPalette.amber : GhostPalette.cyan)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(viewModel.activeNode?.remark ?? "尚未选择节点 (点击导入或选择)")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(GhostPalette.textPrimary)
+                            .lineLimit(1)
+
+                        if let node = viewModel.activeNode {
+                            Text("\(node.host):\(String(node.port)) · \(node.transport.uppercased())")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(GhostPalette.textMuted)
+                                .lineLimit(1)
+                        }
+                    }
+
+                    Spacer()
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(GhostPalette.textMuted)
+                }
+                .padding(11)
+                .background(GhostPalette.cardAlt)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(GhostPalette.border, lineWidth: 1))
+                .cornerRadius(10)
+            }
+
             Button(action: { viewModel.toggleConnection() }) {
                 HStack(spacing: 10) {
                     Image(systemName: viewModel.isConnected ? "stop.fill" : (viewModel.isTransitioning ? "arrow.triangle.2.circlepath" : "play.fill"))
-                        .font(.system(size: 16, weight: .bold))
+                        .font(.system(size: 15, weight: .bold))
                     Text(primaryButtonTitle)
-                        .font(.system(size: 16, weight: .bold))
+                        .font(.system(size: 15, weight: .bold))
                 }
                 .foregroundColor(viewModel.isConnected ? GhostPalette.textPrimary : Color.black)
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 15)
+                .padding(.vertical, 14)
                 .background(
                     viewModel.isConnected
-                        ? GhostPalette.crimson.opacity(0.88)
+                        ? GhostPalette.crimson.opacity(0.90)
                         : (viewModel.isTransitioning ? GhostPalette.amber : GhostPalette.emerald)
                 )
-                .cornerRadius(12)
+                .cornerRadius(11)
             }
 
             LazyVGrid(columns: [
                 GridItem(.flexible(), spacing: 8),
-                GridItem(.flexible(), spacing: 8),
                 GridItem(.flexible(), spacing: 8)
             ], spacing: 8) {
-                metricBox(title: "通道延迟", value: rttText, accent: GhostPalette.cyan)
-                metricBox(title: "传输引擎", value: activeTransportText, accent: GhostPalette.emerald)
-                metricBox(title: "双通道端口", value: hopPortsText, accent: GhostPalette.textPrimary)
-                metricBox(title: "跳跃/轮换", value: "H\(viewModel.status.hopCount) · R\(viewModel.status.rekeyCount)", accent: GhostPalette.cyan)
-                metricBox(title: "FEC 恢复", value: "\(viewModel.status.fecRecovered) pkt", accent: GhostPalette.emerald)
-                metricBox(title: "网卡 / 内存", value: nicAndMemText, accent: GhostPalette.amber)
+                metricBox(title: "延迟 · 协议", value: "\(rttText) · \(activeTransportText)", accent: GhostPalette.cyan)
+                metricBox(title: "双通道端口 · H/R", value: "\(hopPortsText) · H\(viewModel.status.hopCount)", accent: GhostPalette.textPrimary)
+                metricBox(title: "实时速率", value: "↑\(GhostByteFormatter.formatRate(viewModel.status.upBps)) ↓\(GhostByteFormatter.formatRate(viewModel.status.downBps))", accent: GhostPalette.emerald)
+                metricBox(title: "网卡 · 内存", value: nicAndMemText, accent: GhostPalette.amber)
             }
 
             if !viewModel.errorBanner.isEmpty {
@@ -222,276 +285,445 @@ struct ConsoleView: View {
                 .cornerRadius(8)
             }
         }
-        .padding(14)
+        .padding(13)
         .background(GhostPalette.card)
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(GhostPalette.border, lineWidth: 1))
         .cornerRadius(14)
     }
 
-    @ViewBuilder
-    private var editionSpecificCard: some View {
-        switch viewModel.edition {
-        case .vpn:
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Label("重签自适应系统级 VPN", systemImage: "checkmark.shield.fill")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundColor(GhostPalette.emerald)
-                    Spacer()
-                    Text("零 App Group")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundColor(GhostPalette.cyan)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(GhostPalette.cyan.opacity(0.14))
-                        .cornerRadius(5)
+    private var quickModeCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("运行模式", selection: $viewModel.routeMode) {
+                ForEach(GhostRouteMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
                 }
-                Text("Main Bundle: \(Bundle.main.bundleIdentifier ?? "-")")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(GhostPalette.textMuted)
-                Text("Ext Bundle: \(viewModel.detectedExtensionBundleID.isEmpty ? "自动扫描中..." : viewModel.detectedExtensionBundleID)")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(GhostPalette.textPrimary)
-                Text("配置通过 NETunnelProviderProtocol.providerConfiguration 下发，状态通过 sendProviderMessage IPC 同步；全能签改包名 100% 互通。")
-                    .font(.system(size: 11))
-                    .foregroundColor(GhostPalette.textMuted)
             }
-            .padding(14)
-            .background(GhostPalette.card)
-            .overlay(RoundedRectangle(cornerRadius: 14).stroke(GhostPalette.border, lineWidth: 1))
-            .cornerRadius(14)
+            .pickerStyle(.segmented)
+            .onChange(of: viewModel.routeMode) { _ in
+                viewModel.applySettings()
+            }
 
-        case .companion:
-            VStack(alignment: .leading, spacing: 10) {
+            if viewModel.edition == .companion {
+                HStack(spacing: 8) {
+                    Button(action: openInShadowrocket) {
+                        Text("🚀 导入 Shadowrocket")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.black)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 9)
+                            .background(GhostPalette.cyan)
+                            .cornerRadius(9)
+                    }
+
+                    Button(action: copyBypassRule) {
+                        Text("📋 防回环规则")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(GhostPalette.textPrimary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 9)
+                            .background(GhostPalette.cardAlt)
+                            .overlay(RoundedRectangle(cornerRadius: 9).stroke(GhostPalette.border, lineWidth: 1))
+                            .cornerRadius(9)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(GhostPalette.card)
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(GhostPalette.border, lineWidth: 1))
+        .cornerRadius(14)
+    }
+
+    private var quickNavRow: some View {
+        HStack(spacing: 10) {
+            quickNavTile(
+                icon: "list.bullet.rectangle",
+                title: "节点",
+                subtitle: "\(viewModel.nodes.count) 个",
+                accent: GhostPalette.cyan
+            ) {
+                activeSheet = .nodes
+            }
+
+            quickNavTile(
+                icon: "waveform.path.ecg",
+                title: "波形与日志",
+                subtitle: "\(viewModel.combinedLogs.count) 条",
+                accent: GhostPalette.emerald
+            ) {
+                activeSheet = .logs
+            }
+
+            quickNavTile(
+                icon: "slider.horizontal.3",
+                title: "高级设置",
+                subtitle: viewModel.transportMode.rawValue.uppercased(),
+                accent: GhostPalette.amber
+            ) {
+                activeSheet = .settings
+            }
+        }
+    }
+
+    private func quickNavTile(
+        icon: String,
+        title: String,
+        subtitle: String,
+        accent: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Label("单进程伴侣模式 (Shadowrocket 串联)", systemImage: "link.circle.fill")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundColor(GhostPalette.cyan)
+                    Image(systemName: icon)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(accent)
                     Spacer()
-                    Text(viewModel.keepAliveActive ? "静音保活中" : "保活待机")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundColor(viewModel.keepAliveActive ? GhostPalette.emerald : GhostPalette.textMuted)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background((viewModel.keepAliveActive ? GhostPalette.emerald : GhostPalette.textMuted).opacity(0.16))
-                        .cornerRadius(6)
                 }
-
-                Text("16kHz 静音 PCM 混音保活 (.playback + .mixWithOthers)，切后台不杀进程、不打断音乐。")
-                    .font(.system(size: 11))
+                Text(title)
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(GhostPalette.textPrimary)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(GhostPalette.textMuted)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(11)
+            .background(GhostPalette.card)
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(GhostPalette.border, lineWidth: 1))
+            .cornerRadius(12)
+        }
+    }
 
-                Button(action: openInShadowrocket) {
-                    Text("🚀 一键导入本地节点到 Shadowrocket")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundColor(.black)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                        .background(GhostPalette.cyan)
-                        .cornerRadius(10)
-                }
-
-                Button(action: copyBypassRule) {
-                    Text("📋 复制 VPS 防回环直连规则")
-                        .font(.system(size: 13, weight: .semibold))
+    private var drawerMenu: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 10, height: 10)
+                    Text(viewModel.edition.title)
+                        .font(.system(size: 17, weight: .bold))
                         .foregroundColor(GhostPalette.textPrimary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(GhostPalette.cardAlt)
-                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(GhostPalette.border, lineWidth: 1))
-                        .cornerRadius(10)
+                }
+                Text("v4.0.0-LTS · \(viewModel.backendStateLabel)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(GhostPalette.cyan)
+                Text("SOCKS5 :\(String(viewModel.effectiveSocksPort)) · HTTP :\(String(viewModel.effectiveHttpPort))")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(GhostPalette.textMuted)
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 20)
+            .padding(.bottom, 16)
+
+            Divider().background(GhostPalette.border)
+
+            ScrollView {
+                VStack(spacing: 4) {
+                    drawerItem(icon: "qrcode.viewfinder", title: "扫码导入节点") {
+                        closeDrawerThen { showQRScanner = true }
+                    }
+                    drawerItem(icon: "link.badge.plus", title: "链接导入节点 (gft3://)") {
+                        closeDrawerThen {
+                            if let clip = UIPasteboard.general.string, clip.hasPrefix("gft") {
+                                importURIText = clip
+                            }
+                            showImportSheet = true
+                        }
+                    }
+                    drawerItem(icon: "server.rack", title: "节点管理 (\(viewModel.nodes.count))") {
+                        closeDrawerThen { activeSheet = .nodes }
+                    }
+                    drawerItem(icon: "slider.horizontal.3", title: "传输内核与端口设置") {
+                        closeDrawerThen { activeSheet = .settings }
+                    }
+                    drawerItem(icon: "waveform.path.ecg", title: "实时吞吐与内核日志") {
+                        closeDrawerThen { activeSheet = .logs }
+                    }
+                    drawerItem(icon: "stethoscope", title: "脱敏诊断报告") {
+                        closeDrawerThen {
+                            viewModel.refreshDiagnostic()
+                            activeSheet = .diagnostic
+                        }
+                    }
+                }
+                .padding(.vertical, 10)
+                .padding(.horizontal, 10)
+            }
+
+            Divider().background(GhostPalette.border)
+
+            VStack(alignment: .leading, spacing: 5) {
+                if viewModel.edition == .vpn {
+                    Text("重签自适应 · 零 App Group")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(GhostPalette.emerald)
+                    Text("Main: \(Bundle.main.bundleIdentifier ?? "-")")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(GhostPalette.textMuted)
+                        .lineLimit(1)
+                    Text("Ext: \(viewModel.detectedExtensionBundleID)")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(GhostPalette.textMuted)
+                        .lineLimit(1)
+                } else {
+                    Text(viewModel.keepAliveActive ? "16kHz 静音 PCM 后台保活中" : "单进程伴侣模式 (零扩展)")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(viewModel.keepAliveActive ? GhostPalette.emerald : GhostPalette.cyan)
+                    Text("支持 Shadowrocket 本地 SOCKS5 串联")
+                        .font(.system(size: 10))
+                        .foregroundColor(GhostPalette.textMuted)
                 }
             }
-            .padding(14)
-            .background(GhostPalette.card)
-            .overlay(RoundedRectangle(cornerRadius: 14).stroke(GhostPalette.border, lineWidth: 1))
-            .cornerRadius(14)
+            .padding(16)
         }
-    }
-
-    private var waveformCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("实时吞吐 (60s)")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(GhostPalette.textPrimary)
-                Spacer()
-                Text("↑ \(GhostByteFormatter.formatRate(viewModel.status.upBps)) (\(GhostByteFormatter.formatBytes(viewModel.status.totalUp)))")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(GhostPalette.cyan)
-            }
-            HStack {
-                Spacer()
-                Text("↓ \(GhostByteFormatter.formatRate(viewModel.status.downBps)) (\(GhostByteFormatter.formatBytes(viewModel.status.totalDown)))")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(GhostPalette.emerald)
-            }
-
-            TrafficWaveformCanvas(points: viewModel.status.history)
-                .frame(height: 92)
-                .background(GhostPalette.background.opacity(0.6))
-                .cornerRadius(10)
-        }
-        .padding(14)
+        .frame(width: 280)
+        .frame(maxHeight: .infinity)
         .background(GhostPalette.card)
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(GhostPalette.border, lineWidth: 1))
-        .cornerRadius(14)
+        .overlay(Rectangle().frame(width: 1).foregroundColor(GhostPalette.border), alignment: .trailing)
     }
 
-    private var nodesCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("节点列表 (\(viewModel.nodes.count))")
-                    .font(.system(size: 13, weight: .bold))
+    private func drawerItem(icon: String, title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(GhostPalette.cyan)
+                    .frame(width: 22)
+                Text(title)
+                    .font(.system(size: 14, weight: .medium))
                     .foregroundColor(GhostPalette.textPrimary)
                 Spacer()
-                Button("添加节点") { showImportSheet = true }
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(GhostPalette.cyan)
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 11)
+            .background(Color.clear)
+            .cornerRadius(9)
+        }
+    }
 
-            if viewModel.nodes.isEmpty {
-                Text("暂无节点，点击右上角「导入 gft3://」或粘贴分享链接。")
-                    .font(.system(size: 12))
-                    .foregroundColor(GhostPalette.textMuted)
-                    .padding(.vertical, 8)
-            } else {
-                ForEach(viewModel.nodes) { node in
-                    let isSelected = (viewModel.activeNode?.id == node.id)
-                    HStack(spacing: 10) {
-                        Button(action: { viewModel.selectNode(node) }) {
-                            HStack(spacing: 8) {
-                                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                                    .foregroundColor(isSelected ? GhostPalette.emerald : GhostPalette.textMuted)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(node.remark)
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .foregroundColor(GhostPalette.textPrimary)
-                                    Text("\(node.host):\(node.port) · \(node.transport.uppercased())\(node.hopRange.isEmpty ? "" : " · Hop \(node.hopRange)")")
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundColor(GhostPalette.textMuted)
+    private func closeDrawerThen(_ block: @escaping () -> Void) {
+        withAnimation(.easeOut(duration: 0.18)) {
+            showDrawer = false
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20, execute: block)
+    }
+
+    private var nodesSheet: some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: 10) {
+                    if viewModel.nodes.isEmpty {
+                        Text("暂无节点，请使用顶部「扫码」或「导入」添加。")
+                            .font(.system(size: 13))
+                            .foregroundColor(GhostPalette.textMuted)
+                            .padding(.top, 28)
+                    } else {
+                        ForEach(viewModel.nodes) { node in
+                            let isSelected = (viewModel.activeNode?.id == node.id)
+                            HStack(spacing: 10) {
+                                Button(action: {
+                                    viewModel.selectNode(node)
+                                    activeSheet = nil
+                                }) {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                                            .foregroundColor(isSelected ? GhostPalette.emerald : GhostPalette.textMuted)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(node.remark)
+                                                .font(.system(size: 14, weight: .semibold))
+                                                .foregroundColor(GhostPalette.textPrimary)
+                                            Text("\(node.host):\(String(node.port)) · \(node.transport.uppercased())\(node.hopRange.isEmpty ? "" : " · Hop \(node.hopRange)")")
+                                                .font(.system(size: 11, design: .monospaced))
+                                                .foregroundColor(GhostPalette.textMuted)
+                                        }
+                                        Spacer()
+                                    }
                                 }
-                                Spacer()
+
+                                Button(action: { viewModel.deleteNode(node) }) {
+                                    Image(systemName: "trash")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(GhostPalette.crimson.opacity(0.85))
+                                        .padding(6)
+                                }
+                            }
+                            .padding(11)
+                            .background(isSelected ? GhostPalette.emerald.opacity(0.10) : GhostPalette.card)
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(isSelected ? GhostPalette.emerald.opacity(0.6) : GhostPalette.border, lineWidth: 1))
+                            .cornerRadius(10)
+                        }
+                    }
+                }
+                .padding(16)
+            }
+            .background(GhostPalette.background.ignoresSafeArea())
+            .navigationTitle("节点列表 (\(viewModel.nodes.count))")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { activeSheet = nil }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("导入") {
+                        activeSheet = nil
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            showImportSheet = true
+                        }
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private var settingsSheet: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("运行模式")
+                            .font(.system(size: 12))
+                            .foregroundColor(GhostPalette.textMuted)
+                        Picker("运行模式", selection: $viewModel.routeMode) {
+                            ForEach(GhostRouteMode.allCases) { mode in
+                                Text(mode.label).tag(mode)
                             }
                         }
+                        .pickerStyle(.segmented)
+                    }
 
-                        Button(action: { viewModel.deleteNode(node) }) {
-                            Image(systemName: "trash")
-                                .font(.system(size: 13))
-                                .foregroundColor(GhostPalette.crimson.opacity(0.85))
-                                .padding(6)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("传输内核")
+                            .font(.system(size: 12))
+                            .foregroundColor(GhostPalette.textMuted)
+                        Picker("传输内核", selection: $viewModel.transportMode) {
+                            ForEach(GhostTransportMode.allCases) { mode in
+                                Text(mode.label).tag(mode)
+                            }
                         }
+                        .pickerStyle(.segmented)
                     }
-                    .padding(10)
-                    .background(isSelected ? GhostPalette.emerald.opacity(0.10) : GhostPalette.cardAlt)
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(isSelected ? GhostPalette.emerald.opacity(0.6) : GhostPalette.border, lineWidth: 1))
-                    .cornerRadius(10)
+
+                    HStack(spacing: 10) {
+                        labeledNumberField(title: "上行 Mbps (0=自动)", text: $viewModel.upMbpsText)
+                        labeledNumberField(title: "下行 Mbps (0=自动)", text: $viewModel.downMbpsText)
+                    }
+
+                    HStack(spacing: 10) {
+                        labeledNumberField(title: "SOCKS5 端口", text: $viewModel.socksPortText)
+                        labeledNumberField(title: "HTTP 端口", text: $viewModel.httpPortText)
+                    }
+
+                    Button(action: {
+                        viewModel.applySettings()
+                        activeSheet = nil
+                    }) {
+                        Text("保存并应用参数")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(.black)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(GhostPalette.emerald)
+                            .cornerRadius(10)
+                    }
+                }
+                .padding(16)
+            }
+            .background(GhostPalette.background.ignoresSafeArea())
+            .navigationTitle("传输与端口设置")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { activeSheet = nil }
                 }
             }
         }
-        .padding(14)
-        .background(GhostPalette.card)
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(GhostPalette.border, lineWidth: 1))
-        .cornerRadius(14)
+        .preferredColorScheme(.dark)
     }
 
-    private var controlsCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("传输、路由与带宽调优")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundColor(GhostPalette.textPrimary)
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("运行模式")
-                    .font(.system(size: 11))
-                    .foregroundColor(GhostPalette.textMuted)
-                Picker("运行模式", selection: $viewModel.routeMode) {
-                    ForEach(GhostRouteMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("传输内核")
-                    .font(.system(size: 11))
-                    .foregroundColor(GhostPalette.textMuted)
-                Picker("传输内核", selection: $viewModel.transportMode) {
-                    ForEach(GhostTransportMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-            }
-
-            HStack(spacing: 10) {
-                labeledNumberField(title: "上行 Mbps (0=自动)", text: $viewModel.upMbpsText)
-                labeledNumberField(title: "下行 Mbps (0=自动)", text: $viewModel.downMbpsText)
-            }
-
-            HStack(spacing: 10) {
-                labeledNumberField(title: "SOCKS5 端口", text: $viewModel.socksPortText)
-                labeledNumberField(title: "HTTP 端口", text: $viewModel.httpPortText)
-            }
-
-            Button(action: { viewModel.applySettings() }) {
-                Text("保存并应用参数")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(GhostPalette.textPrimary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(GhostPalette.cardAlt)
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(GhostPalette.cyan.opacity(0.65), lineWidth: 1))
-                    .cornerRadius(10)
-            }
-        }
-        .padding(14)
-        .background(GhostPalette.card)
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(GhostPalette.border, lineWidth: 1))
-        .cornerRadius(14)
-    }
-
-    private var logsCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("内核运行日志 (\(viewModel.combinedLogs.count))")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(GhostPalette.textPrimary)
-                Spacer()
-                Button("清空日志") { viewModel.clearLogs() }
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(GhostPalette.textMuted)
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                let entries = Array(viewModel.combinedLogs.suffix(30).reversed())
-                if entries.isEmpty {
-                    Text("等待引擎事件...")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(GhostPalette.textMuted)
-                } else {
-                    ForEach(entries) { item in
-                        HStack(alignment: .top, spacing: 6) {
-                            Text(item.time)
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(GhostPalette.textMuted)
-                            Text(item.message)
+    private var logsAndWaveformSheet: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("60s 实时流量")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(GhostPalette.textPrimary)
+                            Spacer()
+                            Text("累计 ↑\(GhostByteFormatter.formatBytes(viewModel.status.totalUp)) · ↓\(GhostByteFormatter.formatBytes(viewModel.status.totalDown))")
                                 .font(.system(size: 11, design: .monospaced))
-                                .foregroundColor(logColor(for: item.message))
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .foregroundColor(GhostPalette.cyan)
                         }
+                        TrafficWaveformCanvas(points: viewModel.status.history)
+                            .frame(height: 110)
+                            .background(GhostPalette.card)
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(GhostPalette.border, lineWidth: 1))
+                            .cornerRadius(10)
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("运行日志 (\(viewModel.combinedLogs.count))")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(GhostPalette.textPrimary)
+                            Spacer()
+                            Button("复制全部") {
+                                let text = viewModel.combinedLogs.map { "\($0.time) \($0.message)" }.joined(separator: "\n")
+                                UIPasteboard.general.string = text
+                                viewModel.showToast("已复制运行日志")
+                            }
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(GhostPalette.cyan)
+
+                            Button("清空") { viewModel.clearLogs() }
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(GhostPalette.textMuted)
+                                .padding(.leading, 8)
+                        }
+
+                        VStack(alignment: .leading, spacing: 5) {
+                            let entries = Array(viewModel.combinedLogs.suffix(60).reversed())
+                            if entries.isEmpty {
+                                Text("等待引擎事件...")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(GhostPalette.textMuted)
+                            } else {
+                                ForEach(entries) { item in
+                                    HStack(alignment: .top, spacing: 6) {
+                                        Text(item.time)
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundColor(GhostPalette.textMuted)
+                                        Text(item.message)
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .foregroundColor(logColor(for: item.message))
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(10)
+                        .background(GhostPalette.card)
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(GhostPalette.border, lineWidth: 1))
+                        .cornerRadius(10)
                     }
                 }
+                .padding(16)
             }
-            .padding(10)
-            .background(GhostPalette.background)
-            .cornerRadius(10)
+            .background(GhostPalette.background.ignoresSafeArea())
+            .navigationTitle("实时波形与日志")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { activeSheet = nil }
+                }
+            }
         }
-        .padding(14)
-        .background(GhostPalette.card)
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(GhostPalette.border, lineWidth: 1))
-        .cornerRadius(14)
+        .preferredColorScheme(.dark)
     }
 
     private func metricBox(title: String, value: String, accent: Color) -> some View {
@@ -503,7 +735,7 @@ struct ConsoleView: View {
                 .font(.system(size: 12, weight: .bold, design: .monospaced))
                 .foregroundColor(accent)
                 .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .minimumScaleFactor(0.72)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(9)
@@ -523,7 +755,7 @@ struct ConsoleView: View {
                 .foregroundColor(GhostPalette.textPrimary)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
-                .background(GhostPalette.background)
+                .background(GhostPalette.card)
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(GhostPalette.border, lineWidth: 1))
                 .cornerRadius(8)
         }
@@ -648,7 +880,7 @@ struct ConsoleView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("关闭") { showDiagnosticSheet = false }
+                    Button("关闭") { activeSheet = nil }
                 }
             }
         }
@@ -716,19 +948,28 @@ struct ConsoleView: View {
         return GhostPalette.textMuted
     }
 
+    private var kernelStateColor: Color {
+        switch viewModel.status.state {
+        case "connected": return GhostPalette.emerald
+        case "connecting": return GhostPalette.amber
+        case "error": return GhostPalette.crimson
+        default: return GhostPalette.textMuted
+        }
+    }
+
     private var primaryButtonTitle: String {
         if viewModel.isConnected {
-            return "断开 GhostFrame 安全隧道"
+            return "断开安全隧道"
         }
         if viewModel.isTransitioning {
-            return "正在建立加密通道... (点击取消)"
+            return "正在建立通道... (点击取消)"
         }
         return "连接 GhostFrame (v4.0 LTS)"
     }
 
     private var rttText: String {
         let ms = viewModel.status.srttMs > 0 ? viewModel.status.srttMs : viewModel.status.pingMs
-        return ms > 0 ? "\(ms) ms" : "-- ms"
+        return ms > 0 ? "\(ms)ms" : "--"
     }
 
     private var activeTransportText: String {
@@ -744,7 +985,7 @@ struct ConsoleView: View {
             return nonZero.map(String.init).joined(separator: "/")
         }
         if viewModel.status.rtcPort > 0 {
-            return ":\(viewModel.status.rtcPort)"
+            return ":\(String(viewModel.status.rtcPort))"
         }
         return "--"
     }
@@ -757,7 +998,7 @@ struct ConsoleView: View {
 
     private func logColor(for msg: String) -> Color {
         let lower = msg.lowercased()
-        if lower.contains("error") || lower.contains("fail") || lower.contains("timeout") {
+        if lower.contains("error") || lower.contains("fail") || lower.contains("timeout") || lower.contains("rejected") {
             return GhostPalette.crimson
         }
         if lower.contains("connected") || lower.contains("rekey") || lower.contains("hopped") {

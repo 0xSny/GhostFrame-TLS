@@ -24,6 +24,17 @@ final class VPNManager: GhostBackend {
     private var lastObservedStatus: NEVPNStatus?
     private var lastDisconnectErrorText: String = ""
     private var lastIPCLogAt: Date = .distantPast
+    private var currentHTTPPort: Int = 10809
+    private var telemetryChannel: String = "pending"
+    private var loggedHTTPTelemetry: Bool = false
+    private let directSession: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.connectionProxyDictionary = [:]
+        cfg.timeoutIntervalForRequest = 2.0
+        cfg.timeoutIntervalForResource = 3.0
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: cfg)
+    }()
 
     init() {
         detectedExtensionBundleID = Self.resolveTunnelProviderBundleIdentifier()
@@ -79,6 +90,9 @@ final class VPNManager: GhostBackend {
         hasAttemptedConnect = false
         userInitiatedDisconnect = false
         lastDisconnectErrorText = ""
+        currentHTTPPort = config.httpPort
+        telemetryChannel = "pending"
+        loggedHTTPTelemetry = false
         connectAttemptToken &+= 1
         let attemptToken = connectAttemptToken
 
@@ -112,6 +126,7 @@ final class VPNManager: GhostBackend {
     }
 
     func applyLiveConfig(config: GhostEngineConfig, node: GhostNode) {
+        currentHTTPPort = config.httpPort
         loadOrCreateManager { [weak self] result in
             guard let self = self else { return }
             switch result {
@@ -126,12 +141,24 @@ final class VPNManager: GhostBackend {
                             self.handleError(saveErr, stage: "保存 providerConfiguration 失败")
                             return
                         }
-                        self.sendIPC(action: "reload", configJSON: config.toJSONString()) { resp in
+                        let cfgJSON = config.toJSONString()
+                        self.sendIPC(action: "reload", configJSON: cfgJSON) { [weak self] resp in
                             Task { @MainActor in
-                                if let resp = resp, !resp.ok, let msg = resp.error {
-                                    self.onLogMessage?("Live reload error: \(msg)")
-                                } else {
-                                    self.pollStatusOnce()
+                                guard let self = self else { return }
+                                if let resp = resp {
+                                    if !resp.ok, let msg = resp.error {
+                                        self.onLogMessage?("Live reload error: \(msg)")
+                                    } else {
+                                        self.pollStatusOnce()
+                                    }
+                                } else if let body = cfgJSON.data(using: .utf8) {
+                                    self.fetchLoopbackHTTP(method: "POST", path: "/_gft/reload", body: body) { [weak self] data, _ in
+                                        Task { @MainActor in
+                                            if data != nil {
+                                                self?.pollStatusOnce()
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -146,9 +173,21 @@ final class VPNManager: GhostBackend {
             sendIPC(action: "diag", configJSON: nil) { [weak self] resp in
                 if let resp = resp, resp.ok, let payload = resp.payload, !payload.isEmpty {
                     completion(payload)
-                } else {
-                    Task { @MainActor in
-                        completion(self?.localFallbackDiagnostic() ?? "Extension IPC unavailable")
+                    return
+                }
+                Task { @MainActor in
+                    guard let self = self else {
+                        completion("VPN manager unavailable")
+                        return
+                    }
+                    self.fetchLoopbackHTTP(method: "GET", path: "/_gft/diag", body: nil) { data, _ in
+                        Task { @MainActor in
+                            if let data = data, let text = String(data: data, encoding: .utf8), !text.isEmpty {
+                                completion(text)
+                            } else {
+                                completion(self.localFallbackDiagnostic())
+                            }
+                        }
                     }
                 }
             }
@@ -159,6 +198,7 @@ final class VPNManager: GhostBackend {
 
     func clearLogs() {
         sendIPC(action: "clearLogs", configJSON: nil) { _ in }
+        fetchLoopbackHTTP(method: "POST", path: "/_gft/clear-logs", body: nil) { _, _ in }
     }
 
     private func localFallbackDiagnostic() -> String {
@@ -170,9 +210,10 @@ final class VPNManager: GhostBackend {
         MainBundleID: \(mainID)
         ResolvedExtensionBundleID: \(detectedExtensionBundleID)
         VPNState: \(backendStateLabel) (NEVPNStatus=\(neStatus))
+        TelemetryChannel: \(telemetryChannel) (HTTP=127.0.0.1:\(currentHTTPPort))
         LastDisconnectError: \(lastErr)
         ConfigDelivery: NETunnelProviderProtocol.providerConfiguration (Zero App Group)
-        IPCChannel: NETunnelProviderSession.sendProviderMessage
+        IPCChannel: NETunnelProviderSession.sendProviderMessage + Loopback /_gft/*
         """
     }
 
@@ -186,6 +227,9 @@ final class VPNManager: GhostBackend {
                 }) ?? managers?.first
                 if let mgr = matched {
                     self.manager = mgr
+                    if let hp = (mgr.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["httpPort"] as? Int, hp > 0 {
+                        self.currentHTTPPort = hp
+                    }
                     self.updateVPNStatus(mgr.connection.status, connection: mgr.connection)
                 }
                 completion?(matched)
@@ -407,12 +451,64 @@ final class VPNManager: GhostBackend {
 
     private func pollStatusOnce() {
         sendIPC(action: "status", configJSON: nil) { [weak self] resp in
-            guard let resp = resp, resp.ok, let json = resp.payload else { return }
-            let snapshot = GhostMobileBridge.decodeStatus(from: json)
+            if let resp = resp, resp.ok, let json = resp.payload {
+                let snapshot = GhostMobileBridge.decodeStatus(from: json)
+                Task { @MainActor in
+                    self?.telemetryChannel = "IPC"
+                    self?.onStatusUpdate?(snapshot)
+                }
+                return
+            }
+
             Task { @MainActor in
-                self?.onStatusUpdate?(snapshot)
+                guard let self = self else { return }
+                self.fetchLoopbackHTTP(method: "GET", path: "/_gft/status", body: nil) { data, err in
+                    Task { @MainActor in
+                        if let data = data, let json = String(data: data, encoding: .utf8) {
+                            let snapshot = GhostMobileBridge.decodeStatus(from: json)
+                            self.telemetryChannel = "HTTP(127.0.0.1:\(self.currentHTTPPort))"
+                            if !self.loggedHTTPTelemetry {
+                                self.loggedHTTPTelemetry = true
+                                self.onLogMessage?("VPN telemetry: connected via 127.0.0.1:\(self.currentHTTPPort)/_gft/status")
+                            }
+                            self.onStatusUpdate?(snapshot)
+                        } else if let err = err {
+                            self.logIPCWarningThrottled("VPN HTTP fallback failed (:\(self.currentHTTPPort)): \(err.localizedDescription)")
+                        }
+                    }
+                }
             }
         }
+    }
+
+    private func fetchLoopbackHTTP(method: String, path: String, body: Data?, completion: @escaping (Data?, Error?) -> Void) {
+        guard let url = URL(string: "http://127.0.0.1:\(currentHTTPPort)\(path)") else {
+            completion(nil, nil)
+            return
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.timeoutInterval = 2.0
+        if let body = body {
+            req.httpBody = body
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        directSession.dataTask(with: req) { data, response, error in
+            if let error = error {
+                completion(nil, error)
+                return
+            }
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                let err = NSError(
+                    domain: "com.ghostframe.http",
+                    code: http.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"]
+                )
+                completion(nil, err)
+                return
+            }
+            completion(data, nil)
+        }.resume()
     }
 
     private func sendIPC(action: String, configJSON: String?, completion: @escaping (TunnelIPCResponse?) -> Void) {
@@ -427,10 +523,17 @@ final class VPNManager: GhostBackend {
         }
         do {
             try session.sendProviderMessage(reqData) { [weak self] responseData in
-                guard let responseData = responseData,
-                      let resp = try? JSONDecoder().decode(TunnelIPCResponse.self, from: responseData) else {
+                guard let responseData = responseData else {
                     Task { @MainActor in
-                        self?.logIPCWarningThrottled("VPN IPC: empty/unreadable response for \(action)")
+                        self?.logIPCWarningThrottled("VPN IPC: nil response for \(action) (switching to localhost /_gft/*)")
+                    }
+                    completion(nil)
+                    return
+                }
+                guard let resp = try? JSONDecoder().decode(TunnelIPCResponse.self, from: responseData) else {
+                    let count = responseData.count
+                    Task { @MainActor in
+                        self?.logIPCWarningThrottled("VPN IPC: unreadable response for \(action) (bytes=\(count))")
                     }
                     completion(nil)
                     return
