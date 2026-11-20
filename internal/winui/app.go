@@ -194,7 +194,7 @@ func Run(eng *client.Engine) error {
 	}
 	_ = sysDPI
 
-	titlePtr := utf16Ptr("GhostFrame-Pro v4.0.0-LTS")
+	titlePtr := utf16Ptr("GhostFrame-Pro v4.0.1-LTS")
 	hwnd, _, err := pCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(clsPtr)),
@@ -1244,7 +1244,7 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 
 	// Unified Mode Status Hint (rendered when vertical space permits)
 	if btnY-(rowBot+s(6)) >= s(20) {
-		modeHint := "已启用联动：连接后自动接管系统代理并支持 CN 直连"
+		modeHint := "已启用联动：内置规则集分流 (AI/Google/外网代理 + CN/Apple/MS/SteamCDN 直连)"
 		if routeMode == "global" {
 			modeHint = "已启用联动：连接后自动全局代理所有非本地流量"
 		} else if isCore {

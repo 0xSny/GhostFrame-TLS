@@ -58,6 +58,11 @@ type SessionPool struct {
 	retiredDown uint64
 	lastErr     string
 
+	emergMu   sync.Mutex
+	emergWait chan struct{}
+	emergSess *Session
+	emergErr  error
+
 	rttMs atomic.Int64
 	hsMs  atomic.Int64
 
@@ -360,17 +365,81 @@ func (p *SessionPool) Acquire() (*Session, error) {
 		return best, nil
 	}
 
-	// Emergency fast dial if all slots temporarily dropped
-	e, hs, err := p.dialOne(6 * time.Second)
+	// Coalesce concurrent emergency dials into a single-flight reconnect to avoid stampedes.
+	p.emergMu.Lock()
+	if ch := p.emergWait; ch != nil {
+		p.emergMu.Unlock()
+		select {
+		case <-ch:
+		case <-p.ctx.Done():
+			return nil, ErrSessionClosed
+		}
+		p.emergMu.Lock()
+		sess, err := p.emergSess, p.emergErr
+		p.emergMu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		if sess != nil {
+			select {
+			case <-sess.Done():
+			default:
+				return sess, nil
+			}
+		}
+		return nil, ErrSessionClosed
+	}
+
+	ch := make(chan struct{})
+	p.emergWait = ch
+	p.emergSess = nil
+	p.emergErr = nil
+	p.emergMu.Unlock()
+
+	if p.ctx.Err() != nil {
+		p.emergMu.Lock()
+		p.emergErr = ErrSessionClosed
+		p.emergWait = nil
+		close(ch)
+		p.emergMu.Unlock()
+		return nil, ErrSessionClosed
+	}
+
+	e, hs, err := p.dialOne(5 * time.Second)
+	if err != nil && p.ctx.Err() == nil {
+		select {
+		case <-time.After(350 * time.Millisecond):
+			e, hs, err = p.dialOne(5 * time.Second)
+		case <-p.ctx.Done():
+			err = ErrSessionClosed
+		}
+	}
+
+	var outSess *Session
+	if err == nil && e != nil {
+		outSess = e.sess
+		p.hsMs.Store(hs.Milliseconds())
+		p.mu.Lock()
+		p.entries = append(p.entries, e)
+		p.lastErr = ""
+		p.mu.Unlock()
+	} else if err != nil {
+		p.mu.Lock()
+		p.lastErr = err.Error()
+		p.mu.Unlock()
+	}
+
+	p.emergMu.Lock()
+	p.emergSess = outSess
+	p.emergErr = err
+	p.emergWait = nil
+	close(ch)
+	p.emergMu.Unlock()
+
 	if err != nil {
 		return nil, err
 	}
-	p.hsMs.Store(hs.Milliseconds())
-	p.mu.Lock()
-	p.entries = append(p.entries, e)
-	p.lastErr = ""
-	p.mu.Unlock()
-	return e.sess, nil
+	return outSess, nil
 }
 
 // OpenStream opens a multiplexed TCP stream on the least-loaded healthy session.

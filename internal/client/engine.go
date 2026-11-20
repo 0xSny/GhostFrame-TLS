@@ -30,13 +30,14 @@ const (
 
 // ClientConfig holds saved client preferences, nodes, and routing mode.
 type ClientConfig struct {
-	Link       *gft.Link   `json:"link,omitempty"`
-	Nodes      []*gft.Link `json:"nodes,omitempty"`
-	ActiveNode int         `json:"active_node,omitempty"`
-	RouteMode  RouteMode   `json:"route_mode,omitempty"` // "rule" (default), "global", "direct"
-	SocksAddr  string      `json:"socks_addr"`
-	HTTPAddr   string      `json:"http_addr"`
-	SysProxy   bool        `json:"sys_proxy"`
+	Link        *gft.Link   `json:"link,omitempty"`
+	Nodes       []*gft.Link `json:"nodes,omitempty"`
+	ActiveNode  int         `json:"active_node,omitempty"`
+	RouteMode   RouteMode   `json:"route_mode,omitempty"` // "rule" (default), "global", "direct"
+	SocksAddr   string      `json:"socks_addr"`
+	HTTPAddr    string      `json:"http_addr"`
+	SysProxy    bool        `json:"sys_proxy"`
+	CustomRules []string    `json:"custom_rules,omitempty"`
 }
 
 // LogEntry is a single line in the client rolling log.
@@ -161,6 +162,18 @@ func NewEngine(cfgPath string) (*Engine, error) {
 
 	if active := e.activeLinkLocked(); active != nil && active.Params != nil {
 		e.paramStore.Set(*active.Params)
+	}
+
+	var combinedRules []CustomRule
+	if cfgPath != "" {
+		rulesFile := filepath.Join(filepath.Dir(cfgPath), "rules.txt")
+		combinedRules = append(combinedRules, LoadCustomRulesFile(rulesFile)...)
+	}
+	if len(e.config.CustomRules) > 0 {
+		combinedRules = append(combinedRules, ParseCustomRules(e.config.CustomRules)...)
+	}
+	if len(combinedRules) > 0 {
+		e.router.SetCustomRules(combinedRules)
 	}
 
 	if recovered, rerr := RecoverSystemProxyIfDirtyFor(e.proxyBackupPath, e.config.HTTPAddr); recovered {
@@ -580,6 +593,8 @@ func (e *Engine) OpenTargetStream(target string, first []byte) (gft.DataStream, 
 	return e.OpenTargetStreamWithRoute(target, target, first)
 }
 
+var errRouteRejected = errors.New("connection blocked by custom REJECT rule")
+
 // OpenTargetStreamWithRoute classifies routing using routeTarget (e.g. sniffed TLS SNI)
 // while opening the connection to dialTarget without local DNS resolution.
 func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first []byte) (gft.DataStream, RouteAction, error) {
@@ -593,6 +608,9 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 		return nil, ActionProxy, errNoActiveSession
 	}
 	act := e.router.Decide(mode, routeTarget)
+	if act == ActionReject {
+		return nil, ActionReject, errRouteRejected
+	}
 	if act == ActionDirect {
 		d := net.Dialer{Timeout: 8 * time.Second, Control: netbind.Control}
 		c, err := d.Dial("tcp", dialTarget)
@@ -1104,12 +1122,13 @@ func (e *Engine) Status() map[string]any {
 	}
 
 	return map[string]any{
-		"version":          "v4.0.0-LTS",
+		"version":          "v4.0.1-LTS",
 		"state":            string(state),
 		"last_err":         lastErr,
 		"active_transport": activeMode,
 		"transport_pref":   tPref,
 		"route_mode":       string(routeMode),
+		"rule_stats":       e.router.Stats(),
 		"verify_mode":      verifyMode,
 		"hop_range":        hopRange,
 		"rtc_port":         rtcPort,

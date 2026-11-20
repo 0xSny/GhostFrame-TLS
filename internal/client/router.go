@@ -5,13 +5,15 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // RouteMode controls client split-tunneling behavior.
 type RouteMode string
 
 const (
-	RouteRule   RouteMode = "rule"   // Mainland CN / Private direct + auto system proxy
+	RouteRule   RouteMode = "rule"   // RuleSet + GeoIP-CN direct + auto system proxy
 	RouteGlobal RouteMode = "global" // All traffic (except loopback) via GhostFrame + auto system proxy
 	RouteCore   RouteMode = "core"   // Port-only mode (10808/10809 via tunnel, never touches system proxy)
 	RouteDirect RouteMode = "direct" // Legacy config alias automatically mapped to RouteCore
@@ -23,13 +25,18 @@ type RouteAction int
 const (
 	ActionProxy RouteAction = iota
 	ActionDirect
+	ActionReject
 )
 
 func (a RouteAction) String() string {
-	if a == ActionDirect {
+	switch a {
+	case ActionDirect:
 		return "direct"
+	case ActionReject:
+		return "reject"
+	default:
+		return "proxy"
 	}
-	return "proxy"
 }
 
 type ipRange struct {
@@ -39,10 +46,20 @@ type ipRange struct {
 
 // Router classifies destinations without triggering local DNS lookups for domains.
 type Router struct {
-	cnRanges []ipRange
+	cnRanges        []ipRange
+	lanSuffixMap    map[string]string
+	proxySuffixMap  map[string]string
+	directSuffixMap map[string]string
+
+	customMu    sync.RWMutex
+	customRules []CustomRule
+
+	directHits atomic.Uint64
+	proxyHits  atomic.Uint64
+	rejectHits atomic.Uint64
 }
 
-// NewRouter constructs a Router preloaded with private and Mainland China IPv4 ranges.
+// NewRouter constructs a Router preloaded with private/CN IPv4 ranges and curated RuleSet suffix maps.
 func NewRouter() *Router {
 	cidrs := []string{
 		// Private / Loopback / Link-Local / CGNAT
@@ -139,7 +156,51 @@ func NewRouter() *Router {
 		}
 		merged = append(merged, r)
 	}
-	return &Router{cnRanges: merged}
+
+	lanMap := make(map[string]string, len(builtinLanSuffixes))
+	for _, sfx := range builtinLanSuffixes {
+		lanMap[strings.ToLower(sfx)] = "lan"
+	}
+	proxyMap := make(map[string]string, len(builtinProxyRules))
+	for _, seed := range builtinProxyRules {
+		proxyMap[strings.ToLower(seed.domain)] = seed.tag
+	}
+	directMap := make(map[string]string, len(builtinDirectRules))
+	for _, seed := range builtinDirectRules {
+		directMap[strings.ToLower(seed.domain)] = seed.tag
+	}
+
+	return &Router{
+		cnRanges:        merged,
+		lanSuffixMap:    lanMap,
+		proxySuffixMap:  proxyMap,
+		directSuffixMap: directMap,
+	}
+}
+
+// SetCustomRules atomically replaces user-supplied custom routing rules.
+func (r *Router) SetCustomRules(rules []CustomRule) {
+	cp := make([]CustomRule, len(rules))
+	copy(cp, rules)
+	r.customMu.Lock()
+	r.customRules = cp
+	r.customMu.Unlock()
+}
+
+// Stats returns embedded rule capacities and cumulative decision hit counters.
+func (r *Router) Stats() RuleStats {
+	r.customMu.RLock()
+	customN := len(r.customRules)
+	r.customMu.RUnlock()
+	return RuleStats{
+		Version:        BuiltinRuleSetVersion,
+		BuiltinDomains: len(r.proxySuffixMap) + len(r.directSuffixMap),
+		BuiltinCIDRs:   len(r.cnRanges) + len(cnIPv6CIDRs),
+		CustomRules:    customN,
+		DirectHits:     r.directHits.Load(),
+		ProxyHits:      r.proxyHits.Load(),
+		RejectHits:     r.rejectHits.Load(),
+	}
 }
 
 func (r *Router) isDirectIPv4(ip4 net.IP) bool {
@@ -164,109 +225,150 @@ var cnIPv6CIDRs = func() []*net.IPNet {
 	return out
 }()
 
-var cnDomainSuffixes = []string{
-	".cn",
-	".localhost", ".local", ".lan", ".internal",
-	"baidu.com", "bdstatic.com", "baidustatic.com",
-	"qq.com", "gtimg.cn", "weixin.qq.com", "qpic.cn", "wechat.com",
-	"taobao.com", "tmall.com", "alicdn.com", "aliyun.com", "aliyuncs.com", "alipay.com", "alipayobjects.com", "mmstat.com",
-	"jd.com", "360buyimg.com", "jdcloud.com",
-	"163.com", "126.com", "126.net", "netease.com",
-	"bilibili.com", "hdslb.com", "bilivideo.com",
-	"zhihu.com", "zhimg.com",
-	"douyin.com", "toutiao.com", "bytedance.com", "byteimg.com", "snssdk.com", "ixigua.com",
-	"weibo.com", "sinaimg.cn", "sina.com.cn",
-	"mi.com", "xiaomi.com", "xiaomi.net",
-	"huawei.com", "huaweicloud.com",
-	"qcloud.com", "myqcloud.com",
-	"csdn.net", "cnblogs.com", "jianshu.com", "gitee.com",
-	"meituan.com", "dianping.com", "pinduoduo.com", "yangkeduo.com",
-	"iqiyi.com", "youku.com", "mgtv.com", "cctv.com",
-	"bing.cn", "msn.cn", "office365.cn",
-}
-
-var proxyDomainSuffixes = []string{
-	"google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "googlevideo.com",
-	"youtube.com", "ytimg.com", "youtu.be", "gmail.com",
-	"github.com", "githubusercontent.com", "githubassets.com", "gitlab.com",
-	"cloudflare.com", "workers.dev", "pages.dev",
-	"openai.com", "chatgpt.com", "anthropic.com", "claude.ai", "gemini.google.com",
-	"x.com", "twitter.com", "twimg.com", "t.co",
-	"wikipedia.org", "wikimedia.org", "reddit.com", "discord.com", "telegram.org", "t.me",
-	"netflix.com", "nflxvideo.net", "amazonaws.com", "fastly.net",
-}
-
-func matchDomainSuffix(host string, suffixes []string) bool {
-	h := strings.ToLower(strings.TrimSuffix(host, "."))
-	for _, sfx := range suffixes {
-		if strings.HasPrefix(sfx, ".") {
-			if strings.HasSuffix(h, sfx) {
-				return true
+func lookupSuffixMap(hostLower string, m map[string]string) (string, bool) {
+	if hostLower == "" {
+		return "", false
+	}
+	if tag, ok := m[hostLower]; ok {
+		return tag, true
+	}
+	for i := 0; i < len(hostLower); i++ {
+		if hostLower[i] == '.' && i+1 < len(hostLower) {
+			if tag, ok := m[hostLower[i+1:]]; ok {
+				return tag, true
 			}
-		} else if h == sfx || strings.HasSuffix(h, "."+sfx) {
+		}
+	}
+	return "", false
+}
+
+func isLANIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		// 0.0.0.0/8 and RFC 6598 CGNAT 100.64.0.0/10
+		if ip4[0] == 0 || (ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127) {
 			return true
 		}
 	}
 	return false
 }
 
-func isProxyDomain(host string) bool {
-	return matchDomainSuffix(host, proxyDomainSuffixes)
+func (r *Router) matchCustomRule(hostLower string, ip net.IP) (CustomRule, bool) {
+	r.customMu.RLock()
+	rules := r.customRules
+	r.customMu.RUnlock()
+
+	for _, rule := range rules {
+		switch rule.Type {
+		case "DOMAIN":
+			if hostLower == rule.Value {
+				return rule, true
+			}
+		case "DOMAIN-SUFFIX":
+			v := rule.Value
+			if hostLower == v || (len(hostLower) > len(v) && strings.HasSuffix(hostLower, v) && hostLower[len(hostLower)-len(v)-1] == '.') {
+				return rule, true
+			}
+		case "DOMAIN-KEYWORD":
+			if hostLower != "" && strings.Contains(hostLower, rule.Value) {
+				return rule, true
+			}
+		case "IP-CIDR":
+			if ip != nil && rule.CIDR != nil && rule.CIDR.Contains(ip) {
+				return rule, true
+			}
+		}
+	}
+	return CustomRule{}, false
 }
 
-func isCNDomain(host string) bool {
-	h := strings.ToLower(strings.TrimSuffix(host, "."))
-	if h == "localhost" {
-		return true
+func (r *Router) recordDecision(act RouteAction, reason string) (RouteAction, string) {
+	switch act {
+	case ActionDirect:
+		r.directHits.Add(1)
+	case ActionReject:
+		r.rejectHits.Add(1)
+	default:
+		r.proxyHits.Add(1)
 	}
-	return matchDomainSuffix(h, cnDomainSuffixes)
+	return act, reason
 }
 
 // Decide evaluates destination hostport under mode WITHOUT calling DNS lookup on domains.
 func (r *Router) Decide(mode RouteMode, hostport string) RouteAction {
+	act, _ := r.DecideWithReason(mode, hostport)
+	return act
+}
+
+// DecideWithReason evaluates destination hostport under mode and returns (action, ruleTag)
+// with zero heap allocations on suffix lookups and zero local DNS leaks.
+func (r *Router) DecideWithReason(mode RouteMode, hostport string) (RouteAction, string) {
 	host, _, err := net.SplitHostPort(hostport)
 	if err != nil {
 		host = hostport
 	}
-	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	host = strings.TrimSuffix(strings.TrimSpace(strings.Trim(host, "[]")), ".")
+	hostLower := strings.ToLower(host)
 
 	// Internal management domain ALWAYS goes through the GhostFrame tunnel.
-	if strings.EqualFold(host, "gft.internal.panel") {
-		return ActionProxy
+	if hostLower == "gft.internal.panel" {
+		return r.recordDecision(ActionProxy, "internal:panel")
 	}
 
 	switch mode {
 	case RouteCore, RouteDirect, RouteGlobal:
 		// Keep loopback direct so local GUI/apps never loop into VPS; everything else uses tunnel.
 		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-			return ActionDirect
+			return r.recordDecision(ActionDirect, "lan")
 		}
-		if strings.EqualFold(host, "localhost") {
-			return ActionDirect
+		if hostLower == "localhost" {
+			return r.recordDecision(ActionDirect, "lan")
 		}
-		return ActionProxy
+		return r.recordDecision(ActionProxy, "mode:global")
+
 	default: // RouteRule
-		if ip := net.ParseIP(host); ip != nil {
+		ip := net.ParseIP(host)
+		if rule, ok := r.matchCustomRule(hostLower, ip); ok {
+			return r.recordDecision(rule.Action, rule.Tag)
+		}
+
+		if ip != nil {
+			if isLANIP(ip) {
+				return r.recordDecision(ActionDirect, "lan")
+			}
 			if ip4 := ip.To4(); ip4 != nil {
 				if r.isDirectIPv4(ip4) {
-					return ActionDirect
+					return r.recordDecision(ActionDirect, "geoip:cn")
 				}
-				return ActionProxy
+				return r.recordDecision(ActionProxy, "geoip:overseas")
 			}
 			for _, n := range cnIPv6CIDRs {
 				if n.Contains(ip) {
-					return ActionDirect
+					return r.recordDecision(ActionDirect, "geoip:cn")
 				}
 			}
-			return ActionProxy
+			return r.recordDecision(ActionProxy, "geoip:overseas")
 		}
-		if isProxyDomain(host) {
-			return ActionProxy
+
+		if tag, ok := lookupSuffixMap(hostLower, r.lanSuffixMap); ok {
+			return r.recordDecision(ActionDirect, tag)
 		}
-		if isCNDomain(host) {
-			return ActionDirect
+		// Evaluate curated Proxy RuleSet BEFORE CN/GeoIP so overseas services never leak direct.
+		if tag, ok := lookupSuffixMap(hostLower, r.proxySuffixMap); ok {
+			return r.recordDecision(ActionProxy, tag)
+		}
+		if tag, ok := lookupSuffixMap(hostLower, r.directSuffixMap); ok {
+			return r.recordDecision(ActionDirect, tag)
+		}
+		if strings.HasSuffix(hostLower, ".cn") {
+			return r.recordDecision(ActionDirect, "direct:cn")
 		}
 		// Never do local DNS lookup on overseas/unknown domains! Send raw hostname via tunnel.
-		return ActionProxy
+		return r.recordDecision(ActionProxy, "final:proxy")
 	}
 }

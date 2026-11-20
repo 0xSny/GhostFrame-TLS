@@ -37,3 +37,4 @@ desktop.ini
 *.xcodeproj/
 ios/Frameworks/
 ios/build*/
+.ios-dist/

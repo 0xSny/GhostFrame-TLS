@@ -202,3 +202,69 @@ func TestSOCKS5AndHTTPProxyRuleRawIPSNISniff(t *testing.T) {
 		t.Fatalf("expected lossless rewind (%dB), got %dB", len(rec)+5, len(got))
 	}
 }
+
+func TestRuleSetCategoriesAndCustomOverride(t *testing.T) {
+	r := NewRouter()
+
+	cases := []struct {
+		target string
+		want   RouteAction
+		prefix string
+	}{
+		{"chatgpt.com:443", ActionProxy, "proxy:ai"},
+		{"gemini.google.com:443", ActionProxy, "proxy:ai"},
+		{"www.youtube.com:443", ActionProxy, "proxy:google"},
+		{"api.github.com:443", ActionProxy, "proxy:dev"},
+		{"t.me:443", ActionProxy, "proxy:social"},
+		{"www.netflix.com:443", ActionProxy, "proxy:streaming"},
+		{"www.xiaohongshu.com:443", ActionDirect, "direct:cn"},
+		{"chat.deepseek.com:443", ActionDirect, "direct:cn-ai"},
+		{"open.feishu.cn:443", ActionDirect, "direct:cn"},
+		{"p01-caldav.icloud.com.cn:443", ActionDirect, "direct:apple-cn"},
+		{"dl.delivery.mp.microsoft.com:443", ActionDirect, "direct:ms-cn"},
+		{"cache1.steamcontent.com:443", ActionDirect, "direct:steam-cn"},
+		{"nas.local:5000", ActionDirect, "lan"},
+		{"100.64.10.2:8080", ActionDirect, "lan"},
+		{"223.5.5.5:53", ActionDirect, "geoip:cn"},
+		{"8.8.8.8:53", ActionProxy, "geoip:overseas"},
+		{"unknown-overseas-site.io:443", ActionProxy, "final:proxy"},
+	}
+
+	for _, tc := range cases {
+		act, reason := r.DecideWithReason(RouteRule, tc.target)
+		if act != tc.want || !strings.HasPrefix(reason, tc.prefix) {
+			t.Fatalf("DecideWithReason(%q) = (%v, %q), want (%v, prefix %q)",
+				tc.target, act, reason, tc.want, tc.prefix)
+		}
+	}
+
+	custom := ParseCustomRules([]string{
+		"# custom overrides",
+		"DOMAIN,chatgpt.com,DIRECT",
+		"DOMAIN-SUFFIX,baidu.com,PROXY",
+		"DOMAIN-KEYWORD,tracker-ad,REJECT",
+		"IP-CIDR,203.0.113.0/24,REJECT,no-resolve",
+	})
+	if len(custom) != 4 {
+		t.Fatalf("expected 4 custom rules, got %d", len(custom))
+	}
+	r.SetCustomRules(custom)
+
+	if act, reason := r.DecideWithReason(RouteRule, "chatgpt.com:443"); act != ActionDirect || reason != "custom:domain" {
+		t.Fatalf("custom DOMAIN override failed: got (%v, %q)", act, reason)
+	}
+	if act, reason := r.DecideWithReason(RouteRule, "pan.baidu.com:443"); act != ActionProxy || reason != "custom:domain-suffix" {
+		t.Fatalf("custom DOMAIN-SUFFIX override failed: got (%v, %q)", act, reason)
+	}
+	if act, reason := r.DecideWithReason(RouteRule, "eu.tracker-ad.net:443"); act != ActionReject || reason != "custom:domain-keyword" {
+		t.Fatalf("custom DOMAIN-KEYWORD REJECT failed: got (%v, %q)", act, reason)
+	}
+	if act, reason := r.DecideWithReason(RouteRule, "203.0.113.42:443"); act != ActionReject || reason != "custom:ip-cidr" {
+		t.Fatalf("custom IP-CIDR REJECT failed: got (%v, %q)", act, reason)
+	}
+
+	st := r.Stats()
+	if st.Version != BuiltinRuleSetVersion || st.BuiltinDomains < 150 || st.CustomRules != 4 || st.DirectHits == 0 || st.ProxyHits == 0 || st.RejectHits != 2 {
+		t.Fatalf("unexpected RuleStats: %+v", st)
+	}
+}

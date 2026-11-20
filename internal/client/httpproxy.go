@@ -173,7 +173,11 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 				s.engine.Logf("[HTTP Proxy] CONNECT %s failed: %v", target, err)
 			}
 			if !ackSent {
-				_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+				if act == ActionReject {
+					_, _ = c.Write([]byte("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"))
+				} else {
+					_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+				}
 			}
 			return
 		}
@@ -211,7 +215,11 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		if act == ActionProxy {
 			s.engine.Logf("[HTTP Proxy] %s %s failed: %v", req.Method, target, err)
 		}
-		_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		if act == ActionReject {
+			_, _ = c.Write([]byte("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"))
+		} else {
+			_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		}
 		return
 	}
 	defer st.Close()

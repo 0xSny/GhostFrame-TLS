@@ -117,6 +117,7 @@ type rtcSlot struct {
 	maxAge       time.Duration
 	degradedAt   time.Time
 	pingFails    int
+	streamFails  atomic.Int32
 }
 
 // ApexScheduler races and coordinates a Striped GFT-RTC Dual-Session pool (with 0ms WebRTC
@@ -676,7 +677,7 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 		tickDur = 2 * time.Second
 	}
 	t := time.NewTicker(tickDur)
-	pingTicker := time.NewTicker(18 * time.Second)
+	pingTicker := time.NewTicker(10 * time.Second)
 	defer t.Stop()
 	defer pingTicker.Stop()
 
@@ -686,152 +687,160 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 		case <-a.ctx.Done():
 			return
 		case <-a.wakeHopCh:
-			a.handleEmergencyProbeAndHop(1500*time.Millisecond, true)
+			if a.handleEmergencyProbeAndHop(1500*time.Millisecond, true) {
+				a.reapAndTopUpSlots(&backoff)
+			}
 		case <-pingTicker.C:
-			a.handleEmergencyProbeAndHop(4*time.Second, false)
+			if a.handleEmergencyProbeAndHop(3*time.Second, false) {
+				a.reapAndTopUpSlots(&backoff)
+			}
 		case <-t.C:
-			now := time.Now()
-			target := a.rtcPoolTarget()
-			_, _, hasHop := a.link.ParseHopRange()
-
-			a.mu.Lock()
-			var keepSlots []*rtcSlot
-			var dueHop []*rtcSlot
-			hasCh := make(map[int]bool, target)
-			idlePause := a.idlePauseEnabled
-			idleThresh := a.idleRateThresh
-			bytesQuota := a.hopBytesQuota
-			for _, sl := range a.rtcSlots {
-				select {
-				case <-sl.sess.Done():
-					st := sl.sess.Stats()
-					a.retiredRUp += st.UpBytes
-					a.retiredRDown += st.DownBytes
-					a.retiredFEC += st.FECRecovered
-					a.retiredHops += st.HopCount
-					a.retiredRekey += st.RekeyCount
-				default:
-					if hasHop {
-						st := sl.sess.Stats()
-						totalTraffic := st.UpBytes + st.DownBytes
-						var bytesDelta uint64
-						if totalTraffic > sl.lastHopBytes {
-							bytesDelta = totalTraffic - sl.lastHopBytes
-						}
-						if bytesQuota > 0 && bytesDelta >= bytesQuota {
-							dueHop = append(dueHop, sl)
-						} else if now.Sub(sl.lastHopAt) >= sl.maxAge {
-							if !idlePause || sl.sess.Recent30sBytesPerSec() >= idleThresh {
-								dueHop = append(dueHop, sl)
-							}
-						}
-					}
-					if sl.channelIdx > 0 {
-						hasCh[sl.channelIdx] = true
-					}
-					keepSlots = append(keepSlots, sl)
-				}
-			}
-			a.rtcSlots = keepSlots
-			missing := target - len(keepSlots)
-			hopFn := a.rtcHopFn
-			allRTCDown := len(keepSlots) == 0
-			a.mu.Unlock()
-
-			if allRTCDown {
-				a.wakeTCPTrack()
-			}
-
-			// Execute Make-Before-Break 0ms socket port-hop migration quietly (updates header badge, no log spam).
-			for _, sl := range dueHop {
-				nextPort := PickHopPort(a.link)
-				if err := hopFn(sl.sess, nextPort); err == nil {
-					st := sl.sess.Stats()
-					a.mu.Lock()
-					sl.lastHopAt = time.Now()
-					sl.lastHopBytes = st.UpBytes + st.DownBytes
-					sl.maxAge = a.randomHopAge()
-					a.mu.Unlock()
-				} else {
-					a.mu.Lock()
-					sl.lastHopAt = time.Now().Add(-sl.maxAge + 15*time.Second)
-					a.mu.Unlock()
-				}
-			}
-
-			// Top up any closed/missing RTC slots while preserving stable channel labels #1 / #2.
-			if missing > 0 {
-				var dialErr error
-				var wg sync.WaitGroup
-				var dMu sync.Mutex
-				missingIdxs := make([]int, 0, missing)
-				for idx := 1; idx <= target && len(missingIdxs) < missing; idx++ {
-					if !hasCh[idx] {
-						missingIdxs = append(missingIdxs, idx)
-						hasCh[idx] = true
-					}
-				}
-				for len(missingIdxs) < missing {
-					missingIdxs = append(missingIdxs, len(missingIdxs)+1)
-				}
-				for _, chIdx := range missingIdxs {
-					wg.Add(1)
-					go func(idx int) {
-						defer wg.Done()
-						sl, err := a.dialOneRTCSlotWithIndex(6*time.Second, idx)
-						if err != nil {
-							dMu.Lock()
-							dialErr = err
-							dMu.Unlock()
-							return
-						}
-						a.mu.Lock()
-						if !a.closed && a.ctx.Err() == nil {
-							a.rtcSlots = append(a.rtcSlots, sl)
-						} else {
-							sl.sess.Close()
-						}
-						a.mu.Unlock()
-					}(chIdx)
-				}
-				wg.Wait()
-				if up := int(a.upMbps.Load()); up > 0 {
-					a.mu.Lock()
-					n := len(a.rtcSlots)
-					if n > 0 {
-						perUp := SplitBandwidthMbps(up, n)
-						for _, sl := range a.rtcSlots {
-							if sl != nil && sl.sess != nil {
-								sl.sess.UpdateBandwidth(perUp)
-							}
-						}
-					}
-					a.mu.Unlock()
-				}
-				if dialErr != nil {
-					a.mu.Lock()
-					curLen := len(a.rtcSlots)
-					a.mu.Unlock()
-					if curLen == 0 {
-						select {
-						case <-a.ctx.Done():
-							return
-						case <-time.After(backoff):
-						}
-						backoff *= 2
-						if backoff > 20*time.Second {
-							backoff = 20 * time.Second
-						}
-					}
-				} else {
-					backoff = 2 * time.Second
-				}
-			}
+			a.reapAndTopUpSlots(&backoff)
 		}
 	}
 }
 
-func (a *ApexScheduler) handleEmergencyProbeAndHop(probeTimeout time.Duration, forceOnFail bool) {
+func (a *ApexScheduler) reapAndTopUpSlots(backoff *time.Duration) {
+	now := time.Now()
+	target := a.rtcPoolTarget()
+	_, _, hasHop := a.link.ParseHopRange()
+
+	a.mu.Lock()
+	var keepSlots []*rtcSlot
+	var dueHop []*rtcSlot
+	hasCh := make(map[int]bool, target)
+	idlePause := a.idlePauseEnabled
+	idleThresh := a.idleRateThresh
+	bytesQuota := a.hopBytesQuota
+	for _, sl := range a.rtcSlots {
+		select {
+		case <-sl.sess.Done():
+			st := sl.sess.Stats()
+			a.retiredRUp += st.UpBytes
+			a.retiredRDown += st.DownBytes
+			a.retiredFEC += st.FECRecovered
+			a.retiredHops += st.HopCount
+			a.retiredRekey += st.RekeyCount
+		default:
+			if hasHop {
+				st := sl.sess.Stats()
+				totalTraffic := st.UpBytes + st.DownBytes
+				var bytesDelta uint64
+				if totalTraffic > sl.lastHopBytes {
+					bytesDelta = totalTraffic - sl.lastHopBytes
+				}
+				if bytesQuota > 0 && bytesDelta >= bytesQuota {
+					dueHop = append(dueHop, sl)
+				} else if now.Sub(sl.lastHopAt) >= sl.maxAge {
+					if !idlePause || sl.sess.Recent30sBytesPerSec() >= idleThresh {
+						dueHop = append(dueHop, sl)
+					}
+				}
+			}
+			if sl.channelIdx > 0 {
+				hasCh[sl.channelIdx] = true
+			}
+			keepSlots = append(keepSlots, sl)
+		}
+	}
+	a.rtcSlots = keepSlots
+	missing := target - len(keepSlots)
+	hopFn := a.rtcHopFn
+	allRTCDown := len(keepSlots) == 0
+	a.mu.Unlock()
+
+	if allRTCDown {
+		a.wakeTCPTrack()
+	}
+
+	// Execute Make-Before-Break 0ms socket port-hop migration quietly (updates header badge, no log spam).
+	for _, sl := range dueHop {
+		nextPort := PickHopPort(a.link)
+		if err := hopFn(sl.sess, nextPort); err == nil {
+			st := sl.sess.Stats()
+			a.mu.Lock()
+			sl.lastHopAt = time.Now()
+			sl.lastHopBytes = st.UpBytes + st.DownBytes
+			sl.maxAge = a.randomHopAge()
+			a.mu.Unlock()
+		} else {
+			a.mu.Lock()
+			sl.lastHopAt = time.Now().Add(-sl.maxAge + 15*time.Second)
+			a.mu.Unlock()
+		}
+	}
+
+	// Top up any closed/missing RTC slots while preserving stable channel labels #1 / #2.
+	if missing > 0 {
+		var dialErr error
+		var wg sync.WaitGroup
+		var dMu sync.Mutex
+		missingIdxs := make([]int, 0, missing)
+		for idx := 1; idx <= target && len(missingIdxs) < missing; idx++ {
+			if !hasCh[idx] {
+				missingIdxs = append(missingIdxs, idx)
+				hasCh[idx] = true
+			}
+		}
+		for len(missingIdxs) < missing {
+			missingIdxs = append(missingIdxs, len(missingIdxs)+1)
+		}
+		for _, chIdx := range missingIdxs {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				sl, err := a.dialOneRTCSlotWithIndex(6*time.Second, idx)
+				if err != nil {
+					dMu.Lock()
+					dialErr = err
+					dMu.Unlock()
+					return
+				}
+				a.mu.Lock()
+				if !a.closed && a.ctx.Err() == nil {
+					a.rtcSlots = append(a.rtcSlots, sl)
+				} else {
+					sl.sess.Close()
+				}
+				a.mu.Unlock()
+			}(chIdx)
+		}
+		wg.Wait()
+		if up := int(a.upMbps.Load()); up > 0 {
+			a.mu.Lock()
+			n := len(a.rtcSlots)
+			if n > 0 {
+				perUp := SplitBandwidthMbps(up, n)
+				for _, sl := range a.rtcSlots {
+					if sl != nil && sl.sess != nil {
+						sl.sess.UpdateBandwidth(perUp)
+					}
+				}
+			}
+			a.mu.Unlock()
+		}
+		if dialErr != nil {
+			a.mu.Lock()
+			curLen := len(a.rtcSlots)
+			a.mu.Unlock()
+			if curLen == 0 {
+				select {
+				case <-a.ctx.Done():
+					return
+				case <-time.After(*backoff):
+				}
+				*backoff *= 2
+				if *backoff > 20*time.Second {
+					*backoff = 20 * time.Second
+				}
+			}
+		} else {
+			*backoff = 2 * time.Second
+		}
+	}
+}
+
+func (a *ApexScheduler) handleEmergencyProbeAndHop(probeTimeout time.Duration, forceOnFail bool) bool {
 	_, _, hasHop := a.link.ParseHopRange()
 	a.mu.Lock()
 	slots := make([]*rtcSlot, len(a.rtcSlots))
@@ -839,6 +848,7 @@ func (a *ApexScheduler) handleEmergencyProbeAndHop(probeTimeout time.Duration, f
 	hopFn := a.rtcHopFn
 	a.mu.Unlock()
 
+	var closedAny atomic.Bool
 	var wg sync.WaitGroup
 	for _, sl := range slots {
 		if sl == nil || sl.sess == nil {
@@ -846,6 +856,7 @@ func (a *ApexScheduler) handleEmergencyProbeAndHop(probeTimeout time.Duration, f
 		}
 		select {
 		case <-sl.sess.Done():
+			closedAny.Store(true)
 			continue
 		default:
 		}
@@ -860,7 +871,9 @@ func (a *ApexScheduler) handleEmergencyProbeAndHop(probeTimeout time.Duration, f
 				a.rtcRTTMs.Store(ms)
 				a.mu.Lock()
 				slot.pingFails = 0
+				slot.degradedAt = time.Time{}
 				a.mu.Unlock()
+				slot.streamFails.Store(0)
 				return
 			}
 			a.mu.Lock()
@@ -880,7 +893,9 @@ func (a *ApexScheduler) handleEmergencyProbeAndHop(probeTimeout time.Duration, f
 					slot.lastHopBytes = st.UpBytes + st.DownBytes
 					slot.maxAge = a.randomHopAge()
 					slot.pingFails = 0
+					slot.degradedAt = time.Time{}
 					a.mu.Unlock()
+					slot.streamFails.Store(0)
 					if a.onLog != nil {
 						a.onLog("[RTC#%d] Emergency MBB hop recovered path (UDP :%d -> :%d)", chIdx, oldPort, slot.sess.RemotePort())
 					}
@@ -888,18 +903,20 @@ func (a *ApexScheduler) handleEmergencyProbeAndHop(probeTimeout time.Duration, f
 				}
 			}
 			slot.sess.Close()
+			closedAny.Store(true)
 		}(sl)
 	}
 	wg.Wait()
+	return closedAny.Load()
 }
 
-func (a *ApexScheduler) activeRTCForSend() *gftrtc.RTCSession {
+func (a *ApexScheduler) activeSlotForSend(exclude *gftrtc.RTCSession) *rtcSlot {
 	if a.link.EffectiveTransport() == "tcp" {
 		return nil
 	}
 	now := time.Now()
 	a.mu.Lock()
-	var best *gftrtc.RTCSession
+	var best *rtcSlot
 	bestStreams := int(^uint(0) >> 1)
 	n := len(a.rtcSlots)
 	start := 0
@@ -908,7 +925,7 @@ func (a *ApexScheduler) activeRTCForSend() *gftrtc.RTCSession {
 	}
 	for i := 0; i < n; i++ {
 		sl := a.rtcSlots[(start+i)%n]
-		if sl == nil || sl.sess == nil {
+		if sl == nil || sl.sess == nil || sl.sess == exclude {
 			continue
 		}
 		select {
@@ -921,7 +938,7 @@ func (a *ApexScheduler) activeRTCForSend() *gftrtc.RTCSession {
 		}
 		sc := sl.sess.NumStreams()
 		if best == nil || sc < bestStreams {
-			best = sl.sess
+			best = sl
 			bestStreams = sc
 		}
 	}
@@ -939,12 +956,21 @@ func (a *ApexScheduler) activeRTCForSend() *gftrtc.RTCSession {
 	return best
 }
 
+func (a *ApexScheduler) activeRTCForSend() *gftrtc.RTCSession {
+	sl := a.activeSlotForSend(nil)
+	if sl == nil {
+		return nil
+	}
+	return sl.sess
+}
+
 func (a *ApexScheduler) markRTCDegraded(r *gftrtc.RTCSession, err error) {
 	now := time.Now()
 	a.mu.Lock()
 	for _, sl := range a.rtcSlots {
 		if sl != nil && sl.sess == r {
 			sl.degradedAt = now
+			sl.streamFails.Add(1)
 			if err != nil {
 				a.lastErr = err.Error()
 			}
@@ -952,6 +978,12 @@ func (a *ApexScheduler) markRTCDegraded(r *gftrtc.RTCSession, err error) {
 		}
 	}
 	a.mu.Unlock()
+	if a.wakeHopCh != nil {
+		select {
+		case a.wakeHopCh <- struct{}{}:
+		default:
+		}
+	}
 	if !a.hasHealthyRTC() {
 		a.wakeTCPTrack()
 	}
@@ -960,12 +992,21 @@ func (a *ApexScheduler) markRTCDegraded(r *gftrtc.RTCSession, err error) {
 // OpenStream routes a TCP tunnel stream over GFT-RTC striped pool when healthy,
 // falling back in 0ms to the uTLS TCP SessionPool if UDP fails or is throttled.
 func (a *ApexScheduler) OpenStream(target string, first []byte) (DataStream, error) {
-	if r := a.activeRTCForSend(); r != nil {
-		st, err := r.OpenStream(target, first)
+	if sl := a.activeSlotForSend(nil); sl != nil {
+		st, err := sl.sess.OpenStream(target, first)
 		if err == nil {
+			sl.streamFails.Store(0)
 			return st, nil
 		}
-		a.markRTCDegraded(r, err)
+		a.markRTCDegraded(sl.sess, err)
+		if alt := a.activeSlotForSend(sl.sess); alt != nil {
+			st2, err2 := alt.sess.OpenStream(target, first)
+			if err2 == nil {
+				alt.streamFails.Store(0)
+				return st2, nil
+			}
+			a.markRTCDegraded(alt.sess, err2)
+		}
 	}
 	if a.link.EffectiveTransport() == "rtc" {
 		return nil, errors.New("gft: rtc track unavailable")

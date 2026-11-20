@@ -132,9 +132,13 @@ func (e *Engine) BuildDiagnosticSnapshot() string {
 
 	var sb strings.Builder
 	sb.WriteString("=== GhostFrame-Pro Diagnostic Snapshot (Sanitized) ===\n")
-	fmt.Fprintf(&sb, "Version: v4.0.0-LTS (%s/%s, %s)\n", runtime.GOOS, runtime.GOARCH, runtime.Version())
+	fmt.Fprintf(&sb, "Version: v4.0.1-LTS (%s/%s, %s)\n", runtime.GOOS, runtime.GOARCH, runtime.Version())
 	fmt.Fprintf(&sb, "State: %v | ActiveTransport: %v | Pref: %v | RouteMode: %v\n",
 		st["state"], st["active_transport"], st["transport_pref"], st["route_mode"])
+	if rs, ok := st["rule_stats"].(RuleStats); ok {
+		fmt.Fprintf(&sb, "RuleSet: %s (Domains=%d, CIDRs=%d, Custom=%d) | Hits: Direct=%d Proxy=%d Reject=%d\n",
+			rs.Version, rs.BuiltinDomains, rs.BuiltinCIDRs, rs.CustomRules, rs.DirectHits, rs.ProxyHits, rs.RejectHits)
+	}
 	fmt.Fprintf(&sb, "RTT: %vms (SRTT=%vms, MinRTT=%vms) | Loss: %.2f%% | Pacing: %.1f Mbps | FEC Recovered: %v\n",
 		st["ping_ms"], st["srtt_ms"], st["min_rtt_ms"], st["loss_pct"], st["pacing_mbps"], st["fec_recovered"])
 	fmt.Fprintf(&sb, "RTC Channels: %v | HopRange: %v | HopState: %v | HopCount: %v | RekeyCount: %v\n",

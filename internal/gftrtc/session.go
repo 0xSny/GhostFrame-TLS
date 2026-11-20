@@ -1085,7 +1085,7 @@ func (s *RTCSession) timerLoop() {
 				s.cc.OnFeedback(0, lossRate, srtt, minRTT, ptoCount, now)
 				s.kickSend()
 			}
-			if ptoCount >= 10 && now.Sub(time.Unix(0, s.lastRecvNs.Load())) >= 25*time.Second {
+			if ptoCount >= 6 && now.Sub(time.Unix(0, s.lastRecvNs.Load())) >= 10*time.Second {
 				s.fail(errors.New("gftrtc: peer unresponsive"))
 				return
 			}

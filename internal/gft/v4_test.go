@@ -199,4 +199,48 @@ func TestLazyHopPolicyAndWake(t *testing.T) {
 	sched.OnSystemWake()
 }
 
+func TestSessionPoolAcquireCoalescesEmergencyDial(t *testing.T) {
+	ps := NewParamStore(DefaultParams())
+	pool := NewSessionPool(nil, ps, 2, nil)
+	defer pool.Close()
+
+	var dials atomic.Int32
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	sharedSess := NewSession(c1, true, ps, nil)
+	defer sharedSess.Close()
+
+	pool.dialFn = func(ctx context.Context, _ *Link, _ *ParamStore, _ uint16, _ time.Duration) (*Session, time.Duration, error) {
+		dials.Add(1)
+		time.Sleep(120 * time.Millisecond)
+		return sharedSess, 15 * time.Millisecond, nil
+	}
+
+	const workers = 12
+	var wg sync.WaitGroup
+	results := make([]*Session, workers)
+	errs := make([]error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			results[idx], errs[idx] = pool.Acquire()
+		}(i)
+	}
+	wg.Wait()
+
+	if dials.Load() != 1 {
+		t.Fatalf("expected concurrent Acquire() calls to coalesce into 1 dial, got %d", dials.Load())
+	}
+	for i := 0; i < workers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("worker %d Acquire error: %v", i, errs[i])
+		}
+		if results[i] != sharedSess {
+			t.Fatalf("worker %d got unexpected session instance", i)
+		}
+	}
+}
+
 var _ = sync.Mutex{}
