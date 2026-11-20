@@ -34,6 +34,7 @@ final class GhostAppViewModel: ObservableObject {
     @Published var downMbpsText: String = "0"
     @Published var socksPortText: String = "10808"
     @Published var httpPortText: String = "10809"
+    @Published var customRulesText: String = ""
 
     @Published var status: GhostStatusSnapshot = .empty
     @Published var isConnected: Bool = false
@@ -57,6 +58,7 @@ final class GhostAppViewModel: ObservableObject {
     private let storageKeyDownMbps: String
     private let storageKeySocksPort: String
     private let storageKeyHttpPort: String
+    private let storageKeyCustomRules: String
 
     private var toastClearTask: DispatchWorkItem?
 
@@ -73,11 +75,12 @@ final class GhostAppViewModel: ObservableObject {
         storageKeyDownMbps = prefix + "downMbps"
         storageKeySocksPort = prefix + "socksPort"
         storageKeyHttpPort = prefix + "httpPort"
+        storageKeyCustomRules = prefix + "customRules"
 
         loadPreferences()
         bindBackend()
         syncFromBackendState()
-        appendLocalLog("GhostFrame \(edition.title) v4.0.0-LTS initialized")
+        appendLocalLog("GhostFrame \(edition.title) v4.0.20-LTS initialized")
     }
 
     var activeNode: GhostNode? {
@@ -264,6 +267,42 @@ final class GhostAppViewModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.8, execute: task)
     }
 
+    var parsedCustomRules: [String] {
+        customRulesText
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    func quickAddCustomRule(host: String, action: String) {
+        let cleanHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            .lowercased()
+        let act = action.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !cleanHost.isEmpty, act == "DIRECT" || act == "PROXY" || act == "REJECT" else { return }
+
+        let ruleLine: String
+        var ipv4 = in_addr()
+        var ipv6 = in6_addr()
+        if cleanHost.withCString({ inet_pton(AF_INET, $0, &ipv4) }) == 1 {
+            ruleLine = "IP-CIDR,\(cleanHost)/32,\(act)"
+        } else if cleanHost.withCString({ inet_pton(AF_INET6, $0, &ipv6) }) == 1 {
+            ruleLine = "IP-CIDR6,\(cleanHost)/128,\(act)"
+        } else {
+            ruleLine = "DOMAIN-SUFFIX,\(cleanHost),\(act)"
+        }
+
+        let targetType = ruleLine.split(separator: ",").first.map(String.init) ?? ""
+        var lines = parsedCustomRules.filter { existing in
+            let parts = existing.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            return !(parts.count >= 2 && parts[0] == targetType.lowercased() && parts[1] == cleanHost)
+        }
+        lines.insert(ruleLine, at: 0)
+        customRulesText = lines.joined(separator: "\n")
+        applySettings()
+        showToast("已追加规则: \(ruleLine)")
+    }
+
     private func buildEngineConfig(for node: GhostNode) -> GhostEngineConfig {
         GhostEngineConfig(
             linkURI: node.uri,
@@ -273,7 +312,8 @@ final class GhostAppViewModel: ObservableObject {
             transport: transportMode.rawValue,
             upMbps: effectiveUpMbps,
             downMbps: effectiveDownMbps,
-            asyncConnect: true
+            asyncConnect: true,
+            customRules: parsedCustomRules
         )
     }
 
@@ -348,6 +388,7 @@ final class GhostAppViewModel: ObservableObject {
             let hp = defaults.integer(forKey: storageKeyHttpPort)
             if hp > 0 { httpPortText = "\(hp)" }
         }
+        customRulesText = defaults.string(forKey: storageKeyCustomRules) ?? ""
     }
 
     private func savePreferences() {
@@ -361,5 +402,6 @@ final class GhostAppViewModel: ObservableObject {
         defaults.set(effectiveDownMbps, forKey: storageKeyDownMbps)
         defaults.set(effectiveSocksPort, forKey: storageKeySocksPort)
         defaults.set(effectiveHttpPort, forKey: storageKeyHttpPort)
+        defaults.set(customRulesText, forKey: storageKeyCustomRules)
     }
 }

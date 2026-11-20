@@ -618,6 +618,23 @@ struct ConsoleView: View {
                         labeledNumberField(title: "HTTP 端口", text: $viewModel.httpPortText)
                     }
 
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("自定义分流规则 (Clash/Surge 格式，一行一条)")
+                            .font(.system(size: 12))
+                            .foregroundColor(GhostPalette.textMuted)
+                        TextEditor(text: $viewModel.customRulesText)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(GhostPalette.textPrimary)
+                            .frame(height: 110)
+                            .padding(8)
+                            .background(GhostPalette.cardAlt)
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(GhostPalette.border, lineWidth: 1))
+                            .cornerRadius(8)
+                        Text("示例：DOMAIN-SUFFIX,xxxgame.com,DIRECT 或 DOMAIN-KEYWORD,ads,REJECT")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(GhostPalette.textMuted)
+                    }
+
                     Button(action: {
                         viewModel.applySettings()
                         activeSheet = nil
@@ -664,6 +681,67 @@ struct ConsoleView: View {
                             .background(GhostPalette.card)
                             .overlay(RoundedRectangle(cornerRadius: 10).stroke(GhostPalette.border, lineWidth: 1))
                             .cornerRadius(10)
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("最近分流明细 (\(viewModel.status.recentRoutes.count))")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(GhostPalette.textPrimary)
+                            Spacer()
+                            Text("点击域名可一键改规则")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(GhostPalette.textMuted)
+                        }
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            let routes = Array(viewModel.status.recentRoutes.prefix(25))
+                            if routes.isEmpty {
+                                Text("等待连接流量进入...")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(GhostPalette.textMuted)
+                            } else {
+                                ForEach(routes) { item in
+                                    HStack(spacing: 6) {
+                                        Text(item.action)
+                                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                                            .foregroundColor(item.action == "DIRECT" ? GhostPalette.emerald : (item.action == "REJECT" ? GhostPalette.crimson : GhostPalette.cyan))
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 2)
+                                            .background(GhostPalette.cardAlt)
+                                            .cornerRadius(4)
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text(item.target)
+                                                .font(.system(size: 11, design: .monospaced))
+                                                .foregroundColor(GhostPalette.textPrimary)
+                                                .lineLimit(1)
+                                            Text("\(item.time) · \(item.reason)")
+                                                .font(.system(size: 9, design: .monospaced))
+                                                .foregroundColor(GhostPalette.textMuted)
+                                                .lineLimit(1)
+                                        }
+                                        Spacer()
+                                        if !item.host.isEmpty {
+                                            let nextAction = item.action == "DIRECT" ? "PROXY" : "DIRECT"
+                                            Button(item.action == "DIRECT" ? "改代理" : "改直连") {
+                                                viewModel.quickAddCustomRule(host: item.host, action: nextAction)
+                                            }
+                                            .font(.system(size: 10, weight: .semibold))
+                                            .foregroundColor(GhostPalette.textPrimary)
+                                            .padding(.horizontal, 7)
+                                            .padding(.vertical, 4)
+                                            .background(GhostPalette.cardAlt)
+                                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(GhostPalette.border, lineWidth: 1))
+                                            .cornerRadius(6)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .padding(10)
+                        .background(GhostPalette.card)
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(GhostPalette.border, lineWidth: 1))
+                        .cornerRadius(10)
                     }
 
                     VStack(alignment: .leading, spacing: 8) {

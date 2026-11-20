@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # GhostFrame-RTC (GFT) v4.0 LTS Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
-REPO="Spittingjiu/GhostFrame-TLS"
+REPO="Spittingjiu/Ghost"
 ROLE="server"
 UNATTENDED=0
 LISTEN_PORT=443

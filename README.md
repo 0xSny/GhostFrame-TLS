@@ -84,20 +84,20 @@
 ### Linux Server (`gft-server`)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Spittingjiu/GhostFrame-TLS/main/install.sh)
+bash <(curl -fsSL https://github.com/Spittingjiu/Ghost/releases/latest/download/install.sh)
 ```
 
 Unattended server setup with UDP port hopping:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Spittingjiu/GhostFrame-TLS/main/install.sh) \
+bash <(curl -fsSL https://github.com/Spittingjiu/Ghost/releases/latest/download/install.sh) \
   --unattended --port 443 --hop 25000-32000
 ```
 
 ### iStoreOS / OpenWrt (`0Ghost` Prebuilt Binary Bundle)
 
 ```sh
-sh <(curl -fsSL https://raw.githubusercontent.com/Spittingjiu/GhostFrame-TLS/main/scripts/install-0ghost.sh)
+curl -fsSL https://github.com/Spittingjiu/Ghost/releases/latest/download/install-0ghost.sh | sh
 ```
 
 ### iOS OmniSign / ESign Local Repo Sync

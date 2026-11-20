@@ -56,18 +56,7 @@ enum GhostVPNControlBridge {
 
     static func loadPreferredManager() async throws -> NETunnelProviderManager? {
         let managers = try await loadAllManagers()
-        guard !managers.isEmpty else { return nil }
-        if let matched = managers.first(where: { mgr in
-            let desc = (mgr.localizedDescription ?? "").lowercased()
-            let bid = ((mgr.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier ?? "").lowercased()
-            if bid.hasSuffix(".control") {
-                return false
-            }
-            return bid.hasSuffix(".tunnel") || desc.contains("ghostframe") || bid.contains("ghost")
-        }) {
-            return matched
-        }
-        return managers.first
+        return preferredManager(from: managers)
     }
 
     static func isActiveStatus(_ status: NEVPNStatus) -> Bool {
@@ -80,8 +69,24 @@ enum GhostVPNControlBridge {
     }
 
     static func queryIsTunnelActive() async -> Bool {
-        if let mgr = try? await loadPreferredManager() {
+        let managers = (try? await loadAllManagers()) ?? []
+        if let mgr = preferredManager(from: managers) {
             return isActiveStatus(mgr.connection.status)
+        }
+        var ports: [Int] = []
+        for mgr in managers {
+            let pCfg = (mgr.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
+            if let hp = pCfg?["httpPort"] as? Int, (1...65535).contains(hp), !ports.contains(hp) {
+                ports.append(hp)
+            } else if let cfgJSON = pCfg?["configJSON"] as? String,
+                      let data = cfgJSON.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let hp = obj["http_port"] as? Int, (1...65535).contains(hp), !ports.contains(hp) {
+                ports.append(hp)
+            }
+        }
+        for fallback in [10809, 7891, 10819] where !ports.contains(fallback) {
+            ports.append(fallback)
         }
         let cfg = URLSessionConfiguration.ephemeral
         cfg.connectionProxyDictionary = [:]
@@ -89,7 +94,7 @@ enum GhostVPNControlBridge {
         cfg.timeoutIntervalForResource = 0.6
         let session = URLSession(configuration: cfg)
         defer { session.invalidateAndCancel() }
-        for port in [10809, 7891, 10819] {
+        for port in ports {
             guard let url = URL(string: "http://127.0.0.1:\(port)/_gft/ping") else { continue }
             if let (_, resp) = try? await session.data(from: url),
                (resp as? HTTPURLResponse)?.statusCode == 200 {
@@ -97,6 +102,21 @@ enum GhostVPNControlBridge {
             }
         }
         return false
+    }
+
+    private static func preferredManager(from managers: [NETunnelProviderManager]) -> NETunnelProviderManager? {
+        guard !managers.isEmpty else { return nil }
+        if let matched = managers.first(where: { mgr in
+            let desc = (mgr.localizedDescription ?? "").lowercased()
+            let bid = ((mgr.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier ?? "").lowercased()
+            if bid.hasSuffix(".control") {
+                return false
+            }
+            return bid.hasSuffix(".tunnel") || desc.contains("ghostframe") || bid.contains("ghost")
+        }) {
+            return matched
+        }
+        return managers.first
     }
 
     static func reloadControls() {

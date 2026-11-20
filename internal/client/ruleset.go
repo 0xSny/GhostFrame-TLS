@@ -7,7 +7,7 @@ import (
 )
 
 // BuiltinRuleSetVersion identifies the embedded multi-category domain & CIDR rule engine.
-const BuiltinRuleSetVersion = "v4.1-RuleSet"
+const BuiltinRuleSetVersion = "v4.2-SmartRuleSet"
 
 // RuleStats captures embedded rule capacities and cumulative per-action decision hits.
 type RuleStats struct {
@@ -332,9 +332,19 @@ var builtinDirectRules = []ruleSeed{
 	{"weixin.com", "direct:cn"},
 	{"wechat.com", "direct:cn"},
 	{"wx.qq.com", "direct:cn"},
+	{"servicewechat.com", "direct:cn"},
+	{"weixinbridge.com", "direct:cn"},
+	{"wx.qlogo.cn", "direct:cn"},
 	{"tenpay.com", "direct:cn"},
 	{"myqcloud.com", "direct:cn-cloud"},
 	{"qcloud.com", "direct:cn-cloud"},
+	{"qcloudcdn.com", "direct:cn-cloud"},
+	{"cdntips.com", "direct:cn-cloud"},
+	{"ugdtimg.com", "direct:cn"},
+	{"gdtimg.com", "direct:cn"},
+	{"tencentcos.cn", "direct:cn-cloud"},
+	{"dnspod.cn", "direct:cn-cloud"},
+	{"smtcdns.net", "direct:cn-cloud"},
 	{"tencent.com", "direct:cn"},
 	{"tencent-cloud.com", "direct:cn-cloud"},
 
@@ -368,6 +378,10 @@ var builtinDirectRules = []ruleSeed{
 	{"bytedance.com", "direct:cn"},
 	{"byteimg.com", "direct:cn"},
 	{"bytetos.com", "direct:cn"},
+	{"bytecdntp.com", "direct:cn-cloud"},
+	{"alikunlun.com", "direct:cn-cloud"},
+	{"kunlunca.com", "direct:cn-cloud"},
+	{"kunlunar.com", "direct:cn-cloud"},
 	{"snssdk.com", "direct:cn"},
 	{"ixigua.com", "direct:cn"},
 	{"feishu.cn", "direct:cn"},
@@ -447,6 +461,9 @@ var builtinDirectRules = []ruleSeed{
 	{"xiaomi.net", "direct:cn"},
 	{"huawei.com", "direct:cn"},
 	{"huaweicloud.com", "direct:cn-cloud"},
+	{"myhuaweicloud.com", "direct:cn-cloud"},
+	{"cdnhwc1.com", "direct:cn-cloud"},
+	{"cdnhwc2.com", "direct:cn-cloud"},
 	{"oppo.com", "direct:cn"},
 	{"heytap.com", "direct:cn"},
 	{"vivo.com", "direct:cn"},
@@ -467,6 +484,16 @@ var builtinDirectRules = []ruleSeed{
 	{"hoyoverse.com", "direct:cn"},
 	{"hypergryph.com", "direct:cn"},
 	{"taptap.cn", "direct:cn"},
+	{"taptap.com", "direct:cn"},
+	{"tapimg.com", "direct:cn"},
+	{"4399.com", "direct:cn"},
+	{"7k7k.com", "direct:cn"},
+	{"hortorgames.com", "direct:cn"},
+	{"tuyoo.com", "direct:cn"},
+	{"jj.cn", "direct:cn"},
+	{"sanguosha.com", "direct:cn"},
+	{"leiting.com", "direct:cn"},
+	{"lilithgames.com", "direct:cn"},
 	{"nga.cn", "direct:cn"},
 	{"ngacn.cc", "direct:cn"},
 

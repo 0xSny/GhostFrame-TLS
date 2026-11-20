@@ -27,6 +27,9 @@ import (
 	"ghostframe/internal/gftrtc"
 )
 
+// Version is the canonical server build identifier (overridable via -ldflags -X).
+var Version = "v4.0.20-LTS"
+
 const (
 	MaxUDPAssocPerClient = 256
 	maxUDPPerSession     = MaxUDPAssocPerClient
@@ -345,8 +348,8 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}
 
-	s.logger.Printf("GhostFrame v4.0.1-LTS Apex listening tcp=%s rtc=%v (cert=%s fallback=%s target=%s)",
-		ln.Addr(), rtcLn != nil, s.cfg.CertMode, s.cfg.FallbackMode, s.cfg.CamouflageTarget)
+	s.logger.Printf("GhostFrame %s Apex listening tcp=%s rtc=%v (cert=%s fallback=%s target=%s)",
+		Version, ln.Addr(), rtcLn != nil, s.cfg.CertMode, s.cfg.FallbackMode, s.cfg.CamouflageTarget)
 
 	// Public HTTP/1.1 fallback server (reverse_proxy or builtin_blog)
 	hs := &http.Server{

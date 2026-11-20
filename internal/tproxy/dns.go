@@ -245,6 +245,7 @@ func (s *SplitDNSServer) HandlePacket(req []byte) []byte {
 	}
 
 	var act client.RouteAction
+	var smartWireResp []byte
 	if gwMode == ModeGlobal {
 		if isLocalDomain(qname) {
 			act = client.ActionDirect
@@ -252,7 +253,7 @@ func (s *SplitDNSServer) HandlePacket(req []byte) []byte {
 			act = client.ActionProxy
 		}
 	} else {
-		act = s.engine.RouteDecision(net.JoinHostPort(qname, "443"))
+		act, smartWireResp, _ = s.engine.ResolveSmartDNS(client.RouteRule, qname, req[:2])
 	}
 
 	switch act {
@@ -265,6 +266,10 @@ func (s *SplitDNSServer) HandlePacket(req []byte) []byte {
 		cacheKey := fmt.Sprintf("D:%d:%s", qtype, qname)
 		if cached, hit := s.cacheGet(cacheKey, req[:2]); hit {
 			return cached
+		}
+		if qtype == 1 && len(smartWireResp) >= 12 {
+			s.cachePut(cacheKey, smartWireResp, dnsCacheMinTTL)
+			return smartWireResp
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		resp, err := s.queryDirectConcurrent(ctx, req, isLocalDomain(qname))

@@ -5,8 +5,33 @@ set -eu
 # Downloads prebuilt pure-binary bundle from public distribution repo (no source code required).
 
 DIST_REPO="${DIST_REPO:-Spittingjiu/Ghost}"
-TAG="${1:-latest}"
+TAG="latest"
 MIRROR_PREFIX="${MIRROR_PREFIX:-}"
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--mirror)
+			MIRROR_PREFIX="${2:-}"
+			shift 2
+			;;
+		--tag|--version)
+			TAG="${2:-latest}"
+			shift 2
+			;;
+		-*)
+			echo "[0Ghost] Unknown option: $1" >&2
+			exit 1
+			;;
+		*)
+			TAG="$1"
+			shift
+			;;
+	esac
+done
+
+if [ -n "$MIRROR_PREFIX" ]; then
+	MIRROR_PREFIX="${MIRROR_PREFIX%/}/"
+fi
 TMP_DIR="$(mktemp -d /tmp/0ghost-inst.XXXXXX)"
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 

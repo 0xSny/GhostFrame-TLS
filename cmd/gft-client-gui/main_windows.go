@@ -73,7 +73,7 @@ func main() {
 	if err := eng.StartServersAutoFallback(); err != nil {
 		eng.Logf("本地代理端口监听失败（请在界面修改本地端口后点击保存）: %v", err)
 	}
-	eng.Logf("GhostFrame-Pro v4.0.0-LTS (GFT-RTC) native desktop initialized")
+	eng.Logf("GhostFrame-Pro %s (GFT-RTC) native desktop initialized", client.Version)
 
 	if *autoConnect {
 		go func() { _ = eng.Connect() }()

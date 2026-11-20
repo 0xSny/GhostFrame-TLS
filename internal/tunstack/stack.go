@@ -473,13 +473,13 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 		// Unmapped 198.18.x.x UDP cannot be routed externally; drop immediately so app re-resolves DNS.
 		return
 	}
-	act := s.engine.RouteDecision(routeTarget)
+	act, resolvedDial, _ := s.engine.DecideSmartRoute(dialTarget, routeTarget)
 	if act == client.ActionReject {
 		return
 	}
 
 	if act == client.ActionDirect {
-		s.relayUDPDirect(conn, dialTarget)
+		s.relayUDPDirect(conn, resolvedDial)
 		return
 	}
 

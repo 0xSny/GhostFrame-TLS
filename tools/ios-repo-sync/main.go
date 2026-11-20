@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	defaultRepo         = "Spittingjiu/GhostFrame-TLS"
+	defaultRepo         = "Spittingjiu/Ghost"
 	defaultWorkflow     = "ios-dual-ipa.yml"
 	defaultDistDir      = ".ios-dist"
 	defaultListenAddr   = "0.0.0.0:18080"

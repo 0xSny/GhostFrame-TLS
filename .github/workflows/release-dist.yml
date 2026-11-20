@@ -30,18 +30,32 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Build Server, Core CLI, Windows GUI & 0Ghost Side-Router
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          RUN_NUM: ${{ github.run_number }}
         run: |
           set -euo pipefail
           mkdir -p dist _stage_0ghost/usr/bin
 
+          if [ -n "$INPUT_TAG" ]; then
+            REL_VER="$INPUT_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            REL_VER="$REF_NAME"
+          else
+            REL_VER="v4.0.$((15 + RUN_NUM))-LTS"
+          fi
+
           export CGO_ENABLED=0
-          FLAGS=(-trimpath -ldflags="-s -w")
+          VER_X="-X ghostframe/internal/tui.CurrentVersion=${REL_VER} -X ghostframe/internal/client.Version=${REL_VER} -X ghostframe/internal/server.Version=${REL_VER} -X main.gatewayVersion=${REL_VER} -X main.version=${REL_VER}"
+          FLAGS=(-trimpath -ldflags="-s -w ${VER_X}")
 
           GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/gft-server-linux-amd64 ./cmd/gft-server
           GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/gft-server-linux-arm64 ./cmd/gft-server
           GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/gft-core-linux-amd64   ./cmd/gft-core
           GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/gft-core-linux-arm64   ./cmd/gft-core
-          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H=windowsgui" -o dist/GhostFrame-Pro-windows-amd64.exe ./cmd/gft-client-gui
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H=windowsgui ${VER_X}" -o dist/GhostFrame-Pro-windows-amd64.exe ./cmd/gft-client-gui
           GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/0ghost-linux-amd64     ./cmd/0ghost
           GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/0ghost-linux-arm64     ./cmd/0ghost
 
@@ -86,8 +100,28 @@ jobs:
         run: brew install xcodegen
 
       - name: Build GhostMobile.xcframework & Dual Unsigned IPAs
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          RUN_NUM: ${{ github.run_number }}
         run: |
           set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            REL_VER="$INPUT_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            REL_VER="$REF_NAME"
+          else
+            REL_VER="v4.0.$((15 + RUN_NUM))-LTS"
+          fi
+          if [[ "$REL_VER" =~ ^v?(4\.0\.([0-9]+)) ]]; then
+            IOS_APP_VER="${BASH_REMATCH[1]}"
+            DIST_BUILD_NUM="${BASH_REMATCH[2]}"
+          else
+            DIST_BUILD_NUM=$((15 + RUN_NUM))
+            IOS_APP_VER="4.0.${DIST_BUILD_NUM}"
+          fi
+
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
           export PATH="$(go env GOPATH)/bin:$PATH"
@@ -99,7 +133,7 @@ jobs:
             -target=ios/arm64 \
             -iosversion=15.0 \
             -trimpath \
-            -ldflags="-s -w" \
+            -ldflags="-s -w -X ghostframe/internal/client.Version=${REL_VER} -X ghostframe/mobile.Version=${REL_VER}" \
             -o ios/Frameworks/GhostMobile.xcframework \
             ./mobile
           git checkout -- go.mod go.sum
@@ -122,8 +156,6 @@ jobs:
           VPN_APP="$(find ios/build-vpn -maxdepth 4 -type d -name 'GhostFrameVPN.app' | head -n 1)"
           APPEX="$VPN_APP/PlugIns/GhostPacketTunnel.appex"
           CTRL_APPEX="$VPN_APP/PlugIns/GhostControlWidget.appex"
-          DIST_BUILD_NUM=$((14 + GITHUB_RUN_NUMBER))
-          IOS_APP_VER="4.0.${DIST_BUILD_NUM}"
           for plist in "$VPN_APP/Info.plist" "$APPEX/Info.plist" "$CTRL_APPEX/Info.plist"; do
             /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${IOS_APP_VER}" "$plist"
             /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${DIST_BUILD_NUM}" "$plist"
@@ -219,8 +251,11 @@ jobs:
           VPN_SIZE="$(stat -c%s release-out/GhostFrame-VPN-Unsigned.ipa)"
           COMP_SIZE="$(stat -c%s release-out/GhostFrame-Companion-Unsigned.ipa)"
           NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          DIST_BUILD_NUM=$((14 + RUN_NUM))
-          APP_VER="4.0.${DIST_BUILD_NUM}"
+          if [[ "$TAG" =~ ^v?(4\.0\.([0-9]+)) ]]; then
+            APP_VER="${BASH_REMATCH[1]}"
+          else
+            APP_VER="4.0.$((15 + RUN_NUM))"
+          fi
           BASE_DL="https://github.com/${TARGET_REPO}/releases/download/${TAG}"
 
           python3 - <<PY

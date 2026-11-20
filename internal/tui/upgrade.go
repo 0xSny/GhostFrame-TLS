@@ -20,8 +20,8 @@ import (
 	"ghostframe/internal/server"
 )
 
-// CurrentVersion is the canonical release identifier compiled into server & TUI binaries.
-const CurrentVersion = "v4.0.1-LTS"
+// CurrentVersion is the canonical release identifier compiled into server & TUI binaries (overridable via -ldflags -X).
+var CurrentVersion = "v4.0.20-LTS"
 
 const (
 	defaultGitHubAPIBase   = "https://api.github.com"

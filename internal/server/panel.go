@@ -375,7 +375,7 @@ func (p *Panel) handleStats(w http.ResponseWriter, r *http.Request) {
 	rtcActive := p.srv.rtcActive.Load()
 
 	res := map[string]any{
-		"version":     "v4.0.1-LTS",
+		"version":     Version,
 		"uptime_sec":  int64(time.Since(p.srv.started).Seconds()),
 		"active":      activeCount,
 		"rtc_active":  rtcActive,

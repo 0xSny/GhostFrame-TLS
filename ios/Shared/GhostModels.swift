@@ -135,6 +135,7 @@ struct GhostEngineConfig: Codable, Equatable {
     var upMbps: Int
     var downMbps: Int
     var asyncConnect: Bool = true
+    var customRules: [String] = []
 
     enum CodingKeys: String, CodingKey {
         case linkURI = "link_uri"
@@ -145,6 +146,7 @@ struct GhostEngineConfig: Codable, Equatable {
         case upMbps = "up_mbps"
         case downMbps = "down_mbps"
         case asyncConnect = "async_connect"
+        case customRules = "custom_rules"
     }
 
     init(
@@ -155,7 +157,8 @@ struct GhostEngineConfig: Codable, Equatable {
         transport: String,
         upMbps: Int,
         downMbps: Int,
-        asyncConnect: Bool = true
+        asyncConnect: Bool = true,
+        customRules: [String] = []
     ) {
         self.linkURI = linkURI
         self.socksPort = socksPort
@@ -165,6 +168,7 @@ struct GhostEngineConfig: Codable, Equatable {
         self.upMbps = upMbps
         self.downMbps = downMbps
         self.asyncConnect = asyncConnect
+        self.customRules = customRules
     }
 
     init(from decoder: Decoder) throws {
@@ -177,6 +181,7 @@ struct GhostEngineConfig: Codable, Equatable {
         upMbps = (try? c.decode(Int.self, forKey: .upMbps)) ?? 0
         downMbps = (try? c.decode(Int.self, forKey: .downMbps)) ?? 0
         asyncConnect = (try? c.decode(Bool.self, forKey: .asyncConnect)) ?? true
+        customRules = (try? c.decode([String].self, forKey: .customRules)) ?? []
     }
 
     func toJSONString() -> String {
@@ -205,6 +210,15 @@ struct GhostTrafficPoint: Codable, Identifiable, Equatable {
     var t: Int64
     var up: UInt64
     var down: UInt64
+}
+
+struct GhostRecentRoute: Codable, Identifiable, Equatable {
+    var id: String { "\(time)-\(target)-\(action)-\(reason)" }
+    var time: String
+    var target: String
+    var host: String
+    var action: String
+    var reason: String
 }
 
 struct GhostStatusSnapshot: Codable, Equatable {
@@ -247,11 +261,13 @@ struct GhostStatusSnapshot: Codable, Equatable {
     var memAllocMB: Double
     var memSysMB: Double
     var logs: [GhostLogEntry]
+    var customRules: [String]
+    var recentRoutes: [GhostRecentRoute]
 
     static let empty = GhostStatusSnapshot()
 
     init() {
-        version = "v4.0.0-LTS"
+        version = "v4.0.20-LTS"
         state = "disconnected"
         lastErr = ""
         activeTransport = ""
@@ -290,6 +306,8 @@ struct GhostStatusSnapshot: Codable, Equatable {
         memAllocMB = 0
         memSysMB = 0
         logs = []
+        customRules = []
+        recentRoutes = []
     }
 
     enum CodingKeys: String, CodingKey {
@@ -332,6 +350,8 @@ struct GhostStatusSnapshot: Codable, Equatable {
         case memAllocMB = "mem_alloc_mb"
         case memSysMB = "mem_sys_mb"
         case logs
+        case customRules = "custom_rules"
+        case recentRoutes = "recent_routes"
     }
 
     init(from decoder: Decoder) throws {
@@ -376,6 +396,8 @@ struct GhostStatusSnapshot: Codable, Equatable {
         memAllocMB = (try? c.decode(Double.self, forKey: .memAllocMB)) ?? 0
         memSysMB = (try? c.decode(Double.self, forKey: .memSysMB)) ?? 0
         logs = (try? c.decode([GhostLogEntry].self, forKey: .logs)) ?? []
+        customRules = (try? c.decode([String].self, forKey: .customRules)) ?? []
+        recentRoutes = (try? c.decode([GhostRecentRoute].self, forKey: .recentRoutes)) ?? []
     }
 }
 

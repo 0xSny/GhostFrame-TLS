@@ -19,6 +19,9 @@ import (
 	"ghostframe/internal/netbind"
 )
 
+// Version is the canonical release identifier (overridable via -ldflags -X).
+var Version = "v4.0.20-LTS"
+
 type ConnState string
 
 const (
@@ -76,7 +79,10 @@ type Engine struct {
 	paramStore      *gft.ParamStore
 	router          *Router
 	tunnelDNS       *TunnelDNSResolver
-	socksSrv        *SOCKS5Server
+	smartCache        *smartRouteCache
+	recentRoutes      *recentRouteRing
+	directCNResolveFn DirectCNDNSFunc
+	socksSrv          *SOCKS5Server
 	httpSrv         *HTTPProxyServer
 	sysProxyApplied bool
 	proxyDrifted    atomic.Bool
@@ -127,6 +133,8 @@ func NewEngine(cfgPath string) (*Engine, error) {
 		paramStore:      gft.NewParamStore(gft.DefaultParams()),
 		router:          NewRouter(),
 		tunnelDNS:       NewTunnelDNSResolver(),
+		smartCache:      newSmartRouteCache(smartRouteCacheCap),
+		recentRoutes:    newRecentRouteRing(defaultRecentRouteCap),
 		history:         make([]TrafficPoint, 0, 60),
 		logRing:         NewLogRingBuffer(defaultLogRingCap),
 		stopStats:       make(chan struct{}),
@@ -557,12 +565,11 @@ func (e *Engine) IsConnected() bool {
 	return e.state == StateConnected && e.sched != nil
 }
 
-// RouteDecision decides whether hostport should bypass or traverse GhostFrame.
+// RouteDecision decides whether hostport should bypass or traverse GhostFrame,
+// running a 350ms CN DNS GeoIP probe only for unknown candidate domains in Rule mode.
 func (e *Engine) RouteDecision(hostport string) RouteAction {
-	e.mu.RLock()
-	mode := e.config.RouteMode
-	e.mu.RUnlock()
-	return e.router.Decide(mode, hostport)
+	act, _, _ := e.DecideSmartRoute(hostport, hostport)
+	return act
 }
 
 // TunnelDNS returns the client's encrypted over-tunnel DNS LRU resolver.
@@ -626,24 +633,23 @@ func (e *Engine) DirectDialer(timeout time.Duration) net.Dialer {
 }
 
 // OpenTargetStreamWithRoute classifies routing using routeTarget (e.g. sniffed TLS SNI)
-// while opening the connection to dialTarget without local DNS resolution.
+// while opening the connection to dialTarget without local DNS leakage on known overseas hosts.
 func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first []byte) (gft.DataStream, RouteAction, error) {
 	e.mu.RLock()
 	state := e.state
 	sched := e.sched
-	mode := e.config.RouteMode
 	e.mu.RUnlock()
 
 	if state != StateConnected || sched == nil {
 		return nil, ActionProxy, errNoActiveSession
 	}
-	act := e.router.Decide(mode, routeTarget)
+	act, resolvedDial, _ := e.DecideSmartRoute(dialTarget, routeTarget)
 	if act == ActionReject {
 		return nil, ActionReject, errRouteRejected
 	}
 	if act == ActionDirect {
 		d := e.DirectDialer(8 * time.Second)
-		c, err := d.Dial("tcp", dialTarget)
+		c, err := d.Dial("tcp", resolvedDial)
 		if err != nil {
 			return nil, ActionDirect, err
 		}
@@ -656,7 +662,7 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 				return nil, ActionDirect, werr
 			}
 		}
-		return &directStreamConn{Conn: c, target: dialTarget}, ActionDirect, nil
+		return &directStreamConn{Conn: c, target: resolvedDial}, ActionDirect, nil
 	}
 	st, err := sched.OpenStream(dialTarget, first)
 	return st, ActionProxy, err
@@ -798,6 +804,9 @@ func (e *Engine) SetCustomRules(lines []string) error {
 	e.config.CustomRules = cp
 	e.router.SetCustomRules(parsed)
 	e.mu.Unlock()
+	if e.smartCache != nil {
+		e.smartCache.Clear()
+	}
 	e.Logf("Custom rules updated (%d active entries)", len(parsed))
 	return e.SaveConfig()
 }
@@ -1341,13 +1350,15 @@ func (e *Engine) Status() map[string]any {
 	}
 
 	return map[string]any{
-		"version":          "v4.0.1-LTS",
+		"version":          Version,
 		"state":            string(state),
 		"last_err":         lastErr,
 		"active_transport": activeMode,
 		"transport_pref":   tPref,
 		"route_mode":       string(routeMode),
 		"rule_stats":       e.router.Stats(),
+		"custom_rules":     e.CustomRules(),
+		"recent_routes":    e.RecentRoutes(),
 		"verify_mode":      verifyMode,
 		"hop_range":        hopRange,
 		"rtc_port":         rtcPort,

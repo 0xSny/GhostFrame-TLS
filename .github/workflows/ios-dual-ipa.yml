@@ -48,11 +48,14 @@ jobs:
           gomobile init
           go get golang.org/x/mobile/bind
           mkdir -p ios/Frameworks dist
+          BUILD_NUM=$((3 + GITHUB_RUN_NUMBER))
+          IOS_APP_VER="4.0.${BUILD_NUM}"
+          REL_VER="v${IOS_APP_VER}-LTS"
           gomobile bind \
             -target=ios/arm64 \
             -iosversion=15.0 \
             -trimpath \
-            -ldflags="-s -w" \
+            -ldflags="-s -w -X ghostframe/internal/client.Version=${REL_VER} -X ghostframe/mobile.Version=${REL_VER}" \
             -o ios/Frameworks/GhostMobile.xcframework \
             ./mobile
           git checkout -- go.mod go.sum
@@ -92,10 +95,11 @@ jobs:
           plutil -p "$CTRL_APPEX/Info.plist"
           plutil -p "$CTRL_APPEX/Info.plist" | grep -q "com.apple.widgetkit-extension"
 
-          IOS_APP_VER="4.0.${GITHUB_RUN_NUMBER}"
+          BUILD_NUM=$((3 + GITHUB_RUN_NUMBER))
+          IOS_APP_VER="4.0.${BUILD_NUM}"
           for plist in "$VPN_APP/Info.plist" "$APPEX/Info.plist" "$CTRL_APPEX/Info.plist"; do
             /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${IOS_APP_VER}" "$plist"
-            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER}" "$plist"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUM}" "$plist"
           done
 
           # Inside-out ad-hoc entitlement stamping (strictly no --deep on GhostFrameVPN.app)
@@ -159,9 +163,10 @@ jobs:
           plutil -p "$COMP_APP/Info.plist" | grep -q "audio"
           plutil -p "$COMP_APP/Info.plist" | grep -q "shadowrocket"
 
-          IOS_APP_VER="4.0.${GITHUB_RUN_NUMBER}"
+          BUILD_NUM=$((3 + GITHUB_RUN_NUMBER))
+          IOS_APP_VER="4.0.${BUILD_NUM}"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${IOS_APP_VER}" "$COMP_APP/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER}" "$COMP_APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUM}" "$COMP_APP/Info.plist"
 
           # Single-process pure ad-hoc signature with ZERO restricted entitlements
           codesign --force --deep --sign - --timestamp=none "$COMP_APP"

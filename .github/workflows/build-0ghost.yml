@@ -65,8 +65,10 @@ jobs:
           set -euo pipefail
           mkdir -p dist _stage_0ghost/usr/bin
 
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/0ghost-linux-arm64 ./cmd/0ghost
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/0ghost-linux-amd64 ./cmd/0ghost
+          REL_VER="v4.0.20-LTS"
+          VER_X="-X ghostframe/internal/client.Version=${REL_VER} -X main.gatewayVersion=${REL_VER}"
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w ${VER_X}" -o dist/0ghost-linux-arm64 ./cmd/0ghost
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w ${VER_X}" -o dist/0ghost-linux-amd64 ./cmd/0ghost
 
           cp dist/0ghost-linux-arm64 _stage_0ghost/usr/bin/0ghost
           cp -r openwrt/luci-app-0ghost/etc _stage_0ghost/

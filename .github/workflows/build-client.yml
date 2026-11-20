@@ -74,7 +74,8 @@ jobs:
       - name: Build Clean Single-File GhostFrame-Pro.exe (CGO_ENABLED=0)
         run: |
           mkdir -p dist
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H=windowsgui" -o dist/GhostFrame-Pro.exe ./cmd/gft-client-gui
+          REL_VER="v4.0.20-LTS"
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H=windowsgui -X ghostframe/internal/client.Version=${REL_VER}" -o dist/GhostFrame-Pro.exe ./cmd/gft-client-gui
           ls -lh dist/GhostFrame-Pro.exe
 
       - name: Upload Windows Client Binary

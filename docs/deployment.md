@@ -5,13 +5,13 @@
 Run the installer on Ubuntu / Debian / Rocky / Arch Linux:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Spittingjiu/GhostFrame-TLS/main/install.sh)
+bash <(curl -fsSL https://github.com/Spittingjiu/Ghost/releases/latest/download/install.sh)
 ```
 
 For unattended installation on port `443` with conflict-free UDP port hopping (avoiding any existing services and Linux `32768-60999` ephemeral ports):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Spittingjiu/GhostFrame-TLS/main/install.sh) \
+bash <(curl -fsSL https://github.com/Spittingjiu/Ghost/releases/latest/download/install.sh) \
   --unattended --port 443 --hop 25000-32000
 ```
 

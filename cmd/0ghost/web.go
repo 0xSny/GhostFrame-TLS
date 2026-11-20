@@ -288,6 +288,40 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		writeJSON(w, http.StatusOK, s.ProbeDualConnectivity())
 	}))
 
+	mux.HandleFunc("/api/rules/quick", postOnly(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Host   string `json:"host"`
+			Action string `json:"action"`
+		}
+		if err := readJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		host := strings.TrimSpace(strings.Trim(strings.ToLower(req.Host), "[]"))
+		act := strings.ToUpper(strings.TrimSpace(req.Action))
+		if host == "" || (act != "DIRECT" && act != "PROXY" && act != "REJECT") {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid host or action"})
+			return
+		}
+		ruleType := "DOMAIN-SUFFIX"
+		ruleVal := host
+		if net.ParseIP(host) != nil {
+			ruleType = "IP-CIDR"
+			if strings.Contains(host, ":") {
+				ruleVal = host + "/128"
+			} else {
+				ruleVal = host + "/32"
+			}
+		}
+		ruleLine := ruleType + "," + ruleVal + "," + act
+		if err := s.engine.AppendCustomRule(ruleLine); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		s.SyncFirewall()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rule": ruleLine, "custom_rules": s.engine.CustomRules()})
+	}))
+
 	mux.HandleFunc("/api/logs/clear", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		s.engine.ClearLogs()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})

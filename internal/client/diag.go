@@ -132,7 +132,7 @@ func (e *Engine) BuildDiagnosticSnapshot() string {
 
 	var sb strings.Builder
 	sb.WriteString("=== GhostFrame-Pro Diagnostic Snapshot (Sanitized) ===\n")
-	fmt.Fprintf(&sb, "Version: v4.0.1-LTS (%s/%s, %s)\n", runtime.GOOS, runtime.GOARCH, runtime.Version())
+	fmt.Fprintf(&sb, "Version: %s (%s/%s, %s)\n", Version, runtime.GOOS, runtime.GOARCH, runtime.Version())
 	fmt.Fprintf(&sb, "State: %v | ActiveTransport: %v | Pref: %v | RouteMode: %v\n",
 		st["state"], st["active_transport"], st["transport_pref"], st["route_mode"])
 	if rs, ok := st["rule_stats"].(RuleStats); ok {

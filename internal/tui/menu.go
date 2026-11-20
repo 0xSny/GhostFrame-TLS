@@ -24,7 +24,7 @@ import (
 
 const (
 	DefaultConfigPath = "/etc/gft/server.json"
-	ReleaseRepo       = "Spittingjiu/GhostFrame-TLS"
+	ReleaseRepo       = "Spittingjiu/Ghost"
 	SysctlConfPath    = "/etc/sysctl.d/99-gft-rtc.conf"
 )
 

@@ -358,12 +358,13 @@ func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
 		if err != nil {
 			continue
 		}
-		if s.engine.RouteDecision(target) == ActionDirect {
+		act, resolvedTarget, _ := s.engine.DecideSmartRoute(target, target)
+		if act == ActionDirect {
 			pc, err := ensureDirectUDP()
 			if err != nil {
 				continue
 			}
-			uaDst, err := net.ResolveUDPAddr("udp", target)
+			uaDst, err := net.ResolveUDPAddr("udp", resolvedTarget)
 			if err != nil {
 				continue
 			}

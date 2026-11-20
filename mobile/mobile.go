@@ -20,6 +20,9 @@ import (
 	"ghostframe/internal/netbind"
 )
 
+// Version is the mobile runtime identifier (overridable via -ldflags -X).
+var Version = "v4.0.20-LTS"
+
 const (
 	defaultSocksPort = 10808
 	defaultHTTPPort  = 10809
@@ -27,14 +30,15 @@ const (
 )
 
 type mobileStartConfig struct {
-	LinkURI      string `json:"link_uri"`
-	SocksPort    int    `json:"socks_port"`
-	HTTPPort     int    `json:"http_port"`
-	RouteMode    string `json:"route_mode"`
-	Transport    string `json:"transport,omitempty"`
-	UpMbps       *int   `json:"up_mbps,omitempty"`
-	DownMbps     *int   `json:"down_mbps,omitempty"`
-	AsyncConnect bool   `json:"async_connect,omitempty"`
+	LinkURI      string   `json:"link_uri"`
+	SocksPort    int      `json:"socks_port"`
+	HTTPPort     int      `json:"http_port"`
+	RouteMode    string   `json:"route_mode"`
+	Transport    string   `json:"transport,omitempty"`
+	UpMbps       *int     `json:"up_mbps,omitempty"`
+	DownMbps     *int     `json:"down_mbps,omitempty"`
+	AsyncConnect bool     `json:"async_connect,omitempty"`
+	CustomRules  []string `json:"custom_rules,omitempty"`
 }
 
 type parsedLinkInfo struct {
@@ -230,6 +234,11 @@ func StartEngine(configJSON string) error {
 		eng.Close()
 		return fmt.Errorf("mobile: invalid route_mode: %w", err)
 	}
+	if cfg.CustomRules != nil {
+		if err := eng.SetCustomRules(cfg.CustomRules); err != nil {
+			eng.Logf("[Mobile] apply custom rules warning: %v", err)
+		}
+	}
 	if err := eng.SetLink(link); err != nil {
 		eng.Close()
 		return fmt.Errorf("mobile: apply link failed: %w", err)
@@ -390,7 +399,7 @@ func GetStatusJSON() string {
 		logs = allLogs
 	} else {
 		status = map[string]any{
-			"version":          "v4.0.0-LTS",
+			"version":          Version,
 			"state":            string(client.StateDisconnected),
 			"last_err":         cachedErr,
 			"active_transport": "",
@@ -427,7 +436,7 @@ func GetStatusJSON() string {
 
 	b, err := json.Marshal(status)
 	if err != nil {
-		return `{"version":"v4.0.0-LTS","state":"error","last_err":"status marshal failed"}`
+		return fmt.Sprintf(`{"version":%q,"state":"error","last_err":"status marshal failed"}`, Version)
 	}
 	return string(b)
 }
@@ -450,7 +459,8 @@ func GetDiagnosticSnapshot() string {
 		phys = netbind.PreferredInterface()
 	}
 	return fmt.Sprintf(
-		"GhostFrame Mobile Diagnostic (v4.0.0-LTS)\nState: disconnected\nTunnelExtension: %v\nLowMemMode: %v\nPhysicalInterface: %s\nMemAllocMB: %.2f\nMemSysMB: %.2f\n",
+		"GhostFrame Mobile Diagnostic (%s)\nState: disconnected\nTunnelExtension: %v\nLowMemMode: %v\nPhysicalInterface: %s\nMemAllocMB: %.2f\nMemSysMB: %.2f\n",
+		Version,
 		isTunnel,
 		gft.IsLowMemMode(),
 		phys,

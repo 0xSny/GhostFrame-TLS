@@ -216,6 +216,14 @@ textarea{min-height:74px;resize:vertical;font-family:ui-monospace,SFMono-Regular
 
       <div class="card">
         <h3>
+          <span>最近分流明细 (Connection Inspector)</span>
+          <span style="font-size:11px;color:var(--muted)">点击一键改直连 / 改代理</span>
+        </h3>
+        <div class="logs" id="recentRoutesBox" style="height:175px"></div>
+      </div>
+
+      <div class="card">
+        <h3>
           <span>旁路由运行日志</span>
           <button class="btn sm" onclick="clearLogs()">清空</button>
         </h3>
@@ -366,6 +374,20 @@ function resolveConflicts(){
 function clearLogs(){
   api('/api/logs/clear',{method:'POST'}).then(refresh);
 }
+function quickAddRule(host, action){
+  api('/api/rules/quick',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({host, action})
+  }).then(d => {
+    if(d && d.ok){
+      formDirty = false;
+      refresh();
+    } else if(d && d.error){
+      alert(d.error);
+    }
+  });
+}
 function runDualTest(){
   const btn = document.getElementById('probeBtn');
   btn.disabled = true; btn.textContent = '探测中...';
@@ -455,6 +477,28 @@ function refresh(){
       </div>`).join('');
 
     drawSpark(s.history || []);
+    const rb = document.getElementById('recentRoutesBox');
+    if (rb) {
+      const rr = s.recent_routes || [];
+      rb.innerHTML = rr.length === 0 ? '<div style="color:var(--muted)">暂无分流连接记录</div>' :
+        rr.slice(0, 40).map(it => {
+          const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+          const jsHost = String(it.host||'').replace(/[^a-zA-Z0-9.:_-]/g,'');
+          const actCls = it.action==='DIRECT' ? 'c-green' : (it.action==='REJECT' ? 'c-rose' : 'c-cyan');
+          const btnHtml = jsHost ? (it.action==='DIRECT'
+            ? `<button class="btn sm" style="padding:2px 6px;font-size:10px" onclick="quickAddRule('${jsHost}','PROXY')">改代理</button>`
+            : `<button class="btn sm" style="padding:2px 6px;font-size:10px" onclick="quickAddRule('${jsHost}','DIRECT')">改直连</button>`) : '';
+          return `<div style="display:flex;align-items:center;justify-content:space-between;gap:6px;padding:3px 0;border-bottom:1px solid rgba(37,51,78,.45)">
+            <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+              <span style="color:#64748b">${esc(it.time)}</span>
+              <span class="${actCls}" style="font-weight:700;margin:0 4px">${esc(it.action)}</span>
+              <span>${esc(it.target)}</span>
+              <span style="color:var(--muted);font-size:11px">[${esc(it.reason)}]</span>
+            </div>
+            <div style="flex:0 0 auto">${btnHtml}</div>
+          </div>`;
+        }).join('');
+    }
     const lb = document.getElementById('logsBox');
     const atBottom = lb.scrollHeight - lb.scrollTop - lb.clientHeight < 30;
     lb.innerHTML = (s.logs || []).map(l => `<div><span style="color:#64748b">${l.time}</span> ${String(l.message).replace(/</g,'&lt;')}</div>`).join('');

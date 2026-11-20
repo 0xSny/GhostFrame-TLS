@@ -47,6 +47,7 @@ type ipRange struct {
 // Router classifies destinations without triggering local DNS lookups for domains.
 type Router struct {
 	cnRanges        []ipRange
+	cnIPv6          []ipv6Range
 	lanSuffixMap    map[string]string
 	proxySuffixMap  map[string]string
 	directSuffixMap map[string]string
@@ -120,6 +121,7 @@ func NewRouter() *Router {
 
 	return &Router{
 		cnRanges:        merged,
+		cnIPv6:          appendBuiltinCNIPv6Ranges(nil),
 		lanSuffixMap:    lanMap,
 		proxySuffixMap:  proxyMap,
 		directSuffixMap: directMap,
@@ -143,7 +145,7 @@ func (r *Router) Stats() RuleStats {
 	return RuleStats{
 		Version:        BuiltinRuleSetVersion,
 		BuiltinDomains: len(r.proxySuffixMap) + len(r.directSuffixMap),
-		BuiltinCIDRs:   len(r.cnRanges) + len(cnIPv6CIDRs),
+		BuiltinCIDRs:   len(r.cnRanges) + len(r.cnIPv6),
 		CustomRules:    customN,
 		DirectHits:     r.directHits.Load(),
 		ProxyHits:      r.proxyHits.Load(),
@@ -159,19 +161,27 @@ func (r *Router) isDirectIPv4(ip4 net.IP) bool {
 	return idx < len(r.cnRanges) && r.cnRanges[idx].lo <= v
 }
 
-var cnIPv6CIDRs = func() []*net.IPNet {
-	list := []string{
-		"::1/128", "fc00::/7", "fe80::/10",
-		"2408::/20", "2409::/20", "240e::/20", "2400:3200::/32", "2402:4e00::/32", "2001:da8::/32", "2001:250::/32",
+// IsDirectIPv4 reports whether ip4 belongs to LAN or Mainland China IPv4 ranges.
+func (r *Router) IsDirectIPv4(ip4 net.IP) bool {
+	ip4 = ip4.To4()
+	if ip4 == nil {
+		return false
 	}
-	out := make([]*net.IPNet, 0, len(list))
-	for _, s := range list {
-		if _, n, err := net.ParseCIDR(s); err == nil {
-			out = append(out, n)
+	return r.isDirectIPv4(ip4)
+}
+
+func (r *Router) isDirectIPv6(ip net.IP) bool {
+	ip16 := ip.To16()
+	if ip16 == nil || ip.To4() != nil {
+		return false
+	}
+	for _, n := range r.cnIPv6 {
+		if n.contains(ip16) {
+			return true
 		}
 	}
-	return out
-}()
+	return false
+}
 
 func lookupSuffixMap(hostLower string, m map[string]string) (string, bool) {
 	if hostLower == "" {
@@ -235,7 +245,8 @@ func (r *Router) matchCustomRule(hostLower string, ip net.IP) (CustomRule, bool)
 	return CustomRule{}, false
 }
 
-func (r *Router) recordDecision(act RouteAction, reason string) (RouteAction, string) {
+// RecordDecision increments rule hit counters and returns (act, reason).
+func (r *Router) RecordDecision(act RouteAction, reason string) (RouteAction, string) {
 	switch act {
 	case ActionDirect:
 		r.directHits.Add(1)
@@ -256,6 +267,13 @@ func (r *Router) Decide(mode RouteMode, hostport string) RouteAction {
 // DecideWithReason evaluates destination hostport under mode and returns (action, ruleTag)
 // with zero heap allocations on suffix lookups and zero local DNS leaks.
 func (r *Router) DecideWithReason(mode RouteMode, hostport string) (RouteAction, string) {
+	act, reason, _ := r.evaluateStatic(mode, hostport)
+	return r.RecordDecision(act, reason)
+}
+
+// evaluateStatic checks all built-in and custom rules without mutating hit counters.
+// unknownDomain is true only when RouteRule receives a non-IP hostname that matches no built-in or custom rule.
+func (r *Router) evaluateStatic(mode RouteMode, hostport string) (act RouteAction, reason string, unknownDomain bool) {
 	host, _, err := net.SplitHostPort(hostport)
 	if err != nil {
 		host = hostport
@@ -265,58 +283,56 @@ func (r *Router) DecideWithReason(mode RouteMode, hostport string) (RouteAction,
 
 	// Internal management domain ALWAYS goes through the GhostFrame tunnel.
 	if hostLower == "gft.internal.panel" {
-		return r.recordDecision(ActionProxy, "internal:panel")
+		return ActionProxy, "internal:panel", false
 	}
 
 	switch mode {
 	case RouteCore, RouteDirect, RouteGlobal:
 		// Keep loopback direct so local GUI/apps never loop into VPS; everything else uses tunnel.
 		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-			return r.recordDecision(ActionDirect, "lan")
+			return ActionDirect, "lan", false
 		}
 		if hostLower == "localhost" {
-			return r.recordDecision(ActionDirect, "lan")
+			return ActionDirect, "lan", false
 		}
-		return r.recordDecision(ActionProxy, "mode:global")
+		return ActionProxy, "mode:global", false
 
 	default: // RouteRule
 		ip := net.ParseIP(host)
 		if rule, ok := r.matchCustomRule(hostLower, ip); ok {
-			return r.recordDecision(rule.Action, rule.Tag)
+			return rule.Action, rule.Tag, false
 		}
 
 		if ip != nil {
 			if isLANIP(ip) {
-				return r.recordDecision(ActionDirect, "lan")
+				return ActionDirect, "lan", false
 			}
 			if ip4 := ip.To4(); ip4 != nil {
 				if r.isDirectIPv4(ip4) {
-					return r.recordDecision(ActionDirect, "geoip:cn")
+					return ActionDirect, "geoip:cn", false
 				}
-				return r.recordDecision(ActionProxy, "geoip:overseas")
+				return ActionProxy, "geoip:overseas", false
 			}
-			for _, n := range cnIPv6CIDRs {
-				if n.Contains(ip) {
-					return r.recordDecision(ActionDirect, "geoip:cn")
-				}
+			if r.isDirectIPv6(ip) {
+				return ActionDirect, "geoip:cn", false
 			}
-			return r.recordDecision(ActionProxy, "geoip:overseas")
+			return ActionProxy, "geoip:overseas", false
 		}
 
 		if tag, ok := lookupSuffixMap(hostLower, r.lanSuffixMap); ok {
-			return r.recordDecision(ActionDirect, tag)
+			return ActionDirect, tag, false
 		}
 		// Evaluate curated Proxy RuleSet BEFORE CN/GeoIP so overseas services never leak direct.
 		if tag, ok := lookupSuffixMap(hostLower, r.proxySuffixMap); ok {
-			return r.recordDecision(ActionProxy, tag)
+			return ActionProxy, tag, false
 		}
 		if tag, ok := lookupSuffixMap(hostLower, r.directSuffixMap); ok {
-			return r.recordDecision(ActionDirect, tag)
+			return ActionDirect, tag, false
 		}
 		if strings.HasSuffix(hostLower, ".cn") {
-			return r.recordDecision(ActionDirect, "direct:cn")
+			return ActionDirect, "direct:cn", false
 		}
-		// Never do local DNS lookup on overseas/unknown domains! Send raw hostname via tunnel.
-		return r.recordDecision(ActionProxy, "final:proxy")
+		// Unknown hostname: caller may run 350ms CN DNS GeoIP probe or fall back directly to proxy.
+		return ActionProxy, "final:proxy", true
 	}
 }

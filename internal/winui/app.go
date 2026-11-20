@@ -194,7 +194,7 @@ func Run(eng *client.Engine) error {
 	}
 	_ = sysDPI
 
-	titlePtr := utf16Ptr("GhostFrame-Pro v4.0.1-LTS")
+	titlePtr := utf16Ptr("GhostFrame-Pro " + client.Version)
 	hwnd, _, err := pCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(clsPtr)),
