@@ -93,4 +93,24 @@ enum GhostMobileBridge {
     static func buildBypassRule(serverHost: String) -> String {
         MobileBuildBypassRule(serverHost)
     }
+
+    static func startTUN(writer: MobileTunPacketWriterProtocol, mtu: Int = 1400) -> Result<Void, Error> {
+        let raw = MobileStartTUNJSON(writer, mtu)
+        guard let data = raw.data(using: .utf8),
+              let env = try? JSONDecoder().decode(MobileActionEnvelope.self, from: data) else {
+            return .failure(GhostBridgeError(message: "Unable to decode Go TUN start response"))
+        }
+        if env.ok {
+            return .success(())
+        }
+        return .failure(GhostBridgeError(message: env.error ?? "TUN stack failed to start"))
+    }
+
+    static func stopTUN() {
+        _ = MobileStopTUNJSON()
+    }
+
+    static func pushTunPacket(_ packet: Data) {
+        MobilePushTunPacket(packet)
+    }
 }
