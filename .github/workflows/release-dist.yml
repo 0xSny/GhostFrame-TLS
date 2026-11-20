@@ -210,7 +210,7 @@ jobs:
           TARGET_REPO="$SOURCE_REPO"
           HAS_DIST="false"
           if [ -n "${DIST_PUSH_TOKEN}" ]; then
-            TARGET_REPO="Spittingjiu/GhostFrame-Dist"
+            TARGET_REPO="Spittingjiu/Ghost"
             HAS_DIST="true"
           fi
           echo "TARGET_REPO=$TARGET_REPO" >> "$GITHUB_ENV"
@@ -285,17 +285,17 @@ jobs:
           path: release-out/*
           if-no-files-found: error
 
-      - name: Publish Pure-Binary Release to Spittingjiu/GhostFrame-Dist (if DIST_PUSH_TOKEN configured)
+      - name: Publish Pure-Binary Release to Spittingjiu/Ghost (if DIST_PUSH_TOKEN configured)
         if: steps.prep.outputs.has_dist_token == 'true'
         env:
           GH_TOKEN: ${{ secrets.DIST_PUSH_TOKEN }}
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" --repo Spittingjiu/GhostFrame-Dist >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release-out/* --clobber --repo Spittingjiu/GhostFrame-Dist
+          if gh release view "$RELEASE_TAG" --repo Spittingjiu/Ghost >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-out/* --clobber --repo Spittingjiu/Ghost
           else
             gh release create "$RELEASE_TAG" release-out/* \
-              --repo Spittingjiu/GhostFrame-Dist \
+              --repo Spittingjiu/Ghost \
               --title "GhostFrame ${RELEASE_TAG} (All Platforms)" \
               --notes "Automated pure-binary multi-platform release (${RELEASE_TAG}). Includes Linux Server/Core, Windows Client, iStoreOS 0Ghost, Dual iOS IPAs, OmniSign source.json, and sha256 checksums."
           fi

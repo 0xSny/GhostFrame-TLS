@@ -4,7 +4,7 @@ set -eu
 # 0Ghost (GhostFrame iStoreOS / OpenWrt arm64 Side-Router) One-Line Binary Installer
 # Downloads prebuilt pure-binary bundle from public distribution repo (no source code required).
 
-DIST_REPO="${DIST_REPO:-Spittingjiu/GhostFrame-Dist}"
+DIST_REPO="${DIST_REPO:-Spittingjiu/Ghost}"
 TAG="${1:-latest}"
 MIRROR_PREFIX="${MIRROR_PREFIX:-}"
 TMP_DIR="$(mktemp -d /tmp/0ghost-inst.XXXXXX)"

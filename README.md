@@ -142,7 +142,7 @@ All workflows under `.github/workflows/` use strict `paths` filters so platform 
 - `build-client.yml` — Windows GUI client (`GhostFrame-Pro.exe`) build, tracked-secret audit, and zero-`gvisor` check.
 - `build-0ghost.yml` — `0ghost` (`arm64` / `amd64`) and offline `0ghost-istoreos-arm64.tar.gz` (`luci-app-0ghost`) packaging.
 - `ios-dual-ipa.yml` — `macos-15` GoMobile + XcodeGen builds for `GhostFrame-VPN-Unsigned.ipa` and `GhostFrame-Companion-Unsigned.ipa`.
-- `release-dist.yml` — On `v*` tags or manual `workflow_dispatch`, builds all platform binaries, `install.sh`, `install-0ghost.sh`, `checksums.txt`, and `source.json`. When `secrets.DIST_PUSH_TOKEN` is configured, assets are automatically published to `Spittingjiu/GhostFrame-Dist` Releases without exposing source code.
+- `release-dist.yml` — On `v*` tags or manual `workflow_dispatch`, builds all platform binaries, `install.sh`, `install-0ghost.sh`, `checksums.txt`, and `source.json`. When `secrets.DIST_PUSH_TOKEN` is configured, assets are automatically published to `Spittingjiu/Ghost` Releases without exposing source code.
 
 See [docs/architecture.md](docs/architecture.md) and [docs/deployment.md](docs/deployment.md) for deeper protocol details.
 
