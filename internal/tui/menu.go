@@ -3,10 +3,7 @@ package tui
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -82,11 +79,11 @@ func (c *Controller) pause(sc *bufio.Scanner) {
 	sc.Scan()
 }
 
-// RenderDashboard builds the boxed status & 0-11 menu frame with exact column alignment.
+// RenderDashboard builds the boxed status & 0-12 menu frame with exact column alignment.
 func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState string, snap server.RuntimeSnapshot, sniRTT time.Duration) string {
 	b := c.Box
 	var sb strings.Builder
-	sb.WriteString(b.Top("GhostFrame-RTC (GFT) v4.0.0-LTS Apex 交互控制中心") + "\n")
+	sb.WriteString(b.Top(fmt.Sprintf("GhostFrame-RTC (GFT) %s Apex 交互控制中心", CurrentVersion)) + "\n")
 
 	svcBadge := b.c("\x1b[31m", "[○] 已停止")
 	if active {
@@ -119,9 +116,10 @@ func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState s
 		"[1] 查看多端连接配置与终端二维码        [7] 威胁感知审计与探测 IP 封禁",
 		"[2] 更换伪装域名 (SNI) 与回落策略       [8] 服务启停与实时彩色滚动日志",
 		"[3] 修改监听端口与双栈通道开关          [9] 网络环境自检与内核加速调优",
-		"[4] 配置 UDP 动态端口跳跃 (PortHop)     [10] 在线热更新与配置备份恢复",
-		"[5] 轮换密钥、SPKI 证书与管理凭据       [11] 彻底卸载 GFT 服务端",
-		"[6] 调整流量整形与硬件性能档位          [0] 退出控制面板",
+		"[4] 配置 UDP 动态端口跳跃 (PortHop)     [10] 一键升级服务端 (OTA 热更新)",
+		"[5] 轮换密钥、SPKI 证书与管理凭据       [11] 配置备份与灾难恢复",
+		"[6] 调整流量整形与硬件性能档位          [12] 彻底卸载 GFT 服务端",
+		"[0] 退出控制面板",
 	}
 	for _, it := range items {
 		sb.WriteString(b.Line(it) + "\n")
@@ -146,7 +144,7 @@ func ShowDeliveryCard(cfgPath string, out io.Writer) error {
 	qr, qerr := RenderTerminalQR(uri, c.Box.UTF8)
 
 	b := c.Box
-	c.printf("%s\n", b.Top("GhostFrame-RTC (GFT) v4.0.0-LTS 多端部署交付卡"))
+	c.printf("%s\n", b.Top(fmt.Sprintf("GhostFrame-RTC (GFT) %s 多端部署交付卡", CurrentVersion)))
 	c.printf("%s\n", b.Line(fmt.Sprintf("节点地址: %s:%d   SNI: %s   Hop: %s   Smart-Brutal: ↑%d/↓%d Mbps",
 		cfg.PublicHost, ConfigListenPort(cfg.Listen), cfg.SNI, nonEmpty(cfg.HopRange, "未开启"), cfg.UpMbps, cfg.DownMbps)))
 	c.printf("%s\n", b.Bottom())
@@ -182,7 +180,7 @@ func (c *Controller) Run() error {
 
 		c.printf("\x1b[2J\x1b[H")
 		c.printf("%s", c.RenderDashboard(cfg, active, bbr, snap, sniRTT))
-		choice := c.prompt(sc, "请输入操作编号 [0-11]:")
+		choice := c.prompt(sc, "请输入操作编号 [0-12]:")
 
 		switch choice {
 		case "0", "q", "exit":
@@ -207,14 +205,16 @@ func (c *Controller) Run() error {
 			c.handleServiceAndLogsMenu(sc)
 		case "9":
 			c.handleSelfCheckMenu(sc, cfg)
-		case "10":
-			c.handleUpdateAndBackupMenu(sc, cfg)
+		case "10", "u", "upgrade":
+			c.handleOneClickUpgradeMenu(sc)
 		case "11":
+			c.handleBackupRestoreMenu(sc, cfg)
+		case "12":
 			if c.handleUninstallMenu(sc) {
 				return nil
 			}
 		default:
-			c.warnMsg("无效输入，请选择 0-11。")
+			c.warnMsg("无效输入，请选择 0-12。")
 			time.Sleep(800 * time.Millisecond)
 		}
 	}
@@ -656,19 +656,87 @@ func (c *Controller) handleSelfCheckMenu(sc *bufio.Scanner, cfg *server.Config) 
 	c.pause(sc)
 }
 
-func (c *Controller) handleUpdateAndBackupMenu(sc *bufio.Scanner, cfg *server.Config) {
-	c.printf("\n--- 在线更新与配置备份 ---\n")
-	c.printf("  [1] 检查 GitHub Release 并校验 SHA-256 热更新 gft-server\n")
-	c.printf("  [2] 备份 /etc/gft 至 /root/gft-backup-%s.tar.gz\n", time.Now().Format("20060102"))
-	c.printf("  [3] 从 .tar.gz 备份包恢复配置\n")
+func (c *Controller) handleOneClickUpgradeMenu(sc *bufio.Scanner) {
+	c.printf("\n--- 一键升级 GhostFrame 服务端 (OTA 热更新) ---\n")
+	c.printf("  当前版本: %s  |  目标架构: linux/%s\n", CurrentVersion, runtime.GOARCH)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	rel, err := CheckLatestRelease(ctx, UpgradeOptions{})
+	cancel()
+	if err != nil {
+		c.warnMsg(fmt.Sprintf("直连检测最新版本失败 (%v)，可尝试使用国内镜像加速 [m]。", err))
+	} else if strings.EqualFold(normalizeVersionTag(rel.TagName), normalizeVersionTag(CurrentVersion)) {
+		c.okMsg(fmt.Sprintf("远端最新版本: %s (与当前版本一致)", rel.TagName))
+	} else {
+		c.printf("  发现新版本: %s (资源: %s)\n", c.Box.c("\x1b[32m", rel.TagName), rel.AssetName)
+	}
+
+	action := strings.ToLower(strings.TrimSpace(c.prompt(sc, "操作 [直接回车=一键升级最新 / m=国内镜像加速 / v=指定版本 / f=强制重装 / 0=返回]:")))
+	var opts UpgradeOptions
+	switch action {
+	case "0", "q", "exit":
+		return
+	case "", "y", "1":
+		opts = UpgradeOptions{TargetVersion: "latest"}
+	case "m":
+		mirror := strings.TrimSpace(c.prompt(sc, "请输入 GitHub 加速镜像前缀 (默认 https://ghfast.top):"))
+		if mirror == "" {
+			mirror = "https://ghfast.top"
+		}
+		opts = UpgradeOptions{TargetVersion: "latest", MirrorPrefix: mirror, Force: true}
+	case "v":
+		tag := strings.TrimSpace(c.prompt(sc, fmt.Sprintf("请输入目标版本标签 (例 %s):", CurrentVersion)))
+		if tag == "" {
+			return
+		}
+		opts = UpgradeOptions{TargetVersion: tag, Force: true}
+	case "f":
+		opts = UpgradeOptions{TargetVersion: "latest", Force: true}
+	default:
+		c.warnMsg("未识别的操作指令。")
+		c.pause(sc)
+		return
+	}
+
+	res, err := c.PerformOTAUpgrade(opts)
+	if err != nil {
+		c.errMsg("升级失败: " + err.Error())
+		c.pause(sc)
+		return
+	}
+	if res.AlreadyLatest {
+		c.okMsg(fmt.Sprintf("当前已是最新版本 (%s)", res.ToVersion))
+		if strings.EqualFold(c.prompt(sc, "是否强制重新下载覆盖安装? [y/N]:"), "y") {
+			opts.Force = true
+			res, err = c.PerformOTAUpgrade(opts)
+			if err != nil {
+				c.errMsg("重装失败: " + err.Error())
+				c.pause(sc)
+				return
+			}
+		} else {
+			c.pause(sc)
+			return
+		}
+	}
+
+	c.okMsg(fmt.Sprintf("服务端已无缝升级: %s -> %s", res.FromVersion, res.ToVersion))
+	c.printf("  SHA-256 : %s\n", res.SHA256)
+	if res.BackupPath != "" {
+		c.printf("  旧版备份: %s\n", res.BackupPath)
+	}
+	c.printf("  配置与客户端链接 (/etc/gft/server.json) 保持 100%% 不变。\n")
+	c.printf("  提示: 重新输入 `gft` 即可进入新版控制面板。\n")
+	c.pause(sc)
+}
+
+func (c *Controller) handleBackupRestoreMenu(sc *bufio.Scanner, cfg *server.Config) {
+	c.printf("\n--- 配置备份与灾难恢复 ---\n")
+	c.printf("  [1] 备份 /etc/gft 至 /root/gft-backup-%s.tar.gz\n", time.Now().Format("20060102"))
+	c.printf("  [2] 从 .tar.gz 备份包恢复配置\n")
+	c.printf("  [0] 返回\n")
 	switch c.prompt(sc, "请选择:") {
 	case "1":
-		if err := c.performOTAUpdate(); err != nil {
-			c.errMsg("更新失败: " + err.Error())
-		} else {
-			c.okMsg("已校验 SHA-256 并热更新至最新版！")
-		}
-	case "2":
 		dst := fmt.Sprintf("/root/gft-backup-%s.tar.gz", time.Now().Format("20060102"))
 		out, err := exec.Command("tar", "-czf", dst, "-C", filepath.Dir(c.CfgPath), ".").CombinedOutput()
 		if err != nil {
@@ -676,7 +744,7 @@ func (c *Controller) handleUpdateAndBackupMenu(sc *bufio.Scanner, cfg *server.Co
 		} else {
 			c.okMsg("备份完成: " + dst)
 		}
-	case "3":
+	case "2":
 		src := c.prompt(sc, "请输入备份文件路径:")
 		if src == "" {
 			return
@@ -692,75 +760,6 @@ func (c *Controller) handleUpdateAndBackupMenu(sc *bufio.Scanner, cfg *server.Co
 	}
 	_ = cfg
 	c.pause(sc)
-}
-
-func (c *Controller) performOTAUpdate() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/"+ReleaseRepo+"/releases/latest", nil)
-	req.Header.Set("User-Agent", "GhostFrame-Updater/3.4.1")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("release API HTTP %d", resp.StatusCode)
-	}
-	var rel struct {
-		TagName string `json:"tag_name"`
-		Assets  []struct {
-			Name string `json:"name"`
-			URL  string `json:"browser_download_url"`
-		} `json:"assets"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return err
-	}
-	assetName := fmt.Sprintf("gft-server-linux-%s", runtime.GOARCH)
-	var binURL, sumURL string
-	for _, a := range rel.Assets {
-		if a.Name == assetName {
-			binURL = a.URL
-		} else if a.Name == "checksums.txt" {
-			sumURL = a.URL
-		}
-	}
-	if binURL == "" || sumURL == "" {
-		return fmt.Errorf("release %s missing %s or checksums.txt", rel.TagName, assetName)
-	}
-
-	c.printf("发现版本 %s，正在下载 %s 并校验 SHA-256...\n", rel.TagName, assetName)
-	sumBytes, err := httpGetBytes(sumURL)
-	if err != nil {
-		return err
-	}
-	wantHash := ""
-	for _, ln := range strings.Split(string(sumBytes), "\n") {
-		f := strings.Fields(ln)
-		if len(f) >= 2 && strings.TrimPrefix(f[1], "./") == assetName {
-			wantHash = strings.ToLower(f[0])
-			break
-		}
-	}
-	if wantHash == "" {
-		return errors.New("checksums.txt does not contain " + assetName)
-	}
-
-	binBytes, err := httpGetBytes(binURL)
-	if err != nil {
-		return err
-	}
-	gotSum := sha256.Sum256(binBytes)
-	if hex.EncodeToString(gotSum[:]) != wantHash {
-		return errors.New("SHA-256 verification failed, aborting replace")
-	}
-
-	target := "/opt/ghostframe/gft-server"
-	if err := server.WriteFileAtomic(target, binBytes, 0o755); err != nil {
-		return err
-	}
-	return c.Tx.RestartFn()
 }
 
 func (c *Controller) handleUninstallMenu(sc *bufio.Scanner) bool {
@@ -845,21 +844,6 @@ func checkHTTPClockDrift() (time.Duration, error) {
 		return 0, err
 	}
 	return time.Since(t), nil
-}
-
-func httpGetBytes(u string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("download %s: HTTP %d", u, resp.StatusCode)
-	}
-	return io.ReadAll(resp.Body)
 }
 
 func fmtBytes(b uint64) string {

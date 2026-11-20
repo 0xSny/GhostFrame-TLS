@@ -20,7 +20,7 @@ import (
 	"ghostframe/internal/tui"
 )
 
-const version = "v4.0.0-LTS"
+const version = tui.CurrentVersion
 
 func main() {
 	base := strings.TrimSuffix(filepath.Base(os.Args[0]), filepath.Ext(os.Args[0]))
@@ -30,13 +30,15 @@ func main() {
 	}
 
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: gft-server <run|init|link|menu|show-card|sni-test|version> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: gft-server <run|init|link|menu|upgrade|show-card|sni-test|version> [flags]")
 		os.Exit(2)
 	}
 
 	switch os.Args[1] {
 	case "menu":
 		runMenu(os.Args[2:])
+	case "upgrade":
+		runUpgrade(os.Args[2:])
 	case "init":
 		runInit(os.Args[2:])
 	case "link":
@@ -100,6 +102,31 @@ func runMenu(args []string) {
 		fmt.Fprintf(os.Stderr, "gft menu error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runUpgrade(args []string) {
+	fs := flag.NewFlagSet("upgrade", flag.ExitOnError)
+	ver := fs.String("version", "latest", "target release tag or 'latest'")
+	mirror := fs.String("mirror", os.Getenv("GFT_MIRROR"), "optional GitHub mirror/proxy URL prefix")
+	force := fs.Bool("force", false, "reinstall even if remote version matches current")
+	conf := fs.String("config", tui.DefaultConfigPath, "config file")
+	_ = fs.Parse(args)
+
+	ctrl := tui.NewController(*conf)
+	res, err := ctrl.PerformOTAUpgrade(tui.UpgradeOptions{
+		TargetVersion: *ver,
+		MirrorPrefix:  *mirror,
+		Force:         *force,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gft upgrade error: %v\n", err)
+		os.Exit(1)
+	}
+	if res.AlreadyLatest {
+		fmt.Printf("GhostFrame server is already up to date (%s).\n", res.ToVersion)
+		return
+	}
+	fmt.Printf("Upgraded GhostFrame server: %s -> %s (SHA-256: %s)\n", res.FromVersion, res.ToVersion, res.SHA256)
 }
 
 func runInit(args []string) {
