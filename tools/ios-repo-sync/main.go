@@ -374,18 +374,44 @@ func buildHTTPClient(proxyURL *url.URL) *http.Client {
 	}
 }
 
+func resolveGitBinary() string {
+	if p, err := exec.LookPath("git"); err == nil {
+		return p
+	}
+	candidates := []string{
+		`C:\Program Files\Git\cmd\git.exe`,
+		`C:\Program Files\Git\bin\git.exe`,
+		`C:\Program Files (x86)\Git\cmd\git.exe`,
+	}
+	if localApp := strings.TrimSpace(os.Getenv("LOCALAPPDATA")); localApp != "" {
+		candidates = append(candidates, filepath.Join(localApp, "Programs", "Git", "cmd", "git.exe"))
+	}
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return "git"
+}
+
 func resolveGitHubToken() string {
 	for _, k := range []string{"GH_TOKEN", "GITHUB_TOKEN"} {
 		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
 			return v
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "credential", "fill")
+	cmd := exec.CommandContext(ctx, resolveGitBinary(), "credential", "fill")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
 	cmd.Stdin = strings.NewReader("protocol=https\nhost=github.com\n\n")
 	out, err := cmd.Output()
 	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			fmt.Fprintf(os.Stderr, "[WARN] git credential fill failed: %v (%s)\n", err, strings.TrimSpace(string(ee.Stderr)))
+		} else {
+			fmt.Fprintf(os.Stderr, "[WARN] git credential fill failed: %v\n", err)
+		}
 		return ""
 	}
 	for _, ln := range strings.Split(strings.ReplaceAll(string(out), "\r\n", "\n"), "\n") {
