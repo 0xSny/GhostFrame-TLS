@@ -79,6 +79,7 @@ type Engine struct {
 	httpSrv         *HTTPProxyServer
 	sysProxyApplied bool
 	proxyDrifted    atomic.Bool
+	directDNSBypass atomic.Bool
 
 	// Stats
 	prevUp     uint64
@@ -595,6 +596,34 @@ func (e *Engine) OpenTargetStream(target string, first []byte) (gft.DataStream, 
 
 var errRouteRejected = errors.New("connection blocked by custom REJECT rule")
 
+// SetDirectDNSBypass enables direct public CN DNS resolution (223.5.5.5 / 119.29.29.29)
+// for ActionDirect connections so TUN Fake-IP system DNS (198.18.0.1) never causes self-resolution loops.
+func (e *Engine) SetDirectDNSBypass(enabled bool) {
+	e.directDNSBypass.Store(enabled)
+}
+
+// DirectDialer returns a net.Dialer bound to the physical interface and, when TUN Fake-IP DNS is active,
+// configured with a direct CN DNS resolver bypassing the TUN virtual DNS server.
+func (e *Engine) DirectDialer(timeout time.Duration) net.Dialer {
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	d := net.Dialer{Timeout: timeout, Control: netbind.Control}
+	if e.directDNSBypass.Load() {
+		d.Resolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				nd := net.Dialer{Timeout: 3 * time.Second, Control: netbind.Control}
+				if c, err := nd.DialContext(ctx, "udp", "223.5.5.5:53"); err == nil {
+					return c, nil
+				}
+				return nd.DialContext(ctx, "udp", "119.29.29.29:53")
+			},
+		}
+	}
+	return d
+}
+
 // OpenTargetStreamWithRoute classifies routing using routeTarget (e.g. sniffed TLS SNI)
 // while opening the connection to dialTarget without local DNS resolution.
 func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first []byte) (gft.DataStream, RouteAction, error) {
@@ -612,7 +641,7 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 		return nil, ActionReject, errRouteRejected
 	}
 	if act == ActionDirect {
-		d := net.Dialer{Timeout: 8 * time.Second, Control: netbind.Control}
+		d := e.DirectDialer(8 * time.Second)
 		c, err := d.Dial("tcp", dialTarget)
 		if err != nil {
 			return nil, ActionDirect, err

@@ -164,6 +164,7 @@ func StartEngine(configJSON string) error {
 	mu.Unlock()
 
 	if oldEngine != nil {
+		StopTUN()
 		oldEngine.Close()
 	}
 
@@ -250,6 +251,8 @@ func StartEngineJSON(configJSON string) string {
 
 // StopEngine stops the active GhostFrame engine and reclaims Go heap pages back to iOS.
 func StopEngine() error {
+	StopTUN()
+
 	mu.Lock()
 	eng := engineInst
 	engineInst = nil
@@ -334,6 +337,12 @@ func GetStatusJSON() string {
 	status["physical_iface"] = physIface
 	status["mem_alloc_mb"] = float64(ms.Alloc) / (1024 * 1024)
 	status["mem_sys_mb"] = float64(ms.Sys) / (1024 * 1024)
+	if ts := currentTUNStats(); ts != nil {
+		status["tun_active"] = ts.Active
+		status["tun_stats"] = ts
+	} else {
+		status["tun_active"] = false
+	}
 	status["logs"] = logs
 
 	b, err := json.Marshal(status)

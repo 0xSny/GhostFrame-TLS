@@ -11,6 +11,7 @@ on:
       - "internal/gftrtc/**"
       - "internal/gft/**"
       - "internal/client/**"
+      - "internal/tunstack/**"
       - ".github/workflows/ios-dual-ipa.yml"
 
 jobs:
@@ -34,7 +35,7 @@ jobs:
       - name: Verify Darwin Go Core & Mobile Bridge
         run: |
           GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./internal/... ./mobile/...
-          CGO_ENABLED=0 go test -count=1 ./internal/netbind ./mobile
+          CGO_ENABLED=0 go test -count=1 ./internal/netbind ./internal/tunstack ./mobile
 
       - name: Build Shared GhostMobile.xcframework (gomobile)
         run: |
