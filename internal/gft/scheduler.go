@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -429,10 +430,14 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 
 		r2 := <-ch
 		if r2.err != nil {
-			if r1.kind == "rtc" {
-				return r1.err
+			rtcErr, tcpErr := r1.err, r2.err
+			if r1.kind == "tcp" {
+				tcpErr, rtcErr = r1.err, r2.err
 			}
-			return r2.err
+			if a.onLog != nil {
+				a.onLog("[Auto] Dual-track connect failed (rtc=%v | tcp=%v)", rtcErr, tcpErr)
+			}
+			return fmt.Errorf("rtc: %v; tcp: %v", rtcErr, tcpErr)
 		}
 		if r1.kind == "tcp" {
 			if a.onLog != nil {

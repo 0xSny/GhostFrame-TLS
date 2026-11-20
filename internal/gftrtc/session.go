@@ -139,6 +139,7 @@ func (c *closedIDSet) has(id uint32) bool {
 // 0ms XOR-FEC, Smart-Brutal CC, fragmented/fallback UDP, and 0ms socket migration (port hopping).
 type RTCSession struct {
 	isClient bool
+	legacyV3 bool
 	ssrc     uint32
 	clientID [8]byte
 	host     string
@@ -1096,12 +1097,14 @@ func (s *RTCSession) timerLoop() {
 			}
 			if now.After(nextRTCP) {
 				nextRTCP = now.Add(randomRTCPGap())
-				lastAct := s.lastSendNs.Load()
-				if r := s.lastRecvNs.Load(); r > lastAct {
-					lastAct = r
-				}
-				if now.Sub(time.Unix(0, lastAct)) < activeTrafficMaxIdle {
-					s.sendRTCPMimicPacket()
+				if !s.legacyV3 {
+					lastAct := s.lastSendNs.Load()
+					if r := s.lastRecvNs.Load(); r > lastAct {
+						lastAct = r
+					}
+					if now.Sub(time.Unix(0, lastAct)) < activeTrafficMaxIdle {
+						s.sendRTCPMimicPacket()
+					}
 				}
 			}
 
@@ -1141,7 +1144,7 @@ func (s *RTCSession) maintainKeys(now time.Time) {
 		s.pendingTXState = nil
 		s.pendingKeys = nil
 	}
-	if !s.rekeyInFlight && s.isClient {
+	if !s.legacyV3 && !s.rekeyInFlight && s.isClient {
 		bytesDelta := int64(0)
 		if totalTraffic > s.lastRekeyTotal {
 			bytesDelta = int64(totalTraffic - s.lastRekeyTotal)
@@ -2442,7 +2445,20 @@ func DialWithPacketConn(ctx context.Context, pc net.PacketConn, ownPC bool, radd
 	defer func() { _ = pc.SetReadDeadline(time.Time{}) }()
 
 	for attempt, wait := range retryWaits {
-		reqPkt, cliPriv, txID, err := BuildClientBindingReq(opts.PSK, opts.ClientID, rxMbps, 0, time.Now())
+		// Attempts 0, 1, 4 use v4.0 FastMAC tickets; attempts 2, 3 fallback to v3.4 tickets
+		// so clients seamlessly connect to un-upgraded v3.4 servers without degrading v4.0 servers.
+		useLegacyV3 := attempt == 2 || attempt == 3
+		var (
+			reqPkt  []byte
+			cliPriv *ecdh.PrivateKey
+			txID    [12]byte
+			err     error
+		)
+		if useLegacyV3 {
+			reqPkt, cliPriv, txID, err = BuildClientBindingReqLegacyV3(opts.PSK, opts.ClientID, rxMbps, 0, time.Now())
+		} else {
+			reqPkt, cliPriv, txID, err = BuildClientBindingReq(opts.PSK, opts.ClientID, rxMbps, 0, time.Now())
+		}
 		if err != nil {
 			return nil, 0, err
 		}
@@ -2478,6 +2494,7 @@ func DialWithPacketConn(ctx context.Context, pc net.PacketConn, ownPC bool, radd
 				pj = resp.ParamsJSON
 			}
 			sess := newRTCSession(true, resp.SessionSSRC, opts.ClientID, opts.Host, opts.Port, keys, opts.UpMbps, pj, nil)
+			sess.legacyV3 = useLegacyV3
 			sess.connMu.Lock()
 			sess.curConn = pc
 			sess.curOwn = ownPC

@@ -621,8 +621,18 @@ func randomICEUser() string {
 }
 
 // BuildClientBindingReq builds an RFC 5389 ICE-STUN Binding Request carrying an
-// encrypted ephemeral X25519 + PSK auth ticket inside attribute 0xC057.
+// encrypted ephemeral X25519 + PSK auth ticket with 16-byte FastMAC anti-DoS tag inside 0xC057.
 func BuildClientBindingReq(psk []byte, clientID [8]byte, maxRxMbps, flags uint16, now time.Time) ([]byte, *ecdh.PrivateKey, [12]byte, error) {
+	return buildClientBindingReqInternal(psk, clientID, maxRxMbps, flags, now, true)
+}
+
+// BuildClientBindingReqLegacyV3 builds the v3.4 ICE-STUN Binding Request (without trailing
+// 16-byte FastMAC in attribute 0xC057) for backward compatibility with un-upgraded v3.4 servers.
+func BuildClientBindingReqLegacyV3(psk []byte, clientID [8]byte, maxRxMbps, flags uint16, now time.Time) ([]byte, *ecdh.PrivateKey, [12]byte, error) {
+	return buildClientBindingReqInternal(psk, clientID, maxRxMbps, flags, now, false)
+}
+
+func buildClientBindingReqInternal(psk []byte, clientID [8]byte, maxRxMbps, flags uint16, now time.Time, includeFastMAC bool) ([]byte, *ecdh.PrivateKey, [12]byte, error) {
 	var txID [12]byte
 	if len(psk) < 16 {
 		return nil, nil, txID, errors.New("gftrtc: invalid psk length")
@@ -644,8 +654,11 @@ func BuildClientBindingReq(psk []byte, clientID [8]byte, maxRxMbps, flags uint16
 	if PrioritizeChaCha20() {
 		flags |= FlagPreferChaCha20
 	}
-	// Minimum 40..72B padding ensures the complete STUN Binding Request wire length >= 176B.
-	padLen := 40 + mrand.IntN(33)
+	padLen := 16 + mrand.IntN(33)
+	if includeFastMAC {
+		// Minimum 40..72B padding ensures the complete v4.0 STUN Binding Request wire length >= 176B.
+		padLen = 40 + mrand.IntN(33)
+	}
 	pt := make([]byte, 24+padLen)
 	copy(pt[0:4], stunTicketMagic)
 	binary.BigEndian.PutUint64(pt[4:12], uint64(now.Unix()))
@@ -655,13 +668,17 @@ func BuildClientBindingReq(psk []byte, clientID [8]byte, maxRxMbps, flags uint16
 	fillFastRandom(pt[24:])
 
 	ticketBodyLen := 32 + len(pt) + aead.Overhead()
-	ticket := make([]byte, ticketBodyLen+FastMACLen)
+	ticketLen := ticketBodyLen
+	if includeFastMAC {
+		ticketLen += FastMACLen
+	}
+	ticket := make([]byte, ticketLen)
 	copy(ticket, pub)
 	aead.Seal(ticket[:32], txID[:], pt, pub)
 
 	buf := make([]byte, 0, 288)
 	buf = binary.BigEndian.AppendUint16(buf, stunTypeBindingReq)
-	buf = binary.BigEndian.AppendUint16(buf, 0) // set below before FastMAC
+	buf = binary.BigEndian.AppendUint16(buf, 0)
 	buf = binary.BigEndian.AppendUint32(buf, stunMagicCookie)
 	buf = append(buf, txID[:]...)
 
@@ -676,13 +693,15 @@ func BuildClientBindingReq(psk []byte, clientID [8]byte, maxRxMbps, flags uint16
 	ticketValOff := len(buf) + 4
 	buf = appendSTUNAttr(buf, attrGFTTicket, ticket)
 
-	finalMsgLen := len(buf) + 8 - stunHeaderLen
-	binary.BigEndian.PutUint16(buf[2:4], uint16(finalMsgLen))
-	mac, ok := computeFastMACZeroAlloc(psk, buf[:stunHeaderLen], buf[ticketValOff:ticketValOff+ticketBodyLen])
-	if !ok {
-		return nil, nil, txID, errors.New("gftrtc: compute fastmac failed")
+	if includeFastMAC {
+		finalMsgLen := len(buf) + 8 - stunHeaderLen
+		binary.BigEndian.PutUint16(buf[2:4], uint16(finalMsgLen))
+		mac, ok := computeFastMACZeroAlloc(psk, buf[:stunHeaderLen], buf[ticketValOff:ticketValOff+ticketBodyLen])
+		if !ok {
+			return nil, nil, txID, errors.New("gftrtc: compute fastmac failed")
+		}
+		copy(buf[ticketValOff+ticketBodyLen:], mac[:])
 	}
-	copy(buf[ticketValOff+ticketBodyLen:], mac[:])
 
 	buf = finalizeSTUNWithFingerprint(buf)
 	return buf, priv, txID, nil

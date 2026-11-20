@@ -450,6 +450,10 @@ final class VPNManager: GhostBackend {
     }
 
     private func pollStatusOnce() {
+        if loggedHTTPTelemetry {
+            fetchStatusViaHTTP()
+            return
+        }
         sendIPC(action: "status", configJSON: nil) { [weak self] resp in
             if let resp = resp, resp.ok, let json = resp.payload {
                 let snapshot = GhostMobileBridge.decodeStatus(from: json)
@@ -461,21 +465,26 @@ final class VPNManager: GhostBackend {
             }
 
             Task { @MainActor in
+                self?.fetchStatusViaHTTP()
+            }
+        }
+    }
+
+    private func fetchStatusViaHTTP() {
+        fetchLoopbackHTTP(method: "GET", path: "/_gft/status", body: nil) { [weak self] data, err in
+            Task { @MainActor in
                 guard let self = self else { return }
-                self.fetchLoopbackHTTP(method: "GET", path: "/_gft/status", body: nil) { data, err in
-                    Task { @MainActor in
-                        if let data = data, let json = String(data: data, encoding: .utf8) {
-                            let snapshot = GhostMobileBridge.decodeStatus(from: json)
-                            self.telemetryChannel = "HTTP(127.0.0.1:\(self.currentHTTPPort))"
-                            if !self.loggedHTTPTelemetry {
-                                self.loggedHTTPTelemetry = true
-                                self.onLogMessage?("VPN telemetry: connected via 127.0.0.1:\(self.currentHTTPPort)/_gft/status")
-                            }
-                            self.onStatusUpdate?(snapshot)
-                        } else if let err = err {
-                            self.logIPCWarningThrottled("VPN HTTP fallback failed (:\(self.currentHTTPPort)): \(err.localizedDescription)")
-                        }
+                if let data = data, let json = String(data: data, encoding: .utf8) {
+                    let snapshot = GhostMobileBridge.decodeStatus(from: json)
+                    self.telemetryChannel = "HTTP(127.0.0.1:\(self.currentHTTPPort))"
+                    if !self.loggedHTTPTelemetry {
+                        self.loggedHTTPTelemetry = true
+                        self.onLogMessage?("VPN telemetry: connected via 127.0.0.1:\(self.currentHTTPPort)/_gft/status")
                     }
+                    self.onStatusUpdate?(snapshot)
+                } else if let err = err {
+                    self.loggedHTTPTelemetry = false
+                    self.logIPCWarningThrottled("VPN HTTP fallback failed (:\(self.currentHTTPPort)): \(err.localizedDescription)")
                 }
             }
         }

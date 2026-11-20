@@ -3,8 +3,10 @@ package gftrtc
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -707,4 +709,175 @@ func TestV4OnSACK8192WindowNoQuadraticCPU(t *testing.T) {
 		t.Fatalf("8192-bit OnSACK regression took %v (want < 250ms)", elapsed)
 	}
 	t.Logf("10000 pkts / 2000 full-8192 SACKs completed in %v", elapsed)
+}
+
+func TestDialLegacyV3Fallback(t *testing.T) {
+	psk := make([]byte, 32)
+	_, _ = rand.Read(psk)
+
+	// Part 1: Against a v4.0 Listener, attempt 0 connects cleanly with legacyV3=false.
+	swV4 := NewLossyUDPSwitch("127.0.0.1:443", 0, 0, 0, 2*time.Millisecond)
+	defer swV4.CloseAll()
+	lnV4, err := NewListener(swV4.srvConn, false, psk, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lnV4.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	go func() {
+		ss, aerr := lnV4.Accept(ctx)
+		if aerr == nil && ss != nil {
+			ss.SetHandlers(nil, nil, nil)
+		}
+	}()
+
+	cliV4, _, err := DialWithPacketConn(ctx, swV4.NewClientEnd(), true, swV4.srvAddr, DialOptions{
+		Host: "127.0.0.1", Port: 443, PSK: psk, Timeout: 4 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Dial against v4.0 Listener failed: %v", err)
+	}
+	if cliV4.legacyV3 {
+		t.Fatal("expected legacyV3=false when connecting to v4.0 server")
+	}
+	cliV4.Close()
+
+	// Part 2: Simulated v3.4 server (only accepts v3.4 tickets without trailing 16B FastMAC).
+	swV3 := NewLossyUDPSwitch("127.0.0.1:443", 0, 0, 0, 2*time.Millisecond)
+	defer swV3.CloseAll()
+
+	v3RejectedFastMAC := atomic.Int32{}
+	var srvSessMu sync.Mutex
+	var srvSess *RTCSession
+
+	go func() {
+		for {
+			bp := GetPktBuf()
+			n, raddr, rerr := swV3.srvConn.ReadFrom(*bp)
+			if rerr != nil {
+				PutPktBuf(bp)
+				return
+			}
+			raw := (*bp)[:n]
+			srvSessMu.Lock()
+			ss := srvSess
+			srvSessMu.Unlock()
+			if ss != nil && IsRTPPacket(raw) {
+				ss.enqueueInbound(inboundPkt{
+					buf:  bp,
+					n:    n,
+					addr: raddr,
+					at:   time.Now(),
+				})
+				continue
+			}
+			deferPut := bp
+
+			txID, attrs, ok := verifySTUNBaseAndFingerprint(raw, stunTypeBindingReq)
+			if !ok {
+				PutPktBuf(deferPut)
+				continue
+			}
+			ticket, ok := findSTUNAttr(attrs, attrGFTTicket)
+			if !ok || len(ticket) < 32 {
+				PutPktBuf(deferPut)
+				continue
+			}
+			pubBytes := append([]byte(nil), ticket[:32]...)
+			aead, err := hkdfAEADChaCha(psk, txID[:], "gftrtc-v1-c2s")
+			if err != nil {
+				PutPktBuf(deferPut)
+				continue
+			}
+			// Deliberately decrypt the full ticket (without stripping FastMAC), matching v3.4 server behavior:
+			// v4.0 FastMAC packets fail Poly1305 here and get silently dropped!
+			pt, err := aead.Open(nil, txID[:], ticket[32:], pubBytes)
+			wireLen := len(raw)
+			PutPktBuf(deferPut)
+			if err != nil || len(pt) < 24 || string(pt[0:4]) != stunTicketMagic {
+				v3RejectedFastMAC.Add(1)
+				continue
+			}
+			cliPub, err := ecdh.X25519().NewPublicKey(pubBytes)
+			if err != nil {
+				continue
+			}
+			req := &ParsedClientReq{
+				TxID:         txID,
+				ClientPub:    cliPub,
+				ClientRxMbps: binary.BigEndian.Uint16(pt[20:22]),
+				ClientFlags:  binary.BigEndian.Uint16(pt[22:24]),
+				WireLen:      wireLen,
+			}
+			copy(req.ClientID[:], pt[12:20])
+
+			var ssrcBytes [4]byte
+			_, _ = rand.Read(ssrcBytes[:])
+			ssrc := binary.BigEndian.Uint32(ssrcBytes[:]) | 1
+			respPkt, keys, err := BuildServerBindingResp(psk, req, raddr, ssrc, 0, 0, nil)
+			if err != nil {
+				continue
+			}
+			newSS := newRTCSession(false, ssrc, req.ClientID, raddr.String(), 443, keys, 0, nil, nil)
+			newSS.connMu.Lock()
+			newSS.curConn = swV3.srvConn
+			newSS.curOwn = false
+			newSS.curRemote = raddr
+			newSS.curRemoteStr = raddr.String()
+			newSS.connMu.Unlock()
+			newSS.SetHandlers(func(st *RTCStream, _ string, _ []byte) {
+				go func() {
+					defer st.Close()
+					_, _ = io.Copy(st, st)
+				}()
+			}, nil, nil)
+			newSS.startLoops()
+			srvSessMu.Lock()
+			srvSess = newSS
+			srvSessMu.Unlock()
+			_, _ = swV3.srvConn.WriteTo(respPkt, raddr)
+		}
+	}()
+
+	cliV3, _, err := DialWithPacketConn(ctx, swV3.NewClientEnd(), true, swV3.srvAddr, DialOptions{
+		Host: "127.0.0.1", Port: 443, PSK: psk, Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Dial fallback against v3.4 server failed: %v", err)
+	}
+	defer cliV3.Close()
+	defer func() {
+		srvSessMu.Lock()
+		ss := srvSess
+		srvSessMu.Unlock()
+		if ss != nil {
+			ss.Close()
+		}
+	}()
+
+	if !cliV3.legacyV3 {
+		t.Fatal("expected legacyV3=true when falling back to v3.4 server")
+	}
+	if v3RejectedFastMAC.Load() < 2 {
+		t.Fatalf("expected v3.4 server to reject attempts 0 & 1 (FastMAC) before fallback, rejected=%d", v3RejectedFastMAC.Load())
+	}
+
+	st, err := cliV3.OpenStream("legacy.example:443", nil)
+	if err != nil {
+		t.Fatalf("OpenStream on legacyV3 session failed: %v", err)
+	}
+	payload := []byte("hello-v3-server-through-v4-client")
+	if _, err := st.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.CloseWrite()
+	echoed, err := io.ReadAll(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(echoed, payload) {
+		t.Fatalf("echo mismatch: got %q want %q", echoed, payload)
+	}
 }
