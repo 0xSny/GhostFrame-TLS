@@ -525,7 +525,7 @@ func BuildShadowrocketAddURL(socksPort int, remark string) string {
 	}
 	name := strings.TrimSpace(remark)
 	if name == "" {
-		name = "GhostFrame Local"
+		name = "Kestrel Local"
 	}
 	raw := fmt.Sprintf(":@127.0.0.1:%d", socksPort)
 	encoded := base64.StdEncoding.EncodeToString([]byte(raw))

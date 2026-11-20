@@ -476,7 +476,7 @@ func (c *Config) Link(p gft.Params) *gft.Link {
 		verify = "ca"
 	}
 	return &gft.Link{
-		V:         3,
+		V:         4,
 		Host:      c.PublicHost,
 		Port:      port,
 		SNI:       c.SNI,
@@ -490,7 +490,7 @@ func (c *Config) Link(p gft.Params) *gft.Link {
 		UpMbps:    c.UpMbps,
 		DownMbps:  c.DownMbps,
 		Params:    &p,
-		Remark:    "GhostFrame-RTC-v4.0",
+		Remark:    "Kestrel-RTC-v4.0",
 	}
 }
 

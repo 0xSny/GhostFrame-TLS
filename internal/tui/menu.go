@@ -89,9 +89,9 @@ func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState s
 	if active {
 		svcBadge = b.c("\x1b[32m", "[●] 运行中")
 	}
-	rtcBadge := "GFT-RTC: 启用"
+	rtcBadge := "Kestrel-RTC: 启用"
 	if cfg.IsRTCDisabled() {
-		rtcBadge = "GFT-RTC: 关闭"
+		rtcBadge = "Kestrel-RTC: 关闭"
 	}
 	hopBadge := "关闭"
 	if cfg.HopRange != "" {
@@ -373,9 +373,9 @@ func (c *Controller) printProbeChecklist(r sni.ProbeResult) {
 
 func (c *Controller) handlePortAndQUICMenu(sc *bufio.Scanner, cfg *server.Config) {
 	curPort := ConfigListenPort(cfg.Listen)
-	c.printf("\n--- 监听端口 (%d) 与 GFT-RTC 双栈 (%v) ---\n", curPort, !cfg.IsRTCDisabled())
+	c.printf("\n--- 监听端口 (%d) 与 Kestrel-RTC 双栈 (%v) ---\n", curPort, !cfg.IsRTCDisabled())
 	c.printf("  [1] 修改主监听端口 (将预检冲突并同步更新 Hop 目标端口)\n")
-	c.printf("  [2] 切换 GFT-RTC UDP 通道开关 (当前: %v)\n", !cfg.IsRTCDisabled())
+	c.printf("  [2] 切换 Kestrel-RTC UDP 通道开关 (当前: %v)\n", !cfg.IsRTCDisabled())
 	sub := c.prompt(sc, "请选择:")
 	switch sub {
 	case "1":
@@ -409,7 +409,7 @@ func (c *Controller) handlePortAndQUICMenu(sc *bufio.Scanner, cfg *server.Config
 		}); err != nil {
 			c.errMsg(err.Error())
 		} else {
-			c.okMsg("GFT-RTC 双栈开关已更新")
+			c.okMsg("Kestrel-RTC 双栈开关已更新")
 		}
 	}
 	c.pause(sc)
