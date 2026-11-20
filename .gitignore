@@ -24,6 +24,7 @@ server.json
 sysproxy_backup.json
 deploy_record.json
 .gft/
+.local/
 *.log
 
 # OS metadata

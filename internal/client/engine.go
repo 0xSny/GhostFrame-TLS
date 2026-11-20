@@ -34,10 +34,11 @@ type ClientConfig struct {
 	Nodes       []*gft.Link `json:"nodes,omitempty"`
 	ActiveNode  int         `json:"active_node,omitempty"`
 	RouteMode   RouteMode   `json:"route_mode,omitempty"` // "rule" (default), "global", "direct"
-	SocksAddr   string      `json:"socks_addr"`
-	HTTPAddr    string      `json:"http_addr"`
-	SysProxy    bool        `json:"sys_proxy"`
-	CustomRules []string    `json:"custom_rules,omitempty"`
+	SocksAddr   string          `json:"socks_addr"`
+	HTTPAddr    string          `json:"http_addr"`
+	SysProxy    bool            `json:"sys_proxy"`
+	CustomRules []string        `json:"custom_rules,omitempty"`
+	Gateway     json.RawMessage `json:"gateway,omitempty"`
 }
 
 // LogEntry is a single line in the client rolling log.
@@ -696,6 +697,195 @@ func (e *Engine) OpenUDPAssociation() (gft.UDPAssociation, error) {
 		return nil, errNoActiveSession
 	}
 	return sched.OpenUDP()
+}
+
+// TunnelStream opens a single encrypted proxy stream directly to target (used for health probes / gateway services).
+func (e *Engine) TunnelStream(target string) (gft.DataStream, error) {
+	e.mu.RLock()
+	state := e.state
+	sched := e.sched
+	e.mu.RUnlock()
+	if state != StateConnected || sched == nil {
+		return nil, errNoActiveSession
+	}
+	return sched.OpenStream(target, nil)
+}
+
+// ForwardRawDNSThroughTunnel sends a raw RFC 1035 DNS packet over the active GhostFrame UDP
+// association to upstream resolvers (1.1.1.1:53 / 8.8.8.8:53) without any local DNS query.
+func (e *Engine) ForwardRawDNSThroughTunnel(ctx context.Context, query []byte) ([]byte, error) {
+	if len(query) < 12 {
+		return nil, errors.New("dns: short query packet")
+	}
+	assoc, err := e.OpenUDPAssociation()
+	if err != nil {
+		return nil, err
+	}
+	defer assoc.Close()
+
+	txID := [2]byte{query[0], query[1]}
+	servers := []string{"1.1.1.1:53", "8.8.8.8:53"}
+	var lastErr error
+	for _, srv := range servers {
+		if err := assoc.SendTo(srv, query); err != nil {
+			lastErr = err
+			continue
+		}
+		timer := time.NewTimer(2200 * time.Millisecond)
+		for {
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+				lastErr = context.DeadlineExceeded
+				goto nextDNS
+			case pkt, ok := <-assoc.Recv():
+				if !ok {
+					timer.Stop()
+					lastErr = errors.New("dns: assoc closed")
+					goto nextDNS
+				}
+				if len(pkt.Data) >= 12 && pkt.Data[0] == txID[0] && pkt.Data[1] == txID[1] {
+					timer.Stop()
+					out := make([]byte, len(pkt.Data))
+					copy(out, pkt.Data)
+					return out, nil
+				}
+			}
+		}
+	nextDNS:
+	}
+	if lastErr == nil {
+		lastErr = errors.New("dns: no tunnel response")
+	}
+	return nil, lastErr
+}
+
+// SetHopRange updates the active node's UDP port hopping range (e.g. "20000-45000") and reconnects if active.
+func (e *Engine) SetHopRange(hopRange string) error {
+	hr := strings.TrimSpace(hopRange)
+	e.mu.Lock()
+	l := e.activeLinkLocked()
+	if l == nil {
+		e.mu.Unlock()
+		return errors.New("no active node configured")
+	}
+	l.HopRange = hr
+	shouldReconnect := e.state == StateConnected || e.state == StateConnecting || e.state == StateError
+	e.mu.Unlock()
+	if err := e.SaveConfig(); err != nil {
+		return err
+	}
+	e.Logf("Port hopping range updated: %q", hr)
+	if shouldReconnect {
+		e.Disconnect()
+		go func() { _ = e.Connect() }()
+	}
+	return nil
+}
+
+// SetCustomRules updates, compiles, and persists user-defined custom routing rules.
+func (e *Engine) SetCustomRules(lines []string) error {
+	cp := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		if strings.TrimSpace(ln) != "" {
+			cp = append(cp, ln)
+		}
+	}
+	parsed := ParseCustomRules(cp)
+	e.mu.Lock()
+	e.config.CustomRules = cp
+	e.router.SetCustomRules(parsed)
+	e.mu.Unlock()
+	e.Logf("Custom rules updated (%d active entries)", len(parsed))
+	return e.SaveConfig()
+}
+
+// CustomRules returns a copy of configured custom routing lines.
+func (e *Engine) CustomRules() []string {
+	e.mu.RLock()
+	out := make([]string, len(e.config.CustomRules))
+	copy(out, e.config.CustomRules)
+	e.mu.RUnlock()
+	return out
+}
+
+// GatewayConfigRaw returns a copy of any raw gateway config stored in config.json.
+func (e *Engine) GatewayConfigRaw() []byte {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.config.Gateway) == 0 {
+		return nil
+	}
+	cp := make([]byte, len(e.config.Gateway))
+	copy(cp, e.config.Gateway)
+	return cp
+}
+
+// SetGatewayConfigRaw updates and persists the raw gateway configuration block inside config.json.
+func (e *Engine) SetGatewayConfigRaw(raw json.RawMessage) error {
+	e.mu.Lock()
+	cp := make([]byte, len(raw))
+	copy(cp, raw)
+	e.config.Gateway = cp
+	e.mu.Unlock()
+	return e.SaveConfig()
+}
+
+// NodeHostIPs returns unique IPv4 literal addresses for all configured VPS nodes
+// (resolving hostnames using DirectDialer so firewall bypass never hijacks node dials).
+func (e *Engine) NodeHostIPs() []string {
+	e.mu.RLock()
+	hosts := make([]string, 0, len(e.config.Nodes)+1)
+	if e.config.Link != nil && e.config.Link.Host != "" {
+		hosts = append(hosts, e.config.Link.Host)
+	}
+	for _, n := range e.config.Nodes {
+		if n != nil && n.Host != "" {
+			hosts = append(hosts, n.Host)
+		}
+	}
+	e.mu.RUnlock()
+
+	seen := make(map[string]struct{})
+	var ips []string
+	for _, h := range hosts {
+		clean := strings.Trim(strings.TrimSpace(h), "[]")
+		if clean == "" {
+			continue
+		}
+		if ip := net.ParseIP(clean); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				s := ip4.String()
+				if _, ok := seen[s]; !ok {
+					seen[s] = struct{}{}
+					ips = append(ips, s)
+				}
+			}
+			continue
+		}
+		d := e.DirectDialer(3 * time.Second)
+		res := d.Resolver
+		if res == nil {
+			res = net.DefaultResolver
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		addrs, err := res.LookupIPAddr(ctx, clean)
+		cancel()
+		if err == nil {
+			for _, a := range addrs {
+				if ip4 := a.IP.To4(); ip4 != nil {
+					s := ip4.String()
+					if _, ok := seen[s]; !ok {
+						seen[s] = struct{}{}
+						ips = append(ips, s)
+					}
+				}
+			}
+		}
+	}
+	return ips
 }
 
 // Connect starts the ApexScheduler (QUIC Dual-Track + uTLS SessionPool).

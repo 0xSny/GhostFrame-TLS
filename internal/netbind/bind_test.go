@@ -110,3 +110,18 @@ func TestDirectBindToggle(t *testing.T) {
 		t.Fatal("expected DirectBindEnabled to be true after re-enabling")
 	}
 }
+
+func TestOutboundMarkToggle(t *testing.T) {
+	if got := OutboundMark(); got != 0 {
+		t.Fatalf("expected default OutboundMark 0, got %d", got)
+	}
+	SetOutboundMark(0xff)
+	t.Cleanup(func() { SetOutboundMark(0) })
+	if got := OutboundMark(); got != 0xff {
+		t.Fatalf("expected OutboundMark 0xff, got 0x%x", got)
+	}
+	SetOutboundMark(-5)
+	if got := OutboundMark(); got != 0 {
+		t.Fatalf("expected negative OutboundMark clamped to 0, got %d", got)
+	}
+}

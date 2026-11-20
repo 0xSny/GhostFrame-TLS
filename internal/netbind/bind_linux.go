@@ -1,0 +1,27 @@
+//go:build linux
+
+package netbind
+
+import (
+	"syscall"
+)
+
+// DetectPhysicalInterface returns an empty string on Linux; side-router sockets rely on SO_MARK routing.
+func DetectPhysicalInterface() string {
+	return ""
+}
+
+// Control attaches Linux SO_MARK (when OutboundMark() > 0) to every non-loopback
+// outbound TCP/UDP socket (GFT-RTC, lazy port-hopping, TCP-uTLS, and direct CN bypass),
+// guaranteeing kernel-level anti-loop isolation in transparent gateway mode.
+func Control(network, address string, c syscall.RawConn) error {
+	mark := OutboundMark()
+	if mark <= 0 || isLoopbackAddress(address) {
+		return nil
+	}
+	_ = c.Control(func(fd uintptr) {
+		// Best-effort: ignore EPERM/EACCES when running unprivileged outside root/CAP_NET_ADMIN.
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, mark)
+	})
+	return nil
+}

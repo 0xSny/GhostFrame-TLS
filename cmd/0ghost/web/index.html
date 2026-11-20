@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+<title>0Ghost 旁路由透明网关 · v4.0 LTS</title>
+<style>
+:root{
+  --bg:#060913;--card:#0c1324;--card2:#10192f;--border:#1d2a49;
+  --text:#e6eefc;--muted:#7f90b3;--cyan:#22d3ee;--emerald:#10b981;
+  --amber:#f59e0b;--rose:#f43f5e;--indigo:#6366f1;
+}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,rgba(34,211,238,.12),transparent 60%),radial-gradient(900px 500px at 90% 0%,rgba(99,102,241,.10),transparent 60%),var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5}
+.wrap{max-width:1200px;margin:0 auto;padding:18px 16px 36px}
+.topbar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;background:rgba(12,19,36,.88);border:1px solid var(--border);border-radius:16px;padding:14px 18px;backdrop-filter:blur(10px);margin-bottom:14px}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#06b6d4,#6366f1);display:flex;align-items:center;justify-content:center;font-weight:900;font-size:18px;color:#fff;box-shadow:0 0 18px rgba(34,211,238,.35)}
+.title{font-size:18px;font-weight:800;letter-spacing:.3px}
+.sub{font-size:12px;color:var(--muted)}
+.badges{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.pill{padding:5px 11px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--border);background:var(--card2);color:var(--text);display:inline-flex;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.dot.ok{background:var(--emerald);box-shadow:0 0 8px var(--emerald)}
+.dot.warn{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+.dot.err{background:var(--rose);box-shadow:0 0 8px var(--rose)}
+.banner{display:none;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.45);border-radius:14px;padding:12px 16px;margin-bottom:14px;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.banner.show{display:flex}
+.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}
+@media(max-width:920px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px}
+.card h3{margin:0 0 12px;font-size:14px;font-weight:700;color:#cbd8f6;display:flex;align-items:center;justify-content:space-between}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
+@media(max-width:700px){.metrics{grid-template-columns:repeat(2,1fr)}}
+.kpi{background:var(--card2);border:1px solid var(--border);border-radius:12px;padding:11px 12px}
+.kpi .k{font-size:11px;color:var(--muted);margin-bottom:4px}
+.kpi .v{font-size:17px;font-weight:800;font-variant-numeric:tabular-nums}
+.kpi .s{font-size:11px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.c-cyan{color:var(--cyan)}.c-green{color:var(--emerald)}.c-amber{color:var(--amber)}.c-rose{color:var(--rose)}
+.btn{cursor:pointer;border:1px solid var(--border);background:var(--card2);color:var(--text);padding:8px 13px;border-radius:10px;font-size:13px;font-weight:600;transition:.15s}
+.btn:hover{border-color:var(--cyan);color:#fff}
+.btn.primary{background:linear-gradient(135deg,#0891b2,#2563eb);border-color:transparent;color:#fff}
+.btn.danger{background:rgba(244,63,94,.16);border-color:rgba(244,63,94,.5);color:#fda4af}
+.btn.success{background:rgba(16,185,129,.18);border-color:rgba(16,185,129,.5);color:#6ee7b7}
+.btn.sm{padding:5px 10px;font-size:12px;border-radius:8px}
+.seg{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.seg button{flex:1;min-width:110px;padding:8px 10px;border-radius:10px;border:1px solid var(--border);background:var(--card2);color:var(--muted);font-weight:600;font-size:12px;cursor:pointer}
+.seg button.active{border-color:var(--cyan);background:rgba(34,211,238,.12);color:#fff}
+label{display:block;font-size:12px;color:var(--muted);margin:10px 0 5px}
+input,textarea,select{width:100%;background:#080d1a;border:1px solid var(--border);border-radius:10px;color:var(--text);padding:9px 11px;font-size:13px;font-family:inherit;outline:none}
+input:focus,textarea:focus,select:focus{border-color:var(--cyan)}
+textarea{min-height:74px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.row>*{flex:1}
+.node-list{display:flex;flex-direction:column;gap:8px;margin-top:10px;max-height:220px;overflow:auto}
+.node-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:11px;border:1px solid var(--border);background:var(--card2)}
+.node-item.active{border-color:var(--emerald);background:rgba(16,185,129,.08)}
+.spark{width:100%;height:96px;background:#070c18;border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.logs{background:#050811;border:1px solid var(--border);border-radius:12px;padding:10px 12px;height:250px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;line-height:1.55;color:#b8c7e6}
+.chk{display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text);font-size:13px;margin:8px 0}
+.chk input{width:auto}
+.probe-box{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.probe-item{background:#070c18;border:1px solid var(--border);border-radius:10px;padding:9px 11px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="brand">
+      <div class="logo">0G</div>
+      <div>
+        <div class="title">0Ghost 旁路由透明网关 <span style="font-size:12px;color:var(--cyan);font-weight:600" id="verTag">v4.0.1-LTS</span></div>
+        <div class="sub" id="lanSub">N1 ARM64 · 检测局域网信息中...</div>
+      </div>
+    </div>
+    <div class="badges">
+      <span class="pill"><span class="dot" id="stateDot"></span><span id="stateText">加载中</span></span>
+      <span class="pill" id="protoBadge">协议: --</span>
+      <span class="pill" id="fwBadge">防火墙: --</span>
+      <span class="pill">SOCKS5 :10808 · HTTP :10809</span>
+      <button class="btn primary" id="connBtn" onclick="toggleConn()">连接隧道</button>
+    </div>
+  </div>
+
+  <div class="banner" id="conflictBanner">
+    <div>
+      <div style="font-weight:700;color:#fda4af">检测到现存透明代理冲突</div>
+      <div style="font-size:12px;color:#fecdd3" id="conflictText"></div>
+    </div>
+    <button class="btn danger" onclick="resolveConflicts()">一键安全停用冲突代理并接管</button>
+  </div>
+
+  <div class="metrics">
+    <div class="kpi">
+      <div class="k">通道延迟 / 丢包</div>
+      <div class="v c-cyan" id="kpiRtt">-- ms</div>
+      <div class="s" id="kpiSubRtt">Min -- · Loss 0% · FEC 0</div>
+    </div>
+    <div class="kpi">
+      <div class="k">双通道跳频 / Rekey</div>
+      <div class="v" id="kpiPorts">H0 · R0</div>
+      <div class="s" id="kpiPortNums">Ports: --</div>
+    </div>
+    <div class="kpi">
+      <div class="k">实时吞吐 / 累计</div>
+      <div class="v c-green" id="kpiSpeed">↑0 ↓0</div>
+      <div class="s" id="kpiTotal">累计 ↑0 B · ↓0 B</div>
+    </div>
+    <div class="kpi">
+      <div class="k">N1 资源 / 分流 DNS</div>
+      <div class="v" id="kpiHost">-- MB</div>
+      <div class="s" id="kpiDns">DNS 直连0 · 隧道0 · 拦截0</div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card">
+        <h3>
+          <span>旁路由运行模式与分流策略</span>
+          <span style="font-size:11px;color:var(--muted)" id="ruleMeta">RuleSet --</span>
+        </h3>
+        <div class="seg" id="gwModeSeg">
+          <button data-m="rule" onclick="setGatewayMode('rule')">Rule 绕过大陆 (推荐)</button>
+          <button data-m="global" onclick="setGatewayMode('global')">Global 全局透明</button>
+          <button data-m="port" onclick="setGatewayMode('port')">Port 仅局域网端口</button>
+        </div>
+
+        <label>局域网设备访问控制</label>
+        <div class="seg" id="devModeSeg">
+          <button data-d="all" onclick="setDeviceMode('all')">全部 LAN 设备</button>
+          <button data-d="only" onclick="setDeviceMode('only')">仅代理指定 IP</button>
+          <button data-d="bypass" onclick="setDeviceMode('bypass')">指定 IP 绕过直连</button>
+        </div>
+        <div id="devIpsBox" style="display:none">
+          <textarea id="devIps" placeholder="每行或逗号填写一个局域网设备 IP 或 CIDR，例如:&#10;192.168.1.50&#10;192.168.1.88"></textarea>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>国内直连 DNS (留空默认主路由/阿里腾讯)</label>
+            <input id="directDns" placeholder="223.5.5.5, 119.29.29.29" />
+          </div>
+          <div style="padding-top:22px">
+            <label class="chk"><input type="checkbox" id="filterAAAA" /> 过滤 IPv6 AAAA (防分流泄漏)</label>
+            <label class="chk"><input type="checkbox" id="autoYield" /> 启动前自动停用冲突代理</label>
+          </div>
+        </div>
+
+        <label>自定义规则 (Clash/Surge 格式，高于内置 RuleSet)</label>
+        <textarea id="customRules" placeholder="DOMAIN-SUFFIX,openai.com,PROXY&#10;DOMAIN-SUFFIX,doubleclick.net,REJECT&#10;IP-CIDR,192.168.50.0/24,DIRECT"></textarea>
+
+        <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn primary" onclick="saveGatewaySettings()">保存并热应用防火墙规则</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>
+          <span>实时吞吐波形 (60s) & 一键真连接测速</span>
+          <button class="btn success sm" id="probeBtn" onclick="runDualTest()">一键双栈连通性检测</button>
+        </h3>
+        <div class="spark">
+          <svg id="sparkSvg" viewBox="0 0 600 96" preserveAspectRatio="none" style="width:100%;height:100%"></svg>
+        </div>
+        <div class="probe-box">
+          <div class="probe-item">
+            <div style="color:var(--muted)">国内直连 (SO_MARK 0xff 直出)</div>
+            <div style="font-size:15px;font-weight:700;margin-top:3px" id="probeDirect">点击上方按钮开始探测</div>
+          </div>
+          <div class="probe-item">
+            <div style="color:var(--muted)">海外加密隧道 (Cloudflare 204)</div>
+            <div style="font-size:15px;font-weight:700;margin-top:3px" id="probeTunnel">点击上方按钮开始探测</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card">
+        <h3><span>节点导入与传输内核调优</span><span style="font-size:11px;color:var(--muted)" id="nodeCount">0 节点</span></h3>
+        <div class="row">
+          <input id="importInput" onkeydown="if(event.key==='Enter')importNode()" placeholder="粘贴 gft3:// 节点链接，回车或点击导入" />
+          <button class="btn primary" style="flex:0 0 auto" onclick="importNode()">导入节点</button>
+        </div>
+        <div class="node-list" id="nodeList"></div>
+
+        <label>传输协议偏好</label>
+        <div class="seg" id="transSeg">
+          <button data-t="auto" onclick="setTransport('auto')">Auto 双栈自动</button>
+          <button data-t="rtc" onclick="setTransport('rtc')">GFT-RTC 强制 UDP</button>
+          <button data-t="tcp" onclick="setTransport('tcp')">TCP-uTLS 强制 TCP</button>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>UDP 跳频端口范围</label>
+            <input id="hopRange" placeholder="20000-45000 (空=固定)" />
+          </div>
+          <div>
+            <label>上行 Mbps (0=自动)</label>
+            <input id="upMbps" type="number" min="0" max="65535" value="0" />
+          </div>
+          <div>
+            <label>下行 Mbps (0=自动)</label>
+            <input id="downMbps" type="number" min="0" max="65535" value="0" />
+          </div>
+        </div>
+        <div style="margin-top:10px;display:flex;justify-content:flex-end">
+          <button class="btn" onclick="saveTransportSettings()">应用节点传输参数</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>
+          <span>旁路由运行日志</span>
+          <button class="btn sm" onclick="clearLogs()">清空</button>
+        </h3>
+        <div class="logs" id="logsBox"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const apiBase = (() => {
+  let p = window.location.pathname || '/';
+  if (p.endsWith('/console')) p = p.slice(0, -8);
+  if (p.endsWith('/')) p = p.slice(0, -1);
+  return p === '/' ? '' : p;
+})();
+const api = (p, opt) => fetch(apiBase + p, opt).then(r => r.json());
+let curState = 'disconnected';
+let curGwMode = 'rule';
+let curDevMode = 'all';
+let curTransport = 'auto';
+let formDirty = false;
+
+['devIps','directDns','customRules','hopRange','upMbps','downMbps','filterAAAA','autoYield'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { formDirty = true; });
+});
+
+function fmtBytes(n){
+  if(!n || n <= 0) return '0 B';
+  const u=['B','KB','MB','GB','TB'];
+  let i=0; while(n>=1024 && i<u.length-1){n/=1024;i++;}
+  return n.toFixed(i===0?0:1)+' '+u[i];
+}
+function fmtRate(bps){ return fmtBytes(bps)+'/s'; }
+
+function markSeg(segId, attr, val){
+  document.querySelectorAll('#'+segId+' button').forEach(b => {
+    b.classList.toggle('active', b.getAttribute(attr) === val);
+  });
+}
+
+function setGatewayMode(m){
+  curGwMode = m;
+  markSeg('gwModeSeg', 'data-m', m);
+  api('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({gateway_mode:m})}).then(refresh);
+}
+function setDeviceMode(d){
+  curDevMode = d;
+  markSeg('devModeSeg', 'data-d', d);
+  document.getElementById('devIpsBox').style.display = d === 'all' ? 'none' : 'block';
+  formDirty = true;
+}
+function setTransport(t){
+  curTransport = t;
+  markSeg('transSeg', 'data-t', t);
+  api('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({transport:t})}).then(refresh);
+}
+
+function toggleConn(){
+  const ep = (curState === 'connected' || curState === 'connecting') ? '/api/disconnect' : '/api/connect';
+  api(ep, {method:'POST'}).then(refresh);
+}
+
+function importNode(){
+  const inp = document.getElementById('importInput');
+  const uri = inp.value.trim();
+  if(!uri) return;
+  api('/api/import', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({uri})})
+    .then(d => {
+      if(!d.ok){ alert(d.error || '导入失败'); return; }
+      inp.value = '';
+      refresh();
+    });
+}
+function selectNode(i){ api('/api/node/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})}).then(refresh); }
+function deleteNode(i){ api('/api/node/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})}).then(refresh); }
+
+function saveGatewaySettings(){
+  const devIps = document.getElementById('devIps').value.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean);
+  const directDns = document.getElementById('directDns').value.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean);
+  const customRules = document.getElementById('customRules').value.split(/\n+/).map(x=>x.trim()).filter(Boolean);
+  formDirty = false;
+  api('/api/settings', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      gateway_mode: curGwMode,
+      device_mode: curDevMode,
+      device_ips: devIps, has_device_ips: true,
+      direct_dns: directDns, has_direct_dns: true,
+      filter_aaaa: document.getElementById('filterAAAA').checked,
+      auto_yield_conflicts: document.getElementById('autoYield').checked,
+      custom_rules: customRules, has_custom_rules: true
+    })
+  }).then(refresh);
+}
+
+function saveTransportSettings(){
+  formDirty = false;
+  api('/api/settings', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      hop_range: document.getElementById('hopRange').value.trim(),
+      up_mbps: parseInt(document.getElementById('upMbps').value || '0', 10),
+      down_mbps: parseInt(document.getElementById('downMbps').value || '0', 10)
+    })
+  }).then(refresh);
+}
+
+function resolveConflicts(){
+  api('/api/conflicts/resolve',{method:'POST'}).then(refresh);
+}
+function clearLogs(){
+  api('/api/logs/clear',{method:'POST'}).then(refresh);
+}
+function runDualTest(){
+  const btn = document.getElementById('probeBtn');
+  btn.disabled = true; btn.textContent = '探测中...';
+  document.getElementById('probeDirect').textContent = '探测中...';
+  document.getElementById('probeTunnel').textContent = '探测中...';
+  api('/api/test',{method:'POST'}).then(r => {
+    btn.disabled = false; btn.textContent = '一键双栈连通性检测';
+    const dEl = document.getElementById('probeDirect');
+    const tEl = document.getElementById('probeTunnel');
+    dEl.innerHTML = r.direct_ok ? `<span class="c-green">${r.direct_ms} ms</span> <span style="font-size:11px;color:var(--muted)">(${r.direct_info})</span>` : `<span class="c-rose">失败 (${r.direct_info})</span>`;
+    tEl.innerHTML = r.tunnel_ok ? `<span class="c-cyan">${r.tunnel_ms} ms</span> <span style="font-size:11px;color:var(--muted)">(HTTP ${r.tunnel_code})</span>` : `<span class="c-rose">失败 (${r.tunnel_info})</span>`;
+  }).catch(() => { btn.disabled = false; btn.textContent = '一键双栈连通性检测'; });
+}
+
+function drawSpark(hist){
+  const svg = document.getElementById('sparkSvg');
+  if(!hist || hist.length === 0){ svg.innerHTML=''; return; }
+  let maxV = 1024;
+  hist.forEach(p => { if(p.up > maxV) maxV=p.up; if(p.down > maxV) maxV=p.down; });
+  const w=600, h=96, n=hist.length;
+  const pts = (key) => hist.map((p,i) => `${((i/(Math.max(1,n-1)))*w).toFixed(1)},${(h - 8 - (p[key]/maxV)*(h-18)).toFixed(1)}`).join(' ');
+  svg.innerHTML = `<polyline fill="none" stroke="#22d3ee" stroke-width="2" points="${pts('up')}"/><polyline fill="none" stroke="#10b981" stroke-width="2" points="${pts('down')}"/>`;
+}
+
+function refresh(){
+  api('/api/status').then(s => {
+    curState = s.state || 'disconnected';
+    const dot = document.getElementById('stateDot');
+    dot.className = 'dot ' + (curState==='connected'?'ok':curState==='connecting'?'warn':curState==='error'?'err':'');
+    document.getElementById('stateText').textContent = curState==='connected'?'已连接':curState==='connecting'?'连接中':curState==='error'?'异常':'待机';
+    const cBtn = document.getElementById('connBtn');
+    cBtn.textContent = (curState==='connected'||curState==='connecting')?'断开隧道':'连接隧道';
+    cBtn.className = 'btn ' + ((curState==='connected'||curState==='connecting')?'danger':'primary');
+
+    document.getElementById('protoBadge').textContent = '协议: ' + (s.active_transport || s.transport_pref || '--');
+    const tp = s.tproxy_stats || {};
+    document.getElementById('fwBadge').textContent = '防火墙: ' + (tp.firewall_active ? tp.firewall_backend : (tp.firewall_backend || '未挂载'));
+    document.getElementById('lanSub').textContent = `N1 网关 ${tp.lan_ip || '--'} · 网卡 ${tp.lan_iface || 'br-lan'} · 主路由 ${tp.gateway_ip || '--'}`;
+
+    const cb = document.getElementById('conflictBanner');
+    if(tp.conflicts && tp.conflicts.has_conflict){
+      cb.classList.add('show');
+      document.getElementById('conflictText').textContent = (tp.conflicts.items || []).map(x=>x.name+': '+x.detail).join(' | ');
+    } else {
+      cb.classList.remove('show');
+    }
+
+    document.getElementById('kpiRtt').textContent = (s.ping_ms > 0 ? s.ping_ms : '--') + ' ms';
+    document.getElementById('kpiSubRtt').textContent = `Min ${s.min_rtt_ms||0}ms · Loss ${(s.loss_pct||0).toFixed(2)}% · FEC ${s.fec_recovered||0}`;
+    document.getElementById('kpiPorts').textContent = `H${s.hop_count||0} · R${s.rekey_count||0}`;
+    document.getElementById('kpiPortNums').textContent = `双轨 ${(s.rtc_ports||[0,0]).join(' / ')} · ${s.hop_state||'idle'}`;
+    document.getElementById('kpiSpeed').textContent = `↑${fmtRate(s.up_bps)} ↓${fmtRate(s.down_bps)}`;
+    document.getElementById('kpiTotal').textContent = `累计 ↑${fmtBytes(s.total_up)} · ↓${fmtBytes(s.total_down)}`;
+    document.getElementById('kpiHost').textContent = `${(s.go_mem_sys_mb||0).toFixed(1)} MB (Go) · CPU ${(s.sys_cpu_pct||0).toFixed(0)}%`;
+    document.getElementById('kpiDns').textContent = `DNS 直连${tp.dns_direct_hits||0} · 隧道${tp.dns_tunnel_hits||0} · TCP ${tp.tcp_conns||0}/UDP ${tp.udp_conns||0}`;
+
+    const rs = s.rule_stats || {};
+    document.getElementById('ruleMeta').textContent = `${rs.ruleset_version||'v4.1'} (${rs.builtin_domains||0}域+${rs.builtin_cidrs||0}段) · 代理${rs.proxy_hits||0}/直连${rs.direct_hits||0}/拦截${rs.reject_hits||0}`;
+
+    curGwMode = s.gateway_mode || 'rule';
+    markSeg('gwModeSeg', 'data-m', curGwMode);
+    curTransport = s.transport_pref || 'auto';
+    markSeg('transSeg', 'data-t', curTransport);
+
+    if(!formDirty){
+      curDevMode = s.device_mode || 'all';
+      markSeg('devModeSeg', 'data-d', curDevMode);
+      document.getElementById('devIpsBox').style.display = curDevMode === 'all' ? 'none' : 'block';
+      document.getElementById('devIps').value = (s.device_ips || []).join('\n');
+      document.getElementById('directDns').value = (s.direct_dns || []).join(', ');
+      document.getElementById('filterAAAA').checked = !!s.filter_aaaa;
+      document.getElementById('autoYield').checked = !!s.auto_yield_conflicts;
+      document.getElementById('customRules').value = (s.custom_rules || []).join('\n');
+      document.getElementById('hopRange').value = s.hop_range || '';
+      document.getElementById('upMbps').value = s.up_mbps || 0;
+      document.getElementById('downMbps').value = s.down_mbps || 0;
+    }
+
+    const nodes = s.nodes || [];
+    document.getElementById('nodeCount').textContent = `${nodes.length} 节点`;
+    const nl = document.getElementById('nodeList');
+    nl.innerHTML = nodes.length === 0 ? '<div style="color:var(--muted);font-size:12px">暂无节点，请在上方粘贴 gft3:// 链接导入</div>' :
+      nodes.map(n => `<div class="node-item ${n.index===s.active_index?'active':''}">
+        <div><div style="font-weight:700">${n.name}</div><div style="font-size:11px;color:var(--muted)">${n.host}:${n.port} · ${n.transport} ${n.hop_range?('· '+n.hop_range):''}</div></div>
+        <div style="display:flex;gap:6px">${n.index===s.active_index?'<span class="pill" style="border-color:var(--emerald);color:#6ee7b7">当前</span>':`<button class="btn sm" onclick="selectNode(${n.index})">切换</button>`}<button class="btn sm danger" onclick="deleteNode(${n.index})">删</button></div>
+      </div>`).join('');
+
+    drawSpark(s.history || []);
+    const lb = document.getElementById('logsBox');
+    const atBottom = lb.scrollHeight - lb.scrollTop - lb.clientHeight < 30;
+    lb.innerHTML = (s.logs || []).map(l => `<div><span style="color:#64748b">${l.time}</span> ${String(l.message).replace(/</g,'&lt;')}</div>`).join('');
+    if(atBottom) lb.scrollTop = lb.scrollHeight;
+  }).catch(()=>{});
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

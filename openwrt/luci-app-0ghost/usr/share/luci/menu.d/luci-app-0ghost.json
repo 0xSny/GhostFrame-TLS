@@ -1,0 +1,13 @@
+{
+	"admin/services/0ghost": {
+		"title": "0Ghost",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "0ghost/index"
+		},
+		"depends": {
+			"acl": [ "luci-app-0ghost" ]
+		}
+	}
+}

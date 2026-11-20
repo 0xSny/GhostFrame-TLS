@@ -29,10 +29,26 @@ var (
 	preferredMu       sync.RWMutex
 	preferredIface    string
 	directBindEnabled atomic.Bool
+	outboundMark      atomic.Int32
 )
 
 func init() {
 	directBindEnabled.Store(true)
+}
+
+// SetOutboundMark configures the Linux SO_MARK value (e.g. 0xff) attached to
+// outbound sockets created via netbind.Control for anti-loop transparent proxying.
+// Passing 0 disables SO_MARK tagging.
+func SetOutboundMark(mark int) {
+	if mark < 0 {
+		mark = 0
+	}
+	outboundMark.Store(int32(mark))
+}
+
+// OutboundMark returns the active Linux SO_MARK value (0 if disabled).
+func OutboundMark() int {
+	return int(outboundMark.Load())
 }
 
 // SetDirectBindEnabled controls whether netbind.Control pins outbound sockets to a
