@@ -865,7 +865,13 @@ func writeStaticSourceFile(distDir, baseURL string, meta *RepoMetadata) error {
 }
 
 func ensureRepoIcons(distDir string) error {
-	if err := generateShieldIcon(filepath.Join(distDir, vpnIconFileName), color.RGBA{0x00, 0xD4, 0xFF, 0xFF}, color.RGBA{0x02, 0x84, 0xC7, 0xFF}); err != nil {
+	vpnDst := filepath.Join(distDir, vpnIconFileName)
+	repoAppIcon := filepath.Join("ios", "Shared", "Assets.xcassets", "AppIcon.appiconset", "AppIcon-1024.png")
+	if b, err := os.ReadFile(repoAppIcon); err == nil && len(b) > 0 {
+		if werr := os.WriteFile(vpnDst, b, 0o644); werr != nil {
+			return werr
+		}
+	} else if err := generateShieldIcon(vpnDst, color.RGBA{0x00, 0xD4, 0xFF, 0xFF}, color.RGBA{0x02, 0x84, 0xC7, 0xFF}); err != nil {
 		return err
 	}
 	return generateShieldIcon(filepath.Join(distDir, compIconFileName), color.RGBA{0x10, 0xB9, 0x81, 0xFF}, color.RGBA{0x05, 0x96, 0x69, 0xFF})

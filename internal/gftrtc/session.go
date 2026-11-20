@@ -232,11 +232,13 @@ type RTCSession struct {
 
 	streamCount atomic.Int64
 	rttNs       atomic.Int64
-	lastRecvNs  atomic.Int64
-	lastSendNs  atomic.Int64
-	lastUDPNs   atomic.Int64
-	UpBytes     atomic.Uint64
-	DownBytes   atomic.Uint64
+	lastRecvNs       atomic.Int64
+	lastSendNs       atomic.Int64
+	lastDataTxNs     atomic.Int64
+	unackedTxSinceNs atomic.Int64
+	lastUDPNs        atomic.Int64
+	UpBytes          atomic.Uint64
+	DownBytes        atomic.Uint64
 
 	onStream      StreamHandler
 	onUDP         UDPHandler
@@ -529,6 +531,18 @@ func (s *RTCSession) UpdateBandwidth(targetMbps int) {
 	s.cc.SetTargetMbps(targetMbps)
 }
 
+// TimeSinceLastRecv returns elapsed duration since the last valid server packet arrived.
+func (s *RTCSession) TimeSinceLastRecv() time.Duration {
+	if s == nil {
+		return 0
+	}
+	ns := s.lastRecvNs.Load()
+	if ns <= 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ns))
+}
+
 // Stats returns a live protocol telemetry snapshot.
 func (s *RTCSession) Stats() SessionStats {
 	srtt, minRTT, _ := s.loss.RTTMetrics(time.Now())
@@ -719,7 +733,12 @@ func (s *RTCSession) sealAndWriteTo(pc net.PacketConn, raddr net.Addr, plain []b
 	}
 	wireLen = len(sealed)
 	if _, err = pc.WriteTo(sealed, raddr); err == nil {
-		s.lastSendNs.Store(time.Now().UnixNano())
+		nowNs := time.Now().UnixNano()
+		s.lastSendNs.Store(nowNs)
+		if s.isClient && pt != PTAudioCtrl {
+			s.lastDataTxNs.Store(nowNs)
+			s.unackedTxSinceNs.CompareAndSwap(0, nowNs)
+		}
 	}
 	return pktNum, wireLen, err
 }
@@ -1089,6 +1108,16 @@ func (s *RTCSession) timerLoop() {
 				s.fail(errors.New("gftrtc: peer unresponsive"))
 				return
 			}
+			// Dead-session watchdog: if client has active outbound data for >4s with zero server RX, trip & rebuild.
+			if s.isClient {
+				if u := s.unackedTxSinceNs.Load(); u > 0 {
+					lastR := time.Unix(0, s.lastRecvNs.Load())
+					if now.Sub(time.Unix(0, u)) >= 4*time.Second && now.Sub(lastR) >= 4*time.Second {
+						s.fail(errors.New("gftrtc: dead-session watchdog (tx >4s with zero rx)"))
+						return
+					}
+				}
+			}
 
 			// Rekey maintenance, 30s grace key shredding, and RTCP-Mux mimic scheduling.
 			if now.After(nextMaint) {
@@ -1116,6 +1145,18 @@ func (s *RTCSession) timerLoop() {
 					return
 				}
 			} else if now.After(nextKeepalive) {
+				if IsLowMemMode() {
+					recentTraffic := s.streamCount.Load() > 0 ||
+						now.Sub(time.Unix(0, s.lastDataTxNs.Load())) <= 120*time.Second ||
+						now.Sub(time.Unix(0, s.lastRecvNs.Load())) <= 120*time.Second
+					if recentTraffic {
+						nextKeepalive = now.Add(15 * time.Second)
+						if now.Sub(time.Unix(0, s.lastRecvNs.Load())) >= 15*time.Second {
+							s.enqueueCtrlFrame(encodeFramePingPong(FramePing, now.UnixNano()))
+						}
+						continue
+					}
+				}
 				nextKeepalive = now.Add(keepaliveMinGap + time.Duration(mrand.Int64N(int64(keepaliveMaxGap-keepaliveMinGap))))
 				lastSend := time.Unix(0, s.lastSendNs.Load())
 				if now.Sub(lastSend) >= keepaliveMinGap {
@@ -1206,6 +1247,7 @@ func (s *RTCSession) handleInboundPacket(pkt inboundPkt, dst []byte) {
 			return
 		}
 		s.lastRecvNs.Store(pkt.at.UnixNano())
+		s.unackedTxSinceNs.Store(0)
 		s.maybePromotePeerPhase(phase, pkt.at)
 		if s.isClient && pkt.pc != nil {
 			s.notifyProbeHit(pkt.pc)

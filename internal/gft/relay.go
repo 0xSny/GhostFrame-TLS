@@ -11,7 +11,11 @@ import (
 func CopyBuf(dst io.Writer, src io.Reader, onN func(int)) error {
 	bp := GetBuf()
 	defer PutBuf(bp)
-	buf := (*bp)[:32*1024]
+	chunk := 32 * 1024
+	if IsLowMemMode() {
+		chunk = 16 * 1024
+	}
+	buf := (*bp)[:chunk]
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {

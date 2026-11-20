@@ -35,6 +35,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.companion
         PRODUCT_NAME: GhostFrameCompanion
         INFOPLIST_FILE: companion/CompanionInfo.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: "YES"
         OTHER_LDFLAGS:
           - "$(inherited)"

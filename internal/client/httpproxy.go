@@ -16,6 +16,13 @@ import (
 	"ghostframe/internal/gft"
 )
 
+func relayIdleTimeout() time.Duration {
+	if gft.IsLowMemMode() {
+		return 3 * time.Minute
+	}
+	return 15 * time.Minute
+}
+
 // LocalMgmtHandler handles loopback-only management API calls under /_gft/* routes.
 type LocalMgmtHandler func(method, path string, body []byte) (statusCode int, contentType string, respBody []byte)
 
@@ -189,7 +196,7 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 			}
 		}
 		_ = c.SetDeadline(time.Time{})
-		gft.Relay(st, rc, 15*time.Minute)
+		gft.Relay(st, rc, relayIdleTimeout())
 		return
 	}
 
@@ -225,7 +232,7 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 	defer st.Close()
 
 	_ = c.SetDeadline(time.Time{})
-	gft.Relay(st, c, 15*time.Minute)
+	gft.Relay(st, c, relayIdleTimeout())
 }
 
 func isLoopbackRemote(addr net.Addr) bool {

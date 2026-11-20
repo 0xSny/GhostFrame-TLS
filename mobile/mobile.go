@@ -64,6 +64,7 @@ var (
 	engineInst     *client.Engine
 	lastConfigRaw  string
 	lastConnectErr string
+	scrubberStopCh chan struct{}
 )
 
 func init() {
@@ -72,13 +73,42 @@ func init() {
 
 // InitCore configures mobile runtime guardrails before starting the engine.
 // When isTunnelExt is true (50MB iOS PacketTunnel extension cap), memory is tightly
-// bounded (26MB limit, GCPercent=25, LowMemMode=true -> 4MB/8MB windows, 512KB UDP
-// buffers, single RTC session). Companion app mode (isTunnelExt=false) allows 96MB
-// and full dual-RTC session striping.
+// bounded (18MB limit, GCPercent=20, 15s Darwin MADV_FREE physical memory scrubber,
+// LowMemMode=true -> 4MB/8MB windows, 16KB copy buffers, 512KB UDP buffers, single RTC
+// session). Companion app mode (isTunnelExt=false) allows 96MB and full dual-RTC striping.
 func InitCore(dataDir string, isTunnelExt bool) {
 	mu.Lock()
 	defer mu.Unlock()
 	initCoreLocked(dataDir, isTunnelExt)
+}
+
+func stopMemScrubberLocked() {
+	if scrubberStopCh != nil {
+		close(scrubberStopCh)
+		scrubberStopCh = nil
+	}
+}
+
+func startMemScrubberLocked() {
+	stopMemScrubberLocked()
+	ch := make(chan struct{})
+	scrubberStopCh = ch
+	go func(stop <-chan struct{}) {
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		var ms runtime.MemStats
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				runtime.ReadMemStats(&ms)
+				if ms.HeapSys > ms.HeapReleased && (ms.HeapSys-ms.HeapReleased) > (6<<20) {
+					debug.FreeOSMemory()
+				}
+			}
+		}
+	}(ch)
 }
 
 func initCoreLocked(dataDir string, isTunnelExt bool) {
@@ -96,11 +126,13 @@ func initCoreLocked(dataDir string, isTunnelExt bool) {
 	initialized = true
 
 	if isTunnelExt {
-		debug.SetMemoryLimit(26 << 20)
-		debug.SetGCPercent(25)
+		debug.SetMemoryLimit(18 << 20)
+		debug.SetGCPercent(20)
 		gft.SetLowMemMode(true)
 		netbind.SetDirectBindEnabled(false)
+		startMemScrubberLocked()
 	} else {
+		stopMemScrubberLocked()
 		debug.SetMemoryLimit(96 << 20)
 		debug.SetGCPercent(50)
 		gft.SetLowMemMode(false)
@@ -258,6 +290,7 @@ func StopEngine() error {
 	engineInst = nil
 	lastConnectErr = ""
 	isTunnel := tunnelExtState
+	stopMemScrubberLocked()
 	mu.Unlock()
 
 	if eng != nil {

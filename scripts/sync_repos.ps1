@@ -15,13 +15,14 @@ $ForbiddenNames = @(
 )
 $ForbiddenExts = @(".exe", ".dll", ".syso", ".log", ".test", ".out", ".ipa")
 $ForbiddenDirs = @("dist", "build", ".gft")
+$IgnoredLocalDirs = @(".git", ".local", ".ios-dist")
 
 function Assert-NoForbiddenFiles([string]$Root, [bool]$AllowDistInMain) {
     if (-not (Test-Path $Root)) { return }
     Get-ChildItem -LiteralPath $Root -Recurse -Force | ForEach-Object {
         $rel = $_.FullName.Substring($Root.Length).TrimStart('\', '/')
         $segs = $rel -split '[\\/]'
-        if ($segs[0] -eq ".git") { return }
+        if ($IgnoredLocalDirs -contains $segs[0]) { return }
         if ($AllowDistInMain -and $segs[0] -eq "dist") { return }
         if ($_.PSIsContainer) {
             if ($ForbiddenDirs -contains $_.Name) {
@@ -67,7 +68,7 @@ $mainRelSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.S
 Get-ChildItem -LiteralPath $MainSrc -Recurse -Force -File | ForEach-Object {
     $rel = $_.FullName.Substring($MainSrc.Length).TrimStart('\', '/')
     $segs = $rel -split '[\\/]'
-    if ($segs[0] -eq ".git" -or $segs[0] -eq "dist" -or $segs[0] -eq "build" -or $segs[0] -eq ".gft") { return }
+    if ($segs[0] -eq ".git" -or $segs[0] -eq "dist" -or $segs[0] -eq "build" -or $segs[0] -eq ".gft" -or $segs[0] -eq ".local" -or $segs[0] -eq ".ios-dist") { return }
     $null = $mainRelSet.Add($rel)
     Copy-ExactFile $_.FullName (Join-Path $TlsWork $rel)
 }
@@ -88,6 +89,7 @@ $SharedDirs = @(
     "internal\gftrtc",
     "internal\gft",
     "internal\client",
+    "internal\tunstack",
     "internal\winui",
     "cmd\gft-client-gui",
     "mobile",
@@ -148,9 +150,14 @@ Get-ChildItem -LiteralPath $ProWork -Recurse -Force -File | ForEach-Object {
 }
 Remove-EmptyDirs $ProWork
 
-# 3. Verify zero forbidden files in both workstation repos
+# 3. Verify zero forbidden files and mandatory GitHub workflow files in synced repos
 Assert-NoForbiddenFiles $TlsWork $false
 Assert-NoForbiddenFiles $ProWork $false
+foreach ($wf in @(".github\workflows\ci.yml", ".github\workflows\ios-dual-ipa.yml")) {
+    if (-not (Test-Path (Join-Path $TlsWork $wf))) {
+        throw "Missing workflow file in synced GhostFrame-TLS-main: $wf"
+    }
+}
 
 # 4. Verify 100% SHA-256 byte-level parity across all mirrored & shared files
 $fullMismatch = 0
@@ -181,8 +188,12 @@ if ($fullMismatch -gt 0 -or $sharedMismatch -gt 0) {
 # 5. Copy rebuilt Windows client executable to workstation root if built
 $builtExe = Join-Path $MainSrc "dist\GhostFrame-Pro.exe"
 if (Test-Path $builtExe) {
-    Copy-ExactFile $builtExe $ProExeOut
-    Write-Host "Updated $ProExeOut ($((Get-Item $ProExeOut).Length) bytes)"
+    try {
+        Copy-ExactFile $builtExe $ProExeOut
+        Write-Host "Updated $ProExeOut ($((Get-Item $ProExeOut).Length) bytes)"
+    } catch {
+        Write-Warning "Skipped overwriting locked $ProExeOut (close running GhostFrame-Pro.exe to replace): $($_.Exception.Message)"
+    }
 }
 
 Write-Host "SYNC OK: GhostFrame-TLS-main=$($mainRelSet.Count) files (SHA-256 100% match), GhostFrame-Pro-Source shared=$($sharedRelList.Count) files (SHA-256 100% match across all 3 trees)."

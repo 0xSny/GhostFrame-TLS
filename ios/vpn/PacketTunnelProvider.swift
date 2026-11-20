@@ -22,6 +22,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pathMonitor: NWPathMonitor?
     private let monitorQueue = DispatchQueue(label: "com.ghostframe.tunnel.pathmonitor")
     private var lastPhysicalIface: String = ""
+    private var lastPathSignature: String = ""
+    private var pathDebounceWorkItem: DispatchWorkItem?
     private var currentHTTPPort: Int = 10809
     private var currentServerHost: String = ""
     private var tunWriter: PacketFlowTunWriter?
@@ -323,40 +325,97 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let sem = DispatchSemaphore(value: 0)
         let lock = NSLock()
         var initialIface = ""
+        var initialSig = ""
         var signaled = false
 
         monitor.pathUpdateHandler = { [weak self] path in
             let iface = GhostNetworkHelper.preferredPhysicalInterface(from: path)
+            let sig = Self.buildPathSignature(path: path, iface: iface)
+
             lock.lock()
             if !signaled {
                 initialIface = iface
+                initialSig = sig
                 signaled = true
                 lock.unlock()
                 sem.signal()
-            } else {
-                lock.unlock()
+                return
             }
+            lock.unlock()
 
             guard let self = self else { return }
-            if !iface.isEmpty && iface != self.lastPhysicalIface {
+            guard !sig.isEmpty, sig != self.lastPathSignature else { return }
+            self.lastPathSignature = sig
+            if !iface.isEmpty {
                 self.lastPhysicalIface = iface
-                GhostMobileBridge.onNetworkChanged(ifaceName: iface)
             }
+
+            // Debounce rapid iOS NWPath churn (300ms) during Wi-Fi <-> 4G/5G handoffs or IP refresh.
+            self.pathDebounceWorkItem?.cancel()
+            let targetIface = iface.isEmpty ? self.lastPhysicalIface : iface
+            let work = DispatchWorkItem { [weak self] in
+                guard self != nil else { return }
+                GhostMobileBridge.onNetworkChanged(ifaceName: targetIface)
+            }
+            self.pathDebounceWorkItem = work
+            self.monitorQueue.asyncAfter(deadline: .now() + 0.30, execute: work)
         }
         monitor.start(queue: monitorQueue)
         pathMonitor = monitor
         _ = sem.wait(timeout: .now() + timeout)
         lock.lock()
         let resolved = initialIface
+        let resolvedSig = initialSig
+        lock.unlock()
         if !resolved.isEmpty {
             lastPhysicalIface = resolved
         }
-        lock.unlock()
+        if !resolvedSig.isEmpty {
+            lastPathSignature = resolvedSig
+        }
         return resolved
     }
 
     private func stopNetworkMonitor() {
+        pathDebounceWorkItem?.cancel()
+        pathDebounceWorkItem = nil
         pathMonitor?.cancel()
         pathMonitor = nil
+    }
+
+    private static func buildPathSignature(path: NWPath, iface: String) -> String {
+        let statusStr: String
+        switch path.status {
+        case .satisfied: statusStr = "satisfied"
+        case .unsatisfied: statusStr = "unsatisfied"
+        case .requiresConnection: statusStr = "requiresConnection"
+        @unknown default: statusStr = "unknown"
+        }
+        let ips = iface.isEmpty ? "" : interfaceAddressList(ifaceName: iface)
+        return "\(statusStr)|\(iface)|\(ips)|v4=\(path.supportsIPv4)|v6=\(path.supportsIPv6)"
+    }
+
+    private static func interfaceAddressList(ifaceName: String) -> String {
+        var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddrPtr) == 0, let first = ifaddrPtr else { return "" }
+        defer { freeifaddrs(ifaddrPtr) }
+
+        var addrs: [String] = []
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = cursor {
+            defer { cursor = current.pointee.ifa_next }
+            guard let addr = current.pointee.ifa_addr else { continue }
+            let name = String(cString: current.pointee.ifa_name)
+            guard name == ifaceName else { continue }
+            let family = Int32(addr.pointee.sa_family)
+            guard family == AF_INET || family == AF_INET6 else { continue }
+
+            var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let len = socklen_t(addr.pointee.sa_len)
+            if getnameinfo(addr, len, &hostBuf, socklen_t(hostBuf.count), nil, 0, NI_NUMERICHOST) == 0 {
+                addrs.append(String(cString: hostBuf))
+            }
+        }
+        return addrs.sorted().joined(separator: ",")
     }
 }

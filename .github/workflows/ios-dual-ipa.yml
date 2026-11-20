@@ -89,10 +89,14 @@ jobs:
           plutil -p "$CTRL_APPEX/Info.plist"
           plutil -p "$CTRL_APPEX/Info.plist" | grep -q "com.apple.widgetkit-extension"
 
-          # Inside-out ad-hoc entitlement stamping (strictly packet-tunnel-provider only, zero hardcoded App Group)
+          # Inside-out ad-hoc entitlement stamping (strictly no --deep on GhostFrameVPN.app)
           codesign --force --sign - --entitlements ios/vpn/Tunnel.entitlements --timestamp=none "$APPEX"
           codesign --force --sign - --entitlements ios/vpn/Control.entitlements --timestamp=none "$CTRL_APPEX"
           codesign --force --sign - --entitlements ios/vpn/App.entitlements --timestamp=none "$VPN_APP"
+
+          codesign --verify --strict "$APPEX"
+          codesign --verify --strict "$CTRL_APPEX"
+          codesign --verify --strict "$VPN_APP"
 
           echo "=== Verifying GhostPacketTunnel.appex entitlements ==="
           APPEX_ENT="$(codesign -d --entitlements - --xml "$APPEX" 2>&1)"
@@ -100,17 +104,19 @@ jobs:
           echo "$APPEX_ENT" | grep -q "packet-tunnel-provider"
           ! echo "$APPEX_ENT" | grep -q "application-groups"
 
-          echo "=== Verifying GhostControlWidget.appex entitlements ==="
-          CTRL_ENT="$(codesign -d --entitlements - --xml "$CTRL_APPEX" 2>&1)"
+          echo "=== Verifying GhostControlWidget.appex isolation & entitlements ==="
+          CTRL_ENT="$(codesign -d --entitlements - --xml "$CTRL_APPEX" 2>&1 || true)"
           echo "$CTRL_ENT"
-          echo "$CTRL_ENT" | grep -q "packet-tunnel-provider"
+          ! echo "$CTRL_ENT" | grep -q "packet-tunnel-provider"
           ! echo "$CTRL_ENT" | grep -q "application-groups"
+          ! otool -L "$CTRL_APPEX/GhostControlWidget" | grep -q "GhostMobile"
 
-          echo "=== Verifying GhostFrameVPN.app entitlements ==="
+          echo "=== Verifying GhostFrameVPN.app entitlements & AppIcon Assets.car ==="
           APP_ENT="$(codesign -d --entitlements - --xml "$VPN_APP" 2>&1)"
           echo "$APP_ENT"
           echo "$APP_ENT" | grep -q "packet-tunnel-provider"
           ! echo "$APP_ENT" | grep -q "application-groups"
+          test -f "$VPN_APP/Assets.car"
 
           STAGE_VPN="$(mktemp -d)"
           mkdir -p "$STAGE_VPN/Payload"
@@ -146,6 +152,7 @@ jobs:
 
           # Single-process pure ad-hoc signature with ZERO restricted entitlements
           codesign --force --deep --sign - --timestamp=none "$COMP_APP"
+          test -f "$COMP_APP/Assets.car"
 
           COMP_ENT="$(codesign -d --entitlements - --xml "$COMP_APP" 2>&1 || true)"
           echo "=== Companion entitlements check ==="

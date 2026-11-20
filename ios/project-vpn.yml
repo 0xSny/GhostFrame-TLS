@@ -36,6 +36,7 @@ targets:
         PRODUCT_NAME: GhostFrameVPN
         INFOPLIST_FILE: vpn/AppInfo.plist
         CODE_SIGN_ENTITLEMENTS: vpn/App.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: "YES"
         OTHER_LDFLAGS:
           - "$(inherited)"

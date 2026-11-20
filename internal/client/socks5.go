@@ -182,7 +182,7 @@ func (s *SOCKS5Server) handleConn(c net.Conn) {
 			}
 		}
 		_ = c.SetDeadline(time.Time{})
-		gft.Relay(st, c, 15*time.Minute)
+		gft.Relay(st, c, relayIdleTimeout())
 
 	case 0x03: // UDP ASSOCIATE (RFC 1928)
 		s.handleUDPAssociate(c)

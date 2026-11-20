@@ -60,7 +60,10 @@ enum GhostVPNControlBridge {
         if let matched = managers.first(where: { mgr in
             let desc = (mgr.localizedDescription ?? "").lowercased()
             let bid = ((mgr.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier ?? "").lowercased()
-            return desc.contains("ghostframe") || bid.contains("ghost") || bid.hasSuffix(".tunnel")
+            if bid.hasSuffix(".control") {
+                return false
+            }
+            return bid.hasSuffix(".tunnel") || desc.contains("ghostframe") || bid.contains("ghost")
         }) {
             return matched
         }
@@ -117,11 +120,12 @@ enum GhostVPNControlBridge {
         }
 
         if enable {
-            if !manager.isEnabled {
-                manager.isEnabled = true
-                try await savePreferences(manager)
-                try await reloadPreferences(manager)
-            }
+            manager.onDemandRules = [NEOnDemandRuleConnect()]
+            manager.isOnDemandEnabled = true
+            manager.isEnabled = true
+            try await savePreferences(manager)
+            try await reloadPreferences(manager)
+
             let status = manager.connection.status
             if status == .disconnected || status == .invalid || status == .disconnecting {
                 let providerCfg = (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
@@ -136,6 +140,12 @@ enum GhostVPNControlBridge {
                 }
             }
         } else {
+            // Must persist isOnDemandEnabled = false BEFORE calling stopVPNTunnel()
+            // so iOS OnDemand rules do not immediately revive the tunnel after manual switch-off.
+            manager.isOnDemandEnabled = false
+            manager.onDemandRules = []
+            try await savePreferences(manager)
+
             let status = manager.connection.status
             if status != .disconnected && status != .invalid {
                 manager.connection.stopVPNTunnel()

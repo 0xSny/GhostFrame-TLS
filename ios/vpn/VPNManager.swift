@@ -79,9 +79,6 @@ final class VPNManager: GhostBackend {
                     return bid
                 }
             }
-            if let firstID = appexBundles.first?.bundleIdentifier, !firstID.isEmpty {
-                return firstID
-            }
         }
         let mainID = Bundle.main.bundleIdentifier ?? "com.ghostframe.vpn"
         return mainID + ".tunnel"
@@ -118,8 +115,25 @@ final class VPNManager: GhostBackend {
         hasAttemptedConnect = false
         connectAttemptToken &+= 1
         stopPolling()
-        onLogMessage?("VPN: stopVPNTunnel requested")
-        manager?.connection.stopVPNTunnel()
+        onLogMessage?("VPN: disabling OnDemand before stopVPNTunnel...")
+
+        if let mgr = manager {
+            mgr.isOnDemandEnabled = false
+            mgr.onDemandRules = []
+            mgr.saveToPreferences { [weak self] _ in
+                Task { @MainActor in
+                    guard let self = self else { return }
+                    self.onLogMessage?("VPN: stopVPNTunnel requested")
+                    mgr.connection.stopVPNTunnel()
+                    self.isConnected = false
+                    self.isTransitioning = false
+                    self.backendStateLabel = "VPN 已断开"
+                    self.onStateChange?()
+                }
+            }
+            return
+        }
+
         isConnected = false
         isTransitioning = false
         backendStateLabel = "VPN 已断开"
@@ -270,6 +284,8 @@ final class VPNManager: GhostBackend {
         ]
         mgr.protocolConfiguration = proto
         mgr.localizedDescription = "GhostFrame VPN (\(node.remark))"
+        mgr.onDemandRules = [NEOnDemandRuleConnect()]
+        mgr.isOnDemandEnabled = true
         mgr.isEnabled = true
     }
 

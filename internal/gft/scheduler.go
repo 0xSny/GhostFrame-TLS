@@ -234,6 +234,9 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 		a.upMbps.Store(int64(schedLink.UpMbps))
 		a.downMbps.Store(int64(schedLink.DownMbps))
 	}
+	if IsLowMemMode() && tcpPoolSize > 2 {
+		tcpPoolSize = 2
+	}
 	pool := NewSessionPool(schedLink, ps, tcpPoolSize, logf)
 	pool.SetCooldownGuard(a.hasHealthyRTC)
 	pool.dialFn = func(dialCtx context.Context, dl *Link, dps *ParamStore, flags uint16, timeout time.Duration) (*Session, time.Duration, error) {
@@ -993,12 +996,21 @@ func (a *ApexScheduler) markRTCDegraded(r *gftrtc.RTCSession, err error) {
 // falling back in 0ms to the uTLS TCP SessionPool if UDP fails or is throttled.
 func (a *ApexScheduler) OpenStream(target string, first []byte) (DataStream, error) {
 	if sl := a.activeSlotForSend(nil); sl != nil {
-		st, err := sl.sess.OpenStream(target, first)
-		if err == nil {
-			sl.streamFails.Store(0)
-			return st, nil
+		probeOK := true
+		if IsLowMemMode() && sl.sess.TimeSinceLastRecv() > 15*time.Second {
+			if _, perr := sl.sess.ProbeRTT(1200 * time.Millisecond); perr != nil {
+				a.markRTCDegraded(sl.sess, perr)
+				probeOK = false
+			}
 		}
-		a.markRTCDegraded(sl.sess, err)
+		if probeOK {
+			st, err := sl.sess.OpenStream(target, first)
+			if err == nil {
+				sl.streamFails.Store(0)
+				return st, nil
+			}
+			a.markRTCDegraded(sl.sess, err)
+		}
 		if alt := a.activeSlotForSend(sl.sess); alt != nil {
 			st2, err2 := alt.sess.OpenStream(target, first)
 			if err2 == nil {
