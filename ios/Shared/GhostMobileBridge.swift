@@ -113,4 +113,8 @@ enum GhostMobileBridge {
     static func pushTunPacket(_ packet: Data) {
         MobilePushTunPacket(packet)
     }
+
+    static func pushTunPacketBatch(_ concat: Data, lens: Data, count: Int) {
+        MobilePushTunPacketBatch(concat, lens, count)
+    }
 }

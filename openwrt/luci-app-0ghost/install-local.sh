@@ -4,12 +4,22 @@ set -eu
 BASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 echo "[0Ghost] Installing binary & OpenWrt procd/LuCI files..."
-mkdir -p /etc/0ghost /usr/bin /etc/init.d /usr/share/luci/menu.d /usr/share/rpcd/acl.d /www/luci-static/resources/view/0ghost
+mkdir -p /etc/0ghost /usr/bin /etc/init.d /etc/hotplug.d/iface /etc/hotplug.d/firewall /usr/share/luci/menu.d /usr/share/rpcd/acl.d /www/luci-static/resources/view/0ghost
 
 cp -f "$BASE_DIR/usr/bin/0ghost" /usr/bin/0ghost
 chmod 0755 /usr/bin/0ghost
 cp -f "$BASE_DIR/etc/init.d/0ghost" /etc/init.d/0ghost
 chmod 0755 /etc/init.d/0ghost
+if [ -f "$BASE_DIR/etc/hotplug.d/iface/99-0ghost" ]; then
+	cp -f "$BASE_DIR/etc/hotplug.d/iface/99-0ghost" /etc/hotplug.d/iface/99-0ghost
+	chmod 0755 /etc/hotplug.d/iface/99-0ghost
+	sed -i 's/\r$//' /etc/hotplug.d/iface/99-0ghost
+fi
+if [ -f "$BASE_DIR/etc/hotplug.d/firewall/99-0ghost" ]; then
+	cp -f "$BASE_DIR/etc/hotplug.d/firewall/99-0ghost" /etc/hotplug.d/firewall/99-0ghost
+	chmod 0755 /etc/hotplug.d/firewall/99-0ghost
+	sed -i 's/\r$//' /etc/hotplug.d/firewall/99-0ghost
+fi
 cp -f "$BASE_DIR/usr/share/luci/menu.d/luci-app-0ghost.json" /usr/share/luci/menu.d/luci-app-0ghost.json
 chmod 0644 /usr/share/luci/menu.d/luci-app-0ghost.json
 cp -f "$BASE_DIR/usr/share/rpcd/acl.d/luci-app-0ghost.json" /usr/share/rpcd/acl.d/luci-app-0ghost.json

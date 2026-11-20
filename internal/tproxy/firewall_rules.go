@@ -3,10 +3,46 @@ package tproxy
 import (
 	"fmt"
 	"net"
+	"os"
 	"strings"
 
 	"ghostframe/internal/client"
 )
+
+const DefaultCNIPv4OverridePath = "/etc/0ghost/cn_ipv4.txt"
+
+// EffectiveCNIPv4CIDRs returns external override CIDRs from overridePath (defaulting to
+// /etc/0ghost/cn_ipv4.txt if present and non-empty), or the embedded complete APNIC table.
+func EffectiveCNIPv4CIDRs(overridePath string) []string {
+	path := strings.TrimSpace(overridePath)
+	if path == "" {
+		path = DefaultCNIPv4OverridePath
+	}
+	if b, err := os.ReadFile(path); err == nil {
+		var custom []string
+		for _, ln := range strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n") {
+			if idx := strings.IndexAny(ln, "#;"); idx >= 0 {
+				ln = ln[:idx]
+			}
+			s := strings.TrimSpace(ln)
+			if s == "" {
+				continue
+			}
+			if !strings.Contains(s, "/") {
+				if ip := net.ParseIP(s); ip != nil && ip.To4() != nil {
+					s = ip.To4().String() + "/32"
+				}
+			}
+			if _, ipNet, err := net.ParseCIDR(s); err == nil && ipNet.IP.To4() != nil {
+				custom = append(custom, ipNet.String())
+			}
+		}
+		if len(custom) > 0 {
+			return custom
+		}
+	}
+	return client.CNPublicIPv4CIDRs()
+}
 
 // BuildNFTablesScript builds the complete atomic nftables ruleset inside
 // `table inet ghost0` so start/reload/stop remain 100% isolated and leak-free.
@@ -64,7 +100,7 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 	b.WriteString("  }\n")
 
 	// 3. Mainland China IPv4 kernel-level direct bypass set (@cn_ipv4).
-	cnCIDRs := client.CNPublicIPv4CIDRs()
+	cnCIDRs := EffectiveCNIPv4CIDRs(spec.CNIPv4OverridePath)
 	b.WriteString("  set cn_ipv4 {\n")
 	b.WriteString("    type ipv4_addr\n")
 	b.WriteString("    flags interval\n")
@@ -219,6 +255,15 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 			}
 		}
 		b.WriteString("    meta nfproto ipv6 reject with icmpv6 port-unreachable\n")
+		b.WriteString("  }\n")
+	}
+
+	// 9. Optional LAN dynamic masquerade (SNAT) for single-arm asymmetric routing compatibility.
+	if spec.LANMasquerade {
+		b.WriteString("  chain postrouting_masq {\n")
+		b.WriteString("    type nat hook postrouting priority srcnat - 5; policy accept;\n")
+		b.WriteString(fmt.Sprintf("    meta mark %s return\n", markHex))
+		b.WriteString("    iifname != \"lo\" oifname != \"lo\" masquerade\n")
 		b.WriteString("  }\n")
 	}
 

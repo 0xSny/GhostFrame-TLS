@@ -1,0 +1,6 @@
+#!/bin/sh
+# 0Ghost hotplug self-heal: re-mount nftables/policy routes immediately on interface changes.
+[ "${ACTION:-}" = "ifup" ] || [ "${ACTION:-}" = "ifupdate" ] || exit 0
+pid="$(pidof 0ghost 2>/dev/null || true)"
+[ -n "$pid" ] && kill -USR1 $pid 2>/dev/null || true
+exit 0

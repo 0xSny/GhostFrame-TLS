@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -101,21 +103,22 @@ func TestSplitDNSFilterAAAAAndReject(t *testing.T) {
 
 func TestBuildNFTablesScriptOrderingAndSafety(t *testing.T) {
 	spec := FirewallSpec{
-		Mode:         ModeRule,
-		DeviceMode:   DeviceOnly,
-		DeviceIPs:    []string{"192.168.1.50", "192.168.1.51"},
-		VPSIPs:       []string{"203.0.113.10"},
-		TCPPort:      10880,
-		UDPPort:      10881,
-		DNSPort:      7853,
-		WebPort:      19080,
-		SocksPort:    10808,
-		HTTPPort:     10809,
-		FWMark:       0xff,
-		TProxyMark:   0x1,
-		RouteTable:   100,
-		PreferTProxy: true,
-		FilterAAAA:   true,
+		Mode:          ModeRule,
+		DeviceMode:    DeviceOnly,
+		DeviceIPs:     []string{"192.168.1.50", "192.168.1.51"},
+		VPSIPs:        []string{"203.0.113.10"},
+		TCPPort:       10880,
+		UDPPort:       10881,
+		DNSPort:       7853,
+		WebPort:       19080,
+		SocksPort:     10808,
+		HTTPPort:      10809,
+		FWMark:        0xff,
+		TProxyMark:    0x1,
+		RouteTable:    100,
+		PreferTProxy:  true,
+		FilterAAAA:    true,
+		LANMasquerade: true,
 	}
 	script := BuildNFTablesScript(spec)
 
@@ -138,6 +141,8 @@ func TestBuildNFTablesScriptOrderingAndSafety(t *testing.T) {
 		"redirect to :7853",
 		"chain forward_v6_guard",
 		"meta nfproto ipv6 reject with icmpv6 port-unreachable",
+		"chain postrouting_masq",
+		"iifname != \"lo\" oifname != \"lo\" masquerade",
 	}
 	for _, needle := range required {
 		if !strings.Contains(script, needle) {
@@ -154,5 +159,23 @@ func TestBuildNFTablesScriptOrderingAndSafety(t *testing.T) {
 	posTProxy := strings.Index(preSection, "tproxy ip to 127.0.0.1:10880")
 	if !(posMark >= 0 && posMark < posMgmt && posMgmt < posCN && posCN < posTProxy) {
 		t.Fatalf("unexpected rule precedence in mangle_prerouting: mark=%d mgmt=%d cn=%d tproxy=%d", posMark, posMgmt, posCN, posTProxy)
+	}
+}
+
+func TestEffectiveCNIPv4CIDRsAndOverride(t *testing.T) {
+	// 1. Built-in APNIC table should unpack >= 5000 valid IPv4 CIDRs.
+	def := EffectiveCNIPv4CIDRs(filepath.Join(t.TempDir(), "nonexistent.txt"))
+	if len(def) < 5000 {
+		t.Fatalf("expected >= 5000 embedded APNIC CN CIDRs, got %d", len(def))
+	}
+
+	// 2. Router-side override (/etc/0ghost/cn_ipv4.txt equivalent) cleanly replaces embedded set.
+	ovPath := filepath.Join(t.TempDir(), "cn_ipv4.txt")
+	if err := os.WriteFile(ovPath, []byte("# comment\n223.5.5.5\n119.29.0.0/16 ; dnspod\ninvalid_cidr\n"), 0o644); err != nil {
+		t.Fatalf("write override failed: %v", err)
+	}
+	ov := EffectiveCNIPv4CIDRs(ovPath)
+	if len(ov) != 2 || ov[0] != "223.5.5.5/32" || ov[1] != "119.29.0.0/16" {
+		t.Fatalf("unexpected override CIDRs: %v", ov)
 	}
 }

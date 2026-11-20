@@ -17,8 +17,8 @@ func TestGatewayConsoleRoutesAndSettings(t *testing.T) {
 
 	mux := svc.BuildHTTPMux()
 
-	// Verify embedded cyber-dark console HTML serves on /
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	// Verify embedded cyber-dark console HTML serves on / with allowed Host header
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:19080/", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "0Ghost") {
@@ -26,7 +26,7 @@ func TestGatewayConsoleRoutesAndSettings(t *testing.T) {
 	}
 
 	// Verify /api/status JSON structure
-	reqSt := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	reqSt := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:19080/api/status", nil)
 	recSt := httptest.NewRecorder()
 	mux.ServeHTTP(recSt, reqSt)
 	if recSt.Code != http.StatusOK {
@@ -40,16 +40,80 @@ func TestGatewayConsoleRoutesAndSettings(t *testing.T) {
 		t.Fatalf("expected default gateway_mode rule, got %v", snap["gateway_mode"])
 	}
 
-	// Verify device filter + custom rules update via POST /api/settings
-	body := `{"gateway_mode":"rule","device_mode":"only","device_ips":["192.168.1.60"],"has_device_ips":true,"custom_rules":["DOMAIN-SUFFIX,ads.example,REJECT"],"has_custom_rules":true}`
-	reqSet := httptest.NewRequest(http.MethodPost, "/api/settings", strings.NewReader(body))
+	// Verify device filter + custom rules + lan_masquerade update via POST /api/settings
+	body := `{"gateway_mode":"rule","device_mode":"only","device_ips":["192.168.1.60"],"has_device_ips":true,"lan_masquerade":true,"custom_rules":["DOMAIN-SUFFIX,ads.example,REJECT"],"has_custom_rules":true}`
+	reqSet := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:19080/api/settings", strings.NewReader(body))
+	reqSet.Header.Set("Origin", "http://127.0.0.1:19080")
 	recSet := httptest.NewRecorder()
 	mux.ServeHTTP(recSet, reqSet)
 	if recSet.Code != http.StatusOK {
 		t.Fatalf("settings update failed: %d %s", recSet.Code, recSet.Body.String())
 	}
 	cfg := svc.getGatewayConfig()
-	if cfg.DeviceMode != "only" || len(cfg.DeviceIPs) != 1 || cfg.DeviceIPs[0] != "192.168.1.60" {
+	if cfg.DeviceMode != "only" || len(cfg.DeviceIPs) != 1 || cfg.DeviceIPs[0] != "192.168.1.60" || !cfg.LANMasquerade {
 		t.Fatalf("unexpected updated gateway config: %+v", cfg)
+	}
+}
+
+func TestGatewayWebSecurityHardening(t *testing.T) {
+	svc, err := NewGatewayService("", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewGatewayService failed: %v", err)
+	}
+	defer svc.Stop()
+	mux := svc.BuildHTTPMux()
+
+	// 1. Reject DNS rebinding (external public Host header)
+	reqRebind := httptest.NewRequest(http.MethodGet, "http://attacker.evil.com:19080/api/status", nil)
+	recRebind := httptest.NewRecorder()
+	mux.ServeHTTP(recRebind, reqRebind)
+	if recRebind.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for DNS rebinding Host, got %d", recRebind.Code)
+	}
+
+	// 2. Reject cross-origin CSRF POST
+	reqCSRF := httptest.NewRequest(http.MethodPost, "http://192.168.1.1:19080/api/connect", nil)
+	reqCSRF.Header.Set("Origin", "https://evil.site")
+	recCSRF := httptest.NewRecorder()
+	mux.ServeHTTP(recCSRF, reqCSRF)
+	if recCSRF.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin POST, got %d", recCSRF.Code)
+	}
+
+	// 3. Enforce optional WebPassword via cookie login + bearer auth
+	setPwd := `{"web_password":"secret-n1","has_web_password":true}`
+	reqSet := httptest.NewRequest(http.MethodPost, "http://192.168.1.1:19080/api/settings", strings.NewReader(setPwd))
+	reqSet.Header.Set("Origin", "http://192.168.1.1:19080")
+	recSet := httptest.NewRecorder()
+	mux.ServeHTTP(recSet, reqSet)
+	if recSet.Code != http.StatusOK {
+		t.Fatalf("failed setting web_password: %d", recSet.Code)
+	}
+
+	reqUnauth := httptest.NewRequest(http.MethodGet, "http://192.168.1.1:19080/api/status", nil)
+	recUnauth := httptest.NewRecorder()
+	mux.ServeHTTP(recUnauth, reqUnauth)
+	if recUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when unauthenticated, got %d", recUnauth.Code)
+	}
+
+	reqLogin := httptest.NewRequest(http.MethodPost, "http://192.168.1.1:19080/api/auth/login", strings.NewReader(`{"password":"secret-n1"}`))
+	reqLogin.Header.Set("Origin", "http://192.168.1.1:19080")
+	recLogin := httptest.NewRecorder()
+	mux.ServeHTTP(recLogin, reqLogin)
+	if recLogin.Code != http.StatusOK {
+		t.Fatalf("expected login 200, got %d", recLogin.Code)
+	}
+	cookies := recLogin.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatalf("expected auth cookie after login")
+	}
+
+	reqAuth := httptest.NewRequest(http.MethodGet, "http://192.168.1.1:19080/api/status", nil)
+	reqAuth.AddCookie(cookies[0])
+	recAuth := httptest.NewRecorder()
+	mux.ServeHTTP(recAuth, reqAuth)
+	if recAuth.Code != http.StatusOK {
+		t.Fatalf("expected authenticated /api/status 200, got %d", recAuth.Code)
 	}
 }

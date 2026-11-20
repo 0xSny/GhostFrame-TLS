@@ -25,11 +25,13 @@ type GatewayConfig struct {
 	DeviceIPs          []string    `json:"device_ips,omitempty"`
 	DirectDNS          []string    `json:"direct_dns,omitempty"`
 	FilterAAAA         bool        `json:"filter_aaaa"`
+	LANMasquerade      bool        `json:"lan_masquerade"`
 	AutoYieldConflicts bool        `json:"auto_yield_conflicts"`
 	TCPPort            int         `json:"tproxy_tcp_port"`
 	UDPPort            int         `json:"tproxy_udp_port"`
 	DNSPort            int         `json:"dns_port"`
 	WebAddr            string      `json:"web_addr"`
+	WebPassword        string      `json:"web_password,omitempty"`
 	FWMark             int         `json:"fwmark"`
 }
 
@@ -110,8 +112,10 @@ type FirewallSpec struct {
 	FWMark      int
 	TProxyMark  int
 	RouteTable  int
-	PreferTProxy bool
-	FilterAAAA   bool
+	PreferTProxy       bool
+	FilterAAAA         bool
+	LANMasquerade      bool
+	CNIPv4OverridePath string
 }
 
 // Stats reports live transparent gateway counters for telemetry and UI dashboards.

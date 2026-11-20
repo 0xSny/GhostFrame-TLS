@@ -171,7 +171,7 @@ $tlsCount = Sync-ProductWorkspace -Label "GhostFrame-TLS-main" -DstRoot $TlsWork
         "configs",
         "docs"
     ) `
-    -Files @("install.sh", "go.mod", "go.sum", "LICENSE") `
+    -Files @("install.sh", "scripts\sync_all_repos.ps1", "go.mod", "go.sum", "LICENSE") `
     -ReservedFiles @(".gitignore", "README.md", "Makefile", ".github\workflows\ci.yml", ".github\workflows\release.yml") `
     -DisallowedPrefixes @(
         "cmd\gft-client-gui", "cmd\0ghost",

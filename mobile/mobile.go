@@ -311,6 +311,7 @@ func StopEngineJSON() string {
 // OnNetworkChanged notifies netbind and the running engine of a Wi-Fi / Cellular transition.
 func OnNetworkChanged(ifaceName string) {
 	netbind.SetPreferredInterface(strings.TrimSpace(ifaceName))
+	netbind.ResetNAT64Cache()
 	mu.Lock()
 	eng := engineInst
 	mu.Unlock()

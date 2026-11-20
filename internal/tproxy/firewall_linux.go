@@ -89,7 +89,8 @@ func HasNFTTProxy() bool {
 	return false
 }
 
-// CalibrateKernel ensures ip_forward=1 and disables ICMP send_redirects on the single-arm side-router.
+// CalibrateKernel ensures ip_forward=1, disables ICMP send_redirects, and enables liberal
+// TCP conntrack window checking so single-arm asymmetric routing never stalls connections.
 func CalibrateKernel(lanIface string) {
 	writeSysctl("/proc/sys/net/ipv4/ip_forward", "1")
 	writeSysctl("/proc/sys/net/ipv4/conf/all/send_redirects", "0")
@@ -97,6 +98,38 @@ func CalibrateKernel(lanIface string) {
 	if lanIface != "" {
 		writeSysctl(filepath.Join("/proc/sys/net/ipv4/conf", lanIface, "send_redirects"), "0")
 	}
+	if _, err := os.Stat("/proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal"); err == nil {
+		writeSysctl("/proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal", "1")
+	} else {
+		_ = exec.Command("sysctl", "-w", "net.netfilter.nf_conntrack_tcp_be_liberal=1").Run()
+	}
+}
+
+// CheckFirewallHealthy verifies that `table inet ghost0` and the TPROXY policy route
+// are still mounted (e.g. not wiped by an external fw4 reload or hotplug event).
+func CheckFirewallHealthy(mode GatewayMode, tproxyMark, routeTable int) bool {
+	if mode == ModePort {
+		return true
+	}
+	if routeTable <= 0 {
+		routeTable = 100
+	}
+	if _, err := exec.LookPath("nft"); err == nil {
+		if err := exec.Command("nft", "list", "table", "inet", "ghost0").Run(); err != nil {
+			return false
+		}
+	}
+	if HasNFTTProxy() {
+		out, err := exec.Command("ip", "rule", "show").Output()
+		if err != nil {
+			return false
+		}
+		needle := fmt.Sprintf("lookup %d", routeTable)
+		if !strings.Contains(string(out), needle) {
+			return false
+		}
+	}
+	return true
 }
 
 func writeSysctl(path, val string) {

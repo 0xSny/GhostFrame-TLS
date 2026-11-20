@@ -140,9 +140,12 @@ textarea{min-height:74px;resize:vertical;font-family:ui-monospace,SFMono-Regular
           <div>
             <label>国内直连 DNS (留空默认主路由/阿里腾讯)</label>
             <input id="directDns" placeholder="223.5.5.5, 119.29.29.29" />
+            <label>控制台访问口令 (留空表示不设密码)</label>
+            <input id="webPassword" type="password" placeholder="可选：输入新口令，或留空保持不变" />
           </div>
-          <div style="padding-top:22px">
+          <div style="padding-top:16px">
             <label class="chk"><input type="checkbox" id="filterAAAA" /> 过滤 IPv6 AAAA (防分流泄漏)</label>
+            <label class="chk"><input type="checkbox" id="lanMasquerade" /> 旁路由 LAN 动态伪装 SNAT (防非对称断流)</label>
             <label class="chk"><input type="checkbox" id="autoYield" /> 启动前自动停用冲突代理</label>
           </div>
         </div>
@@ -229,14 +232,38 @@ const apiBase = (() => {
   if (p.endsWith('/')) p = p.slice(0, -1);
   return p === '/' ? '' : p;
 })();
-const api = (p, opt) => fetch(apiBase + p, opt).then(r => r.json());
+const api = (p, opt) => fetch(apiBase + p, opt).then(async r => {
+  if (r.status === 401) {
+    promptLogin();
+    throw new Error('auth required');
+  }
+  return r.json();
+});
+let loginPending = false;
+function promptLogin(){
+  if (loginPending) return;
+  loginPending = true;
+  const pwd = window.prompt('0Ghost 控制台已启用访问口令，请输入口令：');
+  if (pwd !== null) {
+    fetch(apiBase + '/api/auth/login', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({password: pwd})
+    }).then(res => {
+      loginPending = false;
+      if (res.ok) refresh();
+    }).catch(() => { loginPending = false; });
+  } else {
+    loginPending = false;
+  }
+}
 let curState = 'disconnected';
 let curGwMode = 'rule';
 let curDevMode = 'all';
 let curTransport = 'auto';
 let formDirty = false;
 
-['devIps','directDns','customRules','hopRange','upMbps','downMbps','filterAAAA','autoYield'].forEach(id => {
+['devIps','directDns','customRules','hopRange','upMbps','downMbps','filterAAAA','lanMasquerade','autoYield','webPassword'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', () => { formDirty = true; });
 });
@@ -295,19 +322,28 @@ function saveGatewaySettings(){
   const devIps = document.getElementById('devIps').value.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean);
   const directDns = document.getElementById('directDns').value.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean);
   const customRules = document.getElementById('customRules').value.split(/\n+/).map(x=>x.trim()).filter(Boolean);
-  formDirty = false;
-  api('/api/settings', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({
+  const webPwdEl = document.getElementById('webPassword');
+  const webPwdVal = webPwdEl ? webPwdEl.value.trim() : '';
+  const payload = {
       gateway_mode: curGwMode,
       device_mode: curDevMode,
       device_ips: devIps, has_device_ips: true,
       direct_dns: directDns, has_direct_dns: true,
       filter_aaaa: document.getElementById('filterAAAA').checked,
+      lan_masquerade: document.getElementById('lanMasquerade').checked,
       auto_yield_conflicts: document.getElementById('autoYield').checked,
       custom_rules: customRules, has_custom_rules: true
-    })
+  };
+  if (webPwdVal !== '') {
+    payload.web_password = webPwdVal;
+    payload.has_web_password = true;
+    webPwdEl.value = '';
+  }
+  formDirty = false;
+  api('/api/settings', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload)
   }).then(refresh);
 }
 
@@ -401,6 +437,7 @@ function refresh(){
       document.getElementById('devIps').value = (s.device_ips || []).join('\n');
       document.getElementById('directDns').value = (s.direct_dns || []).join(', ');
       document.getElementById('filterAAAA').checked = !!s.filter_aaaa;
+      document.getElementById('lanMasquerade').checked = !!s.lan_masquerade;
       document.getElementById('autoYield').checked = !!s.auto_yield_conflicts;
       document.getElementById('customRules').value = (s.custom_rules || []).join('\n');
       document.getElementById('hopRange').value = s.hop_range || '';

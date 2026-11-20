@@ -13,8 +13,37 @@ private final class PacketFlowTunWriter: NSObject, MobileTunPacketWriterProtocol
     }
 
     func writePacket(_ pkt: Data?, family: Int) {
-        guard let data = pkt, !data.isEmpty, let flow = self.flow else { return }
-        flow.writePackets([data], withProtocols: [NSNumber(value: family)])
+        autoreleasepool {
+            guard let data = pkt, !data.isEmpty, let flow = self.flow else { return }
+            flow.writePackets([data], withProtocols: [NSNumber(value: family)])
+        }
+    }
+
+    func writePacketBatch(_ concat: Data?, lens: Data?, count: Int, family: Int) {
+        autoreleasepool {
+            guard let data = concat, let lenBytes = lens, count > 0, lenBytes.count >= count * 2, let flow = self.flow else {
+                return
+            }
+            var packets: [Data] = []
+            var protos: [NSNumber] = []
+            packets.reserveCapacity(count)
+            protos.reserveCapacity(count)
+
+            let protoNum = NSNumber(value: family)
+            var offset = 0
+            for i in 0..<count {
+                let hi = Int(lenBytes[i * 2])
+                let lo = Int(lenBytes[i * 2 + 1])
+                let pktLen = (hi << 8) | lo
+                guard pktLen > 0, offset + pktLen <= data.count else { break }
+                packets.append(data.subdata(in: offset..<(offset + pktLen)))
+                protos.append(protoNum)
+                offset += pktLen
+            }
+            if !packets.isEmpty {
+                flow.writePackets(packets, withProtocols: protos)
+            }
+        }
     }
 }
 
@@ -148,9 +177,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.tunLock.unlock()
             guard active else { return }
 
-            for (idx, pkt) in packets.enumerated() {
-                if idx < protocols.count && protocols[idx].int32Value == AF_INET {
-                    GhostMobileBridge.pushTunPacket(pkt)
+            autoreleasepool {
+                var totalBytes = 0
+                var validCount = 0
+                for (idx, pkt) in packets.enumerated() {
+                    if idx < protocols.count && protocols[idx].int32Value == AF_INET && pkt.count > 0 && pkt.count <= 0xFFFF {
+                        totalBytes += pkt.count
+                        validCount += 1
+                    }
+                }
+                if validCount > 0 {
+                    var concat = Data(capacity: totalBytes)
+                    var lens = Data(capacity: validCount * 2)
+                    for (idx, pkt) in packets.enumerated() {
+                        if idx < protocols.count && protocols[idx].int32Value == AF_INET && pkt.count > 0 && pkt.count <= 0xFFFF {
+                            let n = pkt.count
+                            lens.append(UInt8((n >> 8) & 0xFF))
+                            lens.append(UInt8(n & 0xFF))
+                            concat.append(pkt)
+                        }
+                    }
+                    GhostMobileBridge.pushTunPacketBatch(concat, lens: lens, count: validCount)
                 }
             }
             self.readPacketsLoop()

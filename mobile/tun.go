@@ -2,6 +2,7 @@ package mobile
 
 import (
 	"errors"
+	"path/filepath"
 	"sync"
 
 	"ghostframe/internal/tunstack"
@@ -11,6 +12,7 @@ import (
 // outbound IPv4 packets from Go's gVisor netstack back into iOS packetFlow.
 type TunPacketWriter interface {
 	WritePacket(pkt []byte, family int)
+	WritePacketBatch(concat []byte, lens []byte, count int, family int)
 }
 
 var (
@@ -20,7 +22,7 @@ var (
 
 // StartTUN attaches a memory-bounded gVisor L3/L4 TUN stack to the active mobile Engine.
 // It also enables direct CN DNS bypass on the Engine so ActionDirect connections never
-// self-resolve against the TUN Fake-IP DNS (198.18.0.1).
+// self-resolve against the TUN Fake-IP DNS (198.18.0.1), and restores persisted FakeIP cache.
 func StartTUN(writer TunPacketWriter, mtu int) error {
 	if writer == nil {
 		return errors.New("mobile: nil TUN packet writer")
@@ -29,13 +31,18 @@ func StartTUN(writer TunPacketWriter, mtu int) error {
 	mu.Lock()
 	eng := engineInst
 	isTunnel := tunnelExtState
+	dataDir := dataDirState
 	mu.Unlock()
 	if eng == nil {
 		return errors.New("mobile: engine not started")
 	}
 
 	eng.SetDirectDNSBypass(true)
-	st, err := tunstack.New(eng, writer, mtu, isTunnel)
+	cachePath := ""
+	if dataDir != "" {
+		cachePath = filepath.Join(dataDir, "fakeip_cache.bin")
+	}
+	st, err := tunstack.NewWithOptions(eng, writer, mtu, isTunnel, cachePath)
 	if err != nil {
 		return err
 	}
@@ -57,7 +64,7 @@ func StartTUNJSON(writer TunPacketWriter, mtu int) string {
 	return marshalEnvelope(StartTUN(writer, mtu), nil)
 }
 
-// StopTUN closes the active userspace TUN stack if running.
+// StopTUN closes the active userspace TUN stack if running and flushes persisted FakeIP cache.
 func StopTUN() {
 	tunMu.Lock()
 	st := tunStack
@@ -91,6 +98,20 @@ func PushTunPacket(pkt []byte) {
 	tunMu.Unlock()
 	if st != nil {
 		st.PushPacket(pkt)
+	}
+}
+
+// PushTunPacketBatch forwards concatenated raw IPv4 packets packed with big-endian uint16 lengths
+// from Swift into gVisor netstack in a single FFI crossing.
+func PushTunPacketBatch(concat []byte, lens []byte, count int) {
+	if count <= 0 || len(concat) == 0 || len(lens) < count*2 {
+		return
+	}
+	tunMu.Lock()
+	st := tunStack
+	tunMu.Unlock()
+	if st != nil {
+		st.PushPacketBatch(concat, lens, count)
 	}
 }
 

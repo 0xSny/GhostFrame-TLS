@@ -2159,14 +2159,18 @@ func (s *RTCSession) HopValidated(pickPort func() int, maxAttempts int, probeTim
 		}
 		tried[port] = struct{}{}
 
-		raddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(s.host, strconv.Itoa(port)))
+		raddr, err := netbind.ResolveUDPAddr(context.Background(), s.host, port)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		network := "udp"
-		if raddr.IP != nil && raddr.IP.To4() != nil {
-			network = "udp4"
+		if raddr.IP != nil {
+			if raddr.IP.To4() != nil {
+				network = "udp4"
+			} else {
+				network = "udp6"
+			}
 		}
 		candPC, err := listenClientUDP(network, raddr.IP)
 		if err != nil {
@@ -2437,13 +2441,17 @@ func listenClientUDP(network string, targetIP net.IP) (*net.UDPConn, error) {
 
 // Dial opens an OS UDP socket with tuned buffers and connects to a GhostFrame-RTC server.
 func Dial(ctx context.Context, opts DialOptions) (*RTCSession, time.Duration, error) {
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port)))
+	addr, err := netbind.ResolveUDPAddr(ctx, opts.Host, opts.Port)
 	if err != nil {
 		return nil, 0, err
 	}
 	network := "udp"
-	if addr.IP != nil && addr.IP.To4() != nil {
-		network = "udp4"
+	if addr.IP != nil {
+		if addr.IP.To4() != nil {
+			network = "udp4"
+		} else {
+			network = "udp6"
+		}
 	}
 	pc, err := listenClientUDP(network, addr.IP)
 	if err != nil {

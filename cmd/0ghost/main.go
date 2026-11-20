@@ -210,12 +210,17 @@ func (s *GatewayService) Start() {
 	}
 
 	go s.watchLoop()
+	startFirewallSignalWatcher(s.stopCh, func() {
+		s.engine.Logf("[0Ghost] 收到热插拔重载信号 (SIGUSR1)，正在自愈重挂防火墙规则...")
+		s.SyncFirewall()
+	})
 }
 
 func (s *GatewayService) watchLoop() {
 	t := time.NewTicker(4 * time.Second)
 	defer t.Stop()
 	lastConnected := false
+	healthTick := 0
 	for {
 		select {
 		case <-s.stopCh:
@@ -224,7 +229,20 @@ func (s *GatewayService) watchLoop() {
 			connected := s.engine.IsConnected()
 			if connected != lastConnected {
 				lastConnected = connected
+				healthTick = 0
 				s.SyncFirewall()
+				continue
+			}
+			healthTick++
+			if healthTick >= 5 { // Every 20s verify fw4/ip-rule integrity
+				healthTick = 0
+				cfg := s.getGatewayConfig()
+				if connected && cfg.GatewayMode != tproxy.ModePort {
+					if !tproxy.CheckFirewallHealthy(cfg.GatewayMode, 1, 100) {
+						s.engine.Logf("[0Ghost] 巡检发现 nftables 或策略路由异常脱落，立即自动修复...")
+						s.SyncFirewall()
+					}
+				}
 			}
 		}
 	}
@@ -287,8 +305,9 @@ func (s *GatewayService) SyncFirewall() {
 		FWMark:       cfg.FWMark,
 		TProxyMark:   1,
 		RouteTable:   100,
-		PreferTProxy: true,
-		FilterAAAA:   cfg.FilterAAAA,
+		PreferTProxy:  true,
+		FilterAAAA:    cfg.FilterAAAA,
+		LANMasquerade: cfg.LANMasquerade,
 	}
 
 	backend, err := tproxy.ApplyFirewall(spec)
@@ -489,7 +508,9 @@ func (s *GatewayService) Snapshot() map[string]any {
 	st["device_ips"] = cfg.DeviceIPs
 	st["direct_dns"] = cfg.DirectDNS
 	st["filter_aaaa"] = cfg.FilterAAAA
+	st["lan_masquerade"] = cfg.LANMasquerade
 	st["auto_yield_conflicts"] = cfg.AutoYieldConflicts
+	st["web_password_enabled"] = strings.TrimSpace(cfg.WebPassword) != ""
 	st["custom_rules"] = s.engine.CustomRules()
 	st["tproxy_stats"] = tpStats
 	st["fw_err"] = fwErr

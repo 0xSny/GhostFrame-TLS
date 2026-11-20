@@ -2,6 +2,7 @@ package tunstack
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -30,7 +31,7 @@ import (
 const (
 	tunNICID       tcpip.NICID = 1
 	afINET                     = 2 // POSIX AF_INET (matches iOS NEPacketTunnelFlow protocol family)
-	udpIdleTimeout             = 45 * time.Second
+	maxOutBatch                = 32
 )
 
 // PacketWriter receives outbound raw IP packets from the userspace TCP/IP stack
@@ -39,16 +40,24 @@ type PacketWriter interface {
 	WritePacket(pkt []byte, family int)
 }
 
+// BatchPacketWriter is an optional extension implemented by mobile PacketWriter bridges
+// to receive up to 32 concatenated outbound packets in a single FFI/autoreleasepool boundary.
+type BatchPacketWriter interface {
+	WritePacketBatch(concatPkts []byte, lengthsBE []byte, count int, family int)
+}
+
 // Stats reports live TUN L3/L4 counters for telemetry & diagnostics.
 type Stats struct {
-	Active       bool   `json:"active"`
-	MTU          int    `json:"mtu"`
-	TCPConns     uint64 `json:"tcp_conns"`
-	UDPConns     uint64 `json:"udp_conns"`
-	DNSQueries   uint64 `json:"dns_queries"`
-	PacketsIn    uint64 `json:"packets_in"`
-	PacketsOut   uint64 `json:"packets_out"`
-	FakeIPEntry  int    `json:"fakeip_entries"`
+	Active      bool   `json:"active"`
+	MTU         int    `json:"mtu"`
+	TCPConns    uint64 `json:"tcp_conns"`
+	UDPConns    uint64 `json:"udp_conns"`
+	ActiveTCP   int32  `json:"active_tcp"`
+	ActiveUDP   int32  `json:"active_udp"`
+	DNSQueries  uint64 `json:"dns_queries"`
+	PacketsIn   uint64 `json:"packets_in"`
+	PacketsOut  uint64 `json:"packets_out"`
+	FakeIPEntry int    `json:"fakeip_entries"`
 }
 
 var copyBufPool = sync.Pool{
@@ -58,13 +67,32 @@ var copyBufPool = sync.Pool{
 	},
 }
 
+var udpBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 16*1024)
+		return &b
+	},
+}
+
+var dnsBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 2048)
+		return &b
+	},
+}
+
 // Stack wraps a memory-bounded gVisor netstack bridging raw TUN IPv4 packets
 // into GhostFrame's client.Engine (RuleSet + Fake-IP DNS + SNI Sniff + GFT-RTC/TCP).
 type Stack struct {
-	engine *client.Engine
-	writer PacketWriter
-	mtu    int
-	fakeIP *FakeIPPool
+	engine       *client.Engine
+	writer       PacketWriter
+	batchWriter  BatchPacketWriter
+	mtu          int
+	lowMem       bool
+	maxActiveTCP int32
+	maxActiveUDP int32
+	udpIdle      time.Duration
+	fakeIP       *FakeIPPool
 
 	ns     *stack.Stack
 	ep     *channel.Endpoint
@@ -72,6 +100,8 @@ type Stack struct {
 	cancel context.CancelFunc
 	closed atomic.Bool
 
+	activeTCP  atomic.Int32
+	activeUDP  atomic.Int32
 	tcpConns   atomic.Uint64
 	udpConns   atomic.Uint64
 	dnsQueries atomic.Uint64
@@ -79,9 +109,13 @@ type Stack struct {
 	packetsOut atomic.Uint64
 }
 
-// New creates and starts a userspace TUN TCP/IP stack bound to eng.
-// When lowMem is true (iOS PacketTunnel 50MB cap), TCP windows and queue depths are tightly bounded.
+// New creates and starts an in-memory userspace TUN TCP/IP stack bound to eng.
 func New(eng *client.Engine, writer PacketWriter, mtu int, lowMem bool) (*Stack, error) {
+	return NewWithOptions(eng, writer, mtu, lowMem, "")
+}
+
+// NewWithOptions creates and starts a userspace TUN TCP/IP stack with optional Fake-IP cache persistence.
+func NewWithOptions(eng *client.Engine, writer PacketWriter, mtu int, lowMem bool, fakeCachePath string) (*Stack, error) {
 	if eng == nil {
 		return nil, errors.New("tunstack: nil engine")
 	}
@@ -96,11 +130,17 @@ func New(eng *client.Engine, writer PacketWriter, mtu int, lowMem bool) (*Stack,
 	fakeCap := 8192
 	tcpWnd := 128 * 1024
 	tcpMaxInFlight := 512
+	maxTCP := int32(1024)
+	maxUDP := int32(512)
+	udpIdle := 45 * time.Second
 	if lowMem {
 		queueSize = 256
 		fakeCap = 4096
 		tcpWnd = 64 * 1024
 		tcpMaxInFlight = 256
+		maxTCP = 256
+		maxUDP = 128
+		udpIdle = 20 * time.Second
 	}
 
 	ep := channel.New(queueSize, uint32(mtu), "")
@@ -151,16 +191,22 @@ func New(eng *client.Engine, writer PacketWriter, mtu int, lowMem bool) (*Stack,
 		},
 	})
 
+	bw, _ := writer.(BatchPacketWriter)
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Stack{
-		engine: eng,
-		writer: writer,
-		mtu:    mtu,
-		fakeIP: NewFakeIPPool(fakeCap),
-		ns:     ns,
-		ep:     ep,
-		ctx:    ctx,
-		cancel: cancel,
+		engine:       eng,
+		writer:       writer,
+		batchWriter:  bw,
+		mtu:          mtu,
+		lowMem:       lowMem,
+		maxActiveTCP: maxTCP,
+		maxActiveUDP: maxUDP,
+		udpIdle:      udpIdle,
+		fakeIP:       NewFakeIPPoolWithPersistence(fakeCap, fakeCachePath),
+		ns:           ns,
+		ep:           ep,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 
 	tcpFwd := tcp.NewForwarder(ns, tcpWnd, tcpMaxInFlight, s.handleTCP)
@@ -183,7 +229,6 @@ func (s *Stack) PushPacket(pkt []byte) {
 		return
 	}
 	s.packetsIn.Add(1)
-	// Copy into gVisor owned buffer so caller slice can be reused immediately.
 	cp := make([]byte, len(pkt))
 	copy(cp, pkt)
 	pb := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -191,6 +236,23 @@ func (s *Stack) PushPacket(pkt []byte) {
 	})
 	s.ep.InjectInbound(header.IPv4ProtocolNumber, pb)
 	pb.DecRef()
+}
+
+// PushPacketBatch unpacks concatenated raw IPv4 packets packed with big-endian uint16 lengths
+// and injects them into gVisor netstack in a single FFI crossing.
+func (s *Stack) PushPacketBatch(concatPkts []byte, lengthsBE []byte, count int) {
+	if s.closed.Load() || count <= 0 || len(lengthsBE) < count*2 {
+		return
+	}
+	off := 0
+	for i := 0; i < count; i++ {
+		n := int(binary.BigEndian.Uint16(lengthsBE[i*2 : i*2+2]))
+		if n <= 0 || off+n > len(concatPkts) {
+			break
+		}
+		s.PushPacket(concatPkts[off : off+n])
+		off += n
+	}
 }
 
 // Close shuts down the userspace TCP/IP stack and releases all resources.
@@ -201,6 +263,9 @@ func (s *Stack) Close() {
 	s.cancel()
 	s.ep.Close()
 	s.ns.Close()
+	if s.fakeIP != nil {
+		s.fakeIP.Close()
+	}
 }
 
 // Stats returns live TUN stack metrics.
@@ -210,6 +275,8 @@ func (s *Stack) Stats() Stats {
 		MTU:         s.mtu,
 		TCPConns:    s.tcpConns.Load(),
 		UDPConns:    s.udpConns.Load(),
+		ActiveTCP:   s.activeTCP.Load(),
+		ActiveUDP:   s.activeUDP.Load(),
 		DNSQueries:  s.dnsQueries.Load(),
 		PacketsIn:   s.packetsIn.Load(),
 		PacketsOut:  s.packetsOut.Load(),
@@ -218,22 +285,64 @@ func (s *Stack) Stats() Stats {
 }
 
 func (s *Stack) outboundPump() {
-	outBuf := make([]byte, 0, s.mtu+64)
+	if s.batchWriter == nil {
+		outBuf := make([]byte, 0, s.mtu+64)
+		for {
+			pb := s.ep.ReadContext(s.ctx)
+			if pb == nil {
+				return
+			}
+			outBuf = outBuf[:0]
+			for _, slice := range pb.AsSlices() {
+				outBuf = append(outBuf, slice...)
+			}
+			pb.DecRef()
+			if len(outBuf) == 0 {
+				continue
+			}
+			s.packetsOut.Add(1)
+			s.writer.WritePacket(outBuf, afINET)
+		}
+	}
+
+	batchBuf := make([]byte, 0, (s.mtu+64)*maxOutBatch)
+	var lenBuf [maxOutBatch * 2]byte
 	for {
 		pb := s.ep.ReadContext(s.ctx)
 		if pb == nil {
 			return
 		}
-		outBuf = outBuf[:0]
-		for _, slice := range pb.AsSlices() {
-			outBuf = append(outBuf, slice...)
+		batchBuf = batchBuf[:0]
+		count := 0
+
+		appendPB := func(pkt *stack.PacketBuffer) {
+			start := len(batchBuf)
+			for _, slice := range pkt.AsSlices() {
+				batchBuf = append(batchBuf, slice...)
+			}
+			pkt.DecRef()
+			pktLen := len(batchBuf) - start
+			if pktLen > 0 && pktLen <= 0xFFFF {
+				binary.BigEndian.PutUint16(lenBuf[count*2:count*2+2], uint16(pktLen))
+				count++
+			} else if pktLen > 0xFFFF {
+				batchBuf = batchBuf[:start]
+			}
 		}
-		pb.DecRef()
-		if len(outBuf) == 0 {
+
+		appendPB(pb)
+		for count < maxOutBatch {
+			nextPB := s.ep.Read()
+			if nextPB == nil {
+				break
+			}
+			appendPB(nextPB)
+		}
+		if count == 0 {
 			continue
 		}
-		s.packetsOut.Add(1)
-		s.writer.WritePacket(outBuf, afINET)
+		s.packetsOut.Add(uint64(count))
+		s.batchWriter.WritePacketBatch(batchBuf, lenBuf[:count*2], count, afINET)
 	}
 }
 
@@ -253,10 +362,17 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		r.Complete(true)
 		return
 	}
+	if cur := s.activeTCP.Add(1); cur > s.maxActiveTCP {
+		s.activeTCP.Add(-1)
+		r.Complete(true)
+		return
+	}
+
 	id := r.ID()
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
+		s.activeTCP.Add(-1)
 		r.Complete(true)
 		return
 	}
@@ -270,6 +386,7 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 }
 
 func (s *Stack) relayTCP(conn *gonet.TCPConn, dstAddr tcpip.Address, dstPort uint16) {
+	defer s.activeTCP.Add(-1)
 	defer conn.Close()
 
 	dialTarget, routeTarget, isFake := s.resolveDestination(dstAddr, dstPort)
@@ -313,21 +430,32 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) bool {
 		return false
 	}
 	id := r.ID()
-	var wq waiter.Queue
-	ep, err := r.CreateEndpoint(&wq)
-	if err != nil {
-		return false
-	}
-	conn := gonet.NewUDPConn(&wq, ep)
-
 	// Intercept ALL UDP port 53 traffic (198.18.0.1:53 and any hardcoded external DNS)
 	// with our zero-latency Fake-IP DNS responder.
 	if id.LocalPort == 53 {
+		var wq waiter.Queue
+		ep, err := r.CreateEndpoint(&wq)
+		if err != nil {
+			return false
+		}
+		conn := gonet.NewUDPConn(&wq, ep)
 		s.dnsQueries.Add(1)
 		go s.handleDNSConn(conn)
 		return true
 	}
 
+	if cur := s.activeUDP.Add(1); cur > s.maxActiveUDP {
+		s.activeUDP.Add(-1)
+		return false
+	}
+
+	var wq waiter.Queue
+	ep, err := r.CreateEndpoint(&wq)
+	if err != nil {
+		s.activeUDP.Add(-1)
+		return false
+	}
+	conn := gonet.NewUDPConn(&wq, ep)
 	s.udpConns.Add(1)
 	go s.relayUDP(conn, id.LocalAddress, id.LocalPort)
 	return true
@@ -335,7 +463,10 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) bool {
 
 func (s *Stack) handleDNSConn(conn *gonet.UDPConn) {
 	defer conn.Close()
-	buf := make([]byte, 2048)
+	bufPtr := dnsBufPool.Get().(*[]byte)
+	defer dnsBufPool.Put(bufPtr)
+	buf := *bufPtr
+
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	n, err := conn.Read(buf)
 	if err != nil || n < 12 {
@@ -348,6 +479,7 @@ func (s *Stack) handleDNSConn(conn *gonet.UDPConn) {
 }
 
 func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uint16) {
+	defer s.activeUDP.Add(-1)
 	defer conn.Close()
 
 	dialTarget, routeTarget, _ := s.resolveDestination(dstAddr, dstPort)
@@ -367,6 +499,7 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 	}
 	defer assoc.Close()
 
+	idle := s.udpIdle
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -378,7 +511,7 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 				if !ok {
 					return
 				}
-				_ = conn.SetWriteDeadline(time.Now().Add(udpIdleTimeout))
+				_ = conn.SetWriteDeadline(time.Now().Add(idle))
 				if _, werr := conn.Write(pkt.Data); werr != nil {
 					return
 				}
@@ -386,9 +519,10 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 		}
 	}()
 
-	buf := make([]byte, 65535)
+	bufPtr := udpBufPool.Get().(*[]byte)
+	buf := *bufPtr
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(udpIdleTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(idle))
 		n, rerr := conn.Read(buf)
 		if rerr != nil {
 			break
@@ -397,6 +531,7 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 			break
 		}
 	}
+	udpBufPool.Put(bufPtr)
 	_ = assoc.Close()
 	<-done
 }
@@ -409,35 +544,40 @@ func (s *Stack) relayUDPDirect(conn *gonet.UDPConn, dialTarget string) {
 	}
 	defer remote.Close()
 
+	idle := s.udpIdle
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		buf := make([]byte, 65535)
+		bufPtr := udpBufPool.Get().(*[]byte)
+		defer udpBufPool.Put(bufPtr)
+		buf := *bufPtr
 		for {
-			_ = remote.SetReadDeadline(time.Now().Add(udpIdleTimeout))
+			_ = remote.SetReadDeadline(time.Now().Add(idle))
 			n, rerr := remote.Read(buf)
 			if rerr != nil {
 				return
 			}
-			_ = conn.SetWriteDeadline(time.Now().Add(udpIdleTimeout))
+			_ = conn.SetWriteDeadline(time.Now().Add(idle))
 			if _, werr := conn.Write(buf[:n]); werr != nil {
 				return
 			}
 		}
 	}()
 
-	buf := make([]byte, 65535)
+	bufPtr := udpBufPool.Get().(*[]byte)
+	buf := *bufPtr
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(udpIdleTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(idle))
 		n, rerr := conn.Read(buf)
 		if rerr != nil {
 			break
 		}
-		_ = remote.SetWriteDeadline(time.Now().Add(udpIdleTimeout))
+		_ = remote.SetWriteDeadline(time.Now().Add(idle))
 		if _, werr := remote.Write(buf[:n]); werr != nil {
 			break
 		}
 	}
+	udpBufPool.Put(bufPtr)
 	_ = remote.Close()
 	<-done
 }

@@ -71,11 +71,20 @@ func TestFakeIPPoolAndDNSResponder(t *testing.T) {
 		t.Fatalf("reverse lookup mismatch: found=%v host=%q", found, host)
 	}
 
-	// AAAA query should return NOERROR with 0 answers (forces IPv4 Fake-IP fast path).
+	// Verify A record TTL == 2s.
+	ttl := binary.BigEndian.Uint32(resp[len(resp)-10 : len(resp)-6])
+	if ttl != fakeIPDNSTTL {
+		t.Fatalf("expected FakeIP A TTL=%d, got %d", fakeIPDNSTTL, ttl)
+	}
+
+	// AAAA query should return NOERROR (RCODE=0) with 0 answers (forces IPv4 Fake-IP fast path).
 	qAAAA := buildDNSQuery(0x5678, "api.telegram.org", 28)
 	respAAAA, ok := pool.HandleDNSQuery(qAAAA)
 	if !ok {
 		t.Fatalf("expected valid DNS AAAA response")
+	}
+	if rcode := binary.BigEndian.Uint16(respAAAA[2:4]) & 0x0F; rcode != 0 {
+		t.Fatalf("expected AAAA RCODE=0 (NOERROR), got %d", rcode)
 	}
 	if binary.BigEndian.Uint16(respAAAA[6:8]) != 0 {
 		t.Fatalf("expected ANCOUNT=0 for AAAA, got %d", binary.BigEndian.Uint16(respAAAA[6:8]))
@@ -182,5 +191,71 @@ func TestStackEndToEndFakeIPDNS(t *testing.T) {
 	stats := st.Stats()
 	if stats.DNSQueries < 1 || stats.PacketsIn < 1 || stats.PacketsOut < 1 {
 		t.Fatalf("unexpected TUN stats: %+v", stats)
+	}
+}
+
+func TestFakeIPPersistenceAndBatchIO(t *testing.T) {
+	cachePath := t.TempDir() + "/fakeip_cache.bin"
+	p1 := NewFakeIPPoolWithPersistence(16, cachePath)
+	b4 := p1.Allocate("web.telegram.org")
+	ip := net.IPv4(b4[0], b4[1], b4[2], b4[3])
+	p1.Close()
+
+	// Reopen simulates PacketTunnel extension wakeup / OnDemand restart.
+	p2 := NewFakeIPPoolWithPersistence(16, cachePath)
+	defer p2.Close()
+	host, ok := p2.Lookup(ip)
+	if !ok || host != "web.telegram.org" {
+		t.Fatalf("expected persisted FakeIP %s -> web.telegram.org, got ok=%v host=%q", ip, ok, host)
+	}
+	b4Again := p2.Allocate("web.telegram.org")
+	if b4Again != b4 {
+		t.Fatalf("expected stable re-allocation after reload: got %v want %v", b4Again, b4)
+	}
+
+	// Verify batch packet injection & batch writer path.
+	client.SetNoSysProxy(true)
+	eng, err := client.NewEngine("")
+	if err != nil {
+		t.Fatalf("NewEngine failed: %v", err)
+	}
+	defer eng.Close()
+
+	bw := &batchCaptureWriter{ch: make(chan []byte, 8)}
+	st, err := NewWithOptions(eng, bw, 1400, true, cachePath)
+	if err != nil {
+		t.Fatalf("NewWithOptions failed: %v", err)
+	}
+	defer st.Close()
+
+	q := buildDNSQuery(0x2222, "www.google.com", 1)
+	rawPkt := buildIPv4UDPPacket([4]byte{198, 18, 0, 2}, [4]byte{198, 18, 0, 1}, 55555, 53, q)
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(rawPkt)))
+	st.PushPacketBatch(rawPkt, lenBuf[:], 1)
+
+	select {
+	case out := <-bw.ch:
+		if len(out) < header.IPv4MinimumSize+header.UDPMinimumSize+12 {
+			t.Fatalf("batch output packet too short: %d", len(out))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for batch outbound response")
+	}
+}
+
+type batchCaptureWriter struct {
+	captureWriter
+}
+
+func (b *batchCaptureWriter) WritePacketBatch(concatPkts []byte, lengthsBE []byte, count int, family int) {
+	off := 0
+	for i := 0; i < count; i++ {
+		n := int(binary.BigEndian.Uint16(lengthsBE[i*2 : i*2+2]))
+		if n <= 0 || off+n > len(concatPkts) {
+			break
+		}
+		b.WritePacket(concatPkts[off:off+n], family)
+		off += n
 	}
 }

@@ -68,7 +68,7 @@ return view.extend({
 					target: '_blank',
 					rel: 'noopener noreferrer',
 					class: 'cbi-button cbi-button-action'
-				}, '独立全屏打开控制台 (' + window.location.hostname + ':19080)'),
+				}, '独立标签页打开控制台 (' + window.location.hostname + ':19080)'),
 				E('button', {
 					class: 'cbi-button cbi-button-apply',
 					click: ui.createHandlerFn(this, function() { return this.execService('restart'); })
@@ -85,15 +85,33 @@ return view.extend({
 			style: 'width:100%;height:calc(100vh - 180px);min-height:760px;border:1px solid #1d2a49;border-radius:14px;background:#060913;'
 		});
 
-		// Fallback to direct :19080 if uhttpd proxy_prefix /0ghost is unavailable over HTTP.
-		fetch('/0ghost/api/status', { cache: 'no-store' }).then(function(res) {
+		var httpsNotice = E('div', {
+			style: 'display:none;background:#0c1324;color:#e6eefc;border:1px solid rgba(245,158,11,.45);border-radius:14px;padding:28px 24px;text-align:center;'
+		}, [
+			E('h3', { style: 'margin:0 0 10px;color:#fbbf24;' }, 'HTTPS 混合内容安全拦截提示'),
+			E('p', { style: 'margin:0 0 16px;color:#94a3b8;font-size:14px;line-height:1.7;' },
+				'当前正通过 HTTPS 访问 LuCI，但同源反代 /0ghost/ 未响应；浏览器安全策略会拦截在 HTTPS iframe 内嵌入 HTTP :19080 页面（防止空白页）。'),
+			E('a', {
+				href: directUrl,
+				target: '_blank',
+				rel: 'noopener noreferrer',
+				class: 'cbi-button cbi-button-action',
+				style: 'padding:8px 18px;font-weight:700;'
+			}, '在新标签页打开 0Ghost 独立控制台 (' + directUrl + ')')
+		]);
+
+		// Verify uhttpd same-origin proxy /0ghost/; never inject http:// into an https:// iframe.
+		fetch('/0ghost/api/auth/info', { cache: 'no-store' }).then(function(res) {
 			if (!res.ok) throw new Error('proxy unavailable');
 		}).catch(function() {
-			if (window.location.protocol === 'http:') {
+			if (window.location.protocol === 'https:') {
+				frame.style.display = 'none';
+				httpsNotice.style.display = 'block';
+			} else {
 				frame.src = directUrl;
 			}
 		});
 
-		return E('div', { style: 'padding:4px 0;' }, [toolbar, frame]);
+		return E('div', { style: 'padding:4px 0;' }, [toolbar, httpsNotice, frame]);
 	}
 });

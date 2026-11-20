@@ -1,11 +1,16 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"ghostframe/internal/tproxy"
@@ -31,15 +36,51 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 	mux.HandleFunc("/", serveIndex)
 	mux.HandleFunc("/console", serveIndex)
 
-	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, s.Snapshot())
+	mux.HandleFunc("/api/auth/info", func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.getGatewayConfig()
+		required := strings.TrimSpace(cfg.WebPassword) != ""
+		writeJSON(w, http.StatusOK, map[string]any{
+			"auth_required": required,
+			"authenticated": !required || s.isAuthorizedRequest(r, cfg.WebPassword),
+		})
 	})
 
-	mux.HandleFunc("/api/connect", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		var req struct {
+			Password string `json:"password"`
+		}
+		if err := readJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		cfg := s.getGatewayConfig()
+		want := strings.TrimSpace(cfg.WebPassword)
+		if want != "" && subtle.ConstantTimeCompare([]byte(req.Password), []byte(want)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "口令错误"})
+			return
+		}
+		if want != "" {
+			http.SetCookie(w, &http.Cookie{
+				Name:     "ghost0_auth",
+				Value:    computeWebAuthToken(want),
+				Path:     "/",
+				HttpOnly: true,
+				SameSite: http.SameSiteStrictMode,
+				MaxAge:   86400 * 7,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, s.Snapshot())
+	})
+
+	mux.HandleFunc("/api/connect", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			if err := s.engine.Connect(); err != nil {
 				s.engine.Logf("[0Ghost] 连接失败: %v", err)
@@ -47,23 +88,15 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 			s.SyncFirewall()
 		}()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	})
+	}))
 
-	mux.HandleFunc("/api/disconnect", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	mux.HandleFunc("/api/disconnect", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		s.engine.Disconnect()
 		s.SyncFirewall()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	})
+	}))
 
-	mux.HandleFunc("/api/import", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	mux.HandleFunc("/api/import", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			URI string `json:"uri"`
 		}
@@ -99,13 +132,9 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 			s.SyncFirewall()
 		}()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "imported": imported})
-	})
+	}))
 
-	mux.HandleFunc("/api/node/select", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	mux.HandleFunc("/api/node/select", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Index int `json:"index"`
 		}
@@ -122,13 +151,9 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 			s.SyncFirewall()
 		}()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	})
+	}))
 
-	mux.HandleFunc("/api/node/delete", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	mux.HandleFunc("/api/node/delete", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Index int `json:"index"`
 		}
@@ -142,13 +167,9 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		}
 		s.SyncFirewall()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	})
+	}))
 
-	mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	mux.HandleFunc("/api/settings", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			GatewayMode        *string  `json:"gateway_mode"`
 			DeviceMode         *string  `json:"device_mode"`
@@ -157,7 +178,10 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 			DirectDNS          []string `json:"direct_dns"`
 			HasDirectDNS       bool     `json:"has_direct_dns"`
 			FilterAAAA         *bool    `json:"filter_aaaa"`
+			LANMasquerade      *bool    `json:"lan_masquerade"`
 			AutoYieldConflicts *bool    `json:"auto_yield_conflicts"`
+			WebPassword        *string  `json:"web_password"`
+			HasWebPassword     bool     `json:"has_web_password"`
 			Transport          *string  `json:"transport"`
 			HopRange           *string  `json:"hop_range"`
 			UpMbps             *int     `json:"up_mbps"`
@@ -202,8 +226,14 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		if req.FilterAAAA != nil {
 			cfg.FilterAAAA = *req.FilterAAAA
 		}
+		if req.LANMasquerade != nil {
+			cfg.LANMasquerade = *req.LANMasquerade
+		}
 		if req.AutoYieldConflicts != nil {
 			cfg.AutoYieldConflicts = *req.AutoYieldConflicts
+		}
+		if req.HasWebPassword && req.WebPassword != nil {
+			cfg.WebPassword = strings.TrimSpace(*req.WebPassword)
 		}
 		cfg.Normalize()
 		s.gwCfg = cfg
@@ -242,13 +272,9 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 
 		s.SyncFirewall()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	})
+	}))
 
-	mux.HandleFunc("/api/conflicts/resolve", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	mux.HandleFunc("/api/conflicts/resolve", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		rep := tproxy.ResolveConflicts()
 		for _, act := range rep.Actions {
 			s.engine.Logf("[0Ghost] %s", act)
@@ -256,27 +282,24 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		_ = s.engine.StartServers()
 		s.SyncFirewall()
 		writeJSON(w, http.StatusOK, rep)
-	})
+	}))
 
-	mux.HandleFunc("/api/test", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	mux.HandleFunc("/api/test", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.ProbeDualConnectivity())
-	})
+	}))
 
-	mux.HandleFunc("/api/logs/clear", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	mux.HandleFunc("/api/logs/clear", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		s.engine.ClearLogs()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-	})
+	}))
 
-	// Support both direct root access (:19080/) and uhttpd reverse-proxy (/0ghost/).
+	// Apply DNS-rebinding Host validation, same-origin CSRF checks, optional password gate,
+	// and /0ghost prefix stripping uniformly.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "same-origin")
+
+		rNorm := r
 		if strings.HasPrefix(r.URL.Path, "/0ghost") {
 			r2 := r.Clone(r.Context())
 			trimmed := strings.TrimPrefix(r.URL.Path, "/0ghost")
@@ -284,11 +307,145 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 				trimmed = "/"
 			}
 			r2.URL.Path = trimmed
-			mux.ServeHTTP(w, r2)
+			rNorm = r2
+		}
+
+		if !s.isAllowedHostHeader(rNorm.Host) {
+			http.Error(w, "forbidden host", http.StatusForbidden)
 			return
 		}
-		mux.ServeHTTP(w, r)
+
+		if strings.HasPrefix(rNorm.URL.Path, "/api/") {
+			if !s.isSameOriginAPIRequest(rNorm) {
+				writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "cross-origin request blocked"})
+				return
+			}
+			if rNorm.URL.Path != "/api/auth/info" && rNorm.URL.Path != "/api/auth/login" {
+				cfg := s.getGatewayConfig()
+				if !s.isAuthorizedRequest(rNorm, cfg.WebPassword) {
+					writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "authentication required"})
+					return
+				}
+			}
+		}
+
+		mux.ServeHTTP(w, rNorm)
 	})
+}
+
+func postOnly(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h(w, r)
+	}
+}
+
+func extractHostname(hostport string) string {
+	h := strings.TrimSpace(hostport)
+	if h == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		return strings.Trim(strings.ToLower(host), "[]")
+	}
+	return strings.Trim(strings.ToLower(h), "[]")
+}
+
+func (s *GatewayService) isAllowedHostHeader(hostHdr string) bool {
+	host := extractHostname(hostHdr)
+	if host == "" {
+		return false
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".lan") || strings.HasSuffix(host, ".home") {
+		return true
+	}
+	// Single-label local router hostname (e.g. "istoreos", "openwrt") has no dot.
+	if !strings.Contains(host, ".") && !strings.Contains(host, ":") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+			return true
+		}
+		s.mu.RLock()
+		lanIP := s.lanIP
+		s.mu.RUnlock()
+		return lanIP != "" && ip.String() == lanIP
+	}
+	return false
+}
+
+func (s *GatewayService) isSameOriginAPIRequest(r *http.Request) bool {
+	if sfs := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); sfs == "cross-site" {
+		return false
+	}
+	reqHost := extractHostname(r.Host)
+	checkOriginURL := func(raw string) bool {
+		u, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || u.Host == "" {
+			return false
+		}
+		origHost := extractHostname(u.Host)
+		if origHost == reqHost {
+			return true
+		}
+		// Treat localhost and 127.0.0.1 as equivalent only when reqHost is loopback,
+		// and allow router LAN IP <-> localhost when proxied through uhttpd on 127.0.0.1.
+		origIP := net.ParseIP(origHost)
+		reqIP := net.ParseIP(reqHost)
+		if (reqHost == "127.0.0.1" || reqHost == "localhost" || (reqIP != nil && reqIP.IsLoopback())) &&
+			s.isAllowedHostHeader(u.Host) {
+			return true
+		}
+		if origIP != nil && reqIP != nil && origIP.Equal(reqIP) {
+			return true
+		}
+		return false
+	}
+
+	if origin := r.Header.Get("Origin"); origin != "" {
+		return checkOriginURL(origin)
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		if ref := r.Header.Get("Referer"); ref != "" {
+			return checkOriginURL(ref)
+		}
+	}
+	return true
+}
+
+func computeWebAuthToken(secret string) string {
+	mac := hmac.New(sha256.New, []byte("ghost0-web-session-v1"))
+	_, _ = mac.Write([]byte(secret))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *GatewayService) isAuthorizedRequest(r *http.Request, password string) bool {
+	want := strings.TrimSpace(password)
+	if want == "" {
+		return true
+	}
+	if auth := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		tok := strings.TrimSpace(auth[7:])
+		if subtle.ConstantTimeCompare([]byte(tok), []byte(want)) == 1 {
+			return true
+		}
+	}
+	if hdr := strings.TrimSpace(r.Header.Get("X-Ghost-Token")); hdr != "" {
+		if subtle.ConstantTimeCompare([]byte(hdr), []byte(want)) == 1 {
+			return true
+		}
+	}
+	if c, err := r.Cookie("ghost0_auth"); err == nil && c.Value != "" {
+		expectedTok := computeWebAuthToken(want)
+		if subtle.ConstantTimeCompare([]byte(c.Value), []byte(expectedTok)) == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func readJSON(r *http.Request, dst any) error {

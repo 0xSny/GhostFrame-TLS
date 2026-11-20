@@ -12,6 +12,18 @@ const (
 	ipv6BoundIF = 125 // IPV6_BOUND_IF on Darwin <netinet6/in6.h>
 )
 
+func init() {
+	isPureIPv6PhysicalFn = isPureIPv6PhysicalDarwin
+}
+
+func isPureIPv6PhysicalDarwin() bool {
+	iface, ok := resolveTargetInterface()
+	if !ok {
+		return false
+	}
+	return !interfaceHasRoutableFamily(iface, true) && interfaceHasRoutableFamily(iface, false)
+}
+
 // DetectPhysicalInterface enumerates live interfaces on Darwin/iOS and picks the primary
 // non-tunnel physical interface (preferring preferred iface, then en0, then pdp_ip*).
 func DetectPhysicalInterface() string {

@@ -1,10 +1,17 @@
 package tunstack
 
 import (
+	"bytes"
+	"compress/zlib"
 	"encoding/binary"
+	"errors"
+	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -12,9 +19,16 @@ const (
 	// 198.18.0.1 is reserved for the TUN virtual DNS gateway and 198.18.0.2 for the local TUN interface.
 	fakeIPStart = (198 << 24) | (18 << 16) | (1 << 8) | 1
 	fakeIPEnd   = (198 << 24) | (18 << 16) | (254 << 8) | 254
+
+	// Short 2s TTL guarantees apps re-resolve cleanly if PacketTunnel restarts or wakes from deep sleep.
+	fakeIPDNSTTL uint32 = 2
+
+	fakeCacheMagic   = "GFIP"
+	fakeCacheVersion = 1
 )
 
-// FakeIPPool is a fixed-capacity ring-buffer mapping between queried hostnames and 198.18.x.x IPv4s.
+// FakeIPPool is a fixed-capacity ring-buffer mapping between queried hostnames and 198.18.x.x IPv4s,
+// with optional atomic binary persistence so iOS OnDemand/sleep restarts preserve active Fake-IP mappings.
 type FakeIPPool struct {
 	mu       sync.RWMutex
 	cap      int
@@ -23,10 +37,20 @@ type FakeIPPool struct {
 	hostToIP map[string]uint32
 	ring     []uint32
 	ringPos  int
+
+	cachePath string
+	dirty     bool
+	stopCh    chan struct{}
+	closeOnce sync.Once
 }
 
-// NewFakeIPPool constructs a bounded Fake-IP pool (safe for iOS 50MB NetworkExtension cap).
+// NewFakeIPPool constructs an in-memory bounded Fake-IP pool (safe for iOS 50MB NetworkExtension cap).
 func NewFakeIPPool(capacity int) *FakeIPPool {
+	return NewFakeIPPoolWithPersistence(capacity, "")
+}
+
+// NewFakeIPPoolWithPersistence constructs a bounded Fake-IP pool that loads/saves mappings to cachePath.
+func NewFakeIPPoolWithPersistence(capacity int, cachePath string) *FakeIPPool {
 	if capacity <= 0 {
 		capacity = 4096
 	}
@@ -34,11 +58,43 @@ func NewFakeIPPool(capacity int) *FakeIPPool {
 	if capacity > maxSpan {
 		capacity = maxSpan
 	}
-	return &FakeIPPool{
-		cap:      capacity,
-		ipToHost: make(map[uint32]string, capacity/4),
-		hostToIP: make(map[string]uint32, capacity/4),
-		ring:     make([]uint32, capacity),
+	p := &FakeIPPool{
+		cap:       capacity,
+		ipToHost:  make(map[uint32]string, capacity/4),
+		hostToIP:  make(map[string]uint32, capacity/4),
+		ring:      make([]uint32, capacity),
+		cachePath: strings.TrimSpace(cachePath),
+	}
+	if p.cachePath != "" {
+		_ = p.loadFromFile(p.cachePath)
+		p.stopCh = make(chan struct{})
+		go p.flushLoop()
+	}
+	return p
+}
+
+// Close flushes any dirty Fake-IP mappings to disk and stops background persistence.
+func (p *FakeIPPool) Close() {
+	p.closeOnce.Do(func() {
+		if p.stopCh != nil {
+			close(p.stopCh)
+		}
+		if p.cachePath != "" {
+			_ = p.Flush()
+		}
+	})
+}
+
+func (p *FakeIPPool) flushLoop() {
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-t.C:
+			_ = p.Flush()
+		}
 	}
 }
 
@@ -79,6 +135,7 @@ func (p *FakeIPPool) Allocate(domain string) [4]byte {
 	p.hostToIP[host] = ipU32
 	p.ring[p.ringPos] = ipU32
 	p.ringPos = (p.ringPos + 1) % p.cap
+	p.dirty = true
 	return uint32ToIPv4(ipU32)
 }
 
@@ -103,6 +160,138 @@ func (p *FakeIPPool) Size() int {
 	return n
 }
 
+// Flush persists the current Fake-IP table to cachePath atomically if modified.
+func (p *FakeIPPool) Flush() error {
+	if p.cachePath == "" {
+		return nil
+	}
+
+	p.mu.Lock()
+	if !p.dirty {
+		p.mu.Unlock()
+		return nil
+	}
+
+	var raw bytes.Buffer
+	var hdr [13]byte
+	copy(hdr[0:4], fakeCacheMagic)
+	hdr[4] = fakeCacheVersion
+	binary.BigEndian.PutUint32(hdr[5:9], p.nextOff)
+	binary.BigEndian.PutUint32(hdr[9:13], uint32(len(p.ring)))
+	raw.Write(hdr[:])
+
+	// Preserve chronological ring order up to capacity.
+	written := 0
+	var countBuf [4]byte
+	entriesStart := raw.Len()
+	raw.Write(countBuf[:]) // placeholder for exact entry count
+
+	for step := 0; step < len(p.ring); step++ {
+		idx := (p.ringPos + step) % len(p.ring)
+		ipU32 := p.ring[idx]
+		if ipU32 == 0 {
+			continue
+		}
+		host, ok := p.ipToHost[ipU32]
+		if !ok || host == "" || len(host) > 1024 {
+			continue
+		}
+		var rec [6]byte
+		binary.BigEndian.PutUint32(rec[0:4], ipU32)
+		binary.BigEndian.PutUint16(rec[4:6], uint16(len(host)))
+		raw.Write(rec[:])
+		raw.WriteString(host)
+		written++
+	}
+	p.dirty = false
+	p.mu.Unlock()
+
+	rawBytes := raw.Bytes()
+	binary.BigEndian.PutUint32(rawBytes[entriesStart:entriesStart+4], uint32(written))
+
+	var comp bytes.Buffer
+	zw := zlib.NewWriter(&comp)
+	if _, err := zw.Write(rawBytes); err != nil {
+		_ = zw.Close()
+		return err
+	}
+	if err := zw.Close(); err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(p.cachePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp := p.cachePath + ".tmp"
+	if err := os.WriteFile(tmp, comp.Bytes(), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p.cachePath)
+}
+
+func (p *FakeIPPool) loadFromFile(path string) error {
+	comp, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(comp))
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+	data, err := io.ReadAll(io.LimitReader(zr, 4<<20))
+	if err != nil {
+		return err
+	}
+	if len(data) < 17 || string(data[0:4]) != fakeCacheMagic || data[4] != fakeCacheVersion {
+		return errors.New("tunstack: invalid fakeip cache header")
+	}
+
+	nextOff := binary.BigEndian.Uint32(data[5:9])
+	entryCount := int(binary.BigEndian.Uint32(data[13:17]))
+	pos := 17
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.nextOff = nextOff
+	p.ipToHost = make(map[uint32]string, p.cap/4)
+	p.hostToIP = make(map[string]uint32, p.cap/4)
+	p.ring = make([]uint32, p.cap)
+	p.ringPos = 0
+
+	for i := 0; i < entryCount && pos+6 <= len(data); i++ {
+		ipU32 := binary.BigEndian.Uint32(data[pos : pos+4])
+		hLen := int(binary.BigEndian.Uint16(data[pos+4 : pos+6]))
+		pos += 6
+		if hLen <= 0 || pos+hLen > len(data) {
+			break
+		}
+		if ipU32 >= fakeIPStart && ipU32 <= fakeIPEnd {
+			host := normalizeDomain(string(data[pos : pos+hLen]))
+			if host != "" {
+				if oldIP := p.ring[p.ringPos]; oldIP != 0 {
+					if oh, exists := p.ipToHost[oldIP]; exists {
+						delete(p.hostToIP, oh)
+						delete(p.ipToHost, oldIP)
+					}
+				}
+				if prevHost, exists := p.ipToHost[ipU32]; exists {
+					delete(p.hostToIP, prevHost)
+				}
+				p.ipToHost[ipU32] = host
+				p.hostToIP[host] = ipU32
+				p.ring[p.ringPos] = ipU32
+				p.ringPos = (p.ringPos + 1) % p.cap
+			}
+		}
+		pos += hLen
+	}
+	p.dirty = false
+	return nil
+}
+
 func normalizeDomain(d string) string {
 	d = strings.TrimSpace(strings.ToLower(d))
 	return strings.TrimSuffix(d, ".")
@@ -115,9 +304,9 @@ func uint32ToIPv4(u uint32) [4]byte {
 }
 
 // HandleDNSQuery parses a raw RFC 1035 UDP DNS query and returns a Fake-IP response.
-// - Type A (1): returns an allocated 198.18.x.x A record (TTL=5s).
-// - Type AAAA (28) / HTTPS (65) / SVCB (64) / other: returns NOERROR with 0 answers
-//   so iOS clients cleanly fall back to IPv4 Fake-IP without IPv6/QUIC leaks.
+// - Type A (1): returns an allocated 198.18.x.x A record (TTL=2s).
+// - Type AAAA (28) / HTTPS (65) / SVCB (64) / other: returns NOERROR (RCODE=0) with 0 answers (NODATA)
+//   so dual-stack iOS clients immediately fall back to IPv4 Fake-IP without IPv6/QUIC leaks or NXDOMAIN stalls.
 func (p *FakeIPPool) HandleDNSQuery(query []byte) ([]byte, bool) {
 	if len(query) < 12 {
 		return nil, false
@@ -166,13 +355,13 @@ func (p *FakeIPPool) HandleDNSQuery(query []byte) ([]byte, bool) {
 	binary.BigEndian.PutUint16(resp[10:12], 0) // ARCOUNT=0
 
 	if wantAnswer {
-		// Compressed pointer to QNAME at offset 12 (0xC00C), Type A, Class IN, TTL 5s, RDLENGTH 4.
+		// Compressed pointer to QNAME at offset 12 (0xC00C), Type A, Class IN, TTL 2s, RDLENGTH 4.
 		var ans [16]byte
 		ans[0] = 0xC0
 		ans[1] = 0x0C
-		binary.BigEndian.PutUint16(ans[2:4], 1)  // TYPE A
-		binary.BigEndian.PutUint16(ans[4:6], 1)  // CLASS IN
-		binary.BigEndian.PutUint32(ans[6:10], 5) // TTL 5s
+		binary.BigEndian.PutUint16(ans[2:4], 1)            // TYPE A
+		binary.BigEndian.PutUint16(ans[4:6], 1)            // CLASS IN
+		binary.BigEndian.PutUint32(ans[6:10], fakeIPDNSTTL) // TTL 2s
 		binary.BigEndian.PutUint16(ans[10:12], 4)
 		copy(ans[12:16], fakeIP[:])
 		resp = append(resp, ans[:]...)
