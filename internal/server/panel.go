@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
@@ -20,13 +21,22 @@ import (
 	"ghostframe/internal/qr"
 )
 
-const sessionCookieName = "gft_session"
-const sessionTTL = 24 * time.Hour
+const (
+	sessionCookieName  = "gft_session"
+	sessionTTL         = 24 * time.Hour
+	panelMaxLoginFails = 5
+	panelLockoutDur    = 10 * time.Minute
+)
 
 type panelSession struct {
 	token   string
 	created time.Time
 	expires time.Time
+}
+
+type loginAttempt struct {
+	fails       int
+	lockedUntil time.Time
 }
 
 // Panel implements the hidden management web console and its REST APIs.
@@ -35,14 +45,14 @@ type Panel struct {
 	mu       sync.Mutex
 	sessions map[string]panelSession
 	loginMu  sync.Mutex
-	failures map[string]int // IP -> failure count
+	failures map[string]*loginAttempt // IP -> failure/lockout state
 }
 
 func newPanel(s *Server) *Panel {
 	return &Panel{
 		srv:      s,
 		sessions: make(map[string]panelSession),
-		failures: make(map[string]int),
+		failures: make(map[string]*loginAttempt),
 	}
 }
 
@@ -57,8 +67,13 @@ func (p *Panel) sweep() {
 	p.mu.Unlock()
 
 	p.loginMu.Lock()
+	for ip, att := range p.failures {
+		if att == nil || (!att.lockedUntil.IsZero() && now.After(att.lockedUntil)) {
+			delete(p.failures, ip)
+		}
+	}
 	if len(p.failures) > 2000 {
-		p.failures = make(map[string]int)
+		p.failures = make(map[string]*loginAttempt)
 	}
 	p.loginMu.Unlock()
 }
@@ -74,7 +89,7 @@ func (p *Panel) isAuth(r *http.Request) bool {
 	if !ok || time.Now().After(sess.expires) {
 		return false
 	}
-	return true
+	return subtle.ConstantTimeCompare([]byte(sess.token), []byte(cookie.Value)) == 1
 }
 
 func (p *Panel) createSession() string {
@@ -94,22 +109,29 @@ func (p *Panel) createSession() string {
 func (p *Panel) serve(w http.ResponseWriter, r *http.Request, sub string) {
 	sub = strings.TrimPrefix(sub, "/")
 	if sub == "" || sub == "index.html" {
-		// Handle optional query key login: ?key=PASSWORD
+		// Handle optional query key login: ?key=PASSWORD (guarded by 5-fail 10m lockout)
 		if key := r.URL.Query().Get("key"); key != "" {
+			ip := reqIP(r)
+			if p.checkLockedOut(ip, time.Now()) {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
 			if err := bcrypt.CompareHashAndPassword([]byte(p.srv.cfg.PanelHash), []byte(key)); err == nil {
+				p.clearLoginFailure(ip)
 				token := p.createSession()
 				http.SetCookie(w, &http.Cookie{
 					Name:     sessionCookieName,
 					Value:    token,
 					Path:     p.srv.cfg.PanelPath,
 					HttpOnly: true,
-					Secure:   true,
+					Secure:   r.TLS != nil,
 					SameSite: http.SameSiteStrictMode,
 					MaxAge:   int(sessionTTL / time.Second),
 				})
 				http.Redirect(w, r, p.srv.cfg.PanelPath+"/", http.StatusFound)
 				return
 			}
+			p.recordLoginFailure(ip, time.Now())
 		}
 
 		if !p.isAuth(r) {
@@ -159,11 +181,16 @@ func (p *Panel) serveAPI(w http.ResponseWriter, r *http.Request, action string) 
 		return
 	}
 
-	// CSRF validation on mutating methods
+	// CSRF + Origin validation on mutating methods
 	if (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete) && action != "login" {
+		if !validSameOrigin(r) {
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "forbidden: invalid origin"})
+			return
+		}
 		cookie, _ := r.Cookie(sessionCookieName)
 		csrf := r.Header.Get("X-CSRF-Token")
-		if csrf == "" || cookie == nil || csrf != cookie.Value {
+		if csrf == "" || cookie == nil || subtle.ConstantTimeCompare([]byte(csrf), []byte(cookie.Value)) != 1 {
 			w.WriteHeader(http.StatusForbidden)
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": "forbidden: missing or invalid csrf"})
 			return
@@ -228,15 +255,61 @@ func (p *Panel) serveAPI(w http.ResponseWriter, r *http.Request, action string) 
 	notFound(w)
 }
 
+func validSameOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+func (p *Panel) checkLockedOut(ip string, now time.Time) bool {
+	p.loginMu.Lock()
+	defer p.loginMu.Unlock()
+	att := p.failures[ip]
+	if att == nil {
+		return false
+	}
+	if !att.lockedUntil.IsZero() {
+		if now.Before(att.lockedUntil) {
+			return true
+		}
+		att.fails = 0
+		att.lockedUntil = time.Time{}
+	}
+	return false
+}
+
+func (p *Panel) recordLoginFailure(ip string, now time.Time) {
+	p.loginMu.Lock()
+	defer p.loginMu.Unlock()
+	att := p.failures[ip]
+	if att == nil {
+		att = &loginAttempt{}
+		p.failures[ip] = att
+	}
+	att.fails++
+	if att.fails >= panelMaxLoginFails {
+		att.lockedUntil = now.Add(panelLockoutDur)
+	}
+}
+
+func (p *Panel) clearLoginFailure(ip string) {
+	p.loginMu.Lock()
+	delete(p.failures, ip)
+	p.loginMu.Unlock()
+}
+
 func (p *Panel) handleLogin(w http.ResponseWriter, r *http.Request) {
 	ip := reqIP(r)
-	p.loginMu.Lock()
-	fails := p.failures[ip]
-	p.loginMu.Unlock()
-
-	if fails >= 10 {
+	now := time.Now()
+	if p.checkLockedOut(ip, now) {
 		w.WriteHeader(http.StatusTooManyRequests)
-		_ = json.NewEncoder(w).Encode(map[string]any{"error": "too many attempts"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "too many failed attempts, locked for 10m"})
 		return
 	}
 
@@ -251,18 +324,14 @@ func (p *Panel) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	err := bcrypt.CompareHashAndPassword([]byte(p.srv.cfg.PanelHash), []byte(req.Password))
 	if err != nil {
-		p.loginMu.Lock()
-		p.failures[ip]++
-		p.loginMu.Unlock()
+		p.recordLoginFailure(ip, now)
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": "unauthorized"})
 		return
 	}
 
 	// Login Success: Reset fail counter
-	p.loginMu.Lock()
-	delete(p.failures, ip)
-	p.loginMu.Unlock()
+	p.clearLoginFailure(ip)
 
 	token := p.createSession()
 	http.SetCookie(w, &http.Cookie{
@@ -306,7 +375,7 @@ func (p *Panel) handleStats(w http.ResponseWriter, r *http.Request) {
 	rtcActive := p.srv.rtcActive.Load()
 
 	res := map[string]any{
-		"version":     "v3.4.1",
+		"version":     "v4.0.0-LTS",
 		"uptime_sec":  int64(time.Since(p.srv.started).Seconds()),
 		"active":      activeCount,
 		"rtc_active":  rtcActive,

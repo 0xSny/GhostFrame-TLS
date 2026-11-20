@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GhostFrame-RTC v3.4.1 &middot; Stealth Node Console</title>
+<title>GhostFrame-RTC v4.0.0-LTS &middot; Stealth Node Console</title>
 <style>
 :root {
   --bg-dark: #0a0e17;
@@ -122,7 +122,7 @@ tr:hover td { background: var(--bg-card-hover); }
     <div class="logo-box">
       <div class="logo-icon">G</div>
       <div>
-        <h1>GhostFrame-RTC <span style="color: var(--primary-cyan);">v3.4.1</span> <span id="rtc-badge" class="badge badge-green">GFT-RTC Active</span></h1>
+        <h1>GhostFrame-RTC <span style="color: var(--primary-cyan);">v4.0.0-LTS</span> <span id="rtc-badge" class="badge badge-green">GFT-RTC Active</span></h1>
         <div id="node-subtitle" style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">Loading node profile...</div>
       </div>
     </div>
@@ -244,7 +244,7 @@ tr:hover td { background: var(--bg-card-hover); }
 
   <!-- Connection & Clash Config -->
   <div class="section-box">
-    <div class="section-title"><span>Node Export &amp; Integration (GhostFrame-RTC v3.4)</span></div>
+    <div class="section-title"><span>Node Export &amp; Integration (GhostFrame-RTC v4.0)</span></div>
     <div class="export-grid">
       <div>
         <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 6px;">Universal GhostFrame-RTC (gft3://) Import URI:</div>
@@ -492,7 +492,7 @@ function renderLinkPayload(data) {
   const lnk = data.link || {};
   const hopLine = lnk.hop_range ? `\n  # UDP Hop Range: ${lnk.hop_range}` : '';
   const bwLine = (lnk.up_mbps || lnk.down_mbps) ? `\n  # Smart-Brutal: up=${lnk.up_mbps || 0}Mbps down=${lnk.down_mbps || 0}Mbps` : '';
-  const clashYaml = `- name: "GhostFrame-RTC-v3.4"
+  const clashYaml = `- name: "GhostFrame-RTC-v4.0"
   type: socks5
   server: 127.0.0.1
   port: 10808

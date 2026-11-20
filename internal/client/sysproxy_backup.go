@@ -2,11 +2,14 @@ package client
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // ProxySnapshot captures system proxy settings before GhostFrame modifies them.
@@ -68,16 +71,93 @@ func applyMockSystemProxySnapshot(snap ProxySnapshot) {
 	mockProxyMu.Unlock()
 }
 
+// IsLocalLoopbackProxy reports whether a Windows proxy server string points to 127.0.0.1 / localhost / ::1.
+func IsLocalLoopbackProxy(server string) bool {
+	s := strings.TrimSpace(server)
+	if s == "" {
+		return false
+	}
+	parts := strings.Split(s, ";")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if eq := strings.IndexByte(part, '='); eq >= 0 {
+			part = strings.TrimSpace(part[eq+1:])
+		}
+		part = strings.TrimPrefix(part, "http://")
+		part = strings.TrimPrefix(part, "https://")
+		part = strings.TrimPrefix(part, "socks5://")
+		part = strings.TrimPrefix(part, "socks://")
+		host := part
+		if h, _, err := net.SplitHostPort(part); err == nil {
+			host = h
+		}
+		host = strings.Trim(strings.TrimSpace(host), "[]")
+		if strings.EqualFold(host, "localhost") {
+			return true
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return true
+		}
+	}
+	return false
+}
+
+func extractLoopbackHostPort(server string) string {
+	for _, part := range strings.Split(server, ";") {
+		part = strings.TrimSpace(part)
+		if eq := strings.IndexByte(part, '='); eq >= 0 {
+			part = strings.TrimSpace(part[eq+1:])
+		}
+		part = strings.TrimPrefix(part, "http://")
+		part = strings.TrimPrefix(part, "https://")
+		part = strings.TrimPrefix(part, "socks5://")
+		part = strings.TrimPrefix(part, "socks://")
+		if h, p, err := net.SplitHostPort(part); err == nil && p != "" {
+			hh := strings.Trim(h, "[]")
+			if strings.EqualFold(hh, "localhost") {
+				return net.JoinHostPort("127.0.0.1", p)
+			}
+			if ip := net.ParseIP(hh); ip != nil && ip.IsLoopback() {
+				return net.JoinHostPort(ip.String(), p)
+			}
+		}
+	}
+	return ""
+}
+
+func isLoopbackProxyDead(server string) bool {
+	hp := extractLoopbackHostPort(server)
+	if hp == "" {
+		return false
+	}
+	c, err := net.DialTimeout("tcp", hp, 80*time.Millisecond)
+	if err != nil {
+		return true
+	}
+	_ = c.Close()
+	return false
+}
+
 // EnableSystemProxyWithBackup saves the user's pre-existing system proxy into
 // backupPath (if not already backed up) before enabling addr.
+// Never records a dirty/stale GhostFrame loopback proxy as the clean baseline.
 func EnableSystemProxyWithBackup(addr, backupPath string) error {
 	sysProxyBackupMu.Lock()
 	defer sysProxyBackupMu.Unlock()
 
 	if backupPath != "" {
 		if _, err := os.Stat(backupPath); os.IsNotExist(err) {
-			snap, err := QueryFullSystemProxy()
-			if err == nil {
+			snap, qerr := QueryFullSystemProxy()
+			if qerr == nil {
+				if snap.Enabled && IsLocalLoopbackProxy(snap.Server) {
+					if strings.EqualFold(strings.TrimSpace(snap.Server), strings.TrimSpace(addr)) || isLoopbackProxyDead(snap.Server) {
+						snap.Enabled = false
+						snap.Server = ""
+					}
+				}
 				snap.Applied = addr
 				_ = os.MkdirAll(filepath.Dir(backupPath), 0o755)
 				if b, jerr := json.MarshalIndent(snap, "", "  "); jerr == nil {
@@ -99,6 +179,12 @@ func DisableAndRestoreSystemProxy(backupPath string) error {
 		if b, err := os.ReadFile(backupPath); err == nil {
 			var snap ProxySnapshot
 			if json.Unmarshal(b, &snap) == nil {
+				if snap.Enabled && IsLocalLoopbackProxy(snap.Server) {
+					if (snap.Applied != "" && strings.EqualFold(strings.TrimSpace(snap.Server), strings.TrimSpace(snap.Applied))) || isLoopbackProxyDead(snap.Server) {
+						snap.Enabled = false
+						snap.Server = ""
+					}
+				}
 				if aerr := ApplySystemProxySnapshot(snap); aerr != nil {
 					return aerr
 				}
@@ -112,14 +198,27 @@ func DisableAndRestoreSystemProxy(backupPath string) error {
 }
 
 // RecoverSystemProxyIfDirty runs on startup to restore pre-crash proxy state if
-// sysproxy_backup.json was left behind by a non-graceful termination.
+// sysproxy_backup.json was left behind or an orphaned dead loopback proxy remains active.
 func RecoverSystemProxyIfDirty(backupPath string) (bool, error) {
-	if backupPath == "" {
-		return false, nil
+	return RecoverSystemProxyIfDirtyFor(backupPath, "")
+}
+
+// RecoverSystemProxyIfDirtyFor recovers either from a leftover backup file or, on power-loss,
+// when the OS registry still points to a dead or expected local loopback proxy without a backup file.
+func RecoverSystemProxyIfDirtyFor(backupPath, expectedHTTPAddr string) (bool, error) {
+	if backupPath != "" {
+		if _, err := os.Stat(backupPath); err == nil {
+			rerr := DisableAndRestoreSystemProxy(backupPath)
+			return true, rerr
+		}
 	}
-	if _, err := os.Stat(backupPath); err != nil {
-		return false, nil
+	cur, qerr := QueryFullSystemProxy()
+	if qerr == nil && cur.Enabled && IsLocalLoopbackProxy(cur.Server) {
+		sameOwn := expectedHTTPAddr != "" && strings.EqualFold(strings.TrimSpace(cur.Server), strings.TrimSpace(expectedHTTPAddr))
+		if sameOwn || isLoopbackProxyDead(cur.Server) {
+			serr := SetSystemProxy("", false)
+			return true, serr
+		}
 	}
-	err := DisableAndRestoreSystemProxy(backupPath)
-	return true, err
+	return false, nil
 }

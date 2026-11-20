@@ -31,6 +31,16 @@ jobs:
           go vet ./...
           CGO_ENABLED=1 go test -race -count=1 -v ./...
 
+      - name: Go Fuzz Smoke Checks (3s per target)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          go test -run='^$' -fuzz=FuzzSTUNBindingReqAndPreScreen -fuzztime=3s ./internal/gftrtc
+          go test -run='^$' -fuzz=FuzzRTPAndFrameDecode -fuzztime=3s ./internal/gftrtc
+          go test -run='^$' -fuzz=FuzzExtractTLSClientHelloSNI -fuzztime=3s ./internal/gft
+          go test -run='^$' -fuzz=FuzzEncodeDecodeAddrAndLink -fuzztime=3s ./internal/gft
+          go test -run='^$' -fuzz=FuzzParseDNSResponse -fuzztime=3s ./internal/client
+
       - name: Zero-CGO Cross-Platform Build Check (Linux)
         if: runner.os == 'Linux'
         shell: bash

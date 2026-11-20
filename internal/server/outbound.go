@@ -148,7 +148,7 @@ func ssrfControl(_, address string, _ syscall.RawConn) error {
 
 func dialCheckedIP(ctx context.Context, ip net.IP, port string) (net.Conn, error) {
 	d := net.Dialer{
-		Timeout: 8 * time.Second,
+		Timeout: 10 * time.Second,
 		Control: ssrfControl,
 	}
 	c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), port))
@@ -291,6 +291,7 @@ type udpAssoc struct {
 	pc       net.PacketConn
 	reply    atomic.Pointer[udpReplyTarget]
 	lastSeen atomic.Int64
+	isDNS    atomic.Bool
 	closed   chan struct{}
 	once     sync.Once
 }
@@ -344,11 +345,26 @@ func (m *udpManager) handleDatagramSink(sink gft.UDPReplySink, id uint16, target
 	m.lastUsed.Store(now)
 
 	m.mu.Lock()
+	var evicted []*udpAssoc
 	assoc, ok := m.assocs[id]
 	if !ok {
-		if len(m.assocs) >= maxUDPPerSession {
-			m.mu.Unlock()
-			return
+		for len(m.assocs) >= maxUDPPerSession {
+			var oldestID uint16
+			var oldest *udpAssoc
+			var oldestTS int64
+			for k, v := range m.assocs {
+				ts := v.lastSeen.Load()
+				if oldest == nil || ts < oldestTS {
+					oldestID = k
+					oldest = v
+					oldestTS = ts
+				}
+			}
+			if oldest == nil {
+				break
+			}
+			delete(m.assocs, oldestID)
+			evicted = append(evicted, oldest)
 		}
 		lp := net.ListenPacket
 		if m.outbound != nil && m.outbound.listenPacket != nil {
@@ -357,20 +373,31 @@ func (m *udpManager) handleDatagramSink(sink gft.UDPReplySink, id uint16, target
 		pc, err := lp("udp", ":0")
 		if err != nil {
 			m.mu.Unlock()
+			for _, ev := range evicted {
+				ev.close()
+			}
 			return
 		}
 		assoc = &udpAssoc{id: id, pc: pc, closed: make(chan struct{})}
 		assoc.lastSeen.Store(now)
+		assoc.isDNS.Store(dstAddr.Port == 53)
 		assoc.reply.Store(&udpReplyTarget{sink: sink, id: id})
 		m.assocs[id] = assoc
 		go m.readLoop(assoc)
 	} else {
 		assoc.lastSeen.Store(now)
+		if dstAddr.Port != 53 {
+			assoc.isDNS.Store(false)
+		}
 		if sink != nil {
 			assoc.reply.Store(&udpReplyTarget{sink: sink, id: id})
 		}
 	}
 	m.mu.Unlock()
+
+	for _, ev := range evicted {
+		ev.close()
+	}
 
 	if _, werr := assoc.pc.WriteTo(data, dstAddr); werr != nil {
 		m.logger.Printf("udp writeto %v err=%v", dstAddr, werr)
@@ -414,7 +441,7 @@ func (m *udpManager) handleClose(id uint16) {
 }
 
 func (m *udpManager) reclaimLoop() {
-	t := time.NewTicker(15 * time.Second)
+	t := time.NewTicker(4 * time.Second)
 	defer t.Stop()
 	var sessDone <-chan struct{}
 	if m.perConn && m.defaultSink != nil {
@@ -426,11 +453,16 @@ func (m *udpManager) reclaimLoop() {
 			return
 		case <-sessDone:
 			return
-		case <-t.C:
-			cutoff := time.Now().Add(-udpIdleTimeout).UnixNano()
+		case now := <-t.C:
+			cutoffDNS := now.Add(-udpDNSIdleTimeout).UnixNano()
+			cutoffReg := now.Add(-udpIdleTimeout).UnixNano()
 			var expired []*udpAssoc
 			m.mu.Lock()
 			for id, a := range m.assocs {
+				cutoff := cutoffReg
+				if a.isDNS.Load() {
+					cutoff = cutoffDNS
+				}
 				if a.lastSeen.Load() < cutoff {
 					expired = append(expired, a)
 					delete(m.assocs, id)

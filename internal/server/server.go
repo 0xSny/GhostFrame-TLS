@@ -28,12 +28,14 @@ import (
 )
 
 const (
-	maxUDPPerSession  = 128
-	udpIdleTimeout    = 60 * time.Second
-	internalPanelHost = "gft.internal.panel:80"
+	MaxUDPAssocPerClient = 256
+	maxUDPPerSession     = MaxUDPAssocPerClient
+	udpDNSIdleTimeout    = 12 * time.Second
+	udpIdleTimeout       = 90 * time.Second
+	internalPanelHost    = "gft.internal.panel:80"
 )
 
-// Server is the GhostFrame v3.4 Apex dual-stack server:
+// Server is the GhostFrame v4.0.0-LTS Apex dual-stack server:
 //   - TCP: 0ms Pre-TLS MirrorInspector -> TLS 1.3 + ClientAuth -> Ghost Frame v3 Mux
 //     (probes/scanners are transparently mirrored to CamouflageTarget or fallback HTTP/H2)
 //   - UDP: GhostFrame-RTC (WebRTC STUN/SRTP mimicry + 0ms XOR-FEC + Smart-Brutal CC + 0ms migration)
@@ -343,7 +345,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}
 
-	s.logger.Printf("GhostFrame v3.4 Apex listening tcp=%s rtc=%v (cert=%s fallback=%s target=%s)",
+	s.logger.Printf("GhostFrame v4.0.0-LTS Apex listening tcp=%s rtc=%v (cert=%s fallback=%s target=%s)",
 		ln.Addr(), rtcLn != nil, s.cfg.CertMode, s.cfg.FallbackMode, s.cfg.CamouflageTarget)
 
 	// Public HTTP/1.1 fallback server (reverse_proxy or builtin_blog)
@@ -403,6 +405,10 @@ func (s *Server) Run(ctx context.Context) error {
 		if rawUDP != nil && s.testUDPPC == nil {
 			_ = rawUDP.Close()
 		}
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = hs.Shutdown(shutCtx)
+		_ = panelSrv.Shutdown(shutCtx)
+		shutCancel()
 		_ = hs.Close()
 		_ = panelSrv.Close()
 		s.fallback.Close()

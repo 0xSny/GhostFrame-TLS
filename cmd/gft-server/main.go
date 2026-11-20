@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -19,7 +20,7 @@ import (
 	"ghostframe/internal/tui"
 )
 
-const version = "v3.4.1"
+const version = "v4.0.0-LTS"
 
 func main() {
 	base := strings.TrimSuffix(filepath.Base(os.Args[0]), filepath.Ext(os.Args[0]))
@@ -67,6 +68,9 @@ func main() {
 		c, err := server.LoadConfig(*conf)
 		if err != nil {
 			log.Fatal(err)
+		}
+		if os.Getenv("GOMEMLIMIT") == "" {
+			debug.SetMemoryLimit(int64(c.EffectiveMaxMemoryMB()) << 20)
 		}
 		logger := log.New(os.Stderr, "gft ", log.LstdFlags)
 		s, err := server.New(c, logger)

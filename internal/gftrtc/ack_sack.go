@@ -147,12 +147,25 @@ func (w *ReplayWindow) BuildSACK(now time.Time) (largest uint64, ackDelayUs uint
 	gap := 0
 	inBlock := false
 	blockLen := 0
-	// Walk from delta=0 (largest) downward, skipping zero words when searching gaps.
+	// Walk from delta=0 (largest) downward, skipping zero and all-ones 64-bit words.
 	for d := 0; d < limit; d++ {
-		if !inBlock && (d&63) == 0 && d+64 <= limit && w.words[d>>6] == 0 {
-			gap += 64
-			d += 63
-			continue
+		if (d&63) == 0 && d+64 <= limit {
+			w64 := w.words[d>>6]
+			if w64 == 0 && !inBlock {
+				gap += 64
+				d += 63
+				continue
+			}
+			if w64 == ^uint64(0) {
+				if !inBlock {
+					inBlock = true
+					blockLen = 64
+				} else {
+					blockLen += 64
+				}
+				d += 63
+				continue
+			}
 		}
 		set := (w.words[d>>6] & (uint64(1) << (d & 63))) != 0
 		if set {
@@ -218,7 +231,9 @@ type minRTTBucket struct {
 type LossTracker struct {
 	mu             sync.Mutex
 	sent           map[uint64]*inFlightPkt
+	retired        map[uint64]*inFlightPkt
 	inFlightBytes  int
+	oldestPN       uint64
 	largestSent    uint64
 	largestAcked   uint64
 	largestAckSent time.Time
@@ -241,9 +256,10 @@ type LossTracker struct {
 // links never suffer spurious RTO cascades prior to receiving the first SACK.
 func NewLossTracker() *LossTracker {
 	return &LossTracker{
-		sent:   make(map[uint64]*inFlightPkt, 256),
-		srtt:   333 * time.Millisecond,
-		rttVar: 166 * time.Millisecond,
+		sent:    make(map[uint64]*inFlightPkt, 256),
+		retired: make(map[uint64]*inFlightPkt, 32),
+		srtt:    333 * time.Millisecond,
+		rttVar:  166 * time.Millisecond,
 	}
 }
 
@@ -325,6 +341,9 @@ func (lt *LossTracker) OnPacketSent(pktNum uint64, wireBytes int, frames []Relia
 	if pktNum > lt.largestSent {
 		lt.largestSent = pktNum
 	}
+	if len(lt.sent) == 0 || pktNum < lt.oldestPN {
+		lt.oldestPN = pktNum
+	}
 	lt.sent[pktNum] = &inFlightPkt{
 		pktNum:    pktNum,
 		sentAt:    now,
@@ -332,6 +351,42 @@ func (lt *LossTracker) OnPacketSent(pktNum uint64, wireBytes int, frames []Relia
 		frames:    frames,
 	}
 	lt.inFlightBytes += wireBytes
+}
+
+func (lt *LossTracker) advanceOldestPNLocked() {
+	if len(lt.sent) == 0 {
+		lt.oldestPN = 0
+		return
+	}
+	if lt.oldestPN == 0 {
+		var minPN uint64
+		for pn := range lt.sent {
+			if minPN == 0 || pn < minPN {
+				minPN = pn
+			}
+		}
+		lt.oldestPN = minPN
+		return
+	}
+	steps := 0
+	for lt.oldestPN <= lt.largestSent {
+		if _, ok := lt.sent[lt.oldestPN]; ok {
+			return
+		}
+		lt.oldestPN++
+		steps++
+		if steps > 1024 && steps > len(lt.sent) {
+			var minPN uint64
+			for pn := range lt.sent {
+				if minPN == 0 || pn < minPN {
+					minPN = pn
+				}
+			}
+			lt.oldestPN = minPN
+			return
+		}
+	}
+	lt.oldestPN = 0
 }
 
 // InFlightBytes returns current unacknowledged bytes on the wire.
@@ -345,7 +400,31 @@ func (lt *LossTracker) InFlightBytes() int {
 func (lt *LossTracker) Clear() {
 	lt.mu.Lock()
 	clear(lt.sent)
+	clear(lt.retired)
 	lt.inFlightBytes = 0
+	lt.oldestPN = 0
+	lt.mu.Unlock()
+}
+
+// SentLen returns the number of currently tracked unretired packets (including retired-pending origins).
+func (lt *LossTracker) SentLen() int {
+	lt.mu.Lock()
+	n := len(lt.sent) + len(lt.retired)
+	lt.mu.Unlock()
+	return n
+}
+
+// ResetRTT clears historical SRTT, MinRTT buckets, loss rate, and PTO backoff after sleep/wake or link switch.
+func (lt *LossTracker) ResetRTT() {
+	lt.mu.Lock()
+	lt.hasAck = false
+	lt.srtt = 333 * time.Millisecond
+	lt.rttVar = 166 * time.Millisecond
+	lt.minRTTBuckets = [3]minRTTBucket{}
+	lt.ptoBackoff = 0
+	lt.lastPTOAt = time.Time{}
+	lt.cachedLossRate = 0
+	lt.lossWin = [lossWinBuckets]lossBucket{}
 	lt.mu.Unlock()
 }
 
@@ -397,6 +476,28 @@ type SACKResult struct {
 	LostFrames []ReliableFrame
 }
 
+func appendLostFrames(dst []ReliableFrame, pn uint64, frames []ReliableFrame) []ReliableFrame {
+	for _, f := range frames {
+		if f.OriginPN == 0 {
+			f.OriginPN = pn
+		}
+		dst = append(dst, f)
+	}
+	return dst
+}
+
+func pnInRanges(pn uint64, ranges [][2]uint64) bool {
+	if len(ranges) == 0 || pn > ranges[0][1] || pn < ranges[len(ranges)-1][0] {
+		return false
+	}
+	for i := range ranges {
+		if pn >= ranges[i][0] && pn <= ranges[i][1] {
+			return true
+		}
+	}
+	return false
+}
+
 // OnSACK processes a received SACK frame, updating RTT, freeing acked packets, and detecting RACK/reordering losses.
 func (lt *LossTracker) OnSACK(largestAcked uint64, ackDelayUs uint32, blocks []SACKBlock, now time.Time) SACKResult {
 	lt.mu.Lock()
@@ -407,7 +508,7 @@ func (lt *LossTracker) OnSACK(largestAcked uint64, ackDelayUs uint32, blocks []S
 
 	if largestAcked > lt.largestAcked {
 		lt.largestAcked = largestAcked
-		if p, ok := lt.sent[largestAcked]; ok && !p.retired {
+		if p, ok := lt.sent[largestAcked]; ok {
 			raw := now.Sub(p.sentAt)
 			delay := time.Duration(ackDelayUs) * time.Microsecond
 			if delay > 0 && delay < raw && delay < 50*time.Millisecond {
@@ -424,36 +525,52 @@ func (lt *LossTracker) OnSACK(largestAcked uint64, ackDelayUs uint32, blocks []S
 	}
 
 	ackOne := func(pn uint64) {
-		p, ok := lt.sent[pn]
-		if !ok {
-			return
-		}
-		delete(lt.sent, pn)
-		for _, f := range p.frames {
-			if f.OriginPN != 0 && f.OriginPN != pn {
-				if orig, exists := lt.sent[f.OriginPN]; exists && orig.retired {
-					orig.pendingOrig--
-					if orig.pendingOrig <= 0 {
-						delete(lt.sent, f.OriginPN)
+		if p, ok := lt.sent[pn]; ok {
+			delete(lt.sent, pn)
+			for _, f := range p.frames {
+				if f.OriginPN != 0 && f.OriginPN != pn {
+					if orig, exists := lt.retired[f.OriginPN]; exists {
+						orig.pendingOrig--
+						if orig.pendingOrig <= 0 {
+							delete(lt.retired, f.OriginPN)
+						}
 					}
 				}
 			}
-		}
-		if !p.retired {
 			lt.inFlightBytes -= p.wireBytes
 			if lt.inFlightBytes < 0 {
 				lt.inFlightBytes = 0
 			}
+			res.AckedBytes += p.wireBytes
+			res.AckedPkts++
+			return
 		}
-		res.AckedBytes += p.wireBytes
-		res.AckedPkts++
+		if p, ok := lt.retired[pn]; ok {
+			delete(lt.retired, pn)
+			res.AckedBytes += p.wireBytes
+			res.AckedPkts++
+		}
 	}
 
 	if len(blocks) == 0 {
 		ackOne(largestAcked)
 	} else {
+		var rawRanges [MaxSACKBlocks][2]uint64
+		nRaw := 0
+		var activeRanges [MaxSACKBlocks][2]uint64
+		nActive := 0
+		var activeSpan uint64
+		oldest := lt.oldestPN
+		hasActive := len(lt.sent) > 0 && oldest > 0
+		hasRetired := len(lt.retired) > 0
+
 		cursor := int64(largestAcked) + 1
-		for _, blk := range blocks {
+		limitBlocks := len(blocks)
+		if limitBlocks > MaxSACKBlocks {
+			limitBlocks = MaxSACKBlocks
+		}
+		for i := 0; i < limitBlocks; i++ {
+			blk := blocks[i]
 			end := cursor - 1 - int64(blk.Gap)
 			if end < 1 {
 				break
@@ -462,17 +579,58 @@ func (lt *LossTracker) OnSACK(largestAcked uint64, ackDelayUs uint32, blocks []S
 			if start < 1 {
 				start = 1
 			}
-			for pn := uint64(end); pn >= uint64(start); pn-- {
-				ackOne(pn)
-				if pn == 1 {
+			if end >= start {
+				sU, eU := uint64(start), uint64(end)
+				rawRanges[nRaw] = [2]uint64{sU, eU}
+				nRaw++
+				if hasActive && eU >= oldest {
+					cs := sU
+					if cs < oldest {
+						cs = oldest
+					}
+					activeRanges[nActive] = [2]uint64{cs, eU}
+					nActive++
+					activeSpan += eU - cs + 1
+				} else if !hasRetired && hasActive && eU < oldest {
 					break
 				}
 			}
 			cursor = start
 		}
-	}
 
-	// Detect RACK time threshold & >=3 packet threshold losses among remaining in-flight packets.
+		if nActive > 0 {
+			if activeSpan <= uint64(len(lt.sent))*2 {
+				for i := 0; i < nActive; i++ {
+					cs, ce := activeRanges[i][0], activeRanges[i][1]
+					for pn := ce; pn >= cs; pn-- {
+						ackOne(pn)
+						if pn == 1 {
+							break
+						}
+					}
+				}
+			} else {
+				aSlice := activeRanges[:nActive]
+				for pn := range lt.sent {
+					if pnInRanges(pn, aSlice) {
+						ackOne(pn)
+					}
+				}
+			}
+		}
+
+		if hasRetired && nRaw > 0 {
+			rSlice := rawRanges[:nRaw]
+			for pn := range lt.retired {
+				if pnInRanges(pn, rSlice) {
+					ackOne(pn)
+				}
+			}
+		}
+	}
+	lt.advanceOldestPNLocked()
+
+	// Detect RACK time threshold & >=8 packet threshold losses among remaining active packets.
 	minRTT := lt.srtt
 	pPeriod := now.UnixNano() / int64(minRTTWindowDur)
 	cutoff := pPeriod - 2
@@ -494,33 +652,41 @@ func (lt *LossTracker) OnSACK(largestAcked uint64, ackDelayUs uint32, blocks []S
 	}
 	originAgeLimit *= 2
 
-	var lostCount uint32
-	for pn, p := range lt.sent {
-		if p.retired {
+	if len(lt.retired) > 0 {
+		for pn, p := range lt.retired {
 			if now.Sub(p.retiredAt) >= originAgeLimit {
+				delete(lt.retired, pn)
+			}
+		}
+	}
+
+	var lostCount uint32
+	if lt.oldestPN > 0 && lt.oldestPN < lt.largestAcked {
+		handleMaybeLost := func(pn uint64, p *inFlightPkt) {
+			if pn+8 <= lt.largestAcked || now.Sub(p.sentAt) >= rackThresh {
 				delete(lt.sent, pn)
-			}
-			continue
-		}
-		if pn >= lt.largestAcked {
-			continue
-		}
-		pktThreshold := pn+8 <= lt.largestAcked
-		timeThreshold := now.Sub(p.sentAt) >= rackThresh
-		if pktThreshold || timeThreshold {
-			delete(lt.sent, pn)
-			lt.inFlightBytes -= p.wireBytes
-			if lt.inFlightBytes < 0 {
-				lt.inFlightBytes = 0
-			}
-			lostCount++
-			for _, f := range p.frames {
-				if f.OriginPN == 0 {
-					f.OriginPN = pn
+				lt.inFlightBytes -= p.wireBytes
+				if lt.inFlightBytes < 0 {
+					lt.inFlightBytes = 0
 				}
-				res.LostFrames = append(res.LostFrames, f)
+				lostCount++
+				res.LostFrames = appendLostFrames(res.LostFrames, pn, p.frames)
 			}
 		}
+		if lt.largestAcked-lt.oldestPN <= uint64(len(lt.sent))*2 {
+			for pn := lt.oldestPN; pn < lt.largestAcked; pn++ {
+				if p, ok := lt.sent[pn]; ok {
+					handleMaybeLost(pn, p)
+				}
+			}
+		} else {
+			for pn, p := range lt.sent {
+				if pn < lt.largestAcked {
+					handleMaybeLost(pn, p)
+				}
+			}
+		}
+		lt.advanceOldestPNLocked()
 	}
 
 	lt.recordOutcomeLocked(now, uint32(res.AckedPkts), lostCount)
@@ -584,15 +750,16 @@ func (lt *LossTracker) PollTimeouts(now time.Time) (lostFrames []ReliableFrame, 
 
 	var lostCount uint32
 	var hitPTO bool
-	for pn, p := range lt.sent {
-		elapsed := now.Sub(p.sentAt)
-		if p.retired {
+	if len(lt.retired) > 0 {
+		for pn, p := range lt.retired {
 			if now.Sub(p.retiredAt) >= originAgeLimit {
-				delete(lt.sent, pn)
+				delete(lt.retired, pn)
 				lostCount++
 			}
-			continue
 		}
+	}
+	for pn, p := range lt.sent {
+		elapsed := now.Sub(p.sentAt)
 		rackExpired := pn < lt.largestAcked && elapsed >= rackThresh
 		rtoExpired := elapsed >= rto
 		if rackExpired {
@@ -602,15 +769,11 @@ func (lt *LossTracker) PollTimeouts(now time.Time) (lostFrames []ReliableFrame, 
 				lt.inFlightBytes = 0
 			}
 			lostCount++
-			for _, f := range p.frames {
-				if f.OriginPN == 0 {
-					f.OriginPN = pn
-				}
-				lostFrames = append(lostFrames, f)
-			}
+			lostFrames = appendLostFrames(lostFrames, pn, p.frames)
 		} else if rtoExpired {
-			// Retire in-flight credit and transfer frames once; keep pn briefly for late SACK RTT
+			// Retire in-flight credit and move pn to retired map briefly for late SACK RTT
 			// calibration or until retransmitted packet SACKs resolve OriginPN / age exceeds 2*max(SRTT,500ms).
+			delete(lt.sent, pn)
 			p.retired = true
 			p.retiredAt = now
 			lt.inFlightBytes -= p.wireBytes
@@ -630,8 +793,10 @@ func (lt *LossTracker) PollTimeouts(now time.Time) (lostFrames []ReliableFrame, 
 				p.pendingOrig = pending
 				p.frames = nil
 			}
+			lt.retired[pn] = p
 		}
 	}
+	lt.advanceOldestPNLocked()
 
 	if hitPTO && now.Sub(lt.lastPTOAt) >= rto/2 {
 		lt.ptoBackoff++

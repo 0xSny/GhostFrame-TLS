@@ -185,12 +185,20 @@ var cnDomainSuffixes = []string{
 	"bing.cn", "msn.cn", "office365.cn",
 }
 
-func isCNDomain(host string) bool {
+var proxyDomainSuffixes = []string{
+	"google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "googlevideo.com",
+	"youtube.com", "ytimg.com", "youtu.be", "gmail.com",
+	"github.com", "githubusercontent.com", "githubassets.com", "gitlab.com",
+	"cloudflare.com", "workers.dev", "pages.dev",
+	"openai.com", "chatgpt.com", "anthropic.com", "claude.ai", "gemini.google.com",
+	"x.com", "twitter.com", "twimg.com", "t.co",
+	"wikipedia.org", "wikimedia.org", "reddit.com", "discord.com", "telegram.org", "t.me",
+	"netflix.com", "nflxvideo.net", "amazonaws.com", "fastly.net",
+}
+
+func matchDomainSuffix(host string, suffixes []string) bool {
 	h := strings.ToLower(strings.TrimSuffix(host, "."))
-	if h == "localhost" {
-		return true
-	}
-	for _, sfx := range cnDomainSuffixes {
+	for _, sfx := range suffixes {
 		if strings.HasPrefix(sfx, ".") {
 			if strings.HasSuffix(h, sfx) {
 				return true
@@ -200,6 +208,18 @@ func isCNDomain(host string) bool {
 		}
 	}
 	return false
+}
+
+func isProxyDomain(host string) bool {
+	return matchDomainSuffix(host, proxyDomainSuffixes)
+}
+
+func isCNDomain(host string) bool {
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	if h == "localhost" {
+		return true
+	}
+	return matchDomainSuffix(h, cnDomainSuffixes)
 }
 
 // Decide evaluates destination hostport under mode WITHOUT calling DNS lookup on domains.
@@ -238,6 +258,9 @@ func (r *Router) Decide(mode RouteMode, hostport string) RouteAction {
 					return ActionDirect
 				}
 			}
+			return ActionProxy
+		}
+		if isProxyDomain(host) {
 			return ActionProxy
 		}
 		if isCNDomain(host) {

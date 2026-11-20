@@ -46,7 +46,13 @@ func main() {
 	}
 	if *lowMem {
 		gft.SetLowMemMode(true)
-		debug.SetMemoryLimit(32 << 20)
+	}
+	if os.Getenv("GOMEMLIMIT") == "" {
+		if *lowMem {
+			debug.SetMemoryLimit(64 << 20)
+		} else {
+			debug.SetMemoryLimit(256 << 20)
+		}
 	}
 
 	mutex, primary := winui.AcquireSingleInstance()
@@ -67,7 +73,7 @@ func main() {
 	if err := eng.StartServersAutoFallback(); err != nil {
 		eng.Logf("本地代理端口监听失败（请在界面修改本地端口后点击保存）: %v", err)
 	}
-	eng.Logf("GhostFrame-Pro v3.4.1 (GFT-RTC) native desktop initialized")
+	eng.Logf("GhostFrame-Pro v4.0.0-LTS (GFT-RTC) native desktop initialized")
 
 	if *autoConnect {
 		go func() { _ = eng.Connect() }()

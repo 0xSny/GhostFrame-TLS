@@ -86,7 +86,7 @@ func (c *Controller) pause(sc *bufio.Scanner) {
 func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState string, snap server.RuntimeSnapshot, sniRTT time.Duration) string {
 	b := c.Box
 	var sb strings.Builder
-	sb.WriteString(b.Top("GhostFrame-RTC (GFT) v3.4.1 Apex 交互控制中心") + "\n")
+	sb.WriteString(b.Top("GhostFrame-RTC (GFT) v4.0.0-LTS Apex 交互控制中心") + "\n")
 
 	svcBadge := b.c("\x1b[31m", "[○] 已停止")
 	if active {
@@ -146,7 +146,7 @@ func ShowDeliveryCard(cfgPath string, out io.Writer) error {
 	qr, qerr := RenderTerminalQR(uri, c.Box.UTF8)
 
 	b := c.Box
-	c.printf("%s\n", b.Top("GhostFrame-RTC (GFT) v3.4.1 多端部署交付卡"))
+	c.printf("%s\n", b.Top("GhostFrame-RTC (GFT) v4.0.0-LTS 多端部署交付卡"))
 	c.printf("%s\n", b.Line(fmt.Sprintf("节点地址: %s:%d   SNI: %s   Hop: %s   Smart-Brutal: ↑%d/↓%d Mbps",
 		cfg.PublicHost, ConfigListenPort(cfg.Listen), cfg.SNI, nonEmpty(cfg.HopRange, "未开启"), cfg.UpMbps, cfg.DownMbps)))
 	c.printf("%s\n", b.Bottom())

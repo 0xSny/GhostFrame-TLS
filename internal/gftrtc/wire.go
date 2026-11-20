@@ -6,6 +6,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -27,6 +28,8 @@ import (
 const (
 	// MaxUDPPayload is the outer UDP payload ceiling (safe for PPPoE 1492 MTU zero fragmentation).
 	MaxUDPPayload = 1360
+	// MinUDPPayloadJitter is the minimum outer MTU ceiling used for frame-level length jitter.
+	MinUDPPayloadJitter = 1160
 	// RTPOverhead = 12B RTP header + 8B masked PktNum + 16B AEAD tag.
 	RTPOverhead = 36
 	// MaxInnerPlaintext is the maximum plaintext size inside one SRTP packet.
@@ -38,8 +41,17 @@ const (
 	// MaxFECFrameArea leaves 2B for the original payload length prefix inside XOR parity.
 	MaxFECFrameArea = MaxFrameArea - 2 // 1316
 
-	PTVideoData uint8 = 96
-	PTAudioCtrl uint8 = 111
+	PTVideoData      uint8 = 96
+	PTAudioCtrl      uint8 = 111
+	PTReceiverReport uint8 = 201 // RFC 5761 / RFC 3550 RTCP-Mux RR packet
+
+	// rtpKeyPhaseBit reuses RTP header extension bit (0x10) as 1-bit in-band key rotation generation.
+	rtpKeyPhaseBit uint8 = 0x10
+
+	// Anti-DoS & anti-amplification constants for STUN Binding Request.
+	MinClientSTUNReqLen = 176
+	FastMACLen          = 16
+	fastMACLabel        = "gftrtc-pre"
 
 	stunHeaderLen        = 20
 	stunMagicCookie      = uint32(0x2112A442)
@@ -325,6 +337,67 @@ func findSTUNAttr(attrs []byte, wantType uint16) ([]byte, bool) {
 	return nil, false
 }
 
+const maxFastMACBody = 400
+
+// computeFastMACZeroAlloc computes HMAC-SHA256(psk, "gftrtc-pre" || stunHdr[:20] || ticketBody)[:16]
+// strictly on the stack with 0 heap allocations to defend against UDP Flood CPU exhaustion.
+func computeFastMACZeroAlloc(psk, stunHdr, ticketBody []byte) ([FastMACLen]byte, bool) {
+	var out [FastMACLen]byte
+	if len(stunHdr) != stunHeaderLen || len(ticketBody) > maxFastMACBody {
+		return out, false
+	}
+	var key [64]byte
+	if len(psk) > sha256.BlockSize {
+		sum := sha256.Sum256(psk)
+		copy(key[:], sum[:])
+	} else {
+		copy(key[:], psk)
+	}
+
+	var iBuf [sha256.BlockSize + len(fastMACLabel) + stunHeaderLen + maxFastMACBody]byte
+	for i := 0; i < sha256.BlockSize; i++ {
+		iBuf[i] = key[i] ^ 0x36
+	}
+	off := sha256.BlockSize
+	off += copy(iBuf[off:], fastMACLabel)
+	off += copy(iBuf[off:], stunHdr)
+	off += copy(iBuf[off:], ticketBody)
+	inner := sha256.Sum256(iBuf[:off])
+
+	var oBuf [sha256.BlockSize + sha256.Size]byte
+	for i := 0; i < sha256.BlockSize; i++ {
+		oBuf[i] = key[i] ^ 0x5c
+	}
+	copy(oBuf[sha256.BlockSize:], inner[:])
+	outer := sha256.Sum256(oBuf[:])
+	copy(out[:], outer[:FastMACLen])
+	return out, true
+}
+
+// PreScreenClientBindingReq validates STUN header, CRC32 FINGERPRINT, and 16-byte FastMAC
+// in constant time with zero heap allocations before any X25519 or AEAD allocation occurs.
+func PreScreenClientBindingReq(pkt, psk []byte) bool {
+	if len(psk) < 16 || len(pkt) < MinClientSTUNReqLen || len(pkt) > MaxUDPPayload {
+		return false
+	}
+	_, attrs, ok := verifySTUNBaseAndFingerprint(pkt, stunTypeBindingReq)
+	if !ok {
+		return false
+	}
+	ticket, ok := findSTUNAttr(attrs, attrGFTTicket)
+	if !ok || len(ticket) < 32+24+chacha20poly1305.Overhead+FastMACLen {
+		return false
+	}
+	split := len(ticket) - FastMACLen
+	ticketBody := ticket[:split]
+	gotMAC := ticket[split:]
+	wantMAC, ok := computeFastMACZeroAlloc(psk, pkt[:stunHeaderLen], ticketBody)
+	if !ok {
+		return false
+	}
+	return subtle.ConstantTimeCompare(wantMAC[:], gotMAC) == 1
+}
+
 func hkdfAEADChaCha(secret, salt []byte, info string) (cipher.AEAD, error) {
 	r := hkdf.New(sha256.New, secret, salt, []byte(info))
 	var k [32]byte
@@ -403,7 +476,7 @@ func (g *ReplayGuard) Len() int {
 	return n
 }
 
-// SessionKeys holds forward-secret bi-directional AEAD keys, packet-number masks, and IV prefixes.
+// SessionKeys holds forward-secret bi-directional AEAD keys, packet-number masks, IV prefixes, and ratchet ChainKey.
 type SessionKeys struct {
 	C2SAEAD    cipher.AEAD
 	S2CAEAD    cipher.AEAD
@@ -411,16 +484,13 @@ type SessionKeys struct {
 	S2CMask    uint64
 	C2SIV      [4]byte
 	S2CIV      [4]byte
+	ChainKey   [32]byte
+	Epoch      uint32
 	UseChaCha  bool
 	CipherName string
 }
 
-func deriveSessionKeys(sharedSecret, psk []byte, txID [12]byte, useChaCha bool) (*SessionKeys, cipher.AEAD, error) {
-	ikm := make([]byte, len(sharedSecret)+len(psk))
-	copy(ikm, sharedSecret)
-	copy(ikm[len(sharedSecret):], psk)
-
-	prk := hkdf.Extract(sha256.New, ikm, txID[:])
+func deriveKeysFromPRK(prk []byte, useChaCha bool, epoch uint32) (*SessionKeys, cipher.AEAD, error) {
 	expand := func(info string, out []byte) error {
 		r := hkdf.Expand(sha256.New, prk, []byte(info))
 		_, err := io.ReadFull(r, out)
@@ -439,6 +509,7 @@ func deriveSessionKeys(sharedSecret, psk []byte, txID [12]byte, useChaCha bool) 
 	var ackKey [32]byte
 	var maskBuf [16]byte
 	var ivBuf [8]byte
+	var nextChain [32]byte
 
 	if err := expand("gftrtc-v1-key-c2s", c2sKey); err != nil {
 		return nil, nil, err
@@ -453,6 +524,9 @@ func deriveSessionKeys(sharedSecret, psk []byte, txID [12]byte, useChaCha bool) 
 		return nil, nil, err
 	}
 	if err := expand("gftrtc-v1-ivs", ivBuf[:]); err != nil {
+		return nil, nil, err
+	}
+	if err := expand("gftrtc-v1-chain-key", nextChain[:]); err != nil {
 		return nil, nil, err
 	}
 
@@ -497,12 +571,40 @@ func deriveSessionKeys(sharedSecret, psk []byte, txID [12]byte, useChaCha bool) 
 		S2CAEAD:    s2cAEAD,
 		C2SMask:    binary.BigEndian.Uint64(maskBuf[0:8]),
 		S2CMask:    binary.BigEndian.Uint64(maskBuf[8:16]),
+		ChainKey:   nextChain,
+		Epoch:      epoch,
 		UseChaCha:  useChaCha,
 		CipherName: cipherName,
 	}
 	copy(sk.C2SIV[:], ivBuf[0:4])
 	copy(sk.S2CIV[:], ivBuf[4:8])
 	return sk, ackAEAD, nil
+}
+
+func deriveSessionKeys(sharedSecret, psk []byte, txID [12]byte, useChaCha bool) (*SessionKeys, cipher.AEAD, error) {
+	ikm := make([]byte, len(sharedSecret)+len(psk))
+	copy(ikm, sharedSecret)
+	copy(ikm[len(sharedSecret):], psk)
+	prk := hkdf.Extract(sha256.New, ikm, txID[:])
+	return deriveKeysFromPRK(prk, useChaCha, 0)
+}
+
+// RatchetKeys advances forward-secret session keys using the chain key and an optional fresh ECDH secret.
+func (k *SessionKeys) RatchetKeys(ephemeralShared []byte) (*SessionKeys, error) {
+	if k == nil {
+		return nil, errors.New("gftrtc: nil session keys")
+	}
+	ikm := make([]byte, len(k.ChainKey)+len(ephemeralShared))
+	copy(ikm, k.ChainKey[:])
+	if len(ephemeralShared) > 0 {
+		copy(ikm[len(k.ChainKey):], ephemeralShared)
+	}
+	prk := hkdf.Extract(sha256.New, ikm, []byte("gftrtc-ratchet"))
+	next, _, err := deriveKeysFromPRK(prk, k.UseChaCha, k.Epoch+1)
+	if err != nil {
+		return nil, err
+	}
+	return next, nil
 }
 
 func randomICEUser() string {
@@ -542,7 +644,8 @@ func BuildClientBindingReq(psk []byte, clientID [8]byte, maxRxMbps, flags uint16
 	if PrioritizeChaCha20() {
 		flags |= FlagPreferChaCha20
 	}
-	padLen := 16 + mrand.IntN(33) // 16..48
+	// Minimum 40..72B padding ensures the complete STUN Binding Request wire length >= 176B.
+	padLen := 40 + mrand.IntN(33)
 	pt := make([]byte, 24+padLen)
 	copy(pt[0:4], stunTicketMagic)
 	binary.BigEndian.PutUint64(pt[4:12], uint64(now.Unix()))
@@ -551,13 +654,14 @@ func BuildClientBindingReq(psk []byte, clientID [8]byte, maxRxMbps, flags uint16
 	binary.BigEndian.PutUint16(pt[22:24], flags)
 	fillFastRandom(pt[24:])
 
-	ticket := make([]byte, 32, 32+len(pt)+aead.Overhead())
+	ticketBodyLen := 32 + len(pt) + aead.Overhead()
+	ticket := make([]byte, ticketBodyLen+FastMACLen)
 	copy(ticket, pub)
-	ticket = aead.Seal(ticket, txID[:], pt, pub)
+	aead.Seal(ticket[:32], txID[:], pt, pub)
 
-	buf := make([]byte, 0, 256)
+	buf := make([]byte, 0, 288)
 	buf = binary.BigEndian.AppendUint16(buf, stunTypeBindingReq)
-	buf = binary.BigEndian.AppendUint16(buf, 0) // filled in finalize
+	buf = binary.BigEndian.AppendUint16(buf, 0) // set below before FastMAC
 	buf = binary.BigEndian.AppendUint32(buf, stunMagicCookie)
 	buf = append(buf, txID[:]...)
 
@@ -568,7 +672,18 @@ func BuildClientBindingReq(psk []byte, clientID [8]byte, maxRxMbps, flags uint16
 	var prio [4]byte
 	binary.BigEndian.PutUint32(prio[:], 0x6E001EFF)
 	buf = appendSTUNAttr(buf, attrPriority, prio[:])
+
+	ticketValOff := len(buf) + 4
 	buf = appendSTUNAttr(buf, attrGFTTicket, ticket)
+
+	finalMsgLen := len(buf) + 8 - stunHeaderLen
+	binary.BigEndian.PutUint16(buf[2:4], uint16(finalMsgLen))
+	mac, ok := computeFastMACZeroAlloc(psk, buf[:stunHeaderLen], buf[ticketValOff:ticketValOff+ticketBodyLen])
+	if !ok {
+		return nil, nil, txID, errors.New("gftrtc: compute fastmac failed")
+	}
+	copy(buf[ticketValOff+ticketBodyLen:], mac[:])
+
 	buf = finalizeSTUNWithFingerprint(buf)
 	return buf, priv, txID, nil
 }
@@ -580,11 +695,12 @@ type ParsedClientReq struct {
 	ClientID     [8]byte
 	ClientRxMbps uint16
 	ClientFlags  uint16
+	WireLen      int
 }
 
-// ParseClientBindingReq validates CRC32 fingerprint, ChaCha20 auth ticket, time skew (±90s), and replay cache.
+// ParseClientBindingReq validates FastMAC, CRC32 fingerprint, ChaCha20 auth ticket, time skew (±90s), and replay cache.
 func ParseClientBindingReq(pkt, psk []byte, guard *ReplayGuard, now time.Time) (*ParsedClientReq, bool) {
-	if len(psk) < 16 {
+	if !PreScreenClientBindingReq(pkt, psk) {
 		return nil, false
 	}
 	txID, attrs, ok := verifySTUNBaseAndFingerprint(pkt, stunTypeBindingReq)
@@ -592,19 +708,17 @@ func ParseClientBindingReq(pkt, psk []byte, guard *ReplayGuard, now time.Time) (
 		return nil, false
 	}
 	ticket, ok := findSTUNAttr(attrs, attrGFTTicket)
-	if !ok || len(ticket) < 32+24+chacha20poly1305.Overhead {
+	if !ok || len(ticket) < 32+24+chacha20poly1305.Overhead+FastMACLen {
 		return nil, false
 	}
-	pubBytes := ticket[:32]
-	cliPub, err := ecdh.X25519().NewPublicKey(pubBytes)
-	if err != nil {
-		return nil, false
-	}
+	ticketBody := ticket[:len(ticket)-FastMACLen]
+	pubBytes := ticketBody[:32]
 	aead, err := hkdfAEADChaCha(psk, txID[:], "gftrtc-v1-c2s")
 	if err != nil {
 		return nil, false
 	}
-	pt, err := aead.Open(nil, txID[:], ticket[32:], pubBytes)
+	var ptBuf [256]byte
+	pt, err := aead.Open(ptBuf[:0], txID[:], ticketBody[32:], pubBytes)
 	if err != nil || len(pt) < 24 {
 		return nil, false
 	}
@@ -622,11 +736,16 @@ func ParseClientBindingReq(pkt, psk []byte, guard *ReplayGuard, now time.Time) (
 	if !guard.checkAndRecord(txID, pubBytes[:8], now.Unix()) {
 		return nil, false
 	}
+	cliPub, err := ecdh.X25519().NewPublicKey(pubBytes)
+	if err != nil {
+		return nil, false
+	}
 	res := &ParsedClientReq{
 		TxID:         txID,
 		ClientPub:    cliPub,
 		ClientRxMbps: binary.BigEndian.Uint16(pt[20:22]),
 		ClientFlags:  binary.BigEndian.Uint16(pt[22:24]),
+		WireLen:      len(pkt),
 	}
 	copy(res.ClientID[:], pt[12:20])
 	return res, true
@@ -696,7 +815,26 @@ func BuildServerBindingResp(psk []byte, req *ParsedClientReq, clientAddr net.Add
 		return nil, nil, err
 	}
 
+	buf := make([]byte, 0, 256)
+	buf = binary.BigEndian.AppendUint16(buf, stunTypeBindingResp)
+	buf = binary.BigEndian.AppendUint16(buf, 0)
+	buf = binary.BigEndian.AppendUint32(buf, stunMagicCookie)
+	buf = append(buf, req.TxID[:]...)
+	buf = appendSTUNAttr(buf, attrXorMappedAddr, encodeXorMappedAddr(clientAddr, req.TxID))
+
 	padLen := 16 + mrand.IntN(33)
+	if req.WireLen > 0 {
+		baseWithoutPad := len(buf) + 4 + 32 + 10 + len(paramsJSON) + ackAEAD.Overhead() + 8
+		// Account for up to 3B STUN 4-byte padding on attrGFTTicket.
+		maxTotal := 2 * req.WireLen
+		if baseWithoutPad+padLen+3 > maxTotal {
+			avail := maxTotal - baseWithoutPad - 3
+			if avail < 0 {
+				avail = 0
+			}
+			padLen = avail
+		}
+	}
 	pt := make([]byte, 10+len(paramsJSON)+padLen)
 	binary.BigEndian.PutUint32(pt[0:4], ssrc)
 	binary.BigEndian.PutUint16(pt[4:6], negotiatedTxMbps)
@@ -710,14 +848,11 @@ func BuildServerBindingResp(psk []byte, req *ParsedClientReq, clientAddr net.Add
 	copy(ticket, srvPub)
 	ticket = ackAEAD.Seal(ticket, req.TxID[:], pt, srvPub)
 
-	buf := make([]byte, 0, 256)
-	buf = binary.BigEndian.AppendUint16(buf, stunTypeBindingResp)
-	buf = binary.BigEndian.AppendUint16(buf, 0)
-	buf = binary.BigEndian.AppendUint32(buf, stunMagicCookie)
-	buf = append(buf, req.TxID[:]...)
-	buf = appendSTUNAttr(buf, attrXorMappedAddr, encodeXorMappedAddr(clientAddr, req.TxID))
 	buf = appendSTUNAttr(buf, attrGFTTicket, ticket)
 	buf = finalizeSTUNWithFingerprint(buf)
+	if req.WireLen > 0 && len(buf) > 2*req.WireLen {
+		return nil, nil, fmt.Errorf("gftrtc: server binding resp %dB exceeds 2x amplification ceiling %dB", len(buf), 2*req.WireLen)
+	}
 	return buf, keys, nil
 }
 
@@ -809,9 +944,29 @@ func IsValidSTUNIndication(pkt []byte) bool {
 	return ok
 }
 
-// IsRTPPacket checks whether pkt has an RTP v2 header (first two bits == 10b, len >= 36).
+// IsRTPPacket checks whether pkt has an RTP v2 header (first two bits == 10b, non-RTCP PT, len >= 36).
 func IsRTPPacket(pkt []byte) bool {
-	return len(pkt) >= RTPOverhead && (pkt[0]&0xC0) == 0x80
+	return len(pkt) >= RTPOverhead && (pkt[0]&0xC0) == 0x80 && pkt[1] != PTReceiverReport
+}
+
+// IsRTCPMimic checks whether pkt matches an RFC 5761 multiplexed RTCP Receiver Report (PT=201, 64..112B).
+func IsRTCPMimic(pkt []byte) bool {
+	if len(pkt) < 64 || len(pkt) > 112 || len(pkt)%4 != 0 {
+		return false
+	}
+	if (pkt[0]&0xC0) != 0x80 || pkt[1] != PTReceiverReport {
+		return false
+	}
+	wordsMinus1 := int(binary.BigEndian.Uint16(pkt[2:4]))
+	return (wordsMinus1+1)*4 == len(pkt)
+}
+
+// ExtractKeyPhase reads the 1-bit in-band key rotation phase (0 or 1) from an RTP/RTCP header byte.
+func ExtractKeyPhase(pkt []byte) uint8 {
+	if len(pkt) < 1 || (pkt[0]&rtpKeyPhaseBit) == 0 {
+		return 0
+	}
+	return 1
 }
 
 // ParseRTPHeaderFields extracts SSRC and masked PktNum without decrypting.
@@ -824,9 +979,13 @@ func ParseRTPHeaderFields(pkt []byte) (ssrc uint32, maskedPktNum uint64, ok bool
 	return ssrc, maskedPktNum, true
 }
 
-// SealRTP wraps plaintext into an SRTP v2 packet using buf[:MaxUDPPayload] as backing space.
-// It returns the sealed slice without heap allocations if cap(buf) >= RTPOverhead + len(plaintext).
+// SealRTP wraps plaintext into an SRTP v2 packet using KeyPhase 0.
 func SealRTP(buf []byte, aead cipher.AEAD, iv [4]byte, mask uint64, ssrc uint32, seq uint16, ts90k uint32, pt uint8, marker bool, pktNum uint64, plaintext []byte) ([]byte, error) {
+	return SealRTPPhase(buf, aead, iv, mask, 0, ssrc, seq, ts90k, pt, marker, pktNum, plaintext)
+}
+
+// SealRTPPhase wraps plaintext into an SRTP v2 packet carrying 1-bit KeyPhase inside RTP header byte 0.
+func SealRTPPhase(buf []byte, aead cipher.AEAD, iv [4]byte, mask uint64, phase uint8, ssrc uint32, seq uint16, ts90k uint32, pt uint8, marker bool, pktNum uint64, plaintext []byte) ([]byte, error) {
 	if len(plaintext) > MaxInnerPlaintext {
 		return nil, fmt.Errorf("gftrtc: plaintext %d exceeds %d", len(plaintext), MaxInnerPlaintext)
 	}
@@ -836,7 +995,11 @@ func SealRTP(buf []byte, aead cipher.AEAD, iv [4]byte, mask uint64, ssrc uint32,
 	} else {
 		buf = buf[:20]
 	}
-	buf[0] = 0x80
+	vpx := uint8(0x80)
+	if (phase & 1) != 0 {
+		vpx |= rtpKeyPhaseBit
+	}
+	buf[0] = vpx
 	b1 := pt & 0x7F
 	if marker {
 		b1 |= 0x80
@@ -857,8 +1020,14 @@ func SealRTP(buf []byte, aead cipher.AEAD, iv [4]byte, mask uint64, ssrc uint32,
 
 // OpenRTP decrypts an SRTP v2 packet into dst[:0], validating the 12-byte RTP AAD.
 func OpenRTP(dst, pkt []byte, aead cipher.AEAD, iv [4]byte, mask uint64) (pktNum uint64, pt []byte, payloadType uint8, marker bool, err error) {
+	pktNum, pt, payloadType, marker, _, err = OpenRTPPhase(dst, pkt, aead, iv, mask)
+	return pktNum, pt, payloadType, marker, err
+}
+
+// OpenRTPPhase decrypts an SRTP v2 packet into dst[:0] and also returns its 1-bit KeyPhase.
+func OpenRTPPhase(dst, pkt []byte, aead cipher.AEAD, iv [4]byte, mask uint64) (pktNum uint64, pt []byte, payloadType uint8, marker bool, phase uint8, err error) {
 	if !IsRTPPacket(pkt) {
-		return 0, nil, 0, false, errors.New("not rtp")
+		return 0, nil, 0, false, 0, errors.New("not rtp")
 	}
 	masked := binary.BigEndian.Uint64(pkt[12:20])
 	pktNum = masked ^ mask
@@ -869,9 +1038,71 @@ func OpenRTP(dst, pkt []byte, aead cipher.AEAD, iv [4]byte, mask uint64) (pktNum
 
 	pt, err = aead.Open(dst[:0], nonce[:], pkt[20:], pkt[:12])
 	if err != nil {
-		return 0, nil, 0, false, err
+		return 0, nil, 0, false, 0, err
 	}
 	marker = (pkt[1] & 0x80) != 0
 	payloadType = pkt[1] & 0x7F
-	return pktNum, pt, payloadType, marker, nil
+	phase = ExtractKeyPhase(pkt)
+	return pktNum, pt, payloadType, marker, phase, nil
+}
+
+// SealRTCPMimic builds an encrypted RFC 5761 / RFC 3550 Receiver Report (PT=201) packet (64..112B).
+func SealRTCPMimic(buf []byte, aead cipher.AEAD, iv [4]byte, mask uint64, phase uint8, ssrc uint32, rtcpSeq uint64, payload []byte) ([]byte, error) {
+	var bodyStack [80]byte
+	bodyLen := len(payload)
+	if bodyLen == 0 {
+		bodyLen = 32 + mrand.IntN(13)*4 // 32..80B -> total 64..112B
+		fillFastRandom(bodyStack[:bodyLen])
+	} else {
+		if bodyLen < 32 {
+			bodyLen = 32
+		} else if bodyLen > 80 {
+			bodyLen = 80
+		}
+		bodyLen = (bodyLen + 3) &^ 3
+		fillFastRandom(bodyStack[:bodyLen])
+		copy(bodyStack[:], payload[:min(len(payload), bodyLen)])
+	}
+	totalLen := 16 + bodyLen + aead.Overhead()
+	if cap(buf) < totalLen {
+		buf = make([]byte, totalLen)
+	} else {
+		buf = buf[:16]
+	}
+	vprc := uint8(0x81) // V=2, RC=1
+	if (phase & 1) != 0 {
+		vprc |= rtpKeyPhaseBit
+	}
+	buf[0] = vprc
+	buf[1] = PTReceiverReport
+	binary.BigEndian.PutUint16(buf[2:4], uint16(totalLen/4-1))
+	binary.BigEndian.PutUint32(buf[4:8], ssrc)
+
+	rawTail := rtcpSeq | (uint64(1) << 63)
+	binary.BigEndian.PutUint64(buf[8:16], rawTail^mask)
+
+	var nonce [12]byte
+	copy(nonce[0:4], iv[:])
+	binary.BigEndian.PutUint64(nonce[4:12], rawTail)
+
+	return aead.Seal(buf[:16], nonce[:], bodyStack[:bodyLen], buf[:8]), nil
+}
+
+// OpenRTCPMimic verifies and decrypts an RFC 5761 RTCP-Mux Receiver Report packet.
+func OpenRTCPMimic(dst, pkt []byte, aead cipher.AEAD, iv [4]byte, mask uint64) (ssrc uint32, err error) {
+	if !IsRTCPMimic(pkt) {
+		return 0, errors.New("not rtcp mimic")
+	}
+	rawTail := binary.BigEndian.Uint64(pkt[8:16]) ^ mask
+	if (rawTail & (uint64(1) << 63)) == 0 {
+		return 0, errors.New("invalid rtcp nonce domain")
+	}
+	var nonce [12]byte
+	copy(nonce[0:4], iv[:])
+	binary.BigEndian.PutUint64(nonce[4:12], rawTail)
+
+	if _, err := aead.Open(dst[:0], nonce[:], pkt[16:], pkt[:8]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(pkt[4:8]), nil
 }

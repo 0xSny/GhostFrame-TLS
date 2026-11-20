@@ -14,7 +14,7 @@ import (
 	"ghostframe/internal/gft"
 )
 
-const version = "v3.4.1"
+const version = "v4.0.0-LTS"
 
 func main() {
 	cfgFlag := flag.String("config", "", "optional path to client.json (e.g. /etc/gft/client.json)")
@@ -42,7 +42,13 @@ func main() {
 	}
 	if *lowMem {
 		gft.SetLowMemMode(true)
-		debug.SetMemoryLimit(24 << 20)
+	}
+	if os.Getenv("GOMEMLIMIT") == "" {
+		if *lowMem {
+			debug.SetMemoryLimit(64 << 20)
+		} else {
+			debug.SetMemoryLimit(256 << 20)
+		}
 	}
 
 	eng, err := client.NewEngine(*cfgFlag)

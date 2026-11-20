@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ghostframe/internal/gft"
@@ -70,9 +72,11 @@ type Engine struct {
 	connectGen      uint64
 	paramStore      *gft.ParamStore
 	router          *Router
+	tunnelDNS       *TunnelDNSResolver
 	socksSrv        *SOCKS5Server
 	httpSrv         *HTTPProxyServer
 	sysProxyApplied bool
+	proxyDrifted    atomic.Bool
 
 	// Stats
 	prevUp     uint64
@@ -82,9 +86,8 @@ type Engine struct {
 	pingMs     int64
 	history    []TrafficPoint
 
-	// Rolling log
-	logMu sync.Mutex
-	logs  []LogEntry
+	// Fixed-capacity 1000-entry rolling ring log
+	logRing *LogRingBuffer
 
 	stopStats chan struct{}
 	stopOnce  sync.Once
@@ -119,8 +122,9 @@ func NewEngine(cfgPath string) (*Engine, error) {
 		state:           StateDisconnected,
 		paramStore:      gft.NewParamStore(gft.DefaultParams()),
 		router:          NewRouter(),
+		tunnelDNS:       NewTunnelDNSResolver(),
 		history:         make([]TrafficPoint, 0, 60),
-		logs:            make([]LogEntry, 0, 200),
+		logRing:         NewLogRingBuffer(defaultLogRingCap),
 		stopStats:       make(chan struct{}),
 		config: ClientConfig{
 			RouteMode: RouteRule,
@@ -158,7 +162,7 @@ func NewEngine(cfgPath string) (*Engine, error) {
 		e.paramStore.Set(*active.Params)
 	}
 
-	if recovered, rerr := RecoverSystemProxyIfDirty(e.proxyBackupPath); recovered {
+	if recovered, rerr := RecoverSystemProxyIfDirtyFor(e.proxyBackupPath, e.config.HTTPAddr); recovered {
 		if rerr == nil {
 			e.Logf("Recovered pre-crash Windows system proxy settings cleanly")
 		} else {
@@ -545,9 +549,39 @@ func (e *Engine) RouteDecision(hostport string) RouteAction {
 	return e.router.Decide(mode, hostport)
 }
 
+// TunnelDNS returns the client's encrypted over-tunnel DNS LRU resolver.
+func (e *Engine) TunnelDNS() *TunnelDNSResolver { return e.tunnelDNS }
+
+// ShouldSniffSNI reports whether target is a raw non-private IP on a TLS port eligible
+// for 30ms ClientHello SNI sniffing under Rule mode.
+func (e *Engine) ShouldSniffSNI(target string) bool {
+	e.mu.RLock()
+	mode := e.config.RouteMode
+	e.mu.RUnlock()
+	if mode != RouteRule {
+		return false
+	}
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || !gft.IsTLSSniffPort(port) {
+		return false
+	}
+	ip := net.ParseIP(strings.Trim(strings.TrimSpace(host), "[]"))
+	return ip != nil && !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast()
+}
+
 // OpenTargetStream opens either a direct TCP connection or a multiplexed GFT stream
 // per Router policy (never leaking overseas DNS queries locally).
 func (e *Engine) OpenTargetStream(target string, first []byte) (gft.DataStream, RouteAction, error) {
+	return e.OpenTargetStreamWithRoute(target, target, first)
+}
+
+// OpenTargetStreamWithRoute classifies routing using routeTarget (e.g. sniffed TLS SNI)
+// while opening the connection to dialTarget without local DNS resolution.
+func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first []byte) (gft.DataStream, RouteAction, error) {
 	e.mu.RLock()
 	state := e.state
 	sched := e.sched
@@ -557,9 +591,9 @@ func (e *Engine) OpenTargetStream(target string, first []byte) (gft.DataStream, 
 	if state != StateConnected || sched == nil {
 		return nil, ActionProxy, errNoActiveSession
 	}
-	act := e.router.Decide(mode, target)
+	act := e.router.Decide(mode, routeTarget)
 	if act == ActionDirect {
-		c, err := net.DialTimeout("tcp", target, 8*time.Second)
+		c, err := net.DialTimeout("tcp", dialTarget, 8*time.Second)
 		if err != nil {
 			return nil, ActionDirect, err
 		}
@@ -572,10 +606,35 @@ func (e *Engine) OpenTargetStream(target string, first []byte) (gft.DataStream, 
 				return nil, ActionDirect, werr
 			}
 		}
-		return &directStreamConn{Conn: c, target: target}, ActionDirect, nil
+		return &directStreamConn{Conn: c, target: dialTarget}, ActionDirect, nil
 	}
-	st, err := sched.OpenStream(target, first)
+	st, err := sched.OpenStream(dialTarget, first)
 	return st, ActionProxy, err
+}
+
+// OpenStreamWithOptionalSNISniff performs 30ms TLS SNI sniffing when target is a raw public IP
+// under Rule mode, calling sendAck prior to reading the ClientHello when sniffing applies.
+func (e *Engine) OpenStreamWithOptionalSNISniff(c net.Conn, target string, sendAck func() error) (st gft.DataStream, act RouteAction, rc net.Conn, ackSent bool, err error) {
+	rc = c
+	if e.ShouldSniffSNI(target) {
+		if err = sendAck(); err != nil {
+			return nil, ActionProxy, rc, false, err
+		}
+		ackSent = true
+		_ = rc.SetDeadline(time.Time{})
+		var sni string
+		sni, rc = gft.SniffTLSSNI(rc, 30*time.Millisecond)
+		routeTarget := target
+		if sni != "" {
+			if _, portStr, splitErr := net.SplitHostPort(target); splitErr == nil {
+				routeTarget = net.JoinHostPort(sni, portStr)
+			}
+		}
+		st, act, err = e.OpenTargetStreamWithRoute(target, routeTarget, nil)
+		return st, act, rc, ackSent, err
+	}
+	st, act, err = e.OpenTargetStream(target, nil)
+	return st, act, rc, false, err
 }
 
 // OpenUDPAssociation opens a GFT UDP association (QUIC Datagrams or TCP Mux fallback).
@@ -702,11 +761,16 @@ func (e *Engine) Disconnect() {
 func (e *Engine) statsLoop() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
+	tickCount := 0
 	for {
 		select {
 		case <-e.stopStats:
 			return
 		case <-t.C:
+			tickCount++
+			if tickCount%15 == 0 {
+				e.checkSysProxyDrift()
+			}
 			e.mu.Lock()
 			var curUp, curDown uint64
 			if e.sched != nil {
@@ -740,6 +804,71 @@ func (e *Engine) statsLoop() {
 	}
 }
 
+func (e *Engine) checkSysProxyDrift() {
+	e.mu.RLock()
+	connected := e.state == StateConnected
+	wantProxy := e.config.SysProxy
+	applied := e.sysProxyApplied
+	httpAddr := e.config.HTTPAddr
+	e.mu.RUnlock()
+
+	if !connected || !wantProxy || !applied || IsMockSysProxy() {
+		e.proxyDrifted.Store(false)
+		return
+	}
+	cur, err := QueryFullSystemProxy()
+	if err != nil {
+		return
+	}
+	drifted := !cur.Enabled || !strings.EqualFold(strings.TrimSpace(cur.Server), strings.TrimSpace(httpAddr))
+	prev := e.proxyDrifted.Swap(drifted)
+	if drifted && !prev {
+		e.Logf("[SysProxy] Proxy drift detected (system proxy changed outside GhostFrame)")
+	}
+}
+
+// OnSystemWake resets stale RTT estimators and probes live tunnels after sleep/resume or network change.
+func (e *Engine) OnSystemWake() {
+	e.mu.RLock()
+	sched := e.sched
+	connected := e.state == StateConnected
+	e.mu.RUnlock()
+	if connected && sched != nil {
+		sched.OnSystemWake()
+	}
+	e.checkSysProxyDrift()
+}
+
+// RestoreSystemProxySync synchronously restores pre-session system proxy during WM_QUERYENDSESSION/shutdown.
+func (e *Engine) RestoreSystemProxySync() {
+	e.mu.Lock()
+	applied := e.sysProxyApplied
+	backupPath := e.proxyBackupPath
+	e.sysProxyApplied = false
+	e.proxyDrifted.Store(false)
+	e.mu.Unlock()
+	if applied || backupPath != "" {
+		_ = DisableAndRestoreSystemProxy(backupPath)
+	}
+}
+
+// RebindSystemProxy re-applies the local GhostFrame system proxy after external drift.
+func (e *Engine) RebindSystemProxy() error {
+	e.mu.RLock()
+	httpAddr := e.config.HTTPAddr
+	backupPath := e.proxyBackupPath
+	e.mu.RUnlock()
+	if err := EnableSystemProxyWithBackup(httpAddr, backupPath); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	e.sysProxyApplied = true
+	e.mu.Unlock()
+	e.proxyDrifted.Store(false)
+	e.Logf("[SysProxy] System proxy rebound cleanly (%s)", httpAddr)
+	return nil
+}
+
 // SetSysProxyToggle toggles the Windows system proxy setting with backup/restore.
 func (e *Engine) SetSysProxyToggle(enable bool) error {
 	e.mu.Lock()
@@ -756,29 +885,27 @@ func (e *Engine) SetSysProxyToggle(enable bool) error {
 				e.Logf("SetSystemProxy failed: %v", err)
 				return err
 			}
+			e.proxyDrifted.Store(false)
 			e.Logf("System proxy enabled (%s)", httpAddr)
 		} else {
 			_ = DisableAndRestoreSystemProxy(e.proxyBackupPath)
+			e.proxyDrifted.Store(false)
 			e.Logf("System proxy restored cleanly")
 		}
 	}
 	return nil
 }
 
-// Logf records a log entry.
+// Logf records a log entry in the fixed 1000-entry ring buffer.
 func (e *Engine) Logf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	entry := LogEntry{
 		Time:    time.Now().Format("15:04:05"),
 		Message: msg,
 	}
-	e.logMu.Lock()
-	if len(e.logs) >= 200 {
-		e.logs = append(e.logs[1:], entry)
-	} else {
-		e.logs = append(e.logs, entry)
+	if e.logRing != nil {
+		e.logRing.Push(entry)
 	}
-	e.logMu.Unlock()
 }
 
 // PingNow performs an explicit user-triggered RTT probe (never background polling!).
@@ -879,9 +1006,9 @@ type NodeSummary struct {
 
 // ClearLogs clears recorded client log entries.
 func (e *Engine) ClearLogs() {
-	e.logMu.Lock()
-	e.logs = e.logs[:0]
-	e.logMu.Unlock()
+	if e.logRing != nil {
+		e.logRing.Clear()
+	}
 }
 
 // Status returns the full UI status snapshot.
@@ -923,8 +1050,11 @@ func (e *Engine) Status() map[string]any {
 	l := e.activeLinkLocked()
 	e.mu.RUnlock()
 
-	var totalUp, totalDown, fecRecovered uint64
+	var totalUp, totalDown, fecRecovered, hopCount, rekeyCount uint64
 	activeMode := ""
+	hopState := ""
+	var rtcPorts [2]int
+	var srttMs, minRTTMs int64
 	var rtcPort, activeConns, activeStreams int
 	var lossPct, pacingMbps float64
 	if sched != nil {
@@ -933,6 +1063,12 @@ func (e *Engine) Status() map[string]any {
 		totalDown = st.TotalDown
 		activeMode = st.Mode
 		rtcPort = st.RTCPort
+		rtcPorts = st.RTCPorts
+		hopCount = st.HopCount
+		hopState = st.HopState
+		rekeyCount = st.RekeyCount
+		srttMs = st.SRTTMs
+		minRTTMs = st.MinRTTMs
 		fecRecovered = st.FECRecovered
 		lossPct = st.LossRate * 100.0
 		pacingMbps = st.PacingMbps
@@ -966,6 +1102,7 @@ func (e *Engine) Status() map[string]any {
 	}
 
 	return map[string]any{
+		"version":          "v4.0.0-LTS",
 		"state":            string(state),
 		"last_err":         lastErr,
 		"active_transport": activeMode,
@@ -974,6 +1111,12 @@ func (e *Engine) Status() map[string]any {
 		"verify_mode":      verifyMode,
 		"hop_range":        hopRange,
 		"rtc_port":         rtcPort,
+		"rtc_ports":        rtcPorts,
+		"hop_count":        hopCount,
+		"hop_state":        hopState,
+		"rekey_count":      rekeyCount,
+		"srtt_ms":          srttMs,
+		"min_rtt_ms":       minRTTMs,
 		"fec_recovered":    fecRecovered,
 		"loss_pct":         lossPct,
 		"pacing_mbps":      pacingMbps,
@@ -988,6 +1131,7 @@ func (e *Engine) Status() map[string]any {
 		"total_down":       totalDown,
 		"history":          histCopy,
 		"sys_proxy":        sysProxy,
+		"proxy_drifted":    e.proxyDrifted.Load(),
 		"socks_addr":       socksAddr,
 		"http_addr":        httpAddr,
 		"node_name":        nodeName,
@@ -1002,11 +1146,10 @@ func (e *Engine) Status() map[string]any {
 
 // Logs returns recent log lines.
 func (e *Engine) Logs() []LogEntry {
-	e.logMu.Lock()
-	defer e.logMu.Unlock()
-	cp := make([]LogEntry, len(e.logs))
-	copy(cp, e.logs)
-	return cp
+	if e.logRing == nil {
+		return nil
+	}
+	return e.logRing.Entries()
 }
 
 // LinkURI returns the active node's gft3:// link.

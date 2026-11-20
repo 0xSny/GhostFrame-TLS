@@ -548,7 +548,7 @@ func TestWebPanelRTCConfigUpdateAndSVGQR(t *testing.T) {
 		t.Fatalf("missing csrf token: %+v", sessData)
 	}
 
-	// Verify /api/stats exposes v3.4.1 RTC metadata
+	// Verify /api/stats exposes v4.0.0-LTS RTC metadata
 	stResp, err := pcli.Get(base + "/api/stats")
 	if err != nil {
 		t.Fatal(err)
@@ -556,8 +556,8 @@ func TestWebPanelRTCConfigUpdateAndSVGQR(t *testing.T) {
 	var stBody map[string]any
 	_ = json.NewDecoder(stResp.Body).Decode(&stBody)
 	stResp.Body.Close()
-	if stBody["version"] != "v3.4.1" {
-		t.Fatalf("expected stats version v3.4.1, got %v", stBody["version"])
+	if stBody["version"] != "v4.0.0-LTS" {
+		t.Fatalf("expected stats version v4.0.0-LTS, got %v", stBody["version"])
 	}
 	if en, _ := stBody["rtc_enabled"].(bool); !en {
 		t.Fatalf("expected rtc_enabled=true, got %v", stBody["rtc_enabled"])

@@ -23,20 +23,35 @@ const (
 	FrameUDPClose    byte = 0x08
 	FramePing        byte = 0x09
 	FramePong        byte = 0x0A
+	FrameRekey       byte = 0x0B
+	FrameSessionWin  byte = 0x0C
 )
 
 const (
-	maxStreamChunk      = 1280 // 11B FrameStreamData hdr + 1280B = 1291B (fits comfortably inside 1316B MaxFECFrameArea)
+	maxStreamChunk      = 1100 // 11B FrameStreamData hdr + 1100B = 1111B (fits inside min 1116B dynamic FrameBudget)
 	streamWindowStepMin = 256 * 1024
 	streamWinCheckDur   = 1500 * time.Millisecond
 
-	udpFragBodyCap     = 1200
+	// Session-level aggregate flow-control window ceilings (Tier 2/3 backpressure).
+	DefaultSessionMaxWindow int64 = 32 * 1024 * 1024
+	LowMemSessionMaxWindow  int64 = 8 * 1024 * 1024
+	sessionWinStepBytes     int64 = 1024 * 1024
+
+	udpFragBodyCap     = 1050
 	maxUDPFrags        = 16
 	maxUDPStreamBody   = 65507
 	maxUDPFragPoolSlot = 256
 	udpReassemblyTTL   = 2 * time.Second
 	udpFallbackTarget  = "__gft_udp_stream__:1"
 )
+
+// EffectiveSessionMaxWindow returns the session aggregate memory flow-control ceiling (32MB / 8MB low-mem).
+func EffectiveSessionMaxWindow() int64 {
+	if IsLowMemMode() {
+		return LowMemSessionMaxWindow
+	}
+	return DefaultSessionMaxWindow
+}
 
 var (
 	ErrSessionClosed = errors.New("gftrtc: session closed")
@@ -156,9 +171,26 @@ func encodeFramePingPong(typ byte, tsNano int64) []byte {
 	return b[:]
 }
 
+func encodeFrameRekey(role byte, epoch uint32, pub [32]byte) []byte {
+	b := make([]byte, 38)
+	b[0] = FrameRekey
+	b[1] = role
+	binary.BigEndian.PutUint32(b[2:6], epoch)
+	copy(b[6:38], pub[:])
+	return b
+}
+
+func encodeFrameSessionWin(maxBytes uint64) []byte {
+	b := make([]byte, 9)
+	b[0] = FrameSessionWin
+	binary.BigEndian.PutUint64(b[1:9], maxBytes)
+	return b
+}
+
 type queuedSendChunk struct {
 	seq     uint32
 	frame   []byte
+	dataLen int
 	needPad bool
 }
 
@@ -198,6 +230,7 @@ type RTCStream struct {
 	finQueued   bool
 	wClosed     bool
 	aborted     error
+	writeDone   atomic.Bool
 	closeOnce   sync.Once
 	closed      atomic.Bool
 }
@@ -255,12 +288,14 @@ func (s *RTCStream) deliverChunk(seq uint32, data []byte) {
 		return
 	}
 	if len(data) > 0 {
+		added := 0
 		if seq == s.nextReadSeq {
 			if s.readyOff > 0 && s.readyOff == len(s.readyBuf) {
 				s.readyBuf = s.readyBuf[:0]
 				s.readyOff = 0
 			}
 			s.readyBuf = append(s.readyBuf, data...)
+			added = len(data)
 			s.nextReadSeq++
 			for {
 				nxt, ok := s.reorderBuf[s.nextReadSeq]
@@ -281,11 +316,16 @@ func (s *RTCStream) deliverChunk(seq uint32, data []byte) {
 				copy(cp, data)
 				s.reorderBuf[seq] = cp
 				s.reorderBytes += len(cp)
+				added = len(cp)
 			}
 		}
-		s.Down.Add(uint64(len(data)))
-		s.sess.DownBytes.Add(uint64(len(data)))
-		s.sess.emitBytes(0, len(data))
+		if added > 0 {
+			s.sess.rxBufferedBytes.Add(int64(added))
+			s.Down.Add(uint64(added))
+			s.sess.DownBytes.Add(uint64(added))
+			s.sess.recordTraffic(added, time.Now())
+			s.sess.emitBytes(0, added)
+		}
 	} else if seq == s.nextReadSeq {
 		s.nextReadSeq++
 	}
@@ -342,18 +382,33 @@ func (s *RTCStream) abort(err error, sendRST bool) {
 	if err == nil {
 		err = ErrStreamClosed
 	}
+	s.writeDone.Store(true)
 	s.mu.Lock()
 	if s.aborted == nil {
 		s.aborted = err
 	}
+	discardQueued := 0
+	for i := range s.sendQ {
+		discardQueued += s.sendQ[i].dataLen
+	}
 	s.sendQ = nil
 	s.finQueued = false
+	unread := (len(s.readyBuf) - s.readyOff) + s.reorderBytes
+	s.readyBuf = nil
+	s.readyOff = 0
 	s.reorderBuf = nil
 	s.reorderBytes = 0
 	s.rcond.Broadcast()
 	s.wcond.Broadcast()
 	s.mu.Unlock()
 
+	if discardQueued > 0 {
+		s.sess.releaseQueuedTxBytes(discardQueued)
+	}
+	if unread > 0 {
+		s.sess.onStreamBytesConsumed(unread)
+	}
+	s.sess.winCond.Broadcast()
 	if sendRST {
 		s.sess.enqueueReliableFrame(encodeFrameStreamRST(s.id))
 	}
@@ -429,19 +484,25 @@ func (s *RTCStream) Read(p []byte) (int, error) {
 	}
 	s.mu.Unlock()
 
+	if n > 0 {
+		s.sess.onStreamBytesConsumed(n)
+	}
 	if winFrame != nil {
 		s.sess.enqueueReliableFrame(winFrame)
 	}
 	return n, nil
 }
 
-// Write chunks data cleanly into FrameStreamData frames subject to per-stream flow control.
+// Write chunks data cleanly into FrameStreamData frames subject to per-stream and session-level flow control.
 func (s *RTCStream) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
 	total := 0
 	for len(p) > 0 {
+		if err := s.sess.waitSessionSendBudget(&s.writeDone); err != nil {
+			return total, err
+		}
 		s.mu.Lock()
 		for s.aborted == nil && !s.wClosed && s.nextSendSeq >= s.peerMaxSeq && len(s.sendQ) >= 256 {
 			s.wcond.Wait()
@@ -481,6 +542,7 @@ func (s *RTCStream) Write(p []byte) (int, error) {
 			s.sendQ = append(s.sendQ, queuedSendChunk{
 				seq:     seq,
 				frame:   frame,
+				dataLen: n,
 				needPad: seq < 6,
 			})
 			p = p[n:]
@@ -490,6 +552,10 @@ func (s *RTCStream) Write(p []byte) (int, error) {
 		s.mu.Unlock()
 
 		total += writtenNow
+		if writtenNow > 0 {
+			s.sess.txQueuedBytes.Add(int64(writtenNow))
+			s.sess.recordTraffic(writtenNow, time.Now())
+		}
 		s.Up.Add(uint64(writtenNow))
 		s.sess.UpBytes.Add(uint64(writtenNow))
 		s.sess.emitBytes(writtenNow, 0)
@@ -499,37 +565,43 @@ func (s *RTCStream) Write(p []byte) (int, error) {
 }
 
 // popSendFrame pops at most one outgoing reliable frame respecting budget <= maxLen.
-func (s *RTCStream) popSendFrame(maxLen int) (frame []byte, needPad bool, more bool, ok bool) {
+// When allowData is false, buffered data chunks are withheld for session flow-control while FIN stays unblocked.
+func (s *RTCStream) popSendFrame(maxLen int, allowData bool) (frame []byte, dataLen int, needPad bool, more bool, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.aborted != nil {
-		return nil, false, false, false
+		return nil, 0, false, false, false
 	}
 	if len(s.sendQ) > 0 {
+		if !allowData {
+			return nil, 0, false, true, false
+		}
 		head := s.sendQ[0]
 		if len(head.frame) > maxLen {
-			return nil, false, true, false
+			return nil, 0, false, true, false
 		}
 		s.sendQ[0] = queuedSendChunk{}
 		s.sendQ = s.sendQ[1:]
 		if len(s.sendQ) == 0 && cap(s.sendQ) > 128 {
 			s.sendQ = nil
 		}
-		return head.frame, head.needPad, len(s.sendQ) > 0 || s.finQueued, true
+		return head.frame, head.dataLen, head.needPad, len(s.sendQ) > 0 || s.finQueued, true
 	}
 	if s.finQueued {
 		fin := encodeFrameStreamFIN(s.id, s.nextSendSeq)
 		if len(fin) > maxLen {
-			return nil, false, true, false
+			return nil, 0, false, true, false
 		}
 		s.finQueued = false
-		return fin, false, false, true
+		return fin, 0, false, false, true
 	}
-	return nil, false, false, false
+	return nil, 0, false, false, false
 }
 
 // CloseWrite half-closes outgoing writes and schedules FrameStreamFIN after all pending chunks.
 func (s *RTCStream) CloseWrite() error {
+	s.writeDone.Store(true)
+	s.sess.winCond.Broadcast()
 	s.mu.Lock()
 	if s.wClosed {
 		s.mu.Unlock()
@@ -547,26 +619,46 @@ func (s *RTCStream) CloseWrite() error {
 func (s *RTCStream) Close() error {
 	var sendRST bool
 	s.closeOnce.Do(func() {
+		s.writeDone.Store(true)
 		s.mu.Lock()
 		hadEOF := s.rEOF
 		wasWClosed := s.wClosed
 		alreadyAborted := s.aborted != nil
+		discardQueued := 0
 		if !s.wClosed {
 			s.wClosed = true
 			s.finQueued = true
 		}
-		if !hadEOF && !alreadyAborted {
-			s.rEOF = true
+		var unread int
+		if !alreadyAborted {
+			unread = (len(s.readyBuf) - s.readyOff) + s.reorderBytes
+			s.readyBuf = nil
+			s.readyOff = 0
 			s.reorderBuf = nil
 			s.reorderBytes = 0
-			if !wasWClosed {
-				sendRST = true
+			if !hadEOF {
+				s.rEOF = true
+				if !wasWClosed {
+					sendRST = true
+					for i := range s.sendQ {
+						discardQueued += s.sendQ[i].dataLen
+					}
+					s.sendQ = nil
+					s.finQueued = false
+				}
 			}
 		}
 		s.rcond.Broadcast()
 		s.wcond.Broadcast()
 		s.mu.Unlock()
 
+		if discardQueued > 0 {
+			s.sess.releaseQueuedTxBytes(discardQueued)
+		}
+		if unread > 0 {
+			s.sess.onStreamBytesConsumed(unread)
+		}
+		s.sess.winCond.Broadcast()
 		if sendRST {
 			s.sess.enqueueReliableFrame(encodeFrameStreamRST(s.id))
 		} else {

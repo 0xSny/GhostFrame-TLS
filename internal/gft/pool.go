@@ -121,7 +121,7 @@ func (p *SessionPool) Start(connectTimeout time.Duration) error {
 	p.mu.Unlock()
 
 	if p.onLog != nil {
-		p.onLog("Pool slot #%d connected via uTLS (%s), handshake=%v", e.id, p.link.EffectiveFP(), hs.Round(time.Millisecond))
+		p.onLog("[TCP] Pool slot #%d connected via uTLS (%s), handshake=%v", e.id, p.link.EffectiveFP(), hs.Round(time.Millisecond))
 	}
 
 	p.wg.Add(2)
@@ -186,7 +186,7 @@ func (p *SessionPool) maintainLoop() {
 					p.lastErr = ""
 					p.mu.Unlock()
 					if p.onLog != nil {
-						p.onLog("Pool slot #%d online (active=%d/%d, hs=%v)", e.id, active+1, p.size, hs.Round(time.Millisecond))
+						p.onLog("[TCP] Pool slot #%d online (active=%d/%d, hs=%v)", e.id, active+1, p.size, hs.Round(time.Millisecond))
 					}
 				}()
 			}
@@ -211,7 +211,7 @@ func (p *SessionPool) maintainLoop() {
 					p.lastErr = msg
 					p.mu.Unlock()
 					if p.onLog != nil {
-						p.onLog("Pool reconnect failed (%s), retrying in %v", msg, waitDur)
+						p.onLog("[TCP] Pool reconnect failed (%s), retrying in %v", msg, waitDur)
 					}
 				}
 				timer := time.NewTimer(waitDur)
@@ -263,7 +263,7 @@ func (p *SessionPool) reapAndCheck() (activeCount int, needed int) {
 		if !e.draining && (now.Sub(e.createdAt) >= e.maxAge || e.sess.TotalBytes() >= rotateMaxBytes) {
 			e.draining = true
 			if p.onLog != nil {
-				p.onLog("Pool slot #%d entering graceful drain (age=%v, bytes=%dMB)", e.id, now.Sub(e.createdAt).Round(time.Second), e.sess.TotalBytes()>>20)
+				p.onLog("[TCP] Pool slot #%d entering graceful drain (age=%v, bytes=%dMB)", e.id, now.Sub(e.createdAt).Round(time.Second), e.sess.TotalBytes()>>20)
 			}
 		}
 

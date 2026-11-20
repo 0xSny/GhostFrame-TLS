@@ -157,18 +157,27 @@ func (s *SOCKS5Server) handleConn(c net.Conn) {
 			_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 			return
 		}
-		st, act, err := s.engine.OpenTargetStream(target, nil)
+		sendOK := func() error {
+			_, werr := c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return werr
+		}
+		st, act, rc, ackSent, err := s.engine.OpenStreamWithOptionalSNISniff(c, target, sendOK)
+		c = rc
 		if err != nil {
 			if act == ActionProxy {
 				s.engine.Logf("[SOCKS5] CONNECT %s failed: %v", target, err)
 			}
-			_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			if !ackSent {
+				_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			}
 			return
 		}
 		defer st.Close()
 
-		if _, err := c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
-			return
+		if !ackSent {
+			if err := sendOK(); err != nil {
+				return
+			}
 		}
 		_ = c.SetDeadline(time.Time{})
 		gft.Relay(st, c, 15*time.Minute)

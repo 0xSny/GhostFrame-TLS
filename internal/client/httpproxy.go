@@ -119,21 +119,35 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		if !strings.Contains(target, ":") {
 			target += ":443"
 		}
-		st, act, err := s.engine.OpenTargetStream(target, nil)
+		var sniffConn net.Conn = c
+		if br.Buffered() > 0 {
+			buffered := make([]byte, br.Buffered())
+			n, _ := br.Read(buffered)
+			sniffConn = &bufferedConn{Conn: c, pre: buffered[:n]}
+		}
+		sendOK := func() error {
+			_, werr := c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+			return werr
+		}
+		st, act, rc, ackSent, err := s.engine.OpenStreamWithOptionalSNISniff(sniffConn, target, sendOK)
 		if err != nil {
 			if act == ActionProxy {
 				s.engine.Logf("[HTTP Proxy] CONNECT %s failed: %v", target, err)
 			}
-			_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			if !ackSent {
+				_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			}
 			return
 		}
 		defer st.Close()
 
-		if _, err := c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
-			return
+		if !ackSent {
+			if err := sendOK(); err != nil {
+				return
+			}
 		}
 		_ = c.SetDeadline(time.Time{})
-		gft.Relay(st, c, 15*time.Minute)
+		gft.Relay(st, rc, 15*time.Minute)
 		return
 	}
 
@@ -166,4 +180,30 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 
 	_ = c.SetDeadline(time.Time{})
 	gft.Relay(st, c, 15*time.Minute)
+}
+
+type bufferedConn struct {
+	net.Conn
+	pre []byte
+	off int
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) {
+	if b.off < len(b.pre) {
+		n := copy(p, b.pre[b.off:])
+		b.off += n
+		if b.off >= len(b.pre) {
+			b.pre = nil
+			b.off = 0
+		}
+		return n, nil
+	}
+	return b.Conn.Read(p)
+}
+
+func (b *bufferedConn) CloseWrite() error {
+	if cw, ok := b.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }

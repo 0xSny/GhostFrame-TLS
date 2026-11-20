@@ -42,10 +42,11 @@ type SmartBrutalCC struct {
 	peakDelivery float64
 
 	// 60fps micro-burst pacer state
-	sliceDur    time.Duration
-	sliceNextAt time.Time
-	tokenBudget float64
-	maxBurstCap float64
+	sliceDur      time.Duration
+	sliceNextAt   time.Time
+	tokenBudget   float64
+	maxBurstCap   float64
+	frameOuterCap int
 }
 
 // NewSmartBrutalCC creates a Smart-Brutal controller. targetMbps == 0 enables Auto-Probe.
@@ -264,6 +265,7 @@ func (c *SmartBrutalCC) refillFrameSliceLocked(now time.Time) {
 	slice := randomFrameSlice()
 	c.sliceDur = slice
 	c.sliceNextAt = now.Add(slice)
+	c.frameOuterCap = MinUDPPayloadJitter + mrand.IntN(MaxUDPPayload-MinUDPPayloadJitter+1)
 	grant := rate * slice.Seconds()
 	if grant < float64(MaxUDPPayload*2) {
 		grant = float64(MaxUDPPayload * 2)
@@ -273,6 +275,53 @@ func (c *SmartBrutalCC) refillFrameSliceLocked(now time.Time) {
 	if c.tokenBudget > c.maxBurstCap {
 		c.tokenBudget = c.maxBurstCap
 	}
+}
+
+// FrameBudget returns the randomized inner frame payload ceiling (derived from 1160..1360B outer cap)
+// for the current 60fps micro-burst slice to eliminate static 1360B packet-size histogram spikes.
+func (c *SmartBrutalCC) FrameBudget(fecEnabled bool) int {
+	c.mu.Lock()
+	outerCap := c.frameOuterCap
+	c.mu.Unlock()
+	if outerCap < MinUDPPayloadJitter || outerCap > MaxUDPPayload {
+		outerCap = MaxUDPPayload
+	}
+	budget := outerCap - RTPOverhead - FECHeaderLen
+	if fecEnabled {
+		budget -= 2
+	}
+	if budget < 1116 {
+		budget = 1116
+	}
+	return budget
+}
+
+// ResetOnWake clears stale congestion & delay-gradient state after system sleep/standby or link handoff.
+func (c *SmartBrutalCC) ResetOnWake(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastRho = 1.0
+	c.lastLossRate = 0
+	c.rttRounds = 0
+	c.roundBytes = 0
+	c.roundStart = now
+	c.lastRoundAt = now
+	c.lastBackoffAt = time.Time{}
+	c.peakDelivery = 0
+	if c.targetBps > 0 {
+		c.state = ccCruise
+		c.baseRate = c.targetBps
+	} else {
+		c.state = ccSlowStart
+		if c.baseRate < ccInitialAutoBps {
+			c.baseRate = ccInitialAutoBps
+		}
+		if c.bEst < ccInitialAutoBps {
+			c.bEst = ccInitialAutoBps
+		}
+	}
+	c.tokenBudget = 0
+	c.refillFrameSliceLocked(now)
 }
 
 // PacingMbps returns the current loss-compensated pacing rate in Mbps.

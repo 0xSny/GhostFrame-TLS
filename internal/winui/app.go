@@ -68,6 +68,8 @@ const (
 	hitCopyClash
 	hitCopyLink
 	hitClearLogs
+	hitDiagSnapshot
+	hitRebindProxy
 	hitNodeOption
 )
 
@@ -192,7 +194,7 @@ func Run(eng *client.Engine) error {
 	}
 	_ = sysDPI
 
-	titlePtr := utf16Ptr("GhostFrame-Pro v3.4.1")
+	titlePtr := utf16Ptr("GhostFrame-Pro v4.0.0-LTS")
 	hwnd, _, err := pCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(clsPtr)),
@@ -463,13 +465,32 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		return 0
 
 	case wmQueryEndSession:
+		if a.eng != nil {
+			a.eng.RestoreSystemProxySync()
+		}
 		return 1
 
 	case wmEndSession:
 		if wParam != 0 {
+			if a.eng != nil {
+				a.eng.RestoreSystemProxySync()
+			}
 			a.cleanup()
 		}
 		return 0
+
+	case wmPowerBroadcast:
+		switch wParam {
+		case pbtApmSuspend:
+			if a.eng != nil {
+				a.eng.Logf("[Power] System entering sleep/standby")
+			}
+		case pbtApmResumeAutomatic, pbtApmResumeSuspend:
+			if a.eng != nil {
+				go a.eng.OnSystemWake()
+			}
+		}
+		return 1
 
 	case wmDestroy:
 		a.cleanup()
@@ -817,6 +838,26 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 		a.logScroll = 0
 		a.autoScroll = true
 		a.setToast("日志已清空", false)
+	case hitDiagSnapshot:
+		path, copied, _, err := a.eng.ExportDiagnosticSnapshot(a.hwnd)
+		if err != nil && !copied {
+			a.setToast("导出诊断快照失败: "+err.Error(), true)
+		} else {
+			msg := "已生成脱敏诊断快照"
+			if copied {
+				msg += "（已复制剪贴板）"
+			}
+			if path != "" {
+				msg += " " + path
+			}
+			a.setToastSuccess(msg)
+		}
+	case hitRebindProxy:
+		if err := a.eng.RebindSystemProxy(); err != nil {
+			a.setToast("重绑系统代理失败: "+err.Error(), true)
+		} else {
+			a.setToastSuccess("已重新接管 Windows 系统代理")
+		}
 	}
 	a.invalidate()
 }
@@ -1012,6 +1053,11 @@ func (a *appUI) drawHeroCard(r rect, st map[string]any) {
 	lastErr := strVal(st["last_err"])
 	pingMs := intVal(st["ping_ms"])
 	rtcPort := intVal(st["rtc_port"])
+	rtcPorts, _ := st["rtc_ports"].([2]int)
+	hopCount := uint64Val(st["hop_count"])
+	hopState := strVal(st["hop_state"])
+	rekeyCount := uint64Val(st["rekey_count"])
+	proxyDrifted := boolVal(st["proxy_drifted"])
 	conns := intVal(st["active_conns"])
 	verify := strings.ToUpper(strVal(st["verify_mode"]))
 	if verify == "" {
@@ -1030,7 +1076,7 @@ func (a *appUI) drawHeroCard(r rect, st map[string]any) {
 		btnText = "◌  正在建立 GFT-RTC 双栈通道..."
 	default:
 		c0, c1 = colBtnIdleA, colBtnIdleB
-		btnText = "▶  连接安全隧道 (v3.4 GFT-RTC)"
+		btnText = "▶  连接安全隧道 (v4.0 GFT-RTC)"
 	}
 	if a.hoverID == hitConnect {
 		c0 = lerpColor(c0, 0xFFFFFFFF, 0.10)
@@ -1057,15 +1103,32 @@ func (a *appUI) drawHeroCard(r rect, st map[string]any) {
 		rttTxt = fmt.Sprintf("%d ms", pingMs)
 		rttCol = colEmerald
 	}
+	hopLabel := "活跃出口"
+	if hopCount > 0 || hopState == "Paused(Idle)" {
+		if hopState == "Paused(Idle)" {
+			hopLabel = fmt.Sprintf("静默·跳%d", hopCount)
+		} else {
+			hopLabel = fmt.Sprintf("出口·跳%d", hopCount)
+		}
+	}
 	hopTxt := fmt.Sprintf("TLS %s", verify)
-	if rtcPort > 0 {
+	if rtcPorts[0] > 0 && rtcPorts[1] > 0 {
+		hopTxt = fmt.Sprintf("#1:%d|#2:%d", rtcPorts[0], rtcPorts[1])
+	} else if rtcPort > 0 {
 		hopTxt = fmt.Sprintf("UDP :%d", rtcPort)
 	}
+	connLabel := "复用连接"
+	if rekeyCount > 0 {
+		connLabel = fmt.Sprintf("连接·轮%d", rekeyCount)
+	}
 	drawMiniStat(0, "通道延迟", rttTxt, rttCol)
-	drawMiniStat(1, "活跃出口", hopTxt, colSky)
-	drawMiniStat(2, "复用连接", fmt.Sprintf("%d 条", conns), colTextMain)
+	drawMiniStat(1, hopLabel, hopTxt, colSky)
+	drawMiniStat(2, connLabel, fmt.Sprintf("%d 条", conns), colTextMain)
 
-	if lastErr != "" && state != client.StateConnected {
+	if proxyDrifted && state == client.StateConnected {
+		bannerR := rect{r.Left + s(16), r.Bottom - s(24), r.Right - s(16), r.Bottom - s(3)}
+		a.drawButton(bannerR, hitRebindProxy, "⚠ 检测到系统代理外部漂移，点击一键重绑", colCardAlt, colAmber, colAmber)
+	} else if lastErr != "" && state != client.StateConnected {
 		f.drawText(f.fSmall, f.fmtLeft, rect{r.Left + s(16), r.Bottom - s(22), r.Right - s(16), r.Bottom - s(4)}, colRed, lastErr)
 	}
 }
@@ -1351,6 +1414,8 @@ func (a *appUI) drawLogCard(r rect, logs []client.LogEntry) {
 		fmt.Sprintf("内核运行日志 (%d)", len(logs)))
 
 	clrR := rect{r.Right - s(92), hdrY, r.Right - s(16), hdrY + s(26)}
+	diagR := rect{clrR.Left - s(92), hdrY, clrR.Left - s(8), hdrY + s(26)}
+	a.drawButton(diagR, hitDiagSnapshot, "诊断快照", colCardAlt, colBorderHi, colSky)
 	a.drawButton(clrR, hitClearLogs, "清空日志", colBg, colBorderHi, colTextSub)
 
 	view := rect{r.Left + s(14), r.Top + s(44), r.Right - s(14), r.Bottom - s(12)}

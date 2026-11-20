@@ -46,15 +46,24 @@ type Config struct {
 	CamouflageTarget string      `json:"camouflage_target,omitempty"` // e.g. "<selected-sni>:443"
 	HopRange         string      `json:"hop_range,omitempty"`         // e.g. "20000-40000"
 	DisableRTC       bool        `json:"disable_rtc,omitempty"`
-	DisableQUIC      bool        `json:"disable_quic,omitempty"` // legacy alias for DisableRTC
-	TxMbps           int         `json:"tx_mbps,omitempty"`      // optional server Smart-Brutal max TX Mbps (0 = Auto)
-	UpMbps           int         `json:"up_mbps,omitempty"`      // default exported client Smart-Brutal uplink Mbps (0 = Auto)
-	DownMbps         int         `json:"down_mbps,omitempty"`    // default exported client Smart-Brutal downlink Mbps (0 = Auto)
+	DisableQUIC      bool        `json:"disable_quic,omitempty"`  // legacy alias for DisableRTC
+	TxMbps           int         `json:"tx_mbps,omitempty"`       // optional server Smart-Brutal max TX Mbps (0 = Auto)
+	UpMbps           int         `json:"up_mbps,omitempty"`       // default exported client Smart-Brutal uplink Mbps (0 = Auto)
+	DownMbps         int         `json:"down_mbps,omitempty"`     // default exported client Smart-Brutal downlink Mbps (0 = Auto)
+	MaxMemoryMB      int         `json:"max_memory_mb,omitempty"` // process memory soft cap in MiB (default 512)
 	Params           *gft.Params `json:"params,omitempty"`
 	PanelPath        string      `json:"panel_path"` // e.g. /gft-panel-xxxxxxxx
 	PanelHash        string      `json:"panel_hash"` // bcrypt
 	Pin              string      `json:"pin"`        // SPKI SHA-256 hex
 	StateDir         string      `json:"state_dir"`
+}
+
+// EffectiveMaxMemoryMB returns the configured MiB ceiling or default 512 MiB.
+func (c *Config) EffectiveMaxMemoryMB() int {
+	if c != nil && c.MaxMemoryMB > 0 {
+		return c.MaxMemoryMB
+	}
+	return 512
 }
 
 // IsRTCDisabled reports whether GhostFrame-RTC UDP transport is disabled in server config.
@@ -481,7 +490,7 @@ func (c *Config) Link(p gft.Params) *gft.Link {
 		UpMbps:    c.UpMbps,
 		DownMbps:  c.DownMbps,
 		Params:    &p,
-		Remark:    "GhostFrame-RTC-v3.4",
+		Remark:    "GhostFrame-RTC-v4.0",
 	}
 }
 

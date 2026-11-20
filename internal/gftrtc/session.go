@@ -3,13 +3,16 @@ package gftrtc
 import (
 	"context"
 	"crypto/cipher"
+	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"io"
 	mrand "math/rand/v2"
 	"net"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,7 +27,39 @@ const (
 	closedIDRingSize   = 2048
 	hopOldCloseDelay   = 3 * time.Second
 	hopProbeTimeout    = 600 * time.Millisecond
+
+	rekeyByteThreshold   int64 = 8 * 1024 * 1024 * 1024 // 8 GB
+	rekeyTimeThreshold         = 60 * time.Minute       // 60 minutes
+	rekeyGraceDuration         = 30 * time.Second       // 30s old-key decrypt window
+	rtcpMimicMinGap            = 4 * time.Second
+	rtcpMimicMaxGap            = 9 * time.Second
+	rekeyRoleInit        byte  = 0
+	rekeyRoleResp        byte  = 1
+	activeTrafficMaxIdle       = 30 * time.Second
 )
+
+func effectiveRekeyBytes() int64 {
+	if raw := strings.TrimSpace(os.Getenv("GFT_REKEY_MB")); raw != "" {
+		if mb, err := strconv.ParseInt(raw, 10, 64); err == nil && mb > 0 {
+			return mb * 1024 * 1024
+		}
+	}
+	return rekeyByteThreshold
+}
+
+type dirKeyState struct {
+	aead       cipher.AEAD
+	iv         [4]byte
+	mask       uint64
+	phase      uint8
+	epoch      uint32
+	graceUntil time.Time
+}
+
+type trafficBucket struct {
+	sec   int64
+	bytes uint64
+}
 
 // StreamHandler handles an incoming reliable GFT-RTC stream.
 type StreamHandler func(s *RTCStream, target string, first []byte)
@@ -42,12 +77,17 @@ type SessionStats struct {
 	RemotePort   int
 	RTTMs        int64
 	SRTTMs       int64
+	MinRTTMs     int64
 	LossRate     float64
 	FECRecovered uint64
 	PacingMbps   float64
 	UpBytes      uint64
 	DownBytes    uint64
 	ActiveStream int
+	HopCount     uint64
+	RekeyCount   uint64
+	KeyEpoch     uint32
+	Rate30sBps   uint64
 }
 
 type inboundPkt struct {
@@ -101,12 +141,25 @@ type RTCSession struct {
 	clientID [8]byte
 	host     string
 	keys     *SessionKeys
-	txAEAD   cipher.AEAD
-	rxAEAD   cipher.AEAD
-	txIV     [4]byte
-	rxIV     [4]byte
-	txMask   uint64
-	rxMask   uint64
+
+	keyMu             sync.RWMutex
+	curKeys           *SessionKeys
+	txState           *dirKeyState
+	rxSlots           [2]*dirKeyState
+	pendingKeys       *SessionKeys
+	pendingTXState    *dirKeyState
+	rekeyInFlight     bool
+	rekeyAwaitPeer    bool
+	rekeyStartedAt    time.Time
+	rekeyPendingEpoch uint32
+	rekeyEphPriv      *ecdh.PrivateKey
+	lastRekeyAt       time.Time
+	lastRekeyTotal    uint64
+	rekeyThreshBytes  int64
+	rekeyCount        atomic.Uint64
+	keyEpoch          atomic.Uint32
+	onRekey           atomic.Pointer[func(epoch uint32)]
+	rtcpSeq           atomic.Uint64
 
 	paramsJSON []byte
 	startTime  time.Time
@@ -123,6 +176,7 @@ type RTCSession struct {
 	curRemoteStr string
 	remotePort   atomic.Int32
 	oldConns     []net.PacketConn
+	hopCount     atomic.Uint64
 
 	probeMu   sync.Mutex
 	probeConn net.PacketConn
@@ -146,6 +200,19 @@ type RTCSession struct {
 	sendRR      []*RTCStream
 	sendRRIdx   int
 	inSendRR    map[uint32]bool
+
+	trafficMu      sync.Mutex
+	trafficBuckets [30]trafficBucket
+
+	winMu           sync.Mutex
+	winCond         *sync.Cond
+	peerSessMax     atomic.Int64
+	hasPeerSessWin  atomic.Bool
+	txQueuedBytes   atomic.Int64
+	txStreamBytes   atomic.Int64
+	rxBufferedBytes atomic.Int64
+	rxConsumedBytes atomic.Int64
+	lastSentSessWin atomic.Int64
 
 	mu             sync.Mutex
 	streams        map[uint32]*RTCStream
@@ -180,55 +247,65 @@ type RTCSession struct {
 	errVal    atomic.Value
 }
 
+func newDirKeyStates(isClient bool, keys *SessionKeys) (tx, rx *dirKeyState) {
+	phase := uint8(keys.Epoch & 1)
+	if isClient {
+		tx = &dirKeyState{aead: keys.C2SAEAD, iv: keys.C2SIV, mask: keys.C2SMask, phase: phase, epoch: keys.Epoch}
+		rx = &dirKeyState{aead: keys.S2CAEAD, iv: keys.S2CIV, mask: keys.S2CMask, phase: phase, epoch: keys.Epoch}
+	} else {
+		tx = &dirKeyState{aead: keys.S2CAEAD, iv: keys.S2CIV, mask: keys.S2CMask, phase: phase, epoch: keys.Epoch}
+		rx = &dirKeyState{aead: keys.C2SAEAD, iv: keys.C2SIV, mask: keys.C2SMask, phase: phase, epoch: keys.Epoch}
+	}
+	return tx, rx
+}
+
 func newRTCSession(isClient bool, ssrc uint32, clientID [8]byte, host string, remotePort int, keys *SessionKeys, targetMbps int, paramsJSON []byte, listener *RTCListener) *RTCSession {
 	now := time.Now()
-	txAEAD, rxAEAD := keys.S2CAEAD, keys.C2SAEAD
-	txIV, rxIV := keys.S2CIV, keys.C2SIV
-	txMask, rxMask := keys.S2CMask, keys.C2SMask
+	txState, rxState := newDirKeyStates(isClient, keys)
 	nextStream := uint32(2) // server allocates even stream IDs
 	if isClient {
-		txAEAD, rxAEAD = keys.C2SAEAD, keys.S2CAEAD
-		txIV, rxIV = keys.C2SIV, keys.S2CIV
-		txMask, rxMask = keys.C2SMask, keys.S2CMask
 		nextStream = 1 // client allocates odd stream IDs
 	}
 
 	s := &RTCSession{
-		isClient:       isClient,
-		ssrc:           ssrc,
-		clientID:       clientID,
-		host:           host,
-		keys:           keys,
-		txAEAD:         txAEAD,
-		rxAEAD:         rxAEAD,
-		txIV:           txIV,
-		rxIV:           rxIV,
-		txMask:         txMask,
-		rxMask:         rxMask,
-		paramsJSON:     paramsJSON,
-		startTime:      now,
-		baseTS90k:      mrand.Uint32(),
-		listener:       listener,
-		inboundCh:      make(chan inboundPkt, inboundQueueDepth),
-		sendKick:       make(chan struct{}, 1),
-		ackKick:        make(chan struct{}, 1),
-		pingCh:         make(chan time.Duration, 4),
-		replay:         &ReplayWindow{},
-		loss:           NewLossTracker(),
-		fecEnc:         NewFECEncoder(),
-		fecDec:         NewFECDecoder(),
-		cc:             NewSmartBrutalCC(targetMbps),
-		inSendRR:       make(map[uint32]bool),
-		streams:        make(map[uint32]*RTCStream),
-		pendingStreams: make(map[uint32]*RTCStream),
-		closedIDs:      newClosedIDSet(),
-		nextStream:     nextStream,
-		udps:           make(map[uint16]*RTCUDPAssoc),
-		nextUDP:        1,
-		frags:          make(map[uint32]*udpReassemblyEntry),
-		handlersReady:  make(chan struct{}),
-		done:           make(chan struct{}),
+		isClient:         isClient,
+		ssrc:             ssrc,
+		clientID:         clientID,
+		host:             host,
+		keys:             keys,
+		curKeys:          keys,
+		txState:          txState,
+		lastRekeyAt:      now,
+		rekeyThreshBytes: effectiveRekeyBytes(),
+		paramsJSON:       paramsJSON,
+		startTime:        now,
+		baseTS90k:        mrand.Uint32(),
+		listener:         listener,
+		inboundCh:        make(chan inboundPkt, inboundQueueDepth),
+		sendKick:         make(chan struct{}, 1),
+		ackKick:          make(chan struct{}, 1),
+		pingCh:           make(chan time.Duration, 4),
+		replay:           &ReplayWindow{},
+		loss:             NewLossTracker(),
+		fecEnc:           NewFECEncoder(),
+		fecDec:           NewFECDecoder(),
+		cc:               NewSmartBrutalCC(targetMbps),
+		inSendRR:         make(map[uint32]bool),
+		streams:          make(map[uint32]*RTCStream),
+		pendingStreams:   make(map[uint32]*RTCStream),
+		closedIDs:        newClosedIDSet(),
+		nextStream:       nextStream,
+		udps:             make(map[uint16]*RTCUDPAssoc),
+		nextUDP:          1,
+		frags:            make(map[uint32]*udpReassemblyEntry),
+		handlersReady:    make(chan struct{}),
+		done:             make(chan struct{}),
 	}
+	s.rxSlots[rxState.phase] = rxState
+	s.winCond = sync.NewCond(&s.winMu)
+	s.peerSessMax.Store(DefaultSessionMaxWindow)
+	effWin := EffectiveSessionMaxWindow()
+	s.lastSentSessWin.Store(effWin)
 	s.remotePort.Store(int32(remotePort))
 	s.lastRecvNs.Store(now.UnixNano())
 	s.lastSendNs.Store(now.UnixNano())
@@ -239,6 +316,9 @@ func (s *RTCSession) startLoops() {
 	go s.inboundWorker()
 	go s.sendLoop()
 	go s.timerLoop()
+	if IsLowMemMode() {
+		s.enqueueReliableFrame(encodeFrameSessionWin(uint64(EffectiveSessionMaxWindow())))
+	}
 }
 
 // ClientID returns the persistent 8-byte client identifier authenticated during STUN handshake.
@@ -299,6 +379,148 @@ func (s *RTCSession) emitBytes(up, down int) {
 	}
 }
 
+// SetOnRekey installs an optional notification callback invoked when forward-secret Rekeying advances epoch.
+func (s *RTCSession) SetOnRekey(fn func(epoch uint32)) {
+	if fn == nil {
+		s.onRekey.Store(nil)
+		return
+	}
+	s.onRekey.Store(&fn)
+}
+
+// HopCount returns total successful make-before-break port hops executed by this session.
+func (s *RTCSession) HopCount() uint64 { return s.hopCount.Load() }
+
+// RekeyCount returns how many zero-downtime key rotations have completed on this session.
+func (s *RTCSession) RekeyCount() uint64 { return s.rekeyCount.Load() }
+
+// KeyEpoch returns the current active transmit key epoch.
+func (s *RTCSession) KeyEpoch() uint32 { return s.keyEpoch.Load() }
+
+// LossSentLen returns the number of in-flight / pending-origin entries held by LossTracker.
+func (s *RTCSession) LossSentLen() int { return s.loss.SentLen() }
+
+// ActiveUDPCount returns active client/session UDP association count.
+func (s *RTCSession) ActiveUDPCount() int {
+	s.mu.Lock()
+	n := len(s.udps)
+	s.mu.Unlock()
+	return n
+}
+
+// ResetRTTOnWake clears stale RTT / pacing history immediately after OS sleep/wake or network handoff.
+func (s *RTCSession) ResetRTTOnWake() {
+	s.loss.ResetRTT()
+	s.cc.ResetOnWake(time.Now())
+	s.rttNs.Store(0)
+}
+
+func (s *RTCSession) recordTraffic(n int, at time.Time) {
+	if n <= 0 {
+		return
+	}
+	sec := at.Unix()
+	slot := int(sec % 30)
+	if slot < 0 {
+		slot += 30
+	}
+	s.trafficMu.Lock()
+	if s.trafficBuckets[slot].sec != sec {
+		s.trafficBuckets[slot] = trafficBucket{sec: sec, bytes: uint64(n)}
+	} else {
+		s.trafficBuckets[slot].bytes += uint64(n)
+	}
+	s.trafficMu.Unlock()
+}
+
+// Recent30sBytesPerSec returns the average up+down rate (bytes/sec) over the trailing 30s window.
+func (s *RTCSession) Recent30sBytesPerSec() uint64 {
+	now := time.Now()
+	nowSec := now.Unix()
+	cutoff := nowSec - 30
+	var total uint64
+	s.trafficMu.Lock()
+	for i := range s.trafficBuckets {
+		if s.trafficBuckets[i].sec > cutoff && s.trafficBuckets[i].sec <= nowSec {
+			total += s.trafficBuckets[i].bytes
+		}
+	}
+	s.trafficMu.Unlock()
+	winSec := int64(30)
+	if elapsed := int64(now.Sub(s.startTime).Seconds()); elapsed > 0 && elapsed < winSec {
+		if elapsed < 5 {
+			elapsed = 5
+		}
+		winSec = elapsed
+	}
+	return total / uint64(winSec)
+}
+
+func (s *RTCSession) waitSessionSendBudget(streamDone *atomic.Bool) error {
+	if s.txQueuedBytes.Load() < s.peerSessMax.Load() {
+		return nil
+	}
+	s.winMu.Lock()
+	defer s.winMu.Unlock()
+	for s.txQueuedBytes.Load() >= s.peerSessMax.Load() {
+		if streamDone != nil && streamDone.Load() {
+			return ErrStreamClosed
+		}
+		select {
+		case <-s.done:
+			return ErrSessionClosed
+		default:
+		}
+		s.winCond.Wait()
+	}
+	return nil
+}
+
+func (s *RTCSession) releaseQueuedTxBytes(n int) {
+	if n <= 0 {
+		return
+	}
+	for {
+		cur := s.txQueuedBytes.Load()
+		nxt := cur - int64(n)
+		if nxt < 0 {
+			nxt = 0
+		}
+		if s.txQueuedBytes.CompareAndSwap(cur, nxt) {
+			break
+		}
+	}
+	s.winCond.Broadcast()
+}
+
+func (s *RTCSession) onStreamBytesConsumed(n int) {
+	if n <= 0 {
+		return
+	}
+	for {
+		cur := s.rxBufferedBytes.Load()
+		nxt := cur - int64(n)
+		if nxt < 0 {
+			nxt = 0
+		}
+		if s.rxBufferedBytes.CompareAndSwap(cur, nxt) {
+			break
+		}
+	}
+	consumed := s.rxConsumedBytes.Add(int64(n))
+	newMax := consumed + EffectiveSessionMaxWindow()
+	for {
+		prev := s.lastSentSessWin.Load()
+		if newMax <= prev || newMax-prev < sessionWinStepBytes {
+			break
+		}
+		if s.lastSentSessWin.CompareAndSwap(prev, newMax) {
+			s.enqueueReliableFrame(encodeFrameSessionWin(uint64(newMax)))
+			break
+		}
+	}
+}
+
 // UpdateBandwidth adjusts the Smart-Brutal pacing target at runtime (0 = Auto-Probe).
 func (s *RTCSession) UpdateBandwidth(targetMbps int) {
 	s.cc.SetTargetMbps(targetMbps)
@@ -306,19 +528,24 @@ func (s *RTCSession) UpdateBandwidth(targetMbps int) {
 
 // Stats returns a live protocol telemetry snapshot.
 func (s *RTCSession) Stats() SessionStats {
-	srtt, _, _ := s.loss.RTTMetrics(time.Now())
+	srtt, minRTT, _ := s.loss.RTTMetrics(time.Now())
 	return SessionStats{
 		SSRC:         s.ssrc,
 		Cipher:       s.keys.CipherName,
 		RemotePort:   int(s.remotePort.Load()),
 		RTTMs:        time.Duration(s.rttNs.Load()).Milliseconds(),
 		SRTTMs:       srtt.Milliseconds(),
+		MinRTTMs:     minRTT.Milliseconds(),
 		LossRate:     s.loss.LossRate(),
 		FECRecovered: s.fecDec.RecoveredCount(),
 		PacingMbps:   s.cc.PacingMbps(),
 		UpBytes:      s.UpBytes.Load(),
 		DownBytes:    s.DownBytes.Load(),
 		ActiveStream: int(s.streamCount.Load()),
+		HopCount:     s.hopCount.Load(),
+		RekeyCount:   s.rekeyCount.Load(),
+		KeyEpoch:     s.keyEpoch.Load(),
+		Rate30sBps:   s.Recent30sBytesPerSec(),
 	}
 }
 
@@ -423,6 +650,56 @@ func (s *RTCSession) writeWirePacket(pkt []byte) error {
 	return err
 }
 
+func (s *RTCSession) currentTXState() *dirKeyState {
+	s.keyMu.RLock()
+	st := s.txState
+	s.keyMu.RUnlock()
+	return st
+}
+
+func (s *RTCSession) getRXState(phase uint8, now time.Time) *dirKeyState {
+	s.keyMu.RLock()
+	st := s.rxSlots[phase&1]
+	s.keyMu.RUnlock()
+	if st == nil {
+		return nil
+	}
+	if !st.graceUntil.IsZero() && now.After(st.graceUntil) {
+		return nil
+	}
+	return st
+}
+
+func (s *RTCSession) TriggerRekey() error {
+	select {
+	case <-s.done:
+		return ErrSessionClosed
+	default:
+	}
+	s.keyMu.Lock()
+	if s.rekeyInFlight {
+		s.keyMu.Unlock()
+		return nil
+	}
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		s.keyMu.Unlock()
+		return err
+	}
+	nextEpoch := s.curKeys.Epoch + 1
+	s.rekeyInFlight = true
+	s.rekeyAwaitPeer = false
+	s.rekeyStartedAt = time.Now()
+	s.rekeyPendingEpoch = nextEpoch
+	s.rekeyEphPriv = priv
+	var pub32 [32]byte
+	copy(pub32[:], priv.PublicKey().Bytes())
+	s.keyMu.Unlock()
+
+	s.enqueueReliableFrame(encodeFrameRekey(rekeyRoleInit, nextEpoch, pub32))
+	return nil
+}
+
 func (s *RTCSession) sealAndWriteTo(pc net.PacketConn, raddr net.Addr, plain []byte, pt uint8, marker bool) (pktNum uint64, wireLen int, err error) {
 	if pc == nil || raddr == nil {
 		return 0, 0, ErrSessionClosed
@@ -432,7 +709,8 @@ func (s *RTCSession) sealAndWriteTo(pc net.PacketConn, raddr net.Addr, plain []b
 	pktNum = s.nextPktNum()
 	seq := uint16(s.rtpSeq.Add(1))
 	ts := s.currentTS90k()
-	sealed, serr := SealRTP(*bp, s.txAEAD, s.txIV, s.txMask, s.ssrc, seq, ts, pt, marker, pktNum, plain)
+	tx := s.currentTXState()
+	sealed, serr := SealRTPPhase(*bp, tx.aead, tx.iv, tx.mask, tx.phase, s.ssrc, seq, ts, pt, marker, pktNum, plain)
 	if serr != nil {
 		return 0, 0, serr
 	}
@@ -441,6 +719,27 @@ func (s *RTCSession) sealAndWriteTo(pc net.PacketConn, raddr net.Addr, plain []b
 		s.lastSendNs.Store(time.Now().UnixNano())
 	}
 	return pktNum, wireLen, err
+}
+
+func (s *RTCSession) sendRTCPMimicPacket() {
+	s.connMu.RLock()
+	pc := s.curConn
+	raddr := s.curRemote
+	s.connMu.RUnlock()
+	if pc == nil || raddr == nil {
+		return
+	}
+	bp := GetPktBuf()
+	defer PutPktBuf(bp)
+	tx := s.currentTXState()
+	seq := s.rtcpSeq.Add(1)
+	pkt, err := SealRTCPMimic(*bp, tx.aead, tx.iv, tx.mask, tx.phase, s.ssrc, seq, nil)
+	if err != nil {
+		return
+	}
+	if _, err := pc.WriteTo(pkt, raddr); err == nil {
+		s.lastSendNs.Store(time.Now().UnixNano())
+	}
 }
 
 func (s *RTCSession) sealAndWrite(plain []byte, pt uint8, marker bool) (pktNum uint64, wireLen int, err error) {
@@ -474,12 +773,11 @@ func (s *RTCSession) popRetransmitOrPending(budget int) (frames [][]byte, reliab
 	for len(s.retransmitQ) > 0 {
 		rf := s.retransmitQ[0]
 		if used+len(rf.Bytes) > budget {
-			if used == 0 {
-				// Defensive clamp should never trigger (frames <= 1316)
-				s.retransmitQ = s.retransmitQ[1:]
-				continue
+			if used == 0 && len(rf.Bytes) <= MaxFrameArea {
+				// Frame slightly exceeds jittered budget: let it use physical MaxFrameArea without dropping.
+			} else {
+				break
 			}
-			break
 		}
 		s.retransmitQ[0] = ReliableFrame{}
 		s.retransmitQ = s.retransmitQ[1:]
@@ -494,7 +792,10 @@ func (s *RTCSession) popRetransmitOrPending(budget int) (frames [][]byte, reliab
 	for len(s.udpQ) > 0 {
 		u := s.udpQ[0]
 		if used+len(u) > budget {
-			break
+			if used == 0 && len(u) <= MaxFrameArea {
+			} else {
+				break
+			}
 		}
 		s.udpQ[0] = nil
 		s.udpQ = s.udpQ[1:]
@@ -505,11 +806,14 @@ func (s *RTCSession) popRetransmitOrPending(budget int) (frames [][]byte, reliab
 		}
 	}
 
-	// 3. Control frames (Window updates, Pings, UDPClose)
+	// 3. Control frames (Window updates, Pings, Rekey, UDPClose)
 	for len(s.ctrlQ) > 0 {
 		cf := s.ctrlQ[0]
 		if used+len(cf) > budget {
-			break
+			if used == 0 && len(cf) <= MaxFrameArea {
+			} else {
+				break
+			}
 		}
 		s.ctrlQ[0] = nil
 		s.ctrlQ = s.ctrlQ[1:]
@@ -525,7 +829,8 @@ func (s *RTCSession) popRetransmitOrPending(budget int) (frames [][]byte, reliab
 				s.sendRRIdx = 0
 			}
 			st := s.sendRR[s.sendRRIdx]
-			fr, needPad, more, ok := st.popSendFrame(budget - used)
+			allowData := s.txStreamBytes.Load() < s.peerSessMax.Load()
+			fr, dataLen, needPad, more, ok := st.popSendFrame(budget-used, allowData)
 			if !more {
 				delete(s.inSendRR, st.id)
 				last := len(s.sendRR) - 1
@@ -538,6 +843,9 @@ func (s *RTCSession) popRetransmitOrPending(budget int) (frames [][]byte, reliab
 				visited++
 			}
 			if ok {
+				if dataLen > 0 {
+					s.txStreamBytes.Add(int64(dataLen))
+				}
 				frames = append(frames, fr)
 				reliable = append(reliable, ReliableFrame{Bytes: fr})
 				used += len(fr)
@@ -557,6 +865,9 @@ func (s *RTCSession) popRetransmitOrPending(budget int) (frames [][]byte, reliab
 					used += len(pf)
 				}
 			} else if !more {
+				continue
+			} else if !allowData {
+				// Stream blocked on session window; continue scanning other streams for FIN-only frames.
 				continue
 			} else {
 				// Couldn't fit inside remaining space -> stop pulling streams into this packet
@@ -649,18 +960,32 @@ func (s *RTCSession) sendLoop() {
 		}
 
 		lossRate := s.loss.LossRate()
-		budget := MaxFrameArea
-		if SelectFECCount(lossRate) > 0 {
-			budget = MaxFECFrameArea
-		}
+		fecEnabled := SelectFECCount(lossRate) > 0
+		budget := s.cc.FrameBudget(fecEnabled)
 
-		frames, reliable, pt, _ := s.popRetransmitOrPending(budget)
+		frames, reliable, pt, hasStreamData := s.popRetransmitOrPending(budget)
 		if len(frames) == 0 {
+			// Session flow-control backpressure or empty queues: park until SACK/Window/Kick arrives.
+			select {
+			case <-s.done:
+				return
+			case <-s.ackKick:
+				s.sendSACKNow()
+			case <-s.sendKick:
+			}
 			continue
 		}
 
 		used := 0
-		area := (*frameAreaPtr)[:budget]
+		maxBuf := budget
+		for _, fr := range frames {
+			if used+len(fr) > maxBuf {
+				maxBuf = used + len(fr)
+			}
+			used += len(fr)
+		}
+		used = 0
+		area := (*frameAreaPtr)[:maxBuf]
 		for _, fr := range frames {
 			copy(area[used:], fr)
 			used += len(fr)
@@ -671,12 +996,29 @@ func (s *RTCSession) sendLoop() {
 			largest, delayUs, blocks, ok := s.replay.BuildSACK(now)
 			if ok {
 				sf := encodeFrameSACK(largest, delayUs, blocks)
-				if used+len(sf) <= budget {
+				if used+len(sf) <= len(area) {
 					copy(area[used:], sf)
 					used += len(sf)
 				} else {
 					s.sendSACKNow()
 				}
+			}
+		}
+
+		// Append 8..64B random tail padding on data packets to flatten packet-length histograms.
+		if hasStreamData && len(area)-used >= 11 {
+			maxPad := len(area) - used - 3
+			if maxPad > 64 {
+				maxPad = 64
+			}
+			if maxPad >= 8 {
+				padLen := 8
+				if maxPad > 8 {
+					padLen += mrand.IntN(maxPad - 7)
+				}
+				pf := encodeFramePadding(padLen)
+				copy(area[used:], pf)
+				used += len(pf)
 			}
 		}
 
@@ -708,10 +1050,16 @@ func (s *RTCSession) ackPendingCheck() bool {
 	return p
 }
 
+func randomRTCPGap() time.Duration {
+	return rtcpMimicMinGap + time.Duration(mrand.Int64N(int64(rtcpMimicMaxGap-rtcpMimicMinGap)))
+}
+
 func (s *RTCSession) timerLoop() {
 	t := time.NewTicker(5 * time.Millisecond)
 	defer t.Stop()
 	nextKeepalive := time.Now().Add(keepaliveMinGap + time.Duration(mrand.Int64N(int64(keepaliveMaxGap-keepaliveMinGap))))
+	nextRTCP := time.Now().Add(randomRTCPGap())
+	nextMaint := time.Now().Add(250 * time.Millisecond)
 
 	for {
 		select {
@@ -739,6 +1087,22 @@ func (s *RTCSession) timerLoop() {
 				return
 			}
 
+			// Rekey maintenance, 30s grace key shredding, and RTCP-Mux mimic scheduling.
+			if now.After(nextMaint) {
+				nextMaint = now.Add(250 * time.Millisecond)
+				s.maintainKeys(now)
+			}
+			if now.After(nextRTCP) {
+				nextRTCP = now.Add(randomRTCPGap())
+				lastAct := s.lastSendNs.Load()
+				if r := s.lastRecvNs.Load(); r > lastAct {
+					lastAct = r
+				}
+				if now.Sub(time.Unix(0, lastAct)) < activeTrafficMaxIdle {
+					s.sendRTCPMimicPacket()
+				}
+			}
+
 			// Server idle timeout cleanup
 			if !s.isClient {
 				lastR := time.Unix(0, s.lastRecvNs.Load())
@@ -754,6 +1118,40 @@ func (s *RTCSession) timerLoop() {
 				}
 			}
 		}
+	}
+}
+
+func (s *RTCSession) maintainKeys(now time.Time) {
+	var shouldRekey bool
+	totalTraffic := s.UpBytes.Load() + s.DownBytes.Load()
+
+	s.keyMu.Lock()
+	for i := range s.rxSlots {
+		slot := s.rxSlots[i]
+		if slot != nil && !slot.graceUntil.IsZero() && now.After(slot.graceUntil) {
+			s.rxSlots[i] = nil
+		}
+	}
+	if s.rekeyInFlight && now.Sub(s.rekeyStartedAt) > 15*time.Second {
+		s.rekeyInFlight = false
+		s.rekeyAwaitPeer = false
+		s.rekeyEphPriv = nil
+		s.pendingTXState = nil
+		s.pendingKeys = nil
+	}
+	if !s.rekeyInFlight && s.isClient {
+		bytesDelta := int64(0)
+		if totalTraffic > s.lastRekeyTotal {
+			bytesDelta = int64(totalTraffic - s.lastRekeyTotal)
+		}
+		if (s.rekeyThreshBytes > 0 && bytesDelta >= s.rekeyThreshBytes) || now.Sub(s.lastRekeyAt) >= rekeyTimeThreshold {
+			shouldRekey = true
+		}
+	}
+	s.keyMu.Unlock()
+
+	if shouldRekey {
+		_ = s.TriggerRekey()
 	}
 }
 
@@ -792,20 +1190,55 @@ func (s *RTCSession) inboundWorker() {
 
 func (s *RTCSession) handleInboundPacket(pkt inboundPkt, dst []byte) {
 	wire := (*pkt.buf)[:pkt.n]
+	phase := ExtractKeyPhase(wire)
+
+	if IsRTCPMimic(wire) {
+		rx := s.getRXState(phase, pkt.at)
+		if rx == nil {
+			return
+		}
+		if _, err := OpenRTCPMimic(dst, wire, rx.aead, rx.iv, rx.mask); err != nil {
+			return
+		}
+		s.lastRecvNs.Store(pkt.at.UnixNano())
+		s.maybePromotePeerPhase(phase, pkt.at)
+		if s.isClient && pkt.pc != nil {
+			s.notifyProbeHit(pkt.pc)
+		}
+		if !s.isClient && pkt.addr != nil {
+			addrStr := pkt.addr.String()
+			s.connMu.RLock()
+			curStr := s.curRemoteStr
+			s.connMu.RUnlock()
+			if addrStr != curStr {
+				s.connMu.Lock()
+				s.curRemote = pkt.addr
+				s.curRemoteStr = addrStr
+				s.connMu.Unlock()
+			}
+		}
+		return
+	}
+
 	_, maskedPN, ok := ParseRTPHeaderFields(wire)
 	if !ok {
 		return
 	}
-	pn := maskedPN ^ s.rxMask
+	rx := s.getRXState(phase, pkt.at)
+	if rx == nil {
+		return
+	}
+	pn := maskedPN ^ rx.mask
 	if !s.replay.Allow(pn) {
 		return
 	}
-	pktNum, pt, _, _, err := OpenRTP(dst, wire, s.rxAEAD, s.rxIV, s.rxMask)
+	pktNum, pt, _, _, _, err := OpenRTPPhase(dst, wire, rx.aead, rx.iv, rx.mask)
 	if err != nil || len(pt) < FECHeaderLen {
 		return
 	}
 
 	s.lastRecvNs.Store(pkt.at.UnixNano())
+	s.maybePromotePeerPhase(phase, pkt.at)
 	if s.isClient && pkt.pc != nil {
 		s.notifyProbeHit(pkt.pc)
 	}
@@ -848,6 +1281,146 @@ func (s *RTCSession) handleInboundPacket(pkt inboundPkt, dst []byte) {
 
 	if s.replay.Commit(pktNum, ackEliciting, pkt.at) {
 		s.kickACK()
+	}
+}
+
+func (s *RTCSession) maybePromotePeerPhase(phase uint8, now time.Time) {
+	var fn *func(uint32)
+	var newEpoch uint32
+	var promoted bool
+
+	s.keyMu.Lock()
+	if s.rekeyAwaitPeer && s.pendingTXState != nil && phase == s.pendingTXState.phase {
+		oldPhase := s.txState.phase
+		if s.rxSlots[oldPhase] != nil {
+			s.rxSlots[oldPhase].graceUntil = now.Add(rekeyGraceDuration)
+		}
+		s.txState = s.pendingTXState
+		s.curKeys = s.pendingKeys
+		s.pendingTXState = nil
+		s.pendingKeys = nil
+		s.rekeyAwaitPeer = false
+		s.rekeyInFlight = false
+		s.lastRekeyAt = now
+		s.lastRekeyTotal = s.UpBytes.Load() + s.DownBytes.Load()
+		newEpoch = s.curKeys.Epoch
+		s.rekeyCount.Add(1)
+		s.keyEpoch.Store(newEpoch)
+		fn = s.onRekey.Load()
+		promoted = true
+	}
+	s.keyMu.Unlock()
+
+	if promoted && fn != nil && *fn != nil {
+		(*fn)(newEpoch)
+	}
+}
+
+func (s *RTCSession) handleInboundRekey(role byte, epoch uint32, pubBytes []byte, now time.Time) {
+	if len(pubBytes) != 32 {
+		return
+	}
+	if role == rekeyRoleInit {
+		s.keyMu.Lock()
+		expectedEpoch := s.curKeys.Epoch + 1
+		if epoch != expectedEpoch || (s.rekeyAwaitPeer && s.rekeyPendingEpoch == epoch) {
+			s.keyMu.Unlock()
+			return
+		}
+		if s.rekeyInFlight {
+			if s.isClient {
+				s.keyMu.Unlock()
+				return
+			}
+			s.rekeyInFlight = false
+			s.rekeyEphPriv = nil
+		}
+		peerPub, err := ecdh.X25519().NewPublicKey(pubBytes)
+		if err != nil {
+			s.keyMu.Unlock()
+			return
+		}
+		respPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			s.keyMu.Unlock()
+			return
+		}
+		shared, err := respPriv.ECDH(peerPub)
+		if err != nil {
+			s.keyMu.Unlock()
+			return
+		}
+		nextKeys, err := s.curKeys.RatchetKeys(shared)
+		if err != nil {
+			s.keyMu.Unlock()
+			return
+		}
+		nextTX, nextRX := newDirKeyStates(s.isClient, nextKeys)
+		s.rxSlots[nextRX.phase] = nextRX
+		s.pendingTXState = nextTX
+		s.pendingKeys = nextKeys
+		s.rekeyInFlight = true
+		s.rekeyAwaitPeer = true
+		s.rekeyStartedAt = now
+		s.rekeyPendingEpoch = epoch
+		var pub32 [32]byte
+		copy(pub32[:], respPriv.PublicKey().Bytes())
+		s.keyMu.Unlock()
+
+		s.enqueueReliableFrame(encodeFrameRekey(rekeyRoleResp, epoch, pub32))
+		return
+	}
+
+	if role == rekeyRoleResp {
+		var fn *func(uint32)
+		var newEpoch uint32
+		var promoted bool
+
+		s.keyMu.Lock()
+		if !s.rekeyInFlight || s.rekeyAwaitPeer || s.rekeyPendingEpoch != epoch || s.rekeyEphPriv == nil {
+			s.keyMu.Unlock()
+			return
+		}
+		peerPub, err := ecdh.X25519().NewPublicKey(pubBytes)
+		if err != nil {
+			s.keyMu.Unlock()
+			return
+		}
+		shared, err := s.rekeyEphPriv.ECDH(peerPub)
+		if err != nil {
+			s.keyMu.Unlock()
+			return
+		}
+		nextKeys, err := s.curKeys.RatchetKeys(shared)
+		if err != nil {
+			s.keyMu.Unlock()
+			return
+		}
+		nextTX, nextRX := newDirKeyStates(s.isClient, nextKeys)
+		oldPhase := s.txState.phase
+		if s.rxSlots[oldPhase] != nil {
+			s.rxSlots[oldPhase].graceUntil = now.Add(rekeyGraceDuration)
+		}
+		s.rxSlots[nextRX.phase] = nextRX
+		s.txState = nextTX
+		s.curKeys = nextKeys
+		s.rekeyInFlight = false
+		s.rekeyEphPriv = nil
+		s.lastRekeyAt = now
+		s.lastRekeyTotal = s.UpBytes.Load() + s.DownBytes.Load()
+		newEpoch = nextKeys.Epoch
+		s.rekeyCount.Add(1)
+		s.keyEpoch.Store(newEpoch)
+		fn = s.onRekey.Load()
+		promoted = true
+		s.keyMu.Unlock()
+
+		if promoted {
+			s.enqueueCtrlFrame(encodeFramePingPong(FramePing, now.UnixNano()))
+			if fn != nil && *fn != nil {
+				(*fn)(newEpoch)
+			}
+		}
 	}
 }
 
@@ -970,9 +1543,14 @@ func (s *RTCSession) dispatchFrames(b []byte, now time.Time) (ackEliciting bool)
 			if off+cnt*4 > len(b) {
 				return ackEliciting
 			}
+			var blockBuf [MaxSACKBlocks]SACKBlock
 			var blocks []SACKBlock
 			if cnt > 0 {
-				blocks = make([]SACKBlock, cnt)
+				if cnt <= MaxSACKBlocks {
+					blocks = blockBuf[:cnt]
+				} else {
+					blocks = make([]SACKBlock, cnt)
+				}
 				for i := 0; i < cnt; i++ {
 					blocks[i] = SACKBlock{
 						Gap: binary.BigEndian.Uint16(b[off : off+2]),
@@ -1042,6 +1620,42 @@ func (s *RTCSession) dispatchFrames(b []byte, now time.Time) (ackEliciting bool)
 			default:
 			}
 
+		case FrameRekey:
+			if off+37 > len(b) {
+				return ackEliciting
+			}
+			ackEliciting = true
+			role := b[off]
+			epoch := binary.BigEndian.Uint32(b[off+1 : off+5])
+			pubBytes := b[off+5 : off+37]
+			off += 37
+			s.handleInboundRekey(role, epoch, pubBytes, now)
+
+		case FrameSessionWin:
+			if off+8 > len(b) {
+				return ackEliciting
+			}
+			ackEliciting = true
+			maxWin := int64(binary.BigEndian.Uint64(b[off : off+8]))
+			off += 8
+			if maxWin > 0 {
+				if s.hasPeerSessWin.CompareAndSwap(false, true) {
+					s.peerSessMax.Store(maxWin)
+				} else {
+					for {
+						cur := s.peerSessMax.Load()
+						if maxWin <= cur {
+							break
+						}
+						if s.peerSessMax.CompareAndSwap(cur, maxWin) {
+							break
+						}
+					}
+				}
+				s.winCond.Broadcast()
+				s.kickSend()
+			}
+
 		default:
 			return ackEliciting
 		}
@@ -1072,6 +1686,7 @@ func (s *RTCSession) handleInboundStreamOpen(streamID uint32, target string, fir
 	s.streamCount.Add(1)
 	if len(first) > 0 {
 		s.DownBytes.Add(uint64(len(first)))
+		s.recordTraffic(len(first), time.Now())
 		s.emitBytes(0, len(first))
 	}
 
@@ -1283,7 +1898,7 @@ func (s *RTCSession) OpenStream(target string, first []byte) (*RTCStream, error)
 	s.mu.Unlock()
 	s.streamCount.Add(1)
 
-	maxInOpen := MaxFECFrameArea - (8 + len(ab))
+	maxInOpen := maxStreamChunk - (8 + len(ab))
 	if maxInOpen < 0 {
 		maxInOpen = 0
 	}
@@ -1296,6 +1911,7 @@ func (s *RTCSession) OpenStream(target string, first []byte) (*RTCStream, error)
 	openFrame := encodeFrameStreamOpen(id, ab, inOpen)
 	if len(inOpen) > 0 {
 		s.UpBytes.Add(uint64(len(inOpen)))
+		s.recordTraffic(len(inOpen), time.Now())
 		s.emitBytes(len(inOpen), 0)
 	}
 	s.enqueueReliableFrame(openFrame)
@@ -1617,6 +2233,7 @@ func (s *RTCSession) promoteMigratedSocket(newPC net.PacketConn, ownPC bool, new
 	if newRemotePort > 0 {
 		s.remotePort.Store(int32(newRemotePort))
 	}
+	s.hopCount.Add(1)
 	if oldOwn && oldPC != nil && oldPC != newPC {
 		time.AfterFunc(hopOldCloseDelay, func() {
 			s.connMu.Lock()
@@ -1672,7 +2289,8 @@ func (s *RTCSession) clientReadLoop(pc net.PacketConn, ownPC bool) {
 			}
 			return
 		}
-		if n < RTPOverhead || !IsRTPPacket((*bp)[:n]) {
+		raw := (*bp)[:n]
+		if !IsRTPPacket(raw) && !IsRTCPMimic(raw) {
 			PutPktBuf(bp)
 			continue
 		}
@@ -1692,6 +2310,7 @@ func (s *RTCSession) fail(err error) {
 			s.errVal.Store(err)
 		}
 		close(s.done)
+		s.winCond.Broadcast()
 
 		if s.listener != nil {
 			s.listener.unregisterSSRC(s.ssrc)
@@ -2023,9 +2642,27 @@ func (l *RTCListener) readLoop() {
 		}
 		raw := (*bp)[:n]
 
-		// WebRTC demux rule (RFC 7983):
+		// WebRTC demux rule (RFC 7983 / RFC 5761):
+		// - RTCP Receiver Report mimic has byte0 top bits 10b & PT=201 (64..112B)
 		// - RTP v2 packets have bits 0..1 == 10b (0x80..0xBF)
 		// - STUN packets have bits 0..1 == 00b (0x00..0x3F)
+		if IsRTCPMimic(raw) {
+			ssrc := binary.BigEndian.Uint32(raw[4:8])
+			sess := l.lookupSSRC(ssrc)
+			if sess == nil {
+				PutPktBuf(bp)
+				l.dropped.Add(1)
+				continue
+			}
+			sess.enqueueInbound(inboundPkt{
+				buf:  bp,
+				n:    n,
+				addr: addr,
+				at:   time.Now(),
+			})
+			continue
+		}
+
 		if IsRTPPacket(raw) {
 			ssrc, _, ok := ParseRTPHeaderFields(raw)
 			if !ok {
@@ -2059,7 +2696,12 @@ func (l *RTCListener) readLoop() {
 				continue
 			}
 			if msgType == stunTypeBindingReq {
-				// Copy STUN packet and recycle buffer immediately; validate handshake synchronously or inline
+				// Zero-allocation HMAC FastMAC + Fingerprint pre-screening before copying or ECDH.
+				if !PreScreenClientBindingReq(raw, l.psk) {
+					PutPktBuf(bp)
+					l.dropped.Add(1)
+					continue
+				}
 				pktCopy := make([]byte, n)
 				copy(pktCopy, raw)
 				PutPktBuf(bp)

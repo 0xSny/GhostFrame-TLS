@@ -65,3 +65,11 @@ func (r *RewindConn) Recorded() int { return len(r.rec) }
 
 // RecordedBytes returns a copy of the recorded bytes.
 func (r *RewindConn) RecordedBytes() []byte { return r.rec }
+
+// CloseWrite delegates TCP half-close if the underlying connection supports it.
+func (r *RewindConn) CloseWrite() error {
+	if cw, ok := r.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}

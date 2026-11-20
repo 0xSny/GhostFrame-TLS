@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# GhostFrame-RTC (GFT) v3.4.1 Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
+# GhostFrame-RTC (GFT) v4.0.0-LTS Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
 REPO="Spittingjiu/GhostFrame-TLS"
 ROLE="server"
 UNATTENDED=0
@@ -21,7 +21,7 @@ die()  { printf "\033[1;31m[×]\033[0m %s\n" "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-GhostFrame-RTC (GFT) v3.4.1 Installer
+GhostFrame-RTC (GFT) v4.0.0-LTS Installer
 
 Usage:
   install.sh [options]
@@ -319,7 +319,7 @@ install_server() {
 
   cat > /etc/systemd/system/ghostframe.service <<'EOF'
 [Unit]
-Description=GhostFrame-RTC (GFT) v3.4 Dual-Stack Server
+Description=GhostFrame-RTC (GFT) v4.0 LTS Dual-Stack Server
 After=network-online.target
 Wants=network-online.target
 
@@ -331,7 +331,6 @@ ExecStart=/opt/ghostframe/gft-server run -config /etc/gft/server.json
 Restart=always
 RestartSec=2s
 LimitNOFILE=1048576
-Environment=GOMEMLIMIT=256MiB
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -366,7 +365,7 @@ install_client() {
   if [[ "$INIT_SYS" == "systemd" ]]; then
     cat > /etc/systemd/system/gft-core.service <<EOF
 [Unit]
-Description=GhostFrame-RTC (GFT) v3.4 Headless Core Daemon
+Description=GhostFrame-RTC (GFT) v4.0 LTS Headless Core Daemon
 After=network-online.target
 Wants=network-online.target
 

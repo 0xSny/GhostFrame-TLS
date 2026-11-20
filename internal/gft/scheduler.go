@@ -13,10 +13,13 @@ import (
 )
 
 const (
-	DefaultRTCPoolSize = 2
-	rtcHopMinAge       = 25 * time.Second
-	rtcHopMaxAge       = 50 * time.Second
-	rtcDrainUDPIdle    = 15 * time.Second
+	DefaultRTCPoolSize   = 2
+	rtcHopMinAge         = 60 * time.Second
+	rtcHopMaxAge         = 120 * time.Second
+	rtcHopBytesQuota     = 64 * 1024 * 1024
+	rtcIdleRateThreshold = 64 * 1024
+	rtcHopStagger        = 25 * time.Second
+	rtcDrainUDPIdle      = 15 * time.Second
 )
 
 // DialLimiter implements a token bucket with jitter to prevent reconnect storms.
@@ -85,10 +88,16 @@ type ApexStats struct {
 	Mode          string  `json:"mode"` // "RTC-Smart", "TCP-uTLS", "TCP-Fallback", "Starting"
 	RTCConnected  bool    `json:"rtc_connected"`
 	RTCPort       int     `json:"rtc_port"`
+	RTCPorts      [2]int  `json:"rtc_ports"`
 	RTCRTTMs      int64   `json:"rtc_rtt_ms"`
+	SRTTMs        int64   `json:"srtt_ms"`
+	MinRTTMs      int64   `json:"min_rtt_ms"`
 	TCPRTTMs      int64   `json:"tcp_rtt_ms"`
 	RTTMs         int64   `json:"rtt_ms"`
 	FECRecovered  uint64  `json:"fec_recovered"`
+	HopCount      uint64  `json:"hop_count"`
+	HopState      string  `json:"hop_state"`
+	RekeyCount    uint64  `json:"rekey_count"`
 	LossRate      float64 `json:"loss_rate"`
 	PacingMbps    float64 `json:"pacing_mbps"`
 	ActiveConns   int     `json:"active_conns"`
@@ -99,11 +108,14 @@ type ApexStats struct {
 }
 
 type rtcSlot struct {
-	sess       *gftrtc.RTCSession
-	createdAt  time.Time
-	lastHopAt  time.Time
-	maxAge     time.Duration
-	degradedAt time.Time
+	channelIdx   int
+	sess         *gftrtc.RTCSession
+	createdAt    time.Time
+	lastHopAt    time.Time
+	lastHopBytes uint64
+	maxAge       time.Duration
+	degradedAt   time.Time
+	pingFails    int
 }
 
 // ApexScheduler races and coordinates a Striped GFT-RTC Dual-Session pool (with 0ms WebRTC
@@ -120,13 +132,17 @@ type ApexScheduler struct {
 	rtcDialFn  func(ctx context.Context, l *Link, ps *ParamStore, port int, timeout time.Duration) (*gftrtc.RTCSession, time.Duration, error)
 	rtcHopFn   func(sess *gftrtc.RTCSession, nextPort int) error
 
-	hopMinAge    time.Duration
-	hopMaxAge    time.Duration
-	drainUDPIdle time.Duration
-	maintainTick time.Duration
-	tcpRetryBase time.Duration
-	tcpCoolMin   time.Duration
-	tcpCoolMax   time.Duration
+	hopMinAge        time.Duration
+	hopMaxAge        time.Duration
+	hopStagger       time.Duration
+	hopBytesQuota    uint64
+	idleRateThresh   uint64
+	idlePauseEnabled bool
+	drainUDPIdle     time.Duration
+	maintainTick     time.Duration
+	tcpRetryBase     time.Duration
+	tcpCoolMin       time.Duration
+	tcpCoolMax       time.Duration
 
 	upMbps   atomic.Int64
 	downMbps atomic.Int64
@@ -136,6 +152,8 @@ type ApexScheduler struct {
 	retiredRUp   uint64
 	retiredRDown uint64
 	retiredFEC   uint64
+	retiredHops  uint64
+	retiredRekey uint64
 	lastErr      string
 
 	rtcRR       atomic.Uint64
@@ -145,6 +163,7 @@ type ApexScheduler struct {
 
 	rtcRTTMs  atomic.Int64
 	tcpWakeCh chan struct{}
+	wakeHopCh chan struct{}
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -185,24 +204,29 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 		schedLink = &cp
 	}
 	a := &ApexScheduler{
-		link:         schedLink,
-		ps:           ps,
-		clientID:     cid,
-		limiter:      tcpLim,
-		tcpLimiter:   tcpLim,
-		rtcLimiter:   rtcLim,
-		onLog:        logf,
-		hopMinAge:    rtcHopMinAge,
-		hopMaxAge:    rtcHopMaxAge,
-		drainUDPIdle: rtcDrainUDPIdle,
-		maintainTick: 2 * time.Second,
-		tcpRetryBase: 4 * time.Second,
-		tcpCoolMin:   5 * time.Minute,
-		tcpCoolMax:   15 * time.Minute,
-		udpAssocs:    make(map[uint16]*SchedulerUDPAssoc),
-		tcpWakeCh:    make(chan struct{}, 1),
-		ctx:          ctx,
-		cancel:       cancel,
+		link:             schedLink,
+		ps:               ps,
+		clientID:         cid,
+		limiter:          tcpLim,
+		tcpLimiter:       tcpLim,
+		rtcLimiter:       rtcLim,
+		onLog:            logf,
+		hopMinAge:        rtcHopMinAge,
+		hopMaxAge:        rtcHopMaxAge,
+		hopStagger:       rtcHopStagger,
+		hopBytesQuota:    rtcHopBytesQuota,
+		idleRateThresh:   rtcIdleRateThreshold,
+		idlePauseEnabled: true,
+		drainUDPIdle:     rtcDrainUDPIdle,
+		maintainTick:     2 * time.Second,
+		tcpRetryBase:     4 * time.Second,
+		tcpCoolMin:       5 * time.Minute,
+		tcpCoolMax:       15 * time.Minute,
+		udpAssocs:        make(map[uint16]*SchedulerUDPAssoc),
+		tcpWakeCh:        make(chan struct{}, 1),
+		wakeHopCh:        make(chan struct{}, 1),
+		ctx:              ctx,
+		cancel:           cancel,
 	}
 	if schedLink != nil {
 		a.upMbps.Store(int64(schedLink.UpMbps))
@@ -239,8 +263,22 @@ func (a *ApexScheduler) SetHopTimingsForTest(minAge, maxAge, drainUDPIdle, tick 
 	a.mu.Lock()
 	a.hopMinAge = minAge
 	a.hopMaxAge = maxAge
+	if maxAge < 5*time.Second {
+		a.hopStagger = 0
+		a.idlePauseEnabled = false
+	}
 	a.drainUDPIdle = drainUDPIdle
 	a.maintainTick = tick
+	a.mu.Unlock()
+}
+
+// SetLazyHopPolicyForTest configures traffic-aware lazy hop parameters for unit tests.
+func (a *ApexScheduler) SetLazyHopPolicyForTest(enabled bool, idleBps uint64, hopBytes uint64, stagger time.Duration) {
+	a.mu.Lock()
+	a.idlePauseEnabled = enabled
+	a.idleRateThresh = idleBps
+	a.hopBytesQuota = hopBytes
+	a.hopStagger = stagger
 	a.mu.Unlock()
 }
 
@@ -373,11 +411,11 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 					if r2.err != nil {
 						if r2.kind == "tcp" {
 							if a.onLog != nil {
-								a.onLog("TCP track deferred (%v); running on GFT-RTC Smart-Brutal", r2.err)
+								a.onLog("[TCP] Track deferred (%v); running on GFT-RTC Smart-Brutal", r2.err)
 							}
 							a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
 						} else if a.onLog != nil {
-							a.onLog("GFT-RTC track unavailable (%v); 0ms fallback active on TCP-uTLS", r2.err)
+							a.onLog("[RTC] Track unavailable (%v); 0ms fallback active on [TCP] uTLS", r2.err)
 						}
 					}
 				}
@@ -395,11 +433,11 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 		}
 		if r1.kind == "tcp" {
 			if a.onLog != nil {
-				a.onLog("TCP track deferred (%v); running on GFT-RTC Smart-Brutal", r1.err)
+				a.onLog("[TCP] Track deferred (%v); running on GFT-RTC Smart-Brutal", r1.err)
 			}
 			a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
 		} else if a.onLog != nil {
-			a.onLog("GFT-RTC track unavailable (%v); 0ms fallback active on TCP-uTLS", r1.err)
+			a.onLog("[RTC] Track unavailable (%v); 0ms fallback active on [TCP] uTLS", r1.err)
 		}
 		a.launchLoop(a.rtcMaintainLoop)
 		return nil
@@ -437,7 +475,7 @@ func (a *ApexScheduler) retryTCPStartLoop(timeout time.Duration) {
 			if !trippedLogged {
 				trippedLogged = true
 				if a.onLog != nil {
-					a.onLog("TCP :%d track circuit-breaker open after %d failures while RTC is healthy; cooling %v", a.link.Port, fails, waitDur)
+					a.onLog("[TCP] :%d track circuit-breaker open after %d failures while RTC is healthy; cooling %v", a.link.Port, fails, waitDur)
 				}
 			}
 		} else {
@@ -487,6 +525,13 @@ func (a *ApexScheduler) randomHopAge() time.Duration {
 }
 
 func (a *ApexScheduler) dialOneRTCSlot(timeout time.Duration) (*rtcSlot, error) {
+	return a.dialOneRTCSlotWithIndex(timeout, 1)
+}
+
+func (a *ApexScheduler) dialOneRTCSlotWithIndex(timeout time.Duration, channelIdx int) (*rtcSlot, error) {
+	if channelIdx <= 0 {
+		channelIdx = 1
+	}
 	if err := a.rtcLimiter.Wait(a.ctx); err != nil {
 		return nil, err
 	}
@@ -509,6 +554,13 @@ func (a *ApexScheduler) dialOneRTCSlot(timeout time.Duration) (*rtcSlot, error) 
 		sess.Close()
 		return nil, a.ctx.Err()
 	}
+	chTag := channelIdx
+	sess.SetOnRekey(func(epoch uint32) {
+		if a.onLog != nil {
+			a.onLog("[RTC#%d] Key rotated cleanly (epoch=%d)", chTag, epoch)
+		}
+	})
+
 	ms := hs.Milliseconds()
 	if ms <= 0 {
 		ms = 1
@@ -516,14 +568,19 @@ func (a *ApexScheduler) dialOneRTCSlot(timeout time.Duration) (*rtcSlot, error) 
 	a.rtcRTTMs.Store(ms)
 
 	now := time.Now()
+	maxAge := a.randomHopAge()
+	if channelIdx == 2 && a.hopStagger > 0 {
+		maxAge += a.hopStagger
+	}
 	slot := &rtcSlot{
-		sess:      sess,
-		createdAt: now,
-		lastHopAt: now,
-		maxAge:    a.randomHopAge(),
+		channelIdx: channelIdx,
+		sess:       sess,
+		createdAt:  now,
+		lastHopAt:  now,
+		maxAge:     maxAge,
 	}
 	if a.onLog != nil {
-		a.onLog("GFT-RTC connected (UDP :%d, Cipher=%s, RTT=%dms)", port, sess.Stats().Cipher, ms)
+		a.onLog("[RTC#%d] GFT-RTC connected (UDP :%d, Cipher=%s, RTT=%dms)", channelIdx, port, sess.Stats().Cipher, ms)
 	}
 	return slot, nil
 }
@@ -539,10 +596,11 @@ func (a *ApexScheduler) dialRTCNow(timeout time.Duration) error {
 	var slots []*rtcSlot
 	var lastErr error
 	for i := 0; i < target; i++ {
+		chIdx := i + 1
 		wg.Add(1)
-		go func() {
+		go func(idx int) {
 			defer wg.Done()
-			sl, err := a.dialOneRTCSlot(timeout)
+			sl, err := a.dialOneRTCSlotWithIndex(timeout, idx)
 			resMu.Lock()
 			if err == nil && sl != nil {
 				slots = append(slots, sl)
@@ -550,7 +608,7 @@ func (a *ApexScheduler) dialRTCNow(timeout time.Duration) error {
 				lastErr = err
 			}
 			resMu.Unlock()
-		}()
+		}(chIdx)
 	}
 	wg.Wait()
 
@@ -574,6 +632,33 @@ func (a *ApexScheduler) dialRTCNow(timeout time.Duration) error {
 	return nil
 }
 
+// OnSystemWake resets stale RTT/CC state after OS sleep/wake or network changes and triggers wake probing.
+func (a *ApexScheduler) OnSystemWake() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	slots := make([]*rtcSlot, len(a.rtcSlots))
+	copy(slots, a.rtcSlots)
+	a.mu.Unlock()
+
+	for _, sl := range slots {
+		if sl != nil && sl.sess != nil {
+			sl.sess.ResetRTTOnWake()
+		}
+	}
+	if a.onLog != nil {
+		a.onLog("[SystemWake] Resetting RTT estimators & probing active tunnels")
+	}
+	if a.wakeHopCh != nil {
+		select {
+		case a.wakeHopCh <- struct{}{}:
+		default:
+		}
+	}
+	a.wakeTCPTrack()
+}
+
 func (a *ApexScheduler) rtcMaintainLoop() {
 	defer a.wg.Done()
 	a.mu.Lock()
@@ -592,16 +677,10 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 		select {
 		case <-a.ctx.Done():
 			return
+		case <-a.wakeHopCh:
+			a.handleEmergencyProbeAndHop(1500*time.Millisecond, true)
 		case <-pingTicker.C:
-			if rs := a.activeRTCForSend(); rs != nil {
-				if rtt, err := rs.ProbeRTT(4 * time.Second); err == nil {
-					ms := rtt.Milliseconds()
-					if ms <= 0 {
-						ms = 1
-					}
-					a.rtcRTTMs.Store(ms)
-				}
-			}
+			a.handleEmergencyProbeAndHop(4*time.Second, false)
 		case <-t.C:
 			now := time.Now()
 			target := a.rtcPoolTarget()
@@ -610,6 +689,10 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 			a.mu.Lock()
 			var keepSlots []*rtcSlot
 			var dueHop []*rtcSlot
+			hasCh := make(map[int]bool, target)
+			idlePause := a.idlePauseEnabled
+			idleThresh := a.idleRateThresh
+			bytesQuota := a.hopBytesQuota
 			for _, sl := range a.rtcSlots {
 				select {
 				case <-sl.sess.Done():
@@ -617,9 +700,26 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 					a.retiredRUp += st.UpBytes
 					a.retiredRDown += st.DownBytes
 					a.retiredFEC += st.FECRecovered
+					a.retiredHops += st.HopCount
+					a.retiredRekey += st.RekeyCount
 				default:
-					if hasHop && now.Sub(sl.lastHopAt) >= sl.maxAge {
-						dueHop = append(dueHop, sl)
+					if hasHop {
+						st := sl.sess.Stats()
+						totalTraffic := st.UpBytes + st.DownBytes
+						var bytesDelta uint64
+						if totalTraffic > sl.lastHopBytes {
+							bytesDelta = totalTraffic - sl.lastHopBytes
+						}
+						if bytesQuota > 0 && bytesDelta >= bytesQuota {
+							dueHop = append(dueHop, sl)
+						} else if now.Sub(sl.lastHopAt) >= sl.maxAge {
+							if !idlePause || sl.sess.Recent30sBytesPerSec() >= idleThresh {
+								dueHop = append(dueHop, sl)
+							}
+						}
+					}
+					if sl.channelIdx > 0 {
+						hasCh[sl.channelIdx] = true
 					}
 					keepSlots = append(keepSlots, sl)
 				}
@@ -634,34 +734,43 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 				a.wakeTCPTrack()
 			}
 
-			// Execute Make-Before-Break 0ms socket port-hop migration (zero stream interruption!)
+			// Execute Make-Before-Break 0ms socket port-hop migration quietly (updates header badge, no log spam).
 			for _, sl := range dueHop {
-				oldPort := sl.sess.RemotePort()
 				nextPort := PickHopPort(a.link)
 				if err := hopFn(sl.sess, nextPort); err == nil {
-					actualPort := sl.sess.RemotePort()
+					st := sl.sess.Stats()
 					a.mu.Lock()
 					sl.lastHopAt = time.Now()
+					sl.lastHopBytes = st.UpBytes + st.DownBytes
 					sl.maxAge = a.randomHopAge()
 					a.mu.Unlock()
-					if a.onLog != nil {
-						a.onLog("RTC Make-Before-Break Port-Hop migrated (UDP :%d -> :%d)", oldPort, actualPort)
-					}
-				} else if a.onLog != nil {
-					a.onLog("RTC Port-Hop notice (stayed on UDP :%d): %v", oldPort, err)
+				} else {
+					a.mu.Lock()
+					sl.lastHopAt = time.Now().Add(-sl.maxAge + 15*time.Second)
+					a.mu.Unlock()
 				}
 			}
 
-			// Top up any closed/missing RTC slots
+			// Top up any closed/missing RTC slots while preserving stable channel labels #1 / #2.
 			if missing > 0 {
 				var dialErr error
 				var wg sync.WaitGroup
 				var dMu sync.Mutex
-				for i := 0; i < missing; i++ {
+				missingIdxs := make([]int, 0, missing)
+				for idx := 1; idx <= target && len(missingIdxs) < missing; idx++ {
+					if !hasCh[idx] {
+						missingIdxs = append(missingIdxs, idx)
+						hasCh[idx] = true
+					}
+				}
+				for len(missingIdxs) < missing {
+					missingIdxs = append(missingIdxs, len(missingIdxs)+1)
+				}
+				for _, chIdx := range missingIdxs {
 					wg.Add(1)
-					go func() {
+					go func(idx int) {
 						defer wg.Done()
-						sl, err := a.dialOneRTCSlot(6 * time.Second)
+						sl, err := a.dialOneRTCSlotWithIndex(6*time.Second, idx)
 						if err != nil {
 							dMu.Lock()
 							dialErr = err
@@ -675,7 +784,7 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 							sl.sess.Close()
 						}
 						a.mu.Unlock()
-					}()
+					}(chIdx)
 				}
 				wg.Wait()
 				if up := int(a.upMbps.Load()); up > 0 {
@@ -712,6 +821,68 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 			}
 		}
 	}
+}
+
+func (a *ApexScheduler) handleEmergencyProbeAndHop(probeTimeout time.Duration, forceOnFail bool) {
+	_, _, hasHop := a.link.ParseHopRange()
+	a.mu.Lock()
+	slots := make([]*rtcSlot, len(a.rtcSlots))
+	copy(slots, a.rtcSlots)
+	hopFn := a.rtcHopFn
+	a.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for _, sl := range slots {
+		if sl == nil || sl.sess == nil {
+			continue
+		}
+		select {
+		case <-sl.sess.Done():
+			continue
+		default:
+		}
+		wg.Add(1)
+		go func(slot *rtcSlot) {
+			defer wg.Done()
+			if rtt, err := slot.sess.ProbeRTT(probeTimeout); err == nil {
+				ms := rtt.Milliseconds()
+				if ms <= 0 {
+					ms = 1
+				}
+				a.rtcRTTMs.Store(ms)
+				a.mu.Lock()
+				slot.pingFails = 0
+				a.mu.Unlock()
+				return
+			}
+			a.mu.Lock()
+			slot.pingFails++
+			fails := slot.pingFails
+			chIdx := slot.channelIdx
+			a.mu.Unlock()
+			if !forceOnFail && fails < 2 {
+				return
+			}
+			oldPort := slot.sess.RemotePort()
+			if hasHop && hopFn != nil {
+				if herr := hopFn(slot.sess, PickHopPort(a.link)); herr == nil {
+					st := slot.sess.Stats()
+					a.mu.Lock()
+					slot.lastHopAt = time.Now()
+					slot.lastHopBytes = st.UpBytes + st.DownBytes
+					slot.maxAge = a.randomHopAge()
+					slot.pingFails = 0
+					a.mu.Unlock()
+					if a.onLog != nil {
+						a.onLog("[RTC#%d] Emergency MBB hop recovered path (UDP :%d -> :%d)", chIdx, oldPort, slot.sess.RemotePort())
+					}
+					return
+				}
+			}
+			slot.sess.Close()
+		}(sl)
+	}
+	wg.Wait()
 }
 
 func (a *ApexScheduler) activeRTCForSend() *gftrtc.RTCSession {
@@ -1008,8 +1179,15 @@ func (a *ApexScheduler) Stats() ApexStats {
 	ps := a.pool.Stats()
 	a.mu.Lock()
 	rUp, rDown, rFEC := a.retiredRUp, a.retiredRDown, a.retiredFEC
+	rHops, rRekey := a.retiredHops, a.retiredRekey
 	var rPort, rStreams, rAliveCount int
+	var rtcPorts [2]int
+	var srttMs, minRTTMs int64
+	var anyActiveRate bool
 	var sumPacing, maxLoss float64
+	idlePause := a.idlePauseEnabled
+	idleThresh := a.idleRateThresh
+
 	for _, sl := range a.rtcSlots {
 		if sl == nil || sl.sess == nil {
 			continue
@@ -1018,12 +1196,32 @@ func (a *ApexScheduler) Stats() ApexStats {
 		rUp += st.UpBytes
 		rDown += st.DownBytes
 		rFEC += st.FECRecovered
+		rHops += st.HopCount
+		rRekey += st.RekeyCount
 		select {
 		case <-sl.sess.Done():
 		default:
 			rAliveCount++
 			if rPort == 0 {
 				rPort = st.RemotePort
+			}
+			if sl.channelIdx == 1 && rtcPorts[0] == 0 {
+				rtcPorts[0] = st.RemotePort
+			} else if sl.channelIdx == 2 && rtcPorts[1] == 0 {
+				rtcPorts[1] = st.RemotePort
+			} else if rtcPorts[0] == 0 {
+				rtcPorts[0] = st.RemotePort
+			} else if rtcPorts[1] == 0 {
+				rtcPorts[1] = st.RemotePort
+			}
+			if srttMs == 0 || (st.SRTTMs > 0 && st.SRTTMs < srttMs) {
+				srttMs = st.SRTTMs
+			}
+			if minRTTMs == 0 || (st.MinRTTMs > 0 && st.MinRTTMs < minRTTMs) {
+				minRTTMs = st.MinRTTMs
+			}
+			if st.Rate30sBps >= idleThresh {
+				anyActiveRate = true
 			}
 			rStreams += st.ActiveStream
 			sumPacing += st.PacingMbps
@@ -1034,6 +1232,18 @@ func (a *ApexScheduler) Stats() ApexStats {
 	}
 	lErr := a.lastErr
 	a.mu.Unlock()
+
+	_, _, hasHop := a.link.ParseHopRange()
+	hopState := "Offline"
+	if rAliveCount > 0 {
+		if !hasHop {
+			hopState = "Fixed"
+		} else if idlePause && !anyActiveRate {
+			hopState = "Paused(Idle)"
+		} else {
+			hopState = "Active"
+		}
+	}
 
 	if lErr == "" {
 		lErr = ps.LastErr
@@ -1065,10 +1275,16 @@ func (a *ApexScheduler) Stats() ApexStats {
 		Mode:          mode,
 		RTCConnected:  rAlive,
 		RTCPort:       rPort,
+		RTCPorts:      rtcPorts,
 		RTCRTTMs:      rRTT,
+		SRTTMs:        srttMs,
+		MinRTTMs:      minRTTMs,
 		TCPRTTMs:      tRTT,
 		RTTMs:         bestRTT,
 		FECRecovered:  rFEC,
+		HopCount:      rHops,
+		HopState:      hopState,
+		RekeyCount:    rRekey,
 		LossRate:      maxLoss,
 		PacingMbps:    sumPacing,
 		ActiveConns:   conns,
