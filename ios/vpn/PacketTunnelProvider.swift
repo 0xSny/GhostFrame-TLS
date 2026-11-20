@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import NetworkExtension
+import WidgetKit
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pathMonitor: NWPathMonitor?
@@ -69,6 +70,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 completionHandler(error)
                 return
             }
+            self?.notifyControlCenterReload()
             completionHandler(nil)
         }
     }
@@ -76,7 +78,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         stopNetworkMonitor()
         _ = GhostMobileBridge.stopEngine()
+        notifyControlCenterReload()
         completionHandler()
+    }
+
+    private func notifyControlCenterReload() {
+        if #available(iOS 18.0, *) {
+            ControlCenter.shared.reloadControls(ofKind: "GhostFrameVPNControlToggle")
+            ControlCenter.shared.reloadAllControls()
+        }
     }
 
     override func sleep(completionHandler: @escaping () -> Void) {

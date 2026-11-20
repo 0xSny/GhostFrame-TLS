@@ -29,6 +29,7 @@ targets:
       - path: Shared
       - path: vpn/VPNManager.swift
       - path: vpn/VPNApp.swift
+      - path: vpn/GhostVPNControlIntents.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.vpn
@@ -43,12 +44,15 @@ targets:
     dependencies:
       - target: GhostPacketTunnel
         embed: true
+      - target: GhostControlWidget
+        embed: true
       - framework: Frameworks/GhostMobile.xcframework
         embed: false
       - sdk: AVFoundation.framework
       - sdk: NetworkExtension.framework
       - sdk: Network.framework
       - sdk: Security.framework
+      - sdk: WidgetKit.framework
 
   GhostPacketTunnel:
     type: app-extension
@@ -80,3 +84,29 @@ targets:
       - sdk: NetworkExtension.framework
       - sdk: Network.framework
       - sdk: Security.framework
+      - sdk: WidgetKit.framework
+
+  GhostControlWidget:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: vpn/GhostVPNControlIntents.swift
+      - path: vpn/GhostControlWidget.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.vpn.control
+        PRODUCT_NAME: GhostControlWidget
+        INFOPLIST_FILE: vpn/ControlInfo.plist
+        CODE_SIGN_ENTITLEMENTS: vpn/Control.entitlements
+        APPLICATION_EXTENSION_API_ONLY: "YES"
+        SKIP_INSTALL: "YES"
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+          - "@executable_path/../../Frameworks"
+    dependencies:
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+      - sdk: AppIntents.framework
+      - sdk: NetworkExtension.framework

@@ -1,5 +1,6 @@
 import Foundation
 import NetworkExtension
+import WidgetKit
 
 @MainActor
 final class VPNManager: GhostBackend {
@@ -345,6 +346,7 @@ final class VPNManager: GhostBackend {
         if lastObservedStatus != status {
             lastObservedStatus = status
             onLogMessage?("VPN status -> \(Self.statusName(status))")
+            GhostVPNControlBridge.reloadControls()
         }
 
         switch status {

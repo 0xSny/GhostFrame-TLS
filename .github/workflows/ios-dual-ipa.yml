@@ -76,14 +76,21 @@ jobs:
           test -n "$VPN_APP" && test -d "$VPN_APP"
           APPEX="$VPN_APP/PlugIns/GhostPacketTunnel.appex"
           test -d "$APPEX"
+          CTRL_APPEX="$VPN_APP/PlugIns/GhostControlWidget.appex"
+          test -d "$CTRL_APPEX"
 
           echo "=== Verifying GhostPacketTunnel Info.plist ==="
           plutil -p "$APPEX/Info.plist"
           plutil -p "$APPEX/Info.plist" | grep -q "com.apple.networkextension.packet-tunnel"
           plutil -p "$APPEX/Info.plist" | grep -q "PacketTunnelProvider"
 
+          echo "=== Verifying GhostControlWidget Info.plist ==="
+          plutil -p "$CTRL_APPEX/Info.plist"
+          plutil -p "$CTRL_APPEX/Info.plist" | grep -q "com.apple.widgetkit-extension"
+
           # Inside-out ad-hoc entitlement stamping (strictly packet-tunnel-provider only, zero hardcoded App Group)
           codesign --force --sign - --entitlements ios/vpn/Tunnel.entitlements --timestamp=none "$APPEX"
+          codesign --force --sign - --entitlements ios/vpn/Control.entitlements --timestamp=none "$CTRL_APPEX"
           codesign --force --sign - --entitlements ios/vpn/App.entitlements --timestamp=none "$VPN_APP"
 
           echo "=== Verifying GhostPacketTunnel.appex entitlements ==="
@@ -91,6 +98,12 @@ jobs:
           echo "$APPEX_ENT"
           echo "$APPEX_ENT" | grep -q "packet-tunnel-provider"
           ! echo "$APPEX_ENT" | grep -q "application-groups"
+
+          echo "=== Verifying GhostControlWidget.appex entitlements ==="
+          CTRL_ENT="$(codesign -d --entitlements - --xml "$CTRL_APPEX" 2>&1)"
+          echo "$CTRL_ENT"
+          echo "$CTRL_ENT" | grep -q "packet-tunnel-provider"
+          ! echo "$CTRL_ENT" | grep -q "application-groups"
 
           echo "=== Verifying GhostFrameVPN.app entitlements ==="
           APP_ENT="$(codesign -d --entitlements - --xml "$VPN_APP" 2>&1)"
