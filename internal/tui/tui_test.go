@@ -276,27 +276,39 @@ func newMockOTAServer(t *testing.T, tag string, newBin []byte, checksumOverride 
 	return srv
 }
 
+func setupOTATestController(t *testing.T, oldBin []byte) (string, *Controller, string) {
+	t.Helper()
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "gft-server")
+	if len(oldBin) > 0 {
+		if err := os.WriteFile(target, oldBin, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := NewController(filepath.Join(tmp, "server.json"))
+	c.Out = &bytes.Buffer{}
+	c.Tx.LockPath = filepath.Join(tmp, "menu.lock")
+	c.Tx.PortProbeFn = func(int) error { return nil }
+	return tmp, c, target
+}
+
 func TestOTAUpgradeSuccessAndSHA256Verify(t *testing.T) {
 	oldBin := []byte("old-gft-server-v3.2.0")
 	newBin := []byte("new-gft-server-v4.1.0-elf")
 	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusOK)
 
-	tmp := t.TempDir()
-	target := filepath.Join(tmp, "gft-server")
-	if err := os.WriteFile(target, oldBin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	c := NewController(filepath.Join(tmp, "server.json"))
-	c.Out = &bytes.Buffer{}
+	_, c, target := setupOTATestController(t, oldBin)
 
 	verifiedPath := ""
 	restarted := 0
+	probedPort := 0
 	res, err := c.PerformOTAUpgrade(UpgradeOptions{
-		TargetBinary: target,
-		APIBaseURL:   srv.URL,
-		WebBaseURL:   srv.URL,
-		HTTPClient:   srv.Client(),
+		TargetBinary:  target,
+		APIBaseURL:    srv.URL,
+		WebBaseURL:    srv.URL,
+		HTTPClient:    srv.Client(),
+		ListenPort:    443,
+		SkipDiskCheck: true,
 		VerifyBinFn: func(p string) (string, error) {
 			verifiedPath = p
 			return "gft-server v4.1.0", nil
@@ -306,12 +318,16 @@ func TestOTAUpgradeSuccessAndSHA256Verify(t *testing.T) {
 			return nil
 		},
 		ActiveFn: func() bool { return true },
+		PortProbeFn: func(p int) error {
+			probedPort = p
+			return nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("PerformOTAUpgrade failed: %v", err)
 	}
-	if res.AlreadyLatest || res.ToVersion != "v4.1.0" || restarted != 1 || verifiedPath == "" {
-		t.Fatalf("unexpected upgrade result: %+v restarted=%d verified=%q", res, restarted, verifiedPath)
+	if res.AlreadyLatest || res.ToVersion != "v4.1.0" || restarted != 1 || verifiedPath == "" || probedPort != 443 {
+		t.Fatalf("unexpected upgrade result: %+v restarted=%d probed=%d verified=%q", res, restarted, probedPort, verifiedPath)
 	}
 
 	gotBin, err := os.ReadFile(target)
@@ -329,24 +345,18 @@ func TestOTAUpgradeSHA256MismatchAborts(t *testing.T) {
 	newBin := []byte("tampered-binary-payload")
 	srv := newMockOTAServer(t, "v4.1.0", newBin, strings.Repeat("0", 64), http.StatusOK)
 
-	tmp := t.TempDir()
-	target := filepath.Join(tmp, "gft-server")
-	if err := os.WriteFile(target, oldBin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	c := NewController(filepath.Join(tmp, "server.json"))
-	c.Out = &bytes.Buffer{}
+	_, c, target := setupOTATestController(t, oldBin)
 
 	restarted := 0
 	_, err := c.PerformOTAUpgrade(UpgradeOptions{
-		TargetBinary: target,
-		APIBaseURL:   srv.URL,
-		WebBaseURL:   srv.URL,
-		HTTPClient:   srv.Client(),
-		VerifyBinFn:  func(string) (string, error) { return "ok", nil },
-		RestartFn:    func() error { restarted++; return nil },
-		ActiveFn:     func() bool { return true },
+		TargetBinary:  target,
+		APIBaseURL:    srv.URL,
+		WebBaseURL:    srv.URL,
+		HTTPClient:    srv.Client(),
+		SkipDiskCheck: true,
+		VerifyBinFn:   func(string) (string, error) { return "ok", nil },
+		RestartFn:     func() error { restarted++; return nil },
+		ActiveFn:      func() bool { return true },
 	})
 	if err == nil || !strings.Contains(err.Error(), "SHA-256") {
 		t.Fatalf("expected SHA-256 mismatch error, got %v", err)
@@ -365,23 +375,17 @@ func TestOTAUpgradeRollbackOnRestartFailure(t *testing.T) {
 	newBin := []byte("crashing-new-binary")
 	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusOK)
 
-	tmp := t.TempDir()
-	target := filepath.Join(tmp, "gft-server")
-	if err := os.WriteFile(target, oldBin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	c := NewController(filepath.Join(tmp, "server.json"))
-	c.Out = &bytes.Buffer{}
+	_, c, target := setupOTATestController(t, oldBin)
 
 	restarts := 0
 	var seenOnRestart [][]byte
 	_, err := c.PerformOTAUpgrade(UpgradeOptions{
-		TargetBinary: target,
-		APIBaseURL:   srv.URL,
-		WebBaseURL:   srv.URL,
-		HTTPClient:   srv.Client(),
-		VerifyBinFn:  func(string) (string, error) { return "gft-server v4.1.0", nil },
+		TargetBinary:  target,
+		APIBaseURL:    srv.URL,
+		WebBaseURL:    srv.URL,
+		HTTPClient:    srv.Client(),
+		SkipDiskCheck: true,
+		VerifyBinFn:   func(string) (string, error) { return "gft-server v4.1.0", nil },
 		RestartFn: func() error {
 			restarts++
 			b, _ := os.ReadFile(target)
@@ -413,23 +417,17 @@ func TestOTAUpgradeRedirectFallbackOnAPIRateLimit(t *testing.T) {
 	newBin := []byte("new-binary-via-redirect")
 	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusForbidden)
 
-	tmp := t.TempDir()
-	target := filepath.Join(tmp, "gft-server")
-	if err := os.WriteFile(target, oldBin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	c := NewController(filepath.Join(tmp, "server.json"))
-	c.Out = &bytes.Buffer{}
+	_, c, target := setupOTATestController(t, oldBin)
 
 	res, err := c.PerformOTAUpgrade(UpgradeOptions{
-		TargetBinary: target,
-		APIBaseURL:   srv.URL,
-		WebBaseURL:   srv.URL,
-		HTTPClient:   srv.Client(),
-		VerifyBinFn:  func(string) (string, error) { return "gft-server v4.1.0", nil },
-		RestartFn:    func() error { return nil },
-		ActiveFn:     func() bool { return true },
+		TargetBinary:  target,
+		APIBaseURL:    srv.URL,
+		WebBaseURL:    srv.URL,
+		HTTPClient:    srv.Client(),
+		SkipDiskCheck: true,
+		VerifyBinFn:   func(string) (string, error) { return "gft-server v4.1.0", nil },
+		RestartFn:     func() error { return nil },
+		ActiveFn:      func() bool { return true },
 	})
 	if err != nil {
 		t.Fatalf("PerformOTAUpgrade via 302 redirect fallback failed: %v", err)
@@ -440,5 +438,107 @@ func TestOTAUpgradeRedirectFallbackOnAPIRateLimit(t *testing.T) {
 	gotBin, _ := os.ReadFile(target)
 	if !bytes.Equal(gotBin, newBin) {
 		t.Fatalf("target binary not updated via redirect fallback")
+	}
+}
+
+func TestOTAUpgradeRollbackOnPortProbeFailure(t *testing.T) {
+	oldBin := []byte("healthy-v400-binary")
+	newBin := []byte("broken-bind-binary")
+	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusOK)
+
+	_, c, target := setupOTATestController(t, oldBin)
+
+	restarts := 0
+	_, err := c.PerformOTAUpgrade(UpgradeOptions{
+		TargetBinary:  target,
+		APIBaseURL:    srv.URL,
+		WebBaseURL:    srv.URL,
+		HTTPClient:    srv.Client(),
+		ListenPort:    14443,
+		SkipDiskCheck: true,
+		VerifyBinFn:   func(string) (string, error) { return "gft-server v4.1.0", nil },
+		RestartFn:     func() error { restarts++; return nil },
+		ActiveFn:      func() bool { return true },
+		PortProbeFn:   func(int) error { return errors.New("connection refused") },
+	})
+	if err == nil || !strings.Contains(err.Error(), "回滚") {
+		t.Fatalf("expected port-probe failure rollback error, got %v", err)
+	}
+	if restarts != 2 {
+		t.Fatalf("expected 2 restart calls (initial + rollback), got %d", restarts)
+	}
+	gotBin, _ := os.ReadFile(target)
+	if !bytes.Equal(gotBin, oldBin) {
+		t.Fatalf("target binary not rolled back after port probe failure")
+	}
+}
+
+func TestOTAManualRollbackSuccess(t *testing.T) {
+	oldBin := []byte("known-good-v400")
+	newBin := []byte("canary-v410")
+	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusOK)
+
+	_, c, target := setupOTATestController(t, oldBin)
+
+	_, err := c.PerformOTAUpgrade(UpgradeOptions{
+		TargetBinary:  target,
+		APIBaseURL:    srv.URL,
+		WebBaseURL:    srv.URL,
+		HTTPClient:    srv.Client(),
+		ListenPort:    443,
+		SkipDiskCheck: true,
+		VerifyBinFn:   func(string) (string, error) { return "gft-server v4.1.0", nil },
+		RestartFn:     func() error { return nil },
+		ActiveFn:      func() bool { return true },
+		PortProbeFn:   func(int) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("initial upgrade failed: %v", err)
+	}
+
+	probed := false
+	rb, err := c.PerformOTARollback(UpgradeOptions{
+		TargetBinary: target,
+		ListenPort:   443,
+		VerifyBinFn:  func(string) (string, error) { return "gft-server v4.0.0-LTS", nil },
+		RestartFn:    func() error { return nil },
+		ActiveFn:     func() bool { return true },
+		PortProbeFn:  func(int) error { probed = true; return nil },
+	})
+	if err != nil {
+		t.Fatalf("PerformOTARollback failed: %v", err)
+	}
+	if !probed || rb.RestoredBanner != "gft-server v4.0.0-LTS" {
+		t.Fatalf("unexpected rollback result: %+v probed=%v", rb, probed)
+	}
+	gotBin, _ := os.ReadFile(target)
+	if !bytes.Equal(gotBin, oldBin) {
+		t.Fatalf("expected old binary restored on manual rollback")
+	}
+}
+
+func TestOTAUpgradeConcurrentLockPreventsRace(t *testing.T) {
+	oldBin := []byte("locked-binary")
+	newBin := []byte("should-not-overwrite")
+	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusOK)
+
+	_, c, target := setupOTATestController(t, oldBin)
+	if err := os.WriteFile(c.Tx.LockPath, []byte("99999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := c.PerformOTAUpgrade(UpgradeOptions{
+		TargetBinary:  target,
+		APIBaseURL:    srv.URL,
+		WebBaseURL:    srv.URL,
+		HTTPClient:    srv.Client(),
+		SkipDiskCheck: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "holds lock") {
+		t.Fatalf("expected lock contention error, got %v", err)
+	}
+	gotBin, _ := os.ReadFile(target)
+	if !bytes.Equal(gotBin, oldBin) {
+		t.Fatalf("binary modified despite active lock")
 	}
 }

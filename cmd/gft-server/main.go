@@ -30,7 +30,7 @@ func main() {
 	}
 
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: gft-server <run|init|link|menu|upgrade|show-card|sni-test|version> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: gft-server <run|init|link|menu|upgrade|rollback|show-card|sni-test|version> [flags]")
 		os.Exit(2)
 	}
 
@@ -39,6 +39,8 @@ func main() {
 		runMenu(os.Args[2:])
 	case "upgrade":
 		runUpgrade(os.Args[2:])
+	case "rollback":
+		runRollback(os.Args[2:])
 	case "init":
 		runInit(os.Args[2:])
 	case "link":
@@ -127,6 +129,20 @@ func runUpgrade(args []string) {
 		return
 	}
 	fmt.Printf("Upgraded GhostFrame server: %s -> %s (SHA-256: %s)\n", res.FromVersion, res.ToVersion, res.SHA256)
+}
+
+func runRollback(args []string) {
+	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
+	conf := fs.String("config", tui.DefaultConfigPath, "config file")
+	_ = fs.Parse(args)
+
+	ctrl := tui.NewController(*conf)
+	res, err := ctrl.PerformOTARollback(tui.UpgradeOptions{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gft rollback error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Rolled back GhostFrame server to: %s (from %s)\n", res.RestoredBanner, res.BackupPath)
 }
 
 func runInit(args []string) {

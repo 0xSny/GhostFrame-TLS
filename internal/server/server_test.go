@@ -556,8 +556,8 @@ func TestWebPanelRTCConfigUpdateAndSVGQR(t *testing.T) {
 	var stBody map[string]any
 	_ = json.NewDecoder(stResp.Body).Decode(&stBody)
 	stResp.Body.Close()
-	if stBody["version"] != "v4.0.0-LTS" {
-		t.Fatalf("expected stats version v4.0.0-LTS, got %v", stBody["version"])
+	if stBody["version"] != "v4.0.1-LTS" {
+		t.Fatalf("expected stats version v4.0.1-LTS, got %v", stBody["version"])
 	}
 	if en, _ := stBody["rtc_enabled"].(bool); !en {
 		t.Fatalf("expected rtc_enabled=true, got %v", stBody["rtc_enabled"])

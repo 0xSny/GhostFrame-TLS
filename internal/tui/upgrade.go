@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,26 +21,45 @@ import (
 )
 
 // CurrentVersion is the canonical release identifier compiled into server & TUI binaries.
-const CurrentVersion = "v4.0.0-LTS"
+const CurrentVersion = "v4.0.1-LTS"
 
 const (
-	defaultGitHubAPIBase = "https://api.github.com"
-	defaultGitHubWebBase = "https://github.com"
-	defaultTargetBinary  = "/opt/ghostframe/gft-server"
-	defaultSystemdUnit   = "/etc/systemd/system/ghostframe.service"
-	maxUpgradeBinarySize = 128 << 20 // 128 MiB safety cap
+	defaultGitHubAPIBase   = "https://api.github.com"
+	defaultGitHubWebBase   = "https://github.com"
+	defaultTargetBinary    = "/opt/ghostframe/gft-server"
+	defaultSystemdUnit     = "/etc/systemd/system/ghostframe.service"
+	maxUpgradeBinarySize   = 128 << 20 // 128 MiB safety cap
+	minUpgradeDiskFreeByte = 64 << 20  // 64 MiB free space preflight
 )
 
 // ReleaseInfo describes a resolved GitHub Release target and its verification assets.
 type ReleaseInfo struct {
-	TagName     string
-	AssetName   string
-	BinaryURL   string
-	ChecksumURL string
-	ViaRedirect bool
+	TagName      string
+	AssetName    string
+	BinaryURL    string
+	ChecksumURL  string
+	PublishedAt  string
+	ReleaseNotes string
+	ViaRedirect  bool
 }
 
-// UpgradeOptions parameterizes OTA self-upgrade and allows deterministic unit testing.
+// BackupInfo describes an on-disk previous server binary available for instant rollback.
+type BackupInfo struct {
+	Path    string
+	Size    int64
+	ModTime time.Time
+	Banner  string
+}
+
+// RollbackResult summarizes a restored binary rollback.
+type RollbackResult struct {
+	FromVersion     string
+	RestoredBanner  string
+	BackupPath      string
+	PreRollbackPath string
+}
+
+// UpgradeOptions parameterizes OTA self-upgrade/rollback and allows deterministic unit testing.
 type UpgradeOptions struct {
 	TargetVersion string // "" or "latest" queries GitHub latest release; explicit tag downloads directly
 	MirrorPrefix  string // optional proxy/mirror prefix (e.g. "https://ghfast.top/")
@@ -52,8 +72,12 @@ type UpgradeOptions struct {
 	HTTPClient    *http.Client
 	RestartFn     func() error
 	ActiveFn      func() bool
+	PortProbeFn   func(port int) error
+	ListenPort    int
 	VerifyBinFn   func(path string) (string, error)
 	ProgressFn    func(msg string)
+	SkipLock      bool
+	SkipDiskCheck bool
 }
 
 // UpgradeResult summarizes a completed or skipped OTA upgrade.
@@ -81,7 +105,35 @@ func normalizeVersionTag(v string) string {
 	return strings.TrimSpace(s)
 }
 
-func resolveReleaseOptions(opts UpgradeOptions) UpgradeOptions {
+func summarizeReleaseNotes(body string) string {
+	if strings.TrimSpace(body) == "" {
+		return ""
+	}
+	var kept []string
+	totalRunes := 0
+	for _, ln := range strings.Split(body, "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" {
+			continue
+		}
+		r := []rune(t)
+		if totalRunes+len(r) > 360 {
+			rem := 360 - totalRunes
+			if rem > 3 {
+				kept = append(kept, string(r[:rem-3])+"...")
+			}
+			break
+		}
+		kept = append(kept, t)
+		totalRunes += len(r)
+		if len(kept) >= 6 {
+			break
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
+func (c *Controller) resolveUpgradeOptions(opts UpgradeOptions) (UpgradeOptions, int) {
 	if strings.TrimSpace(opts.Repo) == "" {
 		opts.Repo = ReleaseRepo
 	}
@@ -107,13 +159,63 @@ func resolveReleaseOptions(opts UpgradeOptions) UpgradeOptions {
 	if opts.HTTPClient == nil {
 		opts.HTTPClient = &http.Client{}
 	}
+	if opts.RestartFn == nil {
+		opts.RestartFn = c.Tx.RestartFn
+	}
+	if opts.ActiveFn == nil {
+		opts.ActiveFn = c.Tx.ActiveFn
+	}
+	if opts.PortProbeFn == nil {
+		opts.PortProbeFn = c.Tx.PortProbeFn
+	}
+	if opts.VerifyBinFn == nil {
+		opts.VerifyBinFn = defaultVerifyBinary
+	}
+	if opts.ProgressFn == nil {
+		opts.ProgressFn = func(msg string) {
+			c.printf("%s\n", msg)
+		}
+	}
+
+	port := opts.ListenPort
+	if port <= 0 && c.CfgPath != "" {
+		if cfg, err := server.LoadConfig(c.CfgPath); err == nil {
+			port = ConfigListenPort(cfg.Listen)
+		}
+	}
+	return opts, port
+}
+
+func resolveReleaseQueryOptions(opts UpgradeOptions) UpgradeOptions {
+	if strings.TrimSpace(opts.Repo) == "" {
+		opts.Repo = ReleaseRepo
+	}
+	if strings.TrimSpace(opts.Arch) == "" {
+		opts.Arch = runtime.GOARCH
+	}
+	if strings.TrimSpace(opts.MirrorPrefix) == "" {
+		opts.MirrorPrefix = strings.TrimSpace(os.Getenv("GFT_MIRROR"))
+	}
+	if strings.TrimSpace(opts.APIBaseURL) == "" {
+		opts.APIBaseURL = defaultGitHubAPIBase
+	} else {
+		opts.APIBaseURL = strings.TrimRight(opts.APIBaseURL, "/")
+	}
+	if strings.TrimSpace(opts.WebBaseURL) == "" {
+		opts.WebBaseURL = defaultGitHubWebBase
+	} else {
+		opts.WebBaseURL = strings.TrimRight(opts.WebBaseURL, "/")
+	}
+	if opts.HTTPClient == nil {
+		opts.HTTPClient = &http.Client{}
+	}
 	return opts
 }
 
 // CheckLatestRelease resolves release metadata via GitHub Releases API, falling back
 // to the web /releases/latest 302 redirect if the REST API is rate-limited or unreachable.
 func CheckLatestRelease(ctx context.Context, opts UpgradeOptions) (*ReleaseInfo, error) {
-	opts = resolveReleaseOptions(opts)
+	opts = resolveReleaseQueryOptions(opts)
 	assetName := fmt.Sprintf("gft-server-linux-%s", opts.Arch)
 	target := strings.TrimSpace(opts.TargetVersion)
 
@@ -161,8 +263,10 @@ func fetchReleaseFromAPI(ctx context.Context, client *http.Client, apiURL, asset
 	}
 
 	var payload struct {
-		TagName string `json:"tag_name"`
-		Assets  []struct {
+		TagName     string `json:"tag_name"`
+		PublishedAt string `json:"published_at"`
+		Body        string `json:"body"`
+		Assets      []struct {
 			Name string `json:"name"`
 			URL  string `json:"browser_download_url"`
 		} `json:"assets"`
@@ -188,10 +292,12 @@ func fetchReleaseFromAPI(ctx context.Context, client *http.Client, apiURL, asset
 	}
 
 	return &ReleaseInfo{
-		TagName:     strings.TrimSpace(payload.TagName),
-		AssetName:   assetName,
-		BinaryURL:   applyMirrorURL(mirror, binURL),
-		ChecksumURL: applyMirrorURL(mirror, sumURL),
+		TagName:      strings.TrimSpace(payload.TagName),
+		AssetName:    assetName,
+		BinaryURL:    applyMirrorURL(mirror, binURL),
+		ChecksumURL:  applyMirrorURL(mirror, sumURL),
+		PublishedAt:  strings.TrimSpace(payload.PublishedAt),
+		ReleaseNotes: summarizeReleaseNotes(payload.Body),
 	}, nil
 }
 
@@ -261,7 +367,7 @@ func extractTagFromLocation(loc string) string {
 	return rest
 }
 
-func httpGetBytesWithClient(ctx context.Context, client *http.Client, u string) ([]byte, error) {
+func httpGetBytesWithProgress(ctx context.Context, client *http.Client, u string, onProgress func(downloaded, total int64)) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -275,14 +381,43 @@ func httpGetBytesWithClient(ctx context.Context, client *http.Client, u string) 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("download %s: HTTP %d", u, resp.StatusCode)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxUpgradeBinarySize+1))
-	if err != nil {
-		return nil, err
+
+	var dst bytes.Buffer
+	if resp.ContentLength > 0 && resp.ContentLength <= maxUpgradeBinarySize {
+		dst.Grow(int(resp.ContentLength))
 	}
-	if len(data) > maxUpgradeBinarySize {
-		return nil, fmt.Errorf("download %s exceeded %d bytes cap", u, maxUpgradeBinarySize)
+
+	lr := io.LimitReader(resp.Body, maxUpgradeBinarySize+1)
+	buf := make([]byte, 32*1024)
+	var downloaded int64
+	var lastReported int64
+	lastTick := time.Now()
+
+	for {
+		n, rerr := lr.Read(buf)
+		if n > 0 {
+			dst.Write(buf[:n])
+			downloaded += int64(n)
+			if downloaded > maxUpgradeBinarySize {
+				return nil, fmt.Errorf("download %s exceeded %d bytes cap", u, maxUpgradeBinarySize)
+			}
+			if onProgress != nil && (downloaded-lastReported >= 512*1024 || time.Since(lastTick) >= 250*time.Millisecond) {
+				onProgress(downloaded, resp.ContentLength)
+				lastReported = downloaded
+				lastTick = time.Now()
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				break
+			}
+			return nil, rerr
+		}
 	}
-	return data, nil
+	if onProgress != nil && downloaded > 0 && downloaded != lastReported {
+		onProgress(downloaded, resp.ContentLength)
+	}
+	return dst.Bytes(), nil
 }
 
 func parseChecksumForAsset(sumBytes []byte, assetName string) (string, error) {
@@ -309,24 +444,79 @@ func defaultVerifyBinary(path string) (string, error) {
 	return banner, nil
 }
 
+// InspectBackup returns metadata about the previous server binary (.bak) if present.
+func InspectBackup(targetBinary string) (BackupInfo, bool) {
+	if strings.TrimSpace(targetBinary) == "" {
+		targetBinary = defaultTargetBinary
+	}
+	bak := targetBinary + ".bak"
+	fi, err := os.Stat(bak)
+	if err != nil || fi.IsDir() || fi.Size() == 0 {
+		return BackupInfo{}, false
+	}
+	info := BackupInfo{
+		Path:    bak,
+		Size:    fi.Size(),
+		ModTime: fi.ModTime(),
+	}
+	if banner, berr := defaultVerifyBinary(bak); berr == nil {
+		info.Banner = banner
+	}
+	return info, true
+}
+
+func fileSHA256Hex(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func verifyRestartHealthy(restartFn func() error, activeFn func() bool, portProbeFn func(int) error, listenPort int) error {
+	if err := restartFn(); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(2500 * time.Millisecond)
+	var lastErr error
+	for {
+		if activeFn() {
+			if listenPort > 0 && portProbeFn != nil {
+				if perr := portProbeFn(listenPort); perr == nil {
+					return nil
+				} else {
+					lastErr = perr
+				}
+			} else {
+				return nil
+			}
+		} else {
+			lastErr = errors.New("service not active yet")
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if lastErr == nil {
+		lastErr = errors.New("service health check timed out after 2.5s")
+	}
+	return lastErr
+}
+
 // PerformOTAUpgrade downloads the target release binary, verifies its SHA-256 digest and
 // runnable architecture, backs up the active binary, swaps atomically, restarts systemd,
-// and rolls back automatically if startup health checks fail.
+// verifies active status + listen port health, and rolls back automatically on failure.
 func (c *Controller) PerformOTAUpgrade(opts UpgradeOptions) (*UpgradeResult, error) {
-	opts = resolveReleaseOptions(opts)
-	if opts.RestartFn == nil {
-		opts.RestartFn = c.Tx.RestartFn
-	}
-	if opts.ActiveFn == nil {
-		opts.ActiveFn = c.Tx.ActiveFn
-	}
-	if opts.VerifyBinFn == nil {
-		opts.VerifyBinFn = defaultVerifyBinary
-	}
-	if opts.ProgressFn == nil {
-		opts.ProgressFn = func(msg string) {
-			c.printf("%s\n", msg)
+	opts, listenPort := c.resolveUpgradeOptions(opts)
+
+	if !opts.SkipLock && c.Tx != nil {
+		unlock, err := c.Tx.acquireLock()
+		if err != nil {
+			return nil, err
 		}
+		defer unlock()
 	}
 
 	opts.ProgressFn(fmt.Sprintf("正在检查 %s 最新发行版 (当前: %s, 架构: %s)...", opts.Repo, CurrentVersion, opts.Arch))
@@ -346,9 +536,16 @@ func (c *Controller) PerformOTAUpgrade(opts UpgradeOptions) (*UpgradeResult, err
 		}, nil
 	}
 
-	opts.ProgressFn(fmt.Sprintf("发现目标版本 %s，正在获取 checksums.txt 并下载 %s...", rel.TagName, rel.AssetName))
+	target := opts.TargetBinary
+	if !opts.SkipDiskCheck {
+		if err := checkAvailableDiskSpace(filepath.Dir(target), minUpgradeDiskFreeByte); err != nil {
+			return nil, err
+		}
+	}
+
+	opts.ProgressFn(fmt.Sprintf("发现目标版本 %s，正在获取 checksums.txt 并校验发布清单...", rel.TagName))
 	sumCtx, sumCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	sumBytes, err := httpGetBytesWithClient(sumCtx, opts.HTTPClient, rel.ChecksumURL)
+	sumBytes, err := httpGetBytesWithProgress(sumCtx, opts.HTTPClient, rel.ChecksumURL, nil)
 	sumCancel()
 	if err != nil {
 		return nil, fmt.Errorf("获取校验清单失败: %w", err)
@@ -359,7 +556,16 @@ func (c *Controller) PerformOTAUpgrade(opts UpgradeOptions) (*UpgradeResult, err
 	}
 
 	binCtx, binCancel := context.WithTimeout(context.Background(), 120*time.Second)
-	binBytes, err := httpGetBytesWithClient(binCtx, opts.HTTPClient, rel.BinaryURL)
+	binBytes, err := httpGetBytesWithProgress(binCtx, opts.HTTPClient, rel.BinaryURL, func(downloaded, total int64) {
+		mbDone := float64(downloaded) / (1 << 20)
+		if total > 0 {
+			mbTot := float64(total) / (1 << 20)
+			pct := float64(downloaded) * 100 / float64(total)
+			opts.ProgressFn(fmt.Sprintf("正在下载 %s: %.1f / %.1f MB (%.0f%%)", rel.AssetName, mbDone, mbTot, pct))
+		} else {
+			opts.ProgressFn(fmt.Sprintf("正在下载 %s: %.1f MB", rel.AssetName, mbDone))
+		}
+	})
 	binCancel()
 	if err != nil {
 		return nil, fmt.Errorf("下载服务端二进制失败: %w", err)
@@ -372,10 +578,11 @@ func (c *Controller) PerformOTAUpgrade(opts UpgradeOptions) (*UpgradeResult, err
 	}
 	opts.ProgressFn(fmt.Sprintf("SHA-256 校验通过 (%s...)", gotHash[:16]))
 
-	target := opts.TargetBinary
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return nil, err
 	}
+
+	cfgDigestBefore := fileSHA256Hex(c.CfgPath)
 
 	stagingPath := fmt.Sprintf("%s.staging.%d", target, os.Getpid())
 	sf, err := os.OpenFile(stagingPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
@@ -398,7 +605,7 @@ func (c *Controller) PerformOTAUpgrade(opts UpgradeOptions) (*UpgradeResult, err
 	if err != nil {
 		return nil, err
 	}
-	opts.ProgressFn("新版本自检通过: " + banner)
+	opts.ProgressFn("新版本可执行性自检通过: " + banner)
 
 	var bakPath string
 	if oldBytes, rerr := os.ReadFile(target); rerr == nil && len(oldBytes) > 0 {
@@ -413,38 +620,11 @@ func (c *Controller) PerformOTAUpgrade(opts UpgradeOptions) (*UpgradeResult, err
 	}
 
 	if target == defaultTargetBinary {
-		if _, serr := os.Stat("/usr/local/bin"); serr == nil {
-			linkPath := "/usr/local/bin/gft"
-			if dst, lerr := os.Readlink(linkPath); lerr != nil || dst != defaultTargetBinary {
-				_ = os.Remove(linkPath)
-				_ = os.Symlink(defaultTargetBinary, linkPath)
-			}
-		}
+		ensureLocalSymlink()
 	}
 
-	opts.ProgressFn("正在重启 GhostFrame 服务端并执行启动健康检查...")
-	var startErr error
-	if err := opts.RestartFn(); err != nil {
-		startErr = err
-	} else {
-		deadline := time.Now().Add(2500 * time.Millisecond)
-		activeOK := false
-		for {
-			if opts.ActiveFn() {
-				activeOK = true
-				break
-			}
-			if !time.Now().Before(deadline) {
-				break
-			}
-			time.Sleep(250 * time.Millisecond)
-		}
-		if !activeOK {
-			startErr = errors.New("service failed to become active within 2.5s")
-		}
-	}
-
-	if startErr != nil {
+	opts.ProgressFn("正在重启 GhostFrame 服务端并执行启动与端口健康检查...")
+	if startErr := verifyRestartHealthy(opts.RestartFn, opts.ActiveFn, opts.PortProbeFn, listenPort); startErr != nil {
 		if bakPath != "" {
 			if bakBytes, rerr := os.ReadFile(bakPath); rerr == nil {
 				_ = server.WriteFileAtomic(target, bakBytes, 0o755)
@@ -452,6 +632,12 @@ func (c *Controller) PerformOTAUpgrade(opts UpgradeOptions) (*UpgradeResult, err
 			_ = opts.RestartFn()
 		}
 		return nil, fmt.Errorf("升级后服务启动校验失败: %w (已自动回滚至 %s)", startErr, CurrentVersion)
+	}
+
+	if cfgDigestBefore != "" {
+		if cfgDigestAfter := fileSHA256Hex(c.CfgPath); cfgDigestAfter != "" && cfgDigestAfter != cfgDigestBefore {
+			opts.ProgressFn("警告: 检测到配置文件摘要在重启后发生外部变化，请确认配置状态。")
+		}
 	}
 
 	if target == defaultTargetBinary {
@@ -467,6 +653,74 @@ func (c *Controller) PerformOTAUpgrade(opts UpgradeOptions) (*UpgradeResult, err
 		BackupPath:     bakPath,
 		VerifiedBanner: banner,
 	}, nil
+}
+
+// PerformOTARollback restores TargetBinary from its .bak snapshot, restarts systemd,
+// verifies health, and reverts to pre-rollback if the backup fails to boot.
+func (c *Controller) PerformOTARollback(opts UpgradeOptions) (*RollbackResult, error) {
+	opts, listenPort := c.resolveUpgradeOptions(opts)
+
+	if !opts.SkipLock && c.Tx != nil {
+		unlock, err := c.Tx.acquireLock()
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
+	}
+
+	target := opts.TargetBinary
+	bakPath := target + ".bak"
+	bakBytes, err := os.ReadFile(bakPath)
+	if err != nil || len(bakBytes) == 0 {
+		return nil, fmt.Errorf("未找到可回滚的历史备份 (%s)", bakPath)
+	}
+
+	banner, err := opts.VerifyBinFn(bakPath)
+	if err != nil {
+		return nil, fmt.Errorf("历史备份校验失败 (%s): %w", bakPath, err)
+	}
+	opts.ProgressFn("备份校验通过，准备回滚至: " + banner)
+
+	var prePath string
+	if curBytes, rerr := os.ReadFile(target); rerr == nil && len(curBytes) > 0 {
+		prePath = target + ".pre-rollback"
+		if perr := server.WriteFileAtomic(prePath, curBytes, 0o755); perr != nil {
+			return nil, fmt.Errorf("保存回滚前快照失败: %w", perr)
+		}
+	}
+
+	if err := server.WriteFileAtomic(target, bakBytes, 0o755); err != nil {
+		return nil, fmt.Errorf("恢复备份文件失败: %w", err)
+	}
+
+	opts.ProgressFn("正在重启 GhostFrame 服务端并校验回滚后健康状态...")
+	if startErr := verifyRestartHealthy(opts.RestartFn, opts.ActiveFn, opts.PortProbeFn, listenPort); startErr != nil {
+		if prePath != "" {
+			if preBytes, rerr := os.ReadFile(prePath); rerr == nil {
+				_ = server.WriteFileAtomic(target, preBytes, 0o755)
+			}
+			_ = opts.RestartFn()
+		}
+		return nil, fmt.Errorf("回滚后服务启动失败: %w", startErr)
+	}
+
+	return &RollbackResult{
+		FromVersion:     CurrentVersion,
+		RestoredBanner:  banner,
+		BackupPath:      bakPath,
+		PreRollbackPath: prePath,
+	}, nil
+}
+
+func ensureLocalSymlink() {
+	if _, serr := os.Stat("/usr/local/bin"); serr != nil {
+		return
+	}
+	linkPath := "/usr/local/bin/gft"
+	if dst, lerr := os.Readlink(linkPath); lerr != nil || dst != defaultTargetBinary {
+		_ = os.Remove(linkPath)
+		_ = os.Symlink(defaultTargetBinary, linkPath)
+	}
 }
 
 func refreshSystemdUnitDescription(unitPath string) {

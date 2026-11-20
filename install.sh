@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# GhostFrame-RTC (GFT) v4.0.0-LTS Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
+# GhostFrame-RTC (GFT) v4.0 LTS Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
 REPO="Spittingjiu/GhostFrame-TLS"
 ROLE="server"
 UNATTENDED=0
@@ -21,7 +21,7 @@ die()  { printf "\033[1;31m[×]\033[0m %s\n" "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-GhostFrame-RTC (GFT) v4.0.0-LTS Installer
+GhostFrame-RTC (GFT) v4.0 LTS Installer
 
 Usage:
   install.sh [options]

@@ -103,10 +103,13 @@ func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState s
 	}
 
 	port := ConfigListenPort(cfg.Listen)
-	bwBadge := fmt.Sprintf("↑%d / ↓%d Mbps (0=自动)", cfg.UpMbps, cfg.DownMbps)
+	bwBadge := "自动"
+	if cfg.UpMbps > 0 || cfg.DownMbps > 0 {
+		bwBadge = fmt.Sprintf("↑%d/↓%dM", cfg.UpMbps, cfg.DownMbps)
+	}
 	sb.WriteString(b.Line(fmt.Sprintf("服务状态: %s   |  内核拥塞: %s  |  监听端口: %d", svcBadge, bbrState, port)) + "\n")
 	sb.WriteString(b.Line(fmt.Sprintf("双栈传输: %s  |  UDP 跳跃: %s   |  校验模式: %s", rtcBadge, hopBadge, strings.ToUpper(cfg.CertMode))) + "\n")
-	sb.WriteString(b.Line(fmt.Sprintf("伪装域名: %s (本机握手: %s) | 回落: %s | 默认带宽: %s", cfg.SNI, rttTxt, cfg.FallbackMode, bwBadge)) + "\n")
+	sb.WriteString(b.Line(fmt.Sprintf("伪装域名: %s (握手: %s) | 回落: %s | 带宽: %s", cfg.SNI, rttTxt, cfg.FallbackMode, bwBadge)) + "\n")
 	sb.WriteString(b.Line(fmt.Sprintf("实时流量: ↑%s ↓%s (速率 ↑%s/s ↓%s/s) | 拦截探测: %d 次",
 		fmtBytes(snap.TotalUp), fmtBytes(snap.TotalDown),
 		fmtBytes(snap.UpBps), fmtBytes(snap.DownBps), snap.BlockedCount)) + "\n")
@@ -659,19 +662,34 @@ func (c *Controller) handleSelfCheckMenu(sc *bufio.Scanner, cfg *server.Config) 
 func (c *Controller) handleOneClickUpgradeMenu(sc *bufio.Scanner) {
 	c.printf("\n--- 一键升级 GhostFrame 服务端 (OTA 热更新) ---\n")
 	c.printf("  当前版本: %s  |  目标架构: linux/%s\n", CurrentVersion, runtime.GOARCH)
+	if bak, ok := InspectBackup(defaultTargetBinary); ok {
+		c.printf("  可回滚旧版: %s (备份于 %s)\n", nonEmpty(bak.Banner, bak.Path), bak.ModTime.Format("2006-01-02 15:04"))
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	rel, err := CheckLatestRelease(ctx, UpgradeOptions{})
 	cancel()
 	if err != nil {
 		c.warnMsg(fmt.Sprintf("直连检测最新版本失败 (%v)，可尝试使用国内镜像加速 [m]。", err))
-	} else if strings.EqualFold(normalizeVersionTag(rel.TagName), normalizeVersionTag(CurrentVersion)) {
-		c.okMsg(fmt.Sprintf("远端最新版本: %s (与当前版本一致)", rel.TagName))
 	} else {
-		c.printf("  发现新版本: %s (资源: %s)\n", c.Box.c("\x1b[32m", rel.TagName), rel.AssetName)
+		pubStr := ""
+		if rel.PublishedAt != "" {
+			pubStr = "  |  发布: " + rel.PublishedAt
+		}
+		if strings.EqualFold(normalizeVersionTag(rel.TagName), normalizeVersionTag(CurrentVersion)) {
+			c.okMsg(fmt.Sprintf("远端最新版本: %s (与当前版本一致%s)", rel.TagName, pubStr))
+		} else {
+			c.printf("  发现新版本: %s (资源: %s%s)\n", c.Box.c("\x1b[32m", rel.TagName), rel.AssetName, pubStr)
+		}
+		if rel.ReleaseNotes != "" {
+			c.printf("  更新摘要:\n")
+			for _, ln := range strings.Split(rel.ReleaseNotes, "\n") {
+				c.printf("    %s\n", ln)
+			}
+		}
 	}
 
-	action := strings.ToLower(strings.TrimSpace(c.prompt(sc, "操作 [直接回车=一键升级最新 / m=国内镜像加速 / v=指定版本 / f=强制重装 / 0=返回]:")))
+	action := strings.ToLower(strings.TrimSpace(c.prompt(sc, "操作 [直接回车=一键升级最新 / m=国内镜像加速 / v=指定版本 / f=强制重装 / r=回滚旧版 / 0=返回]:")))
 	var opts UpgradeOptions
 	switch action {
 	case "0", "q", "exit":
@@ -692,6 +710,27 @@ func (c *Controller) handleOneClickUpgradeMenu(sc *bufio.Scanner) {
 		opts = UpgradeOptions{TargetVersion: tag, Force: true}
 	case "f":
 		opts = UpgradeOptions{TargetVersion: "latest", Force: true}
+	case "r":
+		bak, ok := InspectBackup(defaultTargetBinary)
+		if !ok {
+			c.warnMsg("未找到可回滚的历史版本备份。")
+			c.pause(sc)
+			return
+		}
+		if !strings.EqualFold(c.prompt(sc, fmt.Sprintf("确认回滚服务端至 %s? [y/N]:", nonEmpty(bak.Banner, bak.Path))), "y") {
+			c.pause(sc)
+			return
+		}
+		rb, rerr := c.PerformOTARollback(UpgradeOptions{})
+		if rerr != nil {
+			c.errMsg("回滚失败: " + rerr.Error())
+			c.pause(sc)
+			return
+		}
+		c.okMsg(fmt.Sprintf("服务端已成功回滚至: %s", rb.RestoredBanner))
+		c.printf("  配置与客户端链接 (/etc/gft/server.json) 保持 100%% 不变。\n")
+		c.finishSelfReplacingFlow(sc)
+		return
 	default:
 		c.warnMsg("未识别的操作指令。")
 		c.pause(sc)
@@ -726,7 +765,19 @@ func (c *Controller) handleOneClickUpgradeMenu(sc *bufio.Scanner) {
 		c.printf("  旧版备份: %s\n", res.BackupPath)
 	}
 	c.printf("  配置与客户端链接 (/etc/gft/server.json) 保持 100%% 不变。\n")
-	c.printf("  提示: 重新输入 `gft` 即可进入新版控制面板。\n")
+	c.finishSelfReplacingFlow(sc)
+}
+
+func (c *Controller) finishSelfReplacingFlow(sc *bufio.Scanner) {
+	if runtime.GOOS != "windows" {
+		if fi, err := os.Stat(defaultTargetBinary); err == nil && !fi.IsDir() {
+			c.printf("\n按 Enter 无缝重载新版控制面板...")
+			sc.Scan()
+			if err := reexecSelf(defaultTargetBinary, os.Args); err == nil {
+				return
+			}
+		}
+	}
 	c.pause(sc)
 }
 

@@ -14,7 +14,7 @@ import (
 	"ghostframe/internal/gft"
 )
 
-const version = "v4.0.0-LTS"
+const version = "v4.0.1-LTS"
 
 func main() {
 	cfgFlag := flag.String("config", "", "optional path to client.json (e.g. /etc/gft/client.json)")
