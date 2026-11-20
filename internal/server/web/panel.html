@@ -198,6 +198,10 @@ tr:hover td { background: var(--bg-card-hover); }
     </div>
     <div class="form-row">
       <div class="form-group">
+        <label>Node Remark (Exported Link #Name)</label>
+        <input type="text" id="rtc-remark" placeholder="Kestrel-RTC-v4.0" maxlength="64">
+      </div>
+      <div class="form-group">
         <label>UDP Port Hopping Range (min-max or empty)</label>
         <input type="text" id="rtc-hop" placeholder="e.g. 20000-40000">
       </div>
@@ -416,6 +420,7 @@ async function fetchRTC() {
     const res = await fetch('api/rtc');
     if (!res.ok) return;
     const d = await res.json();
+    document.getElementById('rtc-remark').value = d.remark || '';
     document.getElementById('rtc-hop').value = d.hop_range || '';
     document.getElementById('rtc-up').value = d.up_mbps || 0;
     document.getElementById('rtc-down').value = d.down_mbps || 0;
@@ -425,6 +430,7 @@ async function fetchRTC() {
 async function saveRTC() {
   const token = await ensureCSRF();
   const payload = {
+    remark: (document.getElementById('rtc-remark').value || '').trim(),
     hop_range: (document.getElementById('rtc-hop').value || '').trim(),
     up_mbps: parseInt(document.getElementById('rtc-up').value, 10) || 0,
     down_mbps: parseInt(document.getElementById('rtc-down').value, 10) || 0,

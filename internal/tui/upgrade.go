@@ -21,7 +21,7 @@ import (
 )
 
 // CurrentVersion is the canonical release identifier compiled into server & TUI binaries (overridable via -ldflags -X).
-var CurrentVersion = "v4.0.21-LTS"
+var CurrentVersion = "v4.0.25-LTS"
 
 const (
 	defaultGitHubAPIBase   = "https://api.github.com"
@@ -145,7 +145,11 @@ func (c *Controller) resolveUpgradeOptions(opts UpgradeOptions) (UpgradeOptions,
 		opts.TargetBinary = defaultTargetBinary
 	}
 	if strings.TrimSpace(opts.MirrorPrefix) == "" {
-		opts.MirrorPrefix = strings.TrimSpace(os.Getenv("GFT_MIRROR"))
+		if m := strings.TrimSpace(os.Getenv("KSL_MIRROR")); m != "" {
+			opts.MirrorPrefix = m
+		} else {
+			opts.MirrorPrefix = strings.TrimSpace(os.Getenv("GFT_MIRROR"))
+		}
 	}
 	if strings.TrimSpace(opts.APIBaseURL) == "" {
 		opts.APIBaseURL = defaultGitHubAPIBase
@@ -195,7 +199,11 @@ func resolveReleaseQueryOptions(opts UpgradeOptions) UpgradeOptions {
 		opts.Arch = runtime.GOARCH
 	}
 	if strings.TrimSpace(opts.MirrorPrefix) == "" {
-		opts.MirrorPrefix = strings.TrimSpace(os.Getenv("GFT_MIRROR"))
+		if m := strings.TrimSpace(os.Getenv("KSL_MIRROR")); m != "" {
+			opts.MirrorPrefix = m
+		} else {
+			opts.MirrorPrefix = strings.TrimSpace(os.Getenv("GFT_MIRROR"))
+		}
 	}
 	if strings.TrimSpace(opts.APIBaseURL) == "" {
 		opts.APIBaseURL = defaultGitHubAPIBase

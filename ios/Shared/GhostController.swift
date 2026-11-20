@@ -80,7 +80,7 @@ final class GhostAppViewModel: ObservableObject {
         loadPreferences()
         bindBackend()
         syncFromBackendState()
-        appendLocalLog("Kestrel \(edition.title) v4.0.20-LTS initialized")
+        appendLocalLog("Kestrel \(edition.title) v4.0.25-LTS initialized")
     }
 
     var activeNode: GhostNode? {
@@ -209,6 +209,24 @@ final class GhostAppViewModel: ObservableObject {
         }
         savePreferences()
         showToast("已删除节点")
+    }
+
+    func renameNode(_ node: GhostNode, remark: String) {
+        guard let idx = nodes.firstIndex(where: { $0.id == node.id }) else { return }
+        let trimmed = remark.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clean = trimmed.isEmpty ? "\(node.host):\(node.port)" : String(trimmed.prefix(64))
+        var updated = nodes[idx]
+        updated.remark = clean
+        var baseURI = updated.uri
+        if let hashIdx = baseURI.firstIndex(of: "#") {
+            baseURI = String(baseURI[..<hashIdx])
+        }
+        let encoded = clean.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed) ?? clean
+        updated.uri = "\(baseURI)#\(encoded)"
+        nodes[idx] = updated
+        savePreferences()
+        appendLocalLog("Renamed node -> \(clean)")
+        showToast("节点备注已更新：\(clean)")
     }
 
     func applySettings() {

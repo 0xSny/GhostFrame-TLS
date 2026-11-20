@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.0.21-LTS"
+var Version = "v4.0.25-LTS"
 
 type ConnState string
 
@@ -513,6 +513,32 @@ func (e *Engine) DeleteNode(idx int) error {
 	if wasActive {
 		e.Disconnect()
 	}
+	return e.SaveConfig()
+}
+
+// RenameNode updates the display remark of a saved node by index and persists config.
+func (e *Engine) RenameNode(idx int, remark string) error {
+	clean := strings.TrimSpace(remark)
+	if runes := []rune(clean); len(runes) > 64 {
+		clean = string(runes[:64])
+	}
+	e.mu.Lock()
+	if idx < 0 || idx >= len(e.config.Nodes) {
+		e.mu.Unlock()
+		return errors.New("node index out of range")
+	}
+	n := e.config.Nodes[idx]
+	if clean == "" && n != nil {
+		clean = fmt.Sprintf("%s:%d", n.Host, n.Port)
+	}
+	if n != nil {
+		n.Remark = clean
+	}
+	if idx == e.config.ActiveNode && e.config.Link != nil {
+		e.config.Link.Remark = clean
+	}
+	e.mu.Unlock()
+	e.Logf("Renamed node #%d -> %s", idx+1, clean)
 	return e.SaveConfig()
 }
 

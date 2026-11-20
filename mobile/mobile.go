@@ -21,7 +21,7 @@ import (
 )
 
 // Version is the mobile runtime identifier (overridable via -ldflags -X).
-var Version = "v4.0.21-LTS"
+var Version = "v4.0.25-LTS"
 
 const (
 	defaultSocksPort = 10808
@@ -133,7 +133,7 @@ func initCoreLocked(dataDir string, isTunnelExt bool) {
 
 	dir := strings.TrimSpace(dataDir)
 	if dir == "" {
-		dir = filepath.Join(os.TempDir(), "ghostframe-mobile")
+		dir = filepath.Join(os.TempDir(), "kestrel-mobile")
 	}
 	_ = os.MkdirAll(dir, 0o700)
 
@@ -553,16 +553,16 @@ func BuildBypassRule(serverHost string) string {
 
 func handleLocalMgmt(method, path string, body []byte) (int, string, []byte) {
 	switch path {
-	case "/_gft/ping":
+	case "/_ksl/ping", "/_gft/ping":
 		return 200, "application/json; charset=utf-8", []byte(`{"ok":true,"pong":true}`)
-	case "/_gft/status":
+	case "/_ksl/status", "/_gft/status":
 		return 200, "application/json; charset=utf-8", []byte(GetStatusJSON())
-	case "/_gft/diag":
+	case "/_ksl/diag", "/_gft/diag":
 		return 200, "text/plain; charset=utf-8", []byte(GetDiagnosticSnapshot())
-	case "/_gft/clear-logs":
+	case "/_ksl/clear-logs", "/_gft/clear-logs":
 		ClearLogs()
 		return 200, "application/json; charset=utf-8", []byte(`{"ok":true}`)
-	case "/_gft/reload":
+	case "/_ksl/reload", "/_gft/reload":
 		if strings.ToUpper(strings.TrimSpace(method)) != "POST" {
 			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
 		}

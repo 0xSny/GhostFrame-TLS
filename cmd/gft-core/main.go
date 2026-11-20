@@ -14,7 +14,7 @@ import (
 	"ghostframe/internal/gft"
 )
 
-var version = "v4.0.21-LTS"
+var version = "v4.0.25-LTS"
 
 func main() {
 	cfgFlag := flag.String("config", "", "optional path to client.json (e.g. /etc/kestrel/client.json)")
@@ -27,7 +27,7 @@ func main() {
 	downMbpsFlag := flag.Int("down-mbps", -1, "Smart-Brutal target download Mbps override (>=0, 0=Auto-Probe)")
 	lowMem := flag.Bool("low-mem", false, "enable low-memory router mode (<35MB RSS, 4MB stream windows, ideal for Phicomm N1/S905D)")
 	noSysProxy := flag.Bool("no-sysproxy", false, "disable real system proxy modifications (sandbox mode)")
-	showVer := flag.Bool("version", false, "print gft-core version and hardware capabilities")
+	showVer := flag.Bool("version", false, "print kestrel-core version and hardware capabilities")
 	flag.Parse()
 
 	if *showVer {
@@ -53,7 +53,7 @@ func main() {
 
 	eng, err := client.NewEngine(*cfgFlag)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gft-core init failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "kestrel-core init failed: %v\n", err)
 		os.Exit(1)
 	}
 	defer eng.Close()
@@ -96,24 +96,24 @@ func main() {
 	}
 
 	if err := eng.StartServers(); err != nil {
-		fmt.Fprintf(os.Stderr, "gft-core start failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "kestrel-core start failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	st := eng.Status()
-	fmt.Printf("gft-core %s started (arch=%s/%s chacha20=%v low_mem=%v socks=%v http=%v hop=%v up_mbps=%v down_mbps=%v)\n",
+	fmt.Printf("kestrel-core %s started (arch=%s/%s chacha20=%v low_mem=%v socks=%v http=%v hop=%v up_mbps=%v down_mbps=%v)\n",
 		version, runtime.GOOS, runtime.GOARCH, gft.PrioritizeChaCha20(), gft.IsLowMemMode(), st["socks_addr"], st["http_addr"], st["hop_range"], st["up_mbps"], st["down_mbps"])
 
 	if err := eng.Connect(); err != nil {
-		fmt.Fprintf(os.Stderr, "gft-core initial connect error: %v (will continue running/retrying)\n", err)
+		fmt.Fprintf(os.Stderr, "kestrel-core initial connect error: %v (will continue running/retrying)\n", err)
 	} else {
 		st = eng.Status()
-		fmt.Printf("gft-core connected via %v (rtc_port=%v ping=%vms pacing=%.1fMbps fec_recovered=%v)\n",
+		fmt.Printf("kestrel-core connected via %v (rtc_port=%v ping=%vms pacing=%.1fMbps fec_recovered=%v)\n",
 			st["active_transport"], st["rtc_port"], st["ping_ms"], st["pacing_mbps"], st["fec_recovered"])
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	<-ctx.Done()
-	fmt.Println("gft-core shutting down cleanly...")
+	fmt.Println("kestrel-core shutting down cleanly...")
 }

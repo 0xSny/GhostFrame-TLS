@@ -41,7 +41,11 @@ const (
 )
 
 func effectiveRekeyBytes() int64 {
-	if raw := strings.TrimSpace(os.Getenv("GFT_REKEY_MB")); raw != "" {
+	raw := strings.TrimSpace(os.Getenv("KSL_REKEY_MB"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("GFT_REKEY_MB"))
+	}
+	if raw != "" {
 		if mb, err := strconv.ParseInt(raw, 10, 64); err == nil && mb > 0 {
 			return mb * 1024 * 1024
 		}
@@ -63,10 +67,10 @@ type trafficBucket struct {
 	bytes uint64
 }
 
-// StreamHandler handles an incoming reliable GFT-RTC stream.
+// StreamHandler handles an incoming reliable Kestrel-RTC stream.
 type StreamHandler func(s *RTCStream, target string, first []byte)
 
-// UDPHandler handles an incoming UDP datagram over GFT-RTC.
+// UDPHandler handles an incoming UDP datagram over Kestrel-RTC.
 type UDPHandler func(sink UDPReplySink, id uint16, target string, data []byte)
 
 // UDPCloseHandler handles remote closure of a UDP association.
@@ -172,7 +176,7 @@ func (c *closedIDSet) has(id uint32) bool {
 	return ok
 }
 
-// RTCSession represents a single GhostFrame-RTC encrypted session supporting Zero-HOL streams,
+// RTCSession represents a single Kestrel-RTC encrypted session supporting Zero-HOL streams,
 // 0ms XOR-FEC, Smart-Brutal CC, fragmented/fallback UDP, and 0ms socket migration (port hopping).
 type RTCSession struct {
 	isClient bool
@@ -2490,7 +2494,7 @@ func (s *RTCSession) fail(err error) {
 // Close closes the RTCSession and all attached streams/UDP associations.
 func (s *RTCSession) Close() { s.fail(ErrSessionClosed) }
 
-// DialOptions configures a client GFT-RTC connection.
+// DialOptions configures a client Kestrel-RTC connection.
 type DialOptions struct {
 	Host       string
 	Port       int
@@ -2520,7 +2524,7 @@ func listenClientUDP(network string, targetIP net.IP) (*net.UDPConn, error) {
 	return upc, nil
 }
 
-// Dial opens an OS UDP socket with tuned buffers and connects to a GhostFrame-RTC server.
+// Dial opens an OS UDP socket with tuned buffers and connects to a Kestrel-RTC server.
 func Dial(ctx context.Context, opts DialOptions) (*RTCSession, time.Duration, error) {
 	addr, err := netbind.ResolveUDPAddr(ctx, opts.Host, opts.Port)
 	if err != nil {
@@ -2666,7 +2670,7 @@ type RTCListener struct {
 	nextSSRC   atomic.Uint32
 }
 
-// NewListener starts accepting GhostFrame-RTC connections on pc.
+// NewListener starts accepting Kestrel-RTC connections on pc.
 func NewListener(pc net.PacketConn, ownPC bool, psk []byte, serverTxMbps int, paramsJSON []byte) (*RTCListener, error) {
 	if len(psk) < 16 {
 		return nil, errors.New("gftrtc: psk too short")

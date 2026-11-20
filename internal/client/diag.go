@@ -75,15 +75,15 @@ func (r *LogRingBuffer) Len() int {
 }
 
 var (
-	reGFTLink = regexp.MustCompile(`(?i)(?:ksl4|gft3|gft2)://[^\s"'<>]+`)
-	reIPv4    = regexp.MustCompile(`\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b`)
-	rePSKJson = regexp.MustCompile(`(?i)("?(?:psk|password|secret|token|pin)"?\s*[:=]\s*"?)([A-Za-z0-9+/=_-]{8,})("?)`)
+	reKestrelLink = regexp.MustCompile(`(?i)(?:ksl4|gft3|gft2)://[^\s"'<>]+`)
+	reIPv4        = regexp.MustCompile(`\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b`)
+	rePSKJson     = regexp.MustCompile(`(?i)("?(?:psk|password|secret|token|pin)"?\s*[:=]\s*"?)([A-Za-z0-9+/=_-]{8,})("?)`)
 )
 
 // MaskSensitiveText redacts URIs, public IPs, PSKs, passwords, and caller-supplied secrets
 // so exported diagnostic snapshots can be shared safely without credential leakage.
 func MaskSensitiveText(in string, extraSecrets ...string) string {
-	out := reGFTLink.ReplaceAllString(in, "gft3://***")
+	out := reKestrelLink.ReplaceAllString(in, "ksl4://***")
 	for _, sec := range extraSecrets {
 		sec = strings.TrimSpace(sec)
 		if sec != "" && sec != "127.0.0.1" && strings.ToLower(sec) != "localhost" {
@@ -156,7 +156,7 @@ func (e *Engine) BuildDiagnosticSnapshot() string {
 	return MaskSensitiveText(sb.String(), secrets...)
 }
 
-// ExportDiagnosticSnapshot builds a sanitized snapshot, saves it to ~/.gft/diag_snapshot.txt,
+// ExportDiagnosticSnapshot builds a sanitized snapshot, saves it to ~/.kestrel/diag_snapshot.txt,
 // and copies it to the system clipboard on desktop platforms when possible.
 func (e *Engine) ExportDiagnosticSnapshot(hwnd uintptr) (outPath string, copied bool, text string, err error) {
 	text = e.BuildDiagnosticSnapshot()
@@ -166,7 +166,7 @@ func (e *Engine) ExportDiagnosticSnapshot(hwnd uintptr) (outPath string, copied 
 	}
 	if dir == "" {
 		if home, herr := os.UserHomeDir(); herr == nil && home != "" {
-			dir = filepath.Join(home, ".gft")
+			dir = filepath.Join(home, ".kestrel")
 		}
 	}
 	if dir != "" {

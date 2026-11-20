@@ -25,10 +25,10 @@ import (
 const (
 	DefaultConfigPath = "/etc/kestrel/server.json"
 	ReleaseRepo       = "Spittingjiu/Ghost"
-	SysctlConfPath    = "/etc/sysctl.d/99-gft-rtc.conf"
+	SysctlConfPath    = "/etc/sysctl.d/99-ksl-rtc.conf"
 )
 
-// Controller drives the interactive `gft` terminal control center.
+// Controller drives the interactive `ksl` terminal control center.
 type Controller struct {
 	CfgPath string
 	In      io.Reader
@@ -122,6 +122,7 @@ func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState s
 		"[4] 配置 UDP 动态端口跳跃 (PortHop)     [10] 一键升级服务端 (OTA 热更新)",
 		"[5] 轮换密钥、SPKI 证书与管理凭据       [11] 配置备份与灾难恢复",
 		"[6] 调整流量整形与硬件性能档位          [12] 彻底卸载 Kestrel 服务端",
+		"[13] 修改节点导出备注 (当前: " + nonEmpty(cfg.Remark, "Kestrel-RTC-v4.0") + ")",
 		"[0] 退出控制面板",
 	}
 	for _, it := range items {
@@ -216,6 +217,8 @@ func (c *Controller) Run() error {
 			if c.handleUninstallMenu(sc) {
 				return nil
 			}
+		case "13":
+			c.handleRemarkMenu(sc, cfg)
 		default:
 			c.warnMsg("无效输入，请选择 0-12。")
 			time.Sleep(800 * time.Millisecond)
@@ -447,7 +450,7 @@ func (c *Controller) handleHopMenu(sc *bufio.Scanner, cfg *server.Config) {
 		}); err != nil {
 			c.errMsg(err.Error())
 		} else {
-			c.okMsg("已关闭 UDP 端口跳跃并销毁 gft_hop 防火墙表")
+			c.okMsg("已关闭 UDP 端口跳跃并销毁 ksl_hop 防火墙表")
 		}
 	case "3":
 		upStr := c.prompt(sc, "请输入默认客户端上行 Mbps (0=Auto-Probe, 0..65535):")
@@ -649,11 +652,11 @@ func (c *Controller) handleSelfCheckMenu(sc *bufio.Scanner, cfg *server.Config) 
 	port := ConfigListenPort(cfg.Listen)
 	c.printf("  4. 本机监听套接字状态 (:%d): %v\n", port, CheckPortOccupied(port))
 
-	if strings.EqualFold(c.prompt(sc, "\n是否一键写入 /etc/sysctl.d/99-gft-rtc.conf 并应用 BBR + 32MB UDP 缓冲? [y/N]:"), "y") {
+	if strings.EqualFold(c.prompt(sc, "\n是否一键写入 /etc/sysctl.d/99-ksl-rtc.conf 并应用 BBR + 32MB UDP 缓冲? [y/N]:"), "y") {
 		if err := ApplyKernelSysctl(SysctlConfPath, nil); err != nil {
 			c.warnMsg(err.Error())
 		} else {
-			c.okMsg("BBR + fq 与 32MB GFT-RTC UDP 缓冲调优已持久化生效！")
+			c.okMsg("BBR + fq 与 32MB Kestrel-RTC UDP 缓冲调优已持久化生效！")
 		}
 	}
 	c.pause(sc)
@@ -814,7 +817,7 @@ func (c *Controller) handleBackupRestoreMenu(sc *bufio.Scanner, cfg *server.Conf
 }
 
 func (c *Controller) handleUninstallMenu(sc *bufio.Scanner) bool {
-	c.warnMsg("此操作将停止 Kestrel 服务、清理 gft_hop 防火墙表并删除全部程序与配置。")
+	c.warnMsg("此操作将停止 Kestrel 服务、清理 ksl_hop 防火墙表并删除全部程序与配置。")
 	if c.prompt(sc, "请输入 yes 确认彻底卸载:") != "yes" {
 		c.printf("已取消卸载。\n")
 		c.pause(sc)
@@ -899,6 +902,28 @@ func checkHTTPClockDrift() (time.Duration, error) {
 		return 0, err
 	}
 	return time.Since(t), nil
+}
+
+func (c *Controller) handleRemarkMenu(sc *bufio.Scanner, cfg *server.Config) {
+	cur := nonEmpty(cfg.Remark, "Kestrel-RTC-v4.0")
+	c.printf("\n--- 修改导出链接节点备注 (当前: %s) ---\n", cur)
+	raw := c.prompt(sc, "请输入新的节点备注 (留空恢复默认 Kestrel-RTC-v4.0, 输入 q 取消):")
+	if strings.EqualFold(raw, "q") {
+		return
+	}
+	rem := strings.TrimSpace(raw)
+	if runes := []rune(rem); len(runes) > 64 {
+		rem = string(runes[:64])
+	}
+	if err := c.Tx.Apply(func(nc *server.Config) error {
+		nc.Remark = rem
+		return nil
+	}); err != nil {
+		c.errMsg(err.Error())
+	} else {
+		c.okMsg(fmt.Sprintf("节点导出备注已更新为: %s", nonEmpty(rem, "Kestrel-RTC-v4.0")))
+	}
+	c.pause(sc)
 }
 
 func fmtBytes(b uint64) string {

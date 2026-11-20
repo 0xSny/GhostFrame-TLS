@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +46,7 @@ type Config struct {
 	FallbackTarget   string      `json:"fallback_target,omitempty"`   // e.g. "http://127.0.0.1:8080"
 	CamouflageTarget string      `json:"camouflage_target,omitempty"` // e.g. "<selected-sni>:443"
 	HopRange         string      `json:"hop_range,omitempty"`         // e.g. "20000-40000"
+	Remark           string      `json:"remark,omitempty"`            // custom exported link remark (e.g. "Tokyo-Main")
 	DisableRTC       bool        `json:"disable_rtc,omitempty"`
 	DisableQUIC      bool        `json:"disable_quic,omitempty"`  // legacy alias for DisableRTC
 	TxMbps           int         `json:"tx_mbps,omitempty"`       // optional server Smart-Brutal max TX Mbps (0 = Auto)
@@ -52,7 +54,7 @@ type Config struct {
 	DownMbps         int         `json:"down_mbps,omitempty"`     // default exported client Smart-Brutal downlink Mbps (0 = Auto)
 	MaxMemoryMB      int         `json:"max_memory_mb,omitempty"` // process memory soft cap in MiB (default 512)
 	Params           *gft.Params `json:"params,omitempty"`
-	PanelPath        string      `json:"panel_path"` // e.g. /gft-panel-xxxxxxxx
+	PanelPath        string      `json:"panel_path"` // e.g. /ksl-panel-xxxxxxxx
 	PanelHash        string      `json:"panel_hash"` // bcrypt
 	Pin              string      `json:"pin"`        // SPKI SHA-256 hex
 	StateDir         string      `json:"state_dir"`
@@ -66,7 +68,7 @@ func (c *Config) EffectiveMaxMemoryMB() int {
 	return 512
 }
 
-// IsRTCDisabled reports whether GhostFrame-RTC UDP transport is disabled in server config.
+// IsRTCDisabled reports whether Kestrel-RTC UDP transport is disabled in server config.
 func (c *Config) IsRTCDisabled() bool {
 	return c != nil && (c.DisableRTC || c.DisableQUIC)
 }
@@ -254,7 +256,7 @@ func InitWithOptions(opts InitOptions) (*Secrets, error) {
 		FallbackTarget:   opts.FallbackTarget,
 		CamouflageTarget: opts.CamouflageTarget,
 		HopRange:         opts.HopRange,
-		PanelPath:        "/gft-panel-" + randString(32, "abcdefghijklmnopqrstuvwxyz0123456789"),
+		PanelPath:        "/ksl-panel-" + randString(32, "abcdefghijklmnopqrstuvwxyz0123456789"),
 		PanelHash:        string(hash),
 		Pin:              pinHex,
 		StateDir:         opts.StateDir,
@@ -418,7 +420,7 @@ func RotatePSK() (string, error) {
 
 // RotatePanelCreds generates a fresh secret panel path and 20-char admin password + bcrypt hash.
 func RotatePanelCreds() (panelPath, password, bcryptHash string, err error) {
-	path := "/gft-panel-" + randString(32, "abcdefghijklmnopqrstuvwxyz0123456789")
+	path := "/ksl-panel-" + randString(32, "abcdefghijklmnopqrstuvwxyz0123456789")
 	pass := randString(20, "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789")
 	hash, herr := bcrypt.GenerateFromPassword([]byte(pass), 12)
 	if herr != nil {
@@ -475,6 +477,10 @@ func (c *Config) Link(p gft.Params) *gft.Link {
 	if c.CertMode == "acme" || (c.CertMode == "file" && c.Pin == "") {
 		verify = "ca"
 	}
+	remark := strings.TrimSpace(c.Remark)
+	if remark == "" {
+		remark = "Kestrel-RTC-v4.0"
+	}
 	return &gft.Link{
 		V:         4,
 		Host:      c.PublicHost,
@@ -490,7 +496,7 @@ func (c *Config) Link(p gft.Params) *gft.Link {
 		UpMbps:    c.UpMbps,
 		DownMbps:  c.DownMbps,
 		Params:    &p,
-		Remark:    "Kestrel-RTC-v4.0",
+		Remark:    remark,
 	}
 }
 

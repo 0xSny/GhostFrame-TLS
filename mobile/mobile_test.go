@@ -181,31 +181,31 @@ func TestIdleLifecycleAndStatusJSON(t *testing.T) {
 		Timeout:   2 * time.Second,
 		Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
 	}
-	pingResp, err := hc.Get("http://127.0.0.1:29082/_gft/ping")
+	pingResp, err := hc.Get("http://127.0.0.1:29082/_ksl/ping")
 	if err != nil {
-		t.Fatalf("GET /_gft/ping failed: %v", err)
+		t.Fatalf("GET /_ksl/ping failed: %v", err)
 	}
 	pingBody, _ := io.ReadAll(pingResp.Body)
 	pingResp.Body.Close()
 	if pingResp.StatusCode != http.StatusOK || !strings.Contains(string(pingBody), `"pong":true`) {
-		t.Fatalf("unexpected /_gft/ping response (%d): %s", pingResp.StatusCode, string(pingBody))
+		t.Fatalf("unexpected /_ksl/ping response (%d): %s", pingResp.StatusCode, string(pingBody))
 	}
 
-	statusResp, err := hc.Get("http://127.0.0.1:29082/_gft/status")
+	statusResp, err := hc.Get("http://127.0.0.1:29082/_ksl/status")
 	if err != nil {
-		t.Fatalf("GET /_gft/status failed: %v", err)
+		t.Fatalf("GET /_ksl/status failed: %v", err)
 	}
 	statusBody, _ := io.ReadAll(statusResp.Body)
 	statusResp.Body.Close()
 	if statusResp.StatusCode != http.StatusOK {
-		t.Fatalf("unexpected /_gft/status status code %d: %s", statusResp.StatusCode, string(statusBody))
+		t.Fatalf("unexpected /_ksl/status status code %d: %s", statusResp.StatusCode, string(statusBody))
 	}
 	var snap map[string]any
 	if err := json.Unmarshal(statusBody, &snap); err != nil {
-		t.Fatalf("invalid JSON from /_gft/status: %v (%s)", err, string(statusBody))
+		t.Fatalf("invalid JSON from /_ksl/status: %v (%s)", err, string(statusBody))
 	}
 	if _, ok := snap["netbind_enabled"]; !ok {
-		t.Fatalf("expected netbind_enabled in /_gft/status payload, got: %v", snap)
+		t.Fatalf("expected netbind_enabled in /_ksl/status payload, got: %v", snap)
 	}
 
 	if err := StopEngine(); err != nil {

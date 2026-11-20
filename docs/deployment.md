@@ -23,7 +23,7 @@ systemctl status kestrel
 journalctl -u kestrel -f
 ```
 
-### Recommended High-BDP Kernel Tuning (`/etc/sysctl.d/99-gft-rtc.conf`)
+### Recommended High-BDP Kernel Tuning (`/etc/sysctl.d/99-ksl-rtc.conf`)
 
 ```ini
 net.core.default_qdisc = fq
@@ -52,7 +52,7 @@ Apply with `sysctl --system`.
 For automated testing or sandboxed runs without touching Windows Registry proxy settings:
 
 ```powershell
-$env:GFT_NO_SYSPROXY = "1"
+$env:KSL_NO_SYSPROXY = "1"
 .\Kestrel-Pro.exe -no-sysproxy
 ```
 

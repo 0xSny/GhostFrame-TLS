@@ -352,7 +352,7 @@ func applyDarkWindowChrome(hwnd uintptr) {
 // instance already owns it, this sends the wakeup message to its window and
 // returns (0, false) so the caller can exit cleanly.
 func AcquireSingleInstance() (windows.Handle, bool) {
-	if os.Getenv("GFT_NO_SINGLE_INSTANCE") == "1" {
+	if os.Getenv("KSL_NO_SINGLE_INSTANCE") == "1" || os.Getenv("GFT_NO_SINGLE_INSTANCE") == "1" {
 		return 0, true
 	}
 	mutPtr := utf16Ptr(singleMutexName)

@@ -155,7 +155,7 @@ private final class QRScannerViewController: UIViewController, AVCaptureMetadata
     var onCodeScanned: ((String) -> Void)?
     var onCameraError: ((String) -> Void)?
 
-    private let sessionQueue = DispatchQueue(label: "com.ghostframe.qrscanner.session")
+    private let sessionQueue = DispatchQueue(label: "com.kestrel.qrscanner.session")
     private let captureSession = AVCaptureSession()
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private var isConfigured = false

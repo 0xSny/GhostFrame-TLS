@@ -23,7 +23,7 @@ func relayIdleTimeout() time.Duration {
 	return 15 * time.Minute
 }
 
-// LocalMgmtHandler handles loopback-only management API calls under /_gft/* routes.
+// LocalMgmtHandler handles loopback-only management API calls under /_ksl/* routes.
 type LocalMgmtHandler func(method, path string, body []byte) (statusCode int, contentType string, respBody []byte)
 
 var (
@@ -31,7 +31,7 @@ var (
 	localMgmtHandler LocalMgmtHandler
 )
 
-// SetLocalMgmtHandler registers an in-process management handler for loopback /_gft/* requests.
+// SetLocalMgmtHandler registers an in-process management handler for loopback /_ksl/* requests.
 func SetLocalMgmtHandler(fn LocalMgmtHandler) {
 	localMgmtMu.Lock()
 	localMgmtHandler = fn
@@ -142,7 +142,8 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		return
 	}
 
-	if req.Method != http.MethodConnect && req.URL.Scheme == "" && req.URL.Host == "" && strings.HasPrefix(req.URL.Path, "/_gft/") {
+	if req.Method != http.MethodConnect && req.URL.Scheme == "" && req.URL.Host == "" &&
+		(strings.HasPrefix(req.URL.Path, "/_ksl/") || strings.HasPrefix(req.URL.Path, "/_gft/")) {
 		localMgmtMu.RLock()
 		fn := localMgmtHandler
 		localMgmtMu.RUnlock()

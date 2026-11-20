@@ -335,7 +335,7 @@ func TestPortHoppingSeamlessUDPContinuity(t *testing.T) {
 		}
 	}
 
-	// Phase 1: ~900ms over GFT-RTC spanning >= 3 dynamic 0ms socket hops (160ms hop interval).
+	// Phase 1: ~900ms over Kestrel-RTC spanning >= 3 dynamic 0ms socket hops (160ms hop interval).
 	sendAndVerify("rtc-hop", 24, 38*time.Millisecond)
 
 	if hops := rtcHopCount.Load(); hops < 3 {

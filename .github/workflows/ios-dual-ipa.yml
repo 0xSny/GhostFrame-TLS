@@ -21,7 +21,7 @@ jobs:
   build-ios-dual:
     runs-on: macos-15
     env:
-      GFT_NO_SYSPROXY: "1"
+      KSL_NO_SYSPROXY: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

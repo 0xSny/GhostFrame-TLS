@@ -71,7 +71,7 @@ func ParseCustomRules(lines []string) []CustomRule {
 		switch actStr {
 		case "DIRECT":
 			act = ActionDirect
-		case "PROXY", "GFT", "GHOSTFRAME":
+		case "PROXY", "KSL", "KESTREL":
 			act = ActionProxy
 		case "REJECT", "BLOCK", "DROP":
 			act = ActionReject

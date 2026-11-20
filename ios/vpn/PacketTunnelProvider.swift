@@ -68,7 +68,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         guard !configJSON.isEmpty else {
             let err = NSError(
-                domain: "com.ghostframe.tunnel",
+                domain: "com.kestrel.duo.tunnel",
                 code: 1001,
                 userInfo: [NSLocalizedDescriptionKey: "Missing NETunnelProviderProtocol.providerConfiguration[\"configJSON\"]"]
             )

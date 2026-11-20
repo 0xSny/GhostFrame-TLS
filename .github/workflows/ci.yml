@@ -45,7 +45,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
-      GFT_NO_SYSPROXY: "1"
+      KSL_NO_SYSPROXY: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -85,7 +85,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p /tmp/ksl-ci-build
-          REL_VER="v4.0.21-LTS"
+          REL_VER="v4.0.25-LTS"
           VER_X="-X ghostframe/internal/tui.CurrentVersion=${REL_VER} -X ghostframe/internal/client.Version=${REL_VER} -X ghostframe/internal/server.Version=${REL_VER} -X main.version=${REL_VER}"
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w ${VER_X}" -o /tmp/ksl-ci-build/kestrel-server-amd64 ./cmd/gft-server
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w ${VER_X}" -o /tmp/ksl-ci-build/kestrel-server-arm64 ./cmd/gft-server

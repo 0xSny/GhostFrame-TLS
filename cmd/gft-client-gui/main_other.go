@@ -39,13 +39,13 @@ func main() {
 	cfgPath := resolveConfigPath(*cfgFlag)
 	eng, err := client.NewEngine(cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ghostframe init failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "kestrel-pro init failed: %v\n", err)
 		os.Exit(1)
 	}
 	defer eng.Close()
 
 	if err := eng.StartServers(); err != nil {
-		fmt.Fprintf(os.Stderr, "ghostframe start servers failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "kestrel-pro start servers failed: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Kestrel-RTC %s headless client listening (config: %s)\n", client.Version, cfgPath)
@@ -59,5 +59,5 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	<-ctx.Done()
-	fmt.Println("Shutting down GhostFrame headless client...")
+	fmt.Println("Shutting down Kestrel headless client...")
 }

@@ -169,6 +169,22 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}))
 
+	mux.HandleFunc("/api/node/rename", postOnly(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Index  int    `json:"index"`
+			Remark string `json:"remark"`
+		}
+		if err := readJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		if err := s.engine.RenameNode(req.Index, req.Remark); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+
 	mux.HandleFunc("/api/settings", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			GatewayMode        *string  `json:"gateway_mode"`

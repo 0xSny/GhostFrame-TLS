@@ -12,7 +12,7 @@ func DetectPhysicalInterface() string {
 }
 
 // Control attaches Linux SO_MARK (when OutboundMark() > 0) to every non-loopback
-// outbound TCP/UDP socket (GFT-RTC, lazy port-hopping, TCP-uTLS, and direct CN bypass),
+// outbound TCP/UDP socket (Kestrel-RTC, lazy port-hopping, TCP-uTLS, and direct CN bypass),
 // guaranteeing kernel-level anti-loop isolation in transparent gateway mode.
 func Control(network, address string, c syscall.RawConn) error {
 	mark := OutboundMark()

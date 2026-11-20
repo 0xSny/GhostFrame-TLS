@@ -576,8 +576,8 @@ func TestWebPanelRTCConfigUpdateAndSVGQR(t *testing.T) {
 		t.Fatalf("expected 400 for out-of-range hop_range, got %d", badResp.StatusCode)
 	}
 
-	// Persist valid GFT-RTC config via PUT /api/rtc
-	req, _ := http.NewRequest(http.MethodPut, base+"/api/rtc", strings.NewReader(`{"hop_range":"20000-40000","up_mbps":30,"down_mbps":100}`))
+	// Persist valid Kestrel-RTC config + remark via PUT /api/rtc
+	req, _ := http.NewRequest(http.MethodPut, base+"/api/rtc", strings.NewReader(`{"hop_range":"20000-40000","up_mbps":30,"down_mbps":100,"remark":"Tokyo-VIP"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-CSRF-Token", sessData.CSRF)
 	okResp, err := pcli.Do(req)
@@ -589,16 +589,17 @@ func TestWebPanelRTCConfigUpdateAndSVGQR(t *testing.T) {
 		HopRange string `json:"hop_range"`
 		UpMbps   int    `json:"up_mbps"`
 		DownMbps int    `json:"down_mbps"`
+		Remark   string `json:"remark"`
 		URI      string `json:"uri"`
 		QRSVG    string `json:"qr_svg"`
 	}
 	_ = json.NewDecoder(okResp.Body).Decode(&putData)
 	okResp.Body.Close()
-	if okResp.StatusCode != 200 || !putData.OK || putData.HopRange != "20000-40000" || putData.UpMbps != 30 || putData.DownMbps != 100 {
+	if okResp.StatusCode != 200 || !putData.OK || putData.HopRange != "20000-40000" || putData.UpMbps != 30 || putData.DownMbps != 100 || putData.Remark != "Tokyo-VIP" {
 		t.Fatalf("unexpected PUT /api/rtc response status=%d body=%+v", okResp.StatusCode, putData)
 	}
-	if !strings.HasPrefix(putData.URI, "ksl4://") || !strings.Contains(putData.QRSVG, "<svg") {
-		t.Fatalf("expected ksl4:// URI + inline SVG QR from PUT /api/rtc")
+	if !strings.HasPrefix(putData.URI, "ksl4://") || !strings.HasSuffix(putData.URI, "#Tokyo-VIP") || !strings.Contains(putData.QRSVG, "<svg") {
+		t.Fatalf("expected ksl4:// URI ending #Tokyo-VIP + inline SVG QR from PUT /api/rtc, got uri=%q", putData.URI)
 	}
 
 	// Verify atomic persistence to server.json
@@ -606,11 +607,11 @@ func TestWebPanelRTCConfigUpdateAndSVGQR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig(%s) failed: %v", cfgPath, err)
 	}
-	if persisted.HopRange != "20000-40000" || persisted.UpMbps != 30 || persisted.DownMbps != 100 {
+	if persisted.HopRange != "20000-40000" || persisted.UpMbps != 30 || persisted.DownMbps != 100 || persisted.Remark != "Tokyo-VIP" {
 		t.Fatalf("persisted server.json mismatch: %+v", persisted)
 	}
 
-	// Verify /api/link reflects updated gft3:// URI and SVG QR
+	// Verify /api/link reflects updated ksl4:// URI, remark, and SVG QR
 	lResp, err := pcli.Get(base + "/api/link")
 	if err != nil {
 		t.Fatal(err)
@@ -625,7 +626,7 @@ func TestWebPanelRTCConfigUpdateAndSVGQR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseLink(%q) failed: %v", lData.URI, err)
 	}
-	if decoded.HopRange != "20000-40000" || decoded.UpMbps != 30 || decoded.DownMbps != 100 || !strings.Contains(lData.QRSVG, "<svg") {
+	if decoded.HopRange != "20000-40000" || decoded.UpMbps != 30 || decoded.DownMbps != 100 || decoded.Remark != "Tokyo-VIP" || !strings.Contains(lData.QRSVG, "<svg") {
 		t.Fatalf("decoded link or QR mismatch: link=%+v hasSVG=%v", decoded, strings.Contains(lData.QRSVG, "<svg"))
 	}
 }

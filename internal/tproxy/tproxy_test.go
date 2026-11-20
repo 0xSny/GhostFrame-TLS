@@ -123,7 +123,7 @@ func TestBuildNFTablesScriptOrderingAndSafety(t *testing.T) {
 	script := BuildNFTablesScript(spec)
 
 	required := []string{
-		"table inet ghost0 {",
+		"table inet kestrel0 {",
 		"set lan_bypass_v4",
 		"set vps_bypass_v4",
 		"203.0.113.10",
@@ -159,6 +159,19 @@ func TestBuildNFTablesScriptOrderingAndSafety(t *testing.T) {
 	posTProxy := strings.Index(preSection, "tproxy ip to 127.0.0.1:10880")
 	if !(posMark >= 0 && posMark < posMgmt && posMgmt < posCN && posCN < posTProxy) {
 		t.Fatalf("unexpected rule precedence in mangle_prerouting: mark=%d mgmt=%d cn=%d tproxy=%d", posMark, posMgmt, posCN, posTProxy)
+	}
+
+	// Verify dns_output bypasses @lan_bypass_v4 and local IPv6 ranges (so host DNS / probe agents aren't trapped) before :7853 redirect.
+	idxDNSOut := strings.Index(script, "chain dns_output")
+	if idxDNSOut < 0 {
+		t.Fatalf("missing chain dns_output in nftables script")
+	}
+	dnsOutSection := script[idxDNSOut:]
+	posDNSLan := strings.Index(dnsOutSection, "ip daddr @lan_bypass_v4 return")
+	posDNSV6 := strings.Index(dnsOutSection, "ip6 daddr { ::1/128, fe80::/10, fc00::/7 } return")
+	posDNSRedir := strings.Index(dnsOutSection, "redirect to :7853")
+	if !(posDNSLan >= 0 && posDNSV6 > posDNSLan && posDNSRedir > posDNSV6) {
+		t.Fatalf("unexpected rule order in dns_output: lan=%d v6=%d redir=%d", posDNSLan, posDNSV6, posDNSRedir)
 	}
 }
 

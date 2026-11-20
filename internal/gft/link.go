@@ -66,7 +66,7 @@ type Link struct {
 	UpMbps    int     `json:"up_mbps,omitempty"`   // optional Smart-Brutal upload target Mbps (0 = Auto-Probe)
 	DownMbps  int     `json:"down_mbps,omitempty"` // optional Smart-Brutal download target Mbps (0 = Auto-Probe)
 	Params    *Params `json:"params,omitempty"`
-	Remark    string  `json:"-"`
+	Remark    string  `json:"remark,omitempty"`
 }
 
 var hostRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.\-]{0,251}[A-Za-z0-9])?$`)
@@ -194,6 +194,7 @@ func (l *Link) Validate() error {
 // Encode serializes the link as a ksl4:// URI (or legacy gft2:// if explicitly set V == 2 with no v3+ options).
 func (l *Link) Encode() string {
 	cp := *l
+	cp.Remark = "" // keep wire base64 compact; remark travels in URL #fragment
 	scheme := "ksl4://"
 	if cp.V == 2 && !cp.SplitSNI && cp.HopRange == "" && (cp.Transport == "" || cp.Transport == "tcp") {
 		scheme = "gft2://"

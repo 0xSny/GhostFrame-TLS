@@ -780,7 +780,7 @@ func TestDialLegacyV3Fallback(t *testing.T) {
 				PutPktBuf(deferPut)
 				continue
 			}
-			ticket, ok := findSTUNAttr(attrs, attrGFTTicket)
+			ticket, ok := findSTUNAttr(attrs, attrKSLTicket)
 			if !ok || len(ticket) < 32 {
 				PutPktBuf(deferPut)
 				continue

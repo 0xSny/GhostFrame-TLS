@@ -31,6 +31,8 @@ struct ConsoleView: View {
     @State private var showImportSheet = false
     @State private var showQRScanner = false
     @State private var importURIText = ""
+    @State private var renamingNodeID: String?
+    @State private var renameDraftText = ""
 
     var body: some View {
         ZStack(alignment: .leading) {
@@ -524,31 +526,73 @@ struct ConsoleView: View {
                     } else {
                         ForEach(viewModel.nodes) { node in
                             let isSelected = (viewModel.activeNode?.id == node.id)
-                            HStack(spacing: 10) {
-                                Button(action: {
-                                    viewModel.selectNode(node)
-                                    activeSheet = nil
-                                }) {
-                                    HStack(spacing: 8) {
-                                        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                                            .foregroundColor(isSelected ? GhostPalette.emerald : GhostPalette.textMuted)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(node.remark)
-                                                .font(.system(size: 14, weight: .semibold))
-                                                .foregroundColor(GhostPalette.textPrimary)
-                                            Text("\(node.host):\(String(node.port)) · \(node.transport.uppercased())\(node.hopRange.isEmpty ? "" : " · Hop \(node.hopRange)")")
-                                                .font(.system(size: 11, design: .monospaced))
-                                                .foregroundColor(GhostPalette.textMuted)
+                            let isRenaming = (renamingNodeID == node.id)
+                            VStack(spacing: 8) {
+                                HStack(spacing: 10) {
+                                    Button(action: {
+                                        viewModel.selectNode(node)
+                                        activeSheet = nil
+                                    }) {
+                                        HStack(spacing: 8) {
+                                            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                                                .foregroundColor(isSelected ? GhostPalette.emerald : GhostPalette.textMuted)
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                Text(node.remark)
+                                                    .font(.system(size: 14, weight: .semibold))
+                                                    .foregroundColor(GhostPalette.textPrimary)
+                                                Text("\(node.host):\(String(node.port)) · \(node.transport.uppercased())\(node.hopRange.isEmpty ? "" : " · Hop \(node.hopRange)")")
+                                                    .font(.system(size: 11, design: .monospaced))
+                                                    .foregroundColor(GhostPalette.textMuted)
+                                            }
+                                            Spacer()
                                         }
-                                        Spacer()
+                                    }
+
+                                    Button(action: {
+                                        if isRenaming {
+                                            renamingNodeID = nil
+                                        } else {
+                                            renamingNodeID = node.id
+                                            renameDraftText = node.remark
+                                        }
+                                    }) {
+                                        Image(systemName: "square.and.pencil")
+                                            .font(.system(size: 13))
+                                            .foregroundColor(GhostPalette.cyan.opacity(0.9))
+                                            .padding(6)
+                                    }
+
+                                    Button(action: {
+                                        if isRenaming { renamingNodeID = nil }
+                                        viewModel.deleteNode(node)
+                                    }) {
+                                        Image(systemName: "trash")
+                                            .font(.system(size: 13))
+                                            .foregroundColor(GhostPalette.crimson.opacity(0.85))
+                                            .padding(6)
                                     }
                                 }
 
-                                Button(action: { viewModel.deleteNode(node) }) {
-                                    Image(systemName: "trash")
-                                        .font(.system(size: 13))
-                                        .foregroundColor(GhostPalette.crimson.opacity(0.85))
-                                        .padding(6)
+                                if isRenaming {
+                                    HStack(spacing: 8) {
+                                        TextField("输入新节点备注", text: $renameDraftText)
+                                            .font(.system(size: 13))
+                                            .foregroundColor(GhostPalette.textPrimary)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 7)
+                                            .background(GhostPalette.background)
+                                            .cornerRadius(8)
+                                        Button("保存") {
+                                            viewModel.renameNode(node, remark: renameDraftText)
+                                            renamingNodeID = nil
+                                        }
+                                        .font(.system(size: 12, weight: .bold))
+                                        .foregroundColor(.black)
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 7)
+                                        .background(GhostPalette.emerald)
+                                        .cornerRadius(8)
+                                    }
                                 }
                             }
                             .padding(11)

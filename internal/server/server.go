@@ -28,7 +28,7 @@ import (
 )
 
 // Version is the canonical server build identifier (overridable via -ldflags -X).
-var Version = "v4.0.21-LTS"
+var Version = "v4.0.25-LTS"
 
 const (
 	MaxUDPAssocPerClient = 256
@@ -41,7 +41,7 @@ const (
 // Server is the GhostFrame v4.0.0-LTS Apex dual-stack server:
 //   - TCP: 0ms Pre-TLS MirrorInspector -> TLS 1.3 + ClientAuth -> Ghost Frame v3 Mux
 //     (probes/scanners are transparently mirrored to CamouflageTarget or fallback HTTP/H2)
-//   - UDP: GhostFrame-RTC (WebRTC STUN/SRTP mimicry + 0ms XOR-FEC + Smart-Brutal CC + 0ms migration)
+//   - UDP: Kestrel-RTC (WebRTC STUN/SRTP mimicry + 0ms XOR-FEC + Smart-Brutal CC + 0ms migration)
 type Server struct {
 	cfg           *Config
 	psk           []byte
@@ -74,7 +74,7 @@ type Server struct {
 }
 
 // SetConfigPath records the path of the active server.json so web panel
-// updates to GFT-RTC settings can be atomically persisted to disk.
+// updates to Kestrel-RTC settings can be atomically persisted to disk.
 func (s *Server) SetConfigPath(path string) {
 	s.cfgMu.Lock()
 	s.cfgPath = path
@@ -124,14 +124,14 @@ func (s *Server) TCPAddr() net.Addr {
 	return s.tcpAddr
 }
 
-// UDPAddr returns the active GhostFrame-RTC UDP listen address once Run has started (nil if disabled).
+// UDPAddr returns the active Kestrel-RTC UDP listen address once Run has started (nil if disabled).
 func (s *Server) UDPAddr() net.Addr {
 	s.tcpAddrMu.RLock()
 	defer s.tcpAddrMu.RUnlock()
 	return s.udpAddr
 }
 
-// SetTestUDPConn injects a custom net.PacketConn for GhostFrame-RTC unit tests.
+// SetTestUDPConn injects a custom net.PacketConn for Kestrel-RTC unit tests.
 func (s *Server) SetTestUDPConn(pc net.PacketConn) {
 	s.testUDPPC = pc
 }
@@ -311,7 +311,7 @@ func (s *Server) Run(ctx context.Context) error {
 	s.tcpAddr = ln.Addr()
 	s.tcpAddrMu.Unlock()
 
-	// Optional GhostFrame-RTC listener on matching UDP port (unless DisableRTC/DisableQUIC).
+	// Optional Kestrel-RTC listener on matching UDP port (unless DisableRTC/DisableQUIC).
 	var rtcLn *gftrtc.RTCListener
 	var rawUDP net.PacketConn
 	if !s.cfg.IsRTCDisabled() {

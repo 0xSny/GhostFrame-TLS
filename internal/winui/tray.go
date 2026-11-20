@@ -396,7 +396,7 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 	case cmd == cmdTransRTC:
 		go func() {
 			_ = eng.SetTransport("rtc")
-			onToast("传输偏好已切换: GFT-RTC", false)
+			onToast("传输偏好已切换: Kestrel-RTC", false)
 			onRefresh()
 		}()
 	case cmd == cmdTransTCP:

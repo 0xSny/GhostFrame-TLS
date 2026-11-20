@@ -74,7 +74,7 @@ var dnsBufPool = sync.Pool{
 }
 
 // Stack wraps a memory-bounded gVisor netstack bridging raw TUN IPv4 packets
-// into GhostFrame's client.Engine (RuleSet + Fake-IP DNS + SNI Sniff + GFT-RTC/TCP).
+// into GhostFrame's client.Engine (RuleSet + Fake-IP DNS + SNI Sniff + Kestrel-RTC/TCP).
 type Stack struct {
 	engine       *client.Engine
 	writer       PacketWriter

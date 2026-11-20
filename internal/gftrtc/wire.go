@@ -64,7 +64,7 @@ const (
 	attrPriority         = uint16(0x0024)
 	attrFingerprint      = uint16(0x8028)
 	attrIceControlling   = uint16(0x802A)
-	attrGFTTicket        = uint16(0xC057)
+	attrKSLTicket        = uint16(0xC057)
 	stunTicketMagic      = "GRTC"
 	stunSkewSec          = int64(90)
 	stunReplayWindowSec  = int64(180)
@@ -384,7 +384,7 @@ func PreScreenClientBindingReq(pkt, psk []byte) bool {
 	if !ok {
 		return false
 	}
-	ticket, ok := findSTUNAttr(attrs, attrGFTTicket)
+	ticket, ok := findSTUNAttr(attrs, attrKSLTicket)
 	if !ok || len(ticket) < 32+24+chacha20poly1305.Overhead+FastMACLen {
 		return false
 	}
@@ -691,7 +691,7 @@ func buildClientBindingReqInternal(psk []byte, clientID [8]byte, maxRxMbps, flag
 	buf = appendSTUNAttr(buf, attrPriority, prio[:])
 
 	ticketValOff := len(buf) + 4
-	buf = appendSTUNAttr(buf, attrGFTTicket, ticket)
+	buf = appendSTUNAttr(buf, attrKSLTicket, ticket)
 
 	if includeFastMAC {
 		finalMsgLen := len(buf) + 8 - stunHeaderLen
@@ -726,7 +726,7 @@ func ParseClientBindingReq(pkt, psk []byte, guard *ReplayGuard, now time.Time) (
 	if !ok {
 		return nil, false
 	}
-	ticket, ok := findSTUNAttr(attrs, attrGFTTicket)
+	ticket, ok := findSTUNAttr(attrs, attrKSLTicket)
 	if !ok || len(ticket) < 32+24+chacha20poly1305.Overhead+FastMACLen {
 		return nil, false
 	}
@@ -844,7 +844,7 @@ func BuildServerBindingResp(psk []byte, req *ParsedClientReq, clientAddr net.Add
 	padLen := 16 + mrand.IntN(33)
 	if req.WireLen > 0 {
 		baseWithoutPad := len(buf) + 4 + 32 + 10 + len(paramsJSON) + ackAEAD.Overhead() + 8
-		// Account for up to 3B STUN 4-byte padding on attrGFTTicket.
+		// Account for up to 3B STUN 4-byte padding on attrKSLTicket.
 		maxTotal := 2 * req.WireLen
 		if baseWithoutPad+padLen+3 > maxTotal {
 			avail := maxTotal - baseWithoutPad - 3
@@ -867,7 +867,7 @@ func BuildServerBindingResp(psk []byte, req *ParsedClientReq, clientAddr net.Add
 	copy(ticket, srvPub)
 	ticket = ackAEAD.Seal(ticket, req.TxID[:], pt, srvPub)
 
-	buf = appendSTUNAttr(buf, attrGFTTicket, ticket)
+	buf = appendSTUNAttr(buf, attrKSLTicket, ticket)
 	buf = finalizeSTUNWithFingerprint(buf)
 	if req.WireLen > 0 && len(buf) > 2*req.WireLen {
 		return nil, nil, fmt.Errorf("gftrtc: server binding resp %dB exceeds 2x amplification ceiling %dB", len(buf), 2*req.WireLen)
@@ -892,7 +892,7 @@ func ParseServerBindingResp(pkt, psk []byte, cliPriv *ecdh.PrivateKey, expectedT
 	if !ok || txID != expectedTxID {
 		return nil, nil, false
 	}
-	ticket, ok := findSTUNAttr(attrs, attrGFTTicket)
+	ticket, ok := findSTUNAttr(attrs, attrKSLTicket)
 	if !ok || len(ticket) < 32+10+chacha20poly1305.Overhead {
 		return nil, nil, false
 	}

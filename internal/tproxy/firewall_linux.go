@@ -93,9 +93,12 @@ func HasNFTTProxy() bool {
 // TCP conntrack window checking so single-arm asymmetric routing never stalls connections.
 func CalibrateKernel(lanIface string) {
 	writeSysctl("/proc/sys/net/ipv4/ip_forward", "1")
+	writeSysctl("/proc/sys/net/ipv4/conf/all/route_localnet", "1")
+	writeSysctl("/proc/sys/net/ipv4/conf/default/route_localnet", "1")
 	writeSysctl("/proc/sys/net/ipv4/conf/all/send_redirects", "0")
 	writeSysctl("/proc/sys/net/ipv4/conf/default/send_redirects", "0")
 	if lanIface != "" {
+		writeSysctl(filepath.Join("/proc/sys/net/ipv4/conf", lanIface, "route_localnet"), "1")
 		writeSysctl(filepath.Join("/proc/sys/net/ipv4/conf", lanIface, "send_redirects"), "0")
 	}
 	if _, err := os.Stat("/proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal"); err == nil {
@@ -105,7 +108,7 @@ func CalibrateKernel(lanIface string) {
 	}
 }
 
-// CheckFirewallHealthy verifies that `table inet ghost0` and the TPROXY policy route
+// CheckFirewallHealthy verifies that `table inet kestrel0` and the TPROXY policy route
 // are still mounted (e.g. not wiped by an external fw4 reload or hotplug event).
 func CheckFirewallHealthy(mode GatewayMode, tproxyMark, routeTable int) bool {
 	if mode == ModePort {
@@ -115,7 +118,7 @@ func CheckFirewallHealthy(mode GatewayMode, tproxyMark, routeTable int) bool {
 		routeTable = 100
 	}
 	if _, err := exec.LookPath("nft"); err == nil {
-		if err := exec.Command("nft", "list", "table", "inet", "ghost0").Run(); err != nil {
+		if err := exec.Command("nft", "list", "table", "inet", "kestrel0").Run(); err != nil {
 			return false
 		}
 		if HasNFTTProxy() {
@@ -130,8 +133,8 @@ func CheckFirewallHealthy(mode GatewayMode, tproxyMark, routeTable int) bool {
 		}
 		return true
 	}
-	return exec.Command("iptables", "-t", "nat", "-L", "GHOST0_TCP").Run() == nil &&
-		exec.Command("iptables", "-t", "nat", "-L", "GHOST0_DNS").Run() == nil
+	return exec.Command("iptables", "-t", "nat", "-L", "KSL_TCP").Run() == nil &&
+		exec.Command("iptables", "-t", "nat", "-L", "KSL_DNS").Run() == nil
 }
 
 func writeSysctl(path, val string) {
@@ -213,7 +216,7 @@ func ApplyFirewall(spec FirewallSpec) (string, error) {
 	return "iptables (REDIRECT+DNS)", nil
 }
 
-// CleanupFirewall atomically removes `table inet ghost0`, policy routing, and any fallback iptables chains.
+// CleanupFirewall atomically removes `table inet kestrel0` (and legacy `ghost0`), policy routing, and any fallback iptables chains.
 func CleanupFirewall(tproxyMark, routeTable int) {
 	if tproxyMark <= 0 {
 		tproxyMark = 1
@@ -221,6 +224,7 @@ func CleanupFirewall(tproxyMark, routeTable int) {
 	if routeTable <= 0 {
 		routeTable = 100
 	}
+	_ = exec.Command("nft", "delete", "table", "inet", "kestrel0").Run()
 	_ = exec.Command("nft", "delete", "table", "inet", "ghost0").Run()
 	cleanPolicyRoute(fmt.Sprintf("0x%x", tproxyMark), strconv.Itoa(routeTable))
 	cleanupIPTablesFallback()
@@ -240,27 +244,27 @@ func applyIPTablesFallback(spec FirewallSpec) error {
 	markHex := fmt.Sprintf("0x%x", spec.FWMark)
 
 	cmds := [][]string{
-		{"iptables", "-t", "nat", "-N", "GHOST0_DNS"},
-		{"iptables", "-t", "nat", "-A", "GHOST0_DNS", "-m", "mark", "--mark", markHex, "-j", "RETURN"},
-		{"iptables", "-t", "nat", "-A", "GHOST0_DNS", "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", strconv.Itoa(spec.DNSPort)},
-		{"iptables", "-t", "nat", "-A", "GHOST0_DNS", "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", strconv.Itoa(spec.DNSPort)},
-		{"iptables", "-t", "nat", "-I", "PREROUTING", "1", "-j", "GHOST0_DNS"},
+		{"iptables", "-t", "nat", "-N", "KSL_DNS"},
+		{"iptables", "-t", "nat", "-A", "KSL_DNS", "-m", "mark", "--mark", markHex, "-j", "RETURN"},
+		{"iptables", "-t", "nat", "-A", "KSL_DNS", "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", strconv.Itoa(spec.DNSPort)},
+		{"iptables", "-t", "nat", "-A", "KSL_DNS", "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", strconv.Itoa(spec.DNSPort)},
+		{"iptables", "-t", "nat", "-I", "PREROUTING", "1", "-j", "KSL_DNS"},
 
-		{"iptables", "-t", "nat", "-N", "GHOST0_TCP"},
-		{"iptables", "-t", "nat", "-A", "GHOST0_TCP", "-m", "mark", "--mark", markHex, "-j", "RETURN"},
-		{"iptables", "-t", "nat", "-A", "GHOST0_TCP", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "RETURN"},
-		{"iptables", "-t", "nat", "-A", "GHOST0_TCP", "-d", "127.0.0.0/8", "-j", "RETURN"},
-		{"iptables", "-t", "nat", "-A", "GHOST0_TCP", "-d", "10.0.0.0/8", "-j", "RETURN"},
-		{"iptables", "-t", "nat", "-A", "GHOST0_TCP", "-d", "172.16.0.0/12", "-j", "RETURN"},
-		{"iptables", "-t", "nat", "-A", "GHOST0_TCP", "-d", "192.168.0.0/16", "-j", "RETURN"},
-		{"iptables", "-t", "nat", "-A", "GHOST0_TCP", "-d", "224.0.0.0/4", "-j", "RETURN"},
+		{"iptables", "-t", "nat", "-N", "KSL_TCP"},
+		{"iptables", "-t", "nat", "-A", "KSL_TCP", "-m", "mark", "--mark", markHex, "-j", "RETURN"},
+		{"iptables", "-t", "nat", "-A", "KSL_TCP", "-m", "addrtype", "--dst-type", "LOCAL", "-j", "RETURN"},
+		{"iptables", "-t", "nat", "-A", "KSL_TCP", "-d", "127.0.0.0/8", "-j", "RETURN"},
+		{"iptables", "-t", "nat", "-A", "KSL_TCP", "-d", "10.0.0.0/8", "-j", "RETURN"},
+		{"iptables", "-t", "nat", "-A", "KSL_TCP", "-d", "172.16.0.0/12", "-j", "RETURN"},
+		{"iptables", "-t", "nat", "-A", "KSL_TCP", "-d", "192.168.0.0/16", "-j", "RETURN"},
+		{"iptables", "-t", "nat", "-A", "KSL_TCP", "-d", "224.0.0.0/4", "-j", "RETURN"},
 	}
 	for _, vip := range filterValidIPv4s(spec.VPSIPs) {
-		cmds = append(cmds, []string{"iptables", "-t", "nat", "-A", "GHOST0_TCP", "-d", vip, "-j", "RETURN"})
+		cmds = append(cmds, []string{"iptables", "-t", "nat", "-A", "KSL_TCP", "-d", vip, "-j", "RETURN"})
 	}
 	cmds = append(cmds,
-		[]string{"iptables", "-t", "nat", "-A", "GHOST0_TCP", "-p", "tcp", "-j", "REDIRECT", "--to-ports", strconv.Itoa(spec.TCPPort)},
-		[]string{"iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-j", "GHOST0_TCP"},
+		[]string{"iptables", "-t", "nat", "-A", "KSL_TCP", "-p", "tcp", "-j", "REDIRECT", "--to-ports", strconv.Itoa(spec.TCPPort)},
+		[]string{"iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-j", "KSL_TCP"},
 	)
 
 	for _, args := range cmds {
@@ -273,6 +277,12 @@ func applyIPTablesFallback(spec FirewallSpec) error {
 
 func cleanupIPTablesFallback() {
 	for _, args := range [][]string{
+		{"iptables", "-t", "nat", "-D", "PREROUTING", "-j", "KSL_DNS"},
+		{"iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "-j", "KSL_TCP"},
+		{"iptables", "-t", "nat", "-F", "KSL_DNS"},
+		{"iptables", "-t", "nat", "-X", "KSL_DNS"},
+		{"iptables", "-t", "nat", "-F", "KSL_TCP"},
+		{"iptables", "-t", "nat", "-X", "KSL_TCP"},
 		{"iptables", "-t", "nat", "-D", "PREROUTING", "-j", "GHOST0_DNS"},
 		{"iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "-j", "GHOST0_TCP"},
 		{"iptables", "-t", "nat", "-F", "GHOST0_DNS"},

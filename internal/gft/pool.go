@@ -94,7 +94,7 @@ func NewSessionPool(l *Link, ps *ParamStore, size int, logf func(string, ...any)
 }
 
 // SetCooldownGuard registers a predicate indicating whether long circuit-breaker cooldowns
-// should be used when repeated TCP reconnect attempts fail (e.g., while GFT-RTC is healthy).
+// should be used when repeated TCP reconnect attempts fail (e.g., while Kestrel-RTC is healthy).
 func (p *SessionPool) SetCooldownGuard(fn func() bool) {
 	p.mu.Lock()
 	p.shouldCoolDown = fn

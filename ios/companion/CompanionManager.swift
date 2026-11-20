@@ -61,8 +61,8 @@ final class CompanionManager: GhostBackend {
                     self.onStateChange?()
                     self.onLogMessage?("Start failed: \(err.localizedDescription)")
                     self.onErrorReport?(GhostTunnelErrorReport(
-                        title: "启动 Companion 本地代理失败",
-                        domain: "com.ghostframe.companion",
+                        title: "启动 Kestrel Air 本地代理失败",
+                        domain: "com.kestrel.air",
                         code: -1,
                         message: err.localizedDescription,
                         mainBundleID: Bundle.main.bundleIdentifier ?? "unknown",

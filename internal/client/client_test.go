@@ -225,6 +225,28 @@ func TestEngineMultiNodeRouteTransportAndClashYAML(t *testing.T) {
 		t.Fatalf("unexpected Clash Meta YAML:\n%s", yb)
 	}
 
+	if err := eng.RenameNode(1, "  Tokyo-Custom  "); err != nil {
+		t.Fatalf("RenameNode failed: %v", err)
+	}
+	if stR := eng.Status(); stR["node_name"] != "Tokyo-Custom" {
+		t.Fatalf("expected renamed node_name=Tokyo-Custom, got %v", stR["node_name"])
+	}
+	engReload, err := NewEngine(cfgPath)
+	if err != nil {
+		t.Fatalf("reload engine failed: %v", err)
+	}
+	if stRL := engReload.Status(); stRL["node_name"] != "Tokyo-Custom" {
+		engReload.Close()
+		t.Fatalf("expected persisted node_name=Tokyo-Custom, got %v", stRL["node_name"])
+	}
+	engReload.Close()
+	if err := eng.RenameNode(1, ""); err != nil {
+		t.Fatalf("RenameNode fallback failed: %v", err)
+	}
+	if stRF := eng.Status(); stRF["node_name"] != "node2.example:443" {
+		t.Fatalf("expected fallback node_name=node2.example:443, got %v", stRF["node_name"])
+	}
+
 	if err := eng.SelectNode(0); err != nil {
 		t.Fatal(err)
 	}

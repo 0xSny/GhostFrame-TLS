@@ -125,10 +125,10 @@ sync_ntp_clock() {
 }
 sync_ntp_clock
 
-# 3. Kernel BBR + 32MB GFT-RTC UDP Buffers (/etc/sysctl.d/99-gft-rtc.conf)
+# 3. Kernel BBR + 32MB Kestrel-RTC UDP Buffers (/etc/sysctl.d/99-ksl-rtc.conf)
 apply_sysctl_tuning() {
   if [[ -d /etc/sysctl.d ]]; then
-    cat > /etc/sysctl.d/99-gft-rtc.conf <<'EOF'
+    cat > /etc/sysctl.d/99-ksl-rtc.conf <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = 33554432
@@ -140,7 +140,7 @@ net.ipv4.udp_wmem_min = 65536
 net.core.netdev_max_backlog = 16384
 EOF
     sysctl --system >/dev/null 2>&1 || true
-    ok "Applied BBR + fq and 32MB GFT-RTC UDP buffers (/etc/sysctl.d/99-gft-rtc.conf)"
+    ok "Applied BBR + fq and 32MB Kestrel-RTC UDP buffers (/etc/sysctl.d/99-ksl-rtc.conf)"
   fi
 }
 
@@ -244,42 +244,45 @@ apply_hop_firewall() {
 
   if command -v nft >/dev/null 2>&1; then
     nft delete table inet gft_hop >/dev/null 2>&1 || true
+    nft delete table inet ksl_hop >/dev/null 2>&1 || true
     {
-      echo "add table inet gft_hop"
-      echo "add chain inet gft_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }"
+      echo "add table inet ksl_hop"
+      echo "add chain inet ksl_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }"
       if (( ${#exempt_ports[@]} > 0 )); then
         local port_set
         port_set=$(IFS=,; echo "${exempt_ports[*]}")
-        echo "add rule inet gft_hop prerouting udp dport { ${port_set} } return"
+        echo "add rule inet ksl_hop prerouting udp dport { ${port_set} } return"
         ok "Preserved co-hosted UDP ports (${port_set}) with nft RETURN exemption"
       fi
-      echo "add rule inet gft_hop prerouting udp dport ${lo}-${hi} redirect to :${dst}"
+      echo "add rule inet ksl_hop prerouting udp dport ${lo}-${hi} redirect to :${dst}"
     } | nft -f -
-    ok "Configured isolated nftables table inet gft_hop (UDP ${lo}-${hi} -> :${dst})"
+    ok "Configured isolated nftables table inet ksl_hop (UDP ${lo}-${hi} -> :${dst})"
   elif command -v iptables >/dev/null 2>&1; then
-    iptables -t nat -N GFT_HOP >/dev/null 2>&1 || true
-    iptables -t nat -F GFT_HOP
-    iptables -t nat -C PREROUTING -j GFT_HOP >/dev/null 2>&1 || iptables -t nat -A PREROUTING -j GFT_HOP
+    iptables -t nat -D PREROUTING -j GFT_HOP >/dev/null 2>&1 || true
+    iptables -t nat -D PREROUTING -p udp -j GFT_HOP >/dev/null 2>&1 || true
+    iptables -t nat -N KSL_HOP >/dev/null 2>&1 || true
+    iptables -t nat -F KSL_HOP
+    iptables -t nat -C PREROUTING -j KSL_HOP >/dev/null 2>&1 || iptables -t nat -A PREROUTING -j KSL_HOP
     if (( ${#exempt_ports[@]} > 0 )); then
       local i=0 chunk=""
       for p in "${exempt_ports[@]}"; do
         chunk="${chunk:+${chunk},}${p}"
         i=$((i + 1))
         if (( i % 15 == 0 )); then
-          iptables -t nat -A GFT_HOP -p udp -m multiport --dports "${chunk}" -j RETURN
+          iptables -t nat -A KSL_HOP -p udp -m multiport --dports "${chunk}" -j RETURN
           chunk=""
         fi
       done
       if [[ -n "$chunk" ]]; then
-        iptables -t nat -A GFT_HOP -p udp -m multiport --dports "${chunk}" -j RETURN
+        iptables -t nat -A KSL_HOP -p udp -m multiport --dports "${chunk}" -j RETURN
       fi
       ok "Preserved co-hosted UDP ports (${exempt_ports[*]}) with iptables RETURN exemption"
     fi
-    iptables -t nat -A GFT_HOP -p udp --dport "${lo}:${hi}" -j REDIRECT --to-ports "${dst}"
+    iptables -t nat -A KSL_HOP -p udp --dport "${lo}:${hi}" -j REDIRECT --to-ports "${dst}"
     if command -v netfilter-persistent >/dev/null 2>&1; then
       netfilter-persistent save >/dev/null 2>&1 || true
     fi
-    ok "Configured isolated iptables chain GFT_HOP (UDP ${lo}:${hi} -> :${dst})"
+    ok "Configured isolated iptables chain KSL_HOP (UDP ${lo}:${hi} -> :${dst})"
   fi
 }
 
@@ -317,6 +320,19 @@ install_server() {
 
   if [[ -f /etc/kestrel/server.json ]]; then
     log "Preserving existing /etc/kestrel/server.json (lossless binary upgrade)."
+    if [[ -z "$HOP_RANGE" ]]; then
+      local existing_hop
+      existing_hop="$(sed -n 's/.*"hop_range"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/kestrel/server.json | head -n1 || true)"
+      if [[ -n "$existing_hop" ]]; then
+        HOP_RANGE="$existing_hop"
+        log "Preserving existing UDP hop range from server.json: ${HOP_RANGE}"
+      fi
+    fi
+    local existing_port
+    existing_port="$(sed -n 's/.*"listen"[[:space:]]*:[[:space:]]*":\([0-9][0-9]*\)".*/\1/p' /etc/kestrel/server.json | head -n1 || true)"
+    if [[ -n "$existing_port" ]]; then
+      LISTEN_PORT="$existing_port"
+    fi
   else
     check_port_and_guide
     local init_args=(init --conf-dir /etc/kestrel --state-dir /var/lib/kestrel --listen ":${LISTEN_PORT}")

@@ -35,11 +35,13 @@ func SetNoSysProxy(disable bool) {
 }
 
 // IsMockSysProxy returns true when any sandbox condition is active:
-// Go test execution, -no-sysproxy flag, GFT_NO_SYSPROXY=1, or GFT_MOCK_SYSPROXY=1.
+// Go test execution, -no-sysproxy flag, KSL_NO_SYSPROXY=1, or KSL_MOCK_SYSPROXY=1 (legacy GFT_* aliases supported).
 func IsMockSysProxy() bool {
 	return testing.Testing() ||
 		noSysProxy.Load() ||
-		os.Getenv("GFT_NO_SYSPROXY") == "1" ||
+		os.Getenv("KSL_NO_SYSPROXY") == "1" ||
+		os.Getenv("KSL_MOCK_SYSPROXY") == "1" ||
+		os.Getenv("KSL_NO_SYSPROXY") == "1" ||
 		os.Getenv("GFT_MOCK_SYSPROXY") == "1"
 }
 

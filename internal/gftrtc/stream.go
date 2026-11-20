@@ -60,13 +60,13 @@ var (
 	ErrProtocol      = errors.New("gftrtc: protocol error")
 )
 
-// UDPPacket represents a decoded UDP payload received over GFT-RTC.
+// UDPPacket represents a decoded UDP payload received over Kestrel-RTC.
 type UDPPacket struct {
 	Target string
 	Data   []byte
 }
 
-// UDPReplySink lets server outbound forward UDP replies back over GFT-RTC.
+// UDPReplySink lets server outbound forward UDP replies back over Kestrel-RTC.
 type UDPReplySink interface {
 	SendUDPReply(id uint16, target string, data []byte) error
 	SessionDone() <-chan struct{}
@@ -195,7 +195,7 @@ type queuedSendChunk struct {
 }
 
 // RTCStream implements a Zero-HOL-Blocking bidirectional reliable stream (`gft.DataStream`)
-// over GhostFrame-RTC with independent per-stream out-of-order reassembly and BDP sliding flow control.
+// over Kestrel-RTC with independent per-stream out-of-order reassembly and BDP sliding flow control.
 type RTCStream struct {
 	sess   *RTCSession
 	id     uint32
@@ -702,7 +702,7 @@ type udpReassemblyEntry struct {
 	createdAt time.Time
 }
 
-// RTCUDPAssoc implements `gft.UDPAssociation` over GFT-RTC datagrams with <=16-frag
+// RTCUDPAssoc implements `gft.UDPAssociation` over Kestrel-RTC datagrams with <=16-frag
 // reassembly and automatic dedicated reliable stream fallback for >16KB datagrams.
 type RTCUDPAssoc struct {
 	sess      *RTCSession

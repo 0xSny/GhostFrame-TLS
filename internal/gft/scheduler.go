@@ -84,7 +84,7 @@ func (d *DialLimiter) Wait(ctx context.Context) error {
 	return nil
 }
 
-// ApexStats reports live status across both GFT-RTC striped sessions and TCP uTLS pool.
+// ApexStats reports live status across both Kestrel-RTC striped sessions and TCP uTLS pool.
 type ApexStats struct {
 	Mode          string  `json:"mode"` // "RTC-Smart", "TCP-uTLS", "TCP-Fallback", "Starting"
 	RTCConnected  bool    `json:"rtc_connected"`
@@ -120,7 +120,7 @@ type rtcSlot struct {
 	streamFails  atomic.Int32
 }
 
-// ApexScheduler races and coordinates a Striped GFT-RTC Dual-Session pool (with 0ms WebRTC
+// ApexScheduler races and coordinates a Striped Kestrel-RTC Dual-Session pool (with 0ms WebRTC
 // socket migration port hopping, XOR-FEC, and Smart-Brutal CC) alongside the TCP uTLS SessionPool.
 type ApexScheduler struct {
 	link       *Link
@@ -184,7 +184,7 @@ func (a *ApexScheduler) launchLoop(fn func()) {
 	go fn()
 }
 
-// NewApexScheduler creates an Apex dual-track scheduler (GFT-RTC + TCP-uTLS) for link.
+// NewApexScheduler creates an Apex dual-track scheduler (Kestrel-RTC + TCP-uTLS) for link.
 func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string, ...any)) *ApexScheduler {
 	var cid [8]byte
 	if _, err := io.ReadFull(rand.Reader, cid[:]); err != nil {
@@ -307,7 +307,7 @@ func (a *ApexScheduler) SetDialJitterForTest(minMs, maxMs int, rate float64) {
 	}
 }
 
-// SetRTCDialHookForTest overrides the GFT-RTC dial function used by the scheduler.
+// SetRTCDialHookForTest overrides the Kestrel-RTC dial function used by the scheduler.
 func (a *ApexScheduler) SetRTCDialHookForTest(fn func(ctx context.Context, l *Link, ps *ParamStore, port int, timeout time.Duration, clientID [8]byte) (*gftrtc.RTCSession, time.Duration, error)) {
 	a.mu.Lock()
 	a.rtcDialFn = func(dialCtx context.Context, dl *Link, dps *ParamStore, port int, timeout time.Duration) (*gftrtc.RTCSession, time.Duration, error) {
@@ -332,7 +332,7 @@ func (a *ApexScheduler) SetTCPBackoffForTest(base, coolMin, coolMax time.Duratio
 	a.mu.Unlock()
 }
 
-// UpdateBandwidth updates pacing targets on active GFT-RTC sessions live, dividing manual targets evenly.
+// UpdateBandwidth updates pacing targets on active Kestrel-RTC sessions live, dividing manual targets evenly.
 func (a *ApexScheduler) UpdateBandwidth(upMbps, downMbps int) {
 	a.upMbps.Store(int64(upMbps))
 	a.downMbps.Store(int64(downMbps))
@@ -395,7 +395,7 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 		}
 		a.launchLoop(a.rtcMaintainLoop)
 		return nil
-	default: // "auto": race GFT-RTC + TCP-uTLS simultaneously
+	default: // "auto": race Kestrel-RTC + TCP-uTLS simultaneously
 		type res struct {
 			kind string
 			err  error
@@ -419,7 +419,7 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 					if r2.err != nil {
 						if r2.kind == "tcp" {
 							if a.onLog != nil {
-								a.onLog("[TCP] Track deferred (%v); running on GFT-RTC Smart-Brutal", r2.err)
+								a.onLog("[TCP] Track deferred (%v); running on Kestrel-RTC Smart-Brutal", r2.err)
 							}
 							a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
 						} else if a.onLog != nil {
@@ -445,7 +445,7 @@ func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 		}
 		if r1.kind == "tcp" {
 			if a.onLog != nil {
-				a.onLog("[TCP] Track deferred (%v); running on GFT-RTC Smart-Brutal", r1.err)
+				a.onLog("[TCP] Track deferred (%v); running on Kestrel-RTC Smart-Brutal", r1.err)
 			}
 			a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
 		} else if a.onLog != nil {
@@ -592,7 +592,7 @@ func (a *ApexScheduler) dialOneRTCSlotWithIndex(timeout time.Duration, channelId
 		maxAge:     maxAge,
 	}
 	if a.onLog != nil {
-		a.onLog("[RTC#%d] GFT-RTC connected (UDP :%d, Cipher=%s, RTT=%dms)", channelIdx, port, sess.Stats().Cipher, ms)
+		a.onLog("[RTC#%d] Kestrel-RTC connected (UDP :%d, Cipher=%s, RTT=%dms)", channelIdx, port, sess.Stats().Cipher, ms)
 	}
 	return slot, nil
 }
@@ -992,7 +992,7 @@ func (a *ApexScheduler) markRTCDegraded(r *gftrtc.RTCSession, err error) {
 	}
 }
 
-// OpenStream routes a TCP tunnel stream over GFT-RTC striped pool when healthy,
+// OpenStream routes a TCP tunnel stream over Kestrel-RTC striped pool when healthy,
 // falling back in 0ms to the uTLS TCP SessionPool if UDP fails or is throttled.
 func (a *ApexScheduler) OpenStream(target string, first []byte) (DataStream, error) {
 	if sl := a.activeSlotForSend(nil); sl != nil {
@@ -1235,7 +1235,7 @@ func (u *SchedulerUDPAssoc) Close() error {
 	return nil
 }
 
-// Stats returns a live metrics snapshot across GFT-RTC and TCP-uTLS tracks.
+// Stats returns a live metrics snapshot across Kestrel-RTC and TCP-uTLS tracks.
 func (a *ApexScheduler) Stats() ApexStats {
 	ps := a.pool.Stats()
 	a.mu.Lock()
@@ -1356,7 +1356,7 @@ func (a *ApexScheduler) Stats() ApexStats {
 	}
 }
 
-// Close shuts down GFT-RTC striped sessions, UDP associations, and TCP SessionPool cleanly.
+// Close shuts down Kestrel-RTC striped sessions, UDP associations, and TCP SessionPool cleanly.
 func (a *ApexScheduler) Close() {
 	a.loopMu.Lock()
 	a.closed = true

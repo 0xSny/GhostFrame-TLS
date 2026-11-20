@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"ghostframe/internal/client"
@@ -18,7 +19,7 @@ import (
 const (
 	timerRefreshID = 1
 
-	// Palette (GhostFrame Obsidian Dark)
+	// Palette (Kestrel Obsidian Dark)
 	colBg         uint32 = 0xFF070B12
 	colCard       uint32 = 0xFF0F172A
 	colCardAlt    uint32 = 0xFF131D33
@@ -51,6 +52,9 @@ const (
 	hitPing
 	hitImport
 	hitNodeDrop
+	hitNodeRename
+	hitNodeRenameBox
+	hitNodeRenameSave
 	hitNodeDelete
 	hitRouteRule
 	hitRouteGlobal
@@ -102,11 +106,12 @@ type appUI struct {
 	autoScroll   bool
 	lastLogCount int
 
-	editFocus    int // 0=none, 1=socks5 port, 2=http port, 3=bw up mbps, 4=bw down mbps
-	portSocksBuf string
-	portHTTPBuf  string
-	bwUpBuf      string
-	bwDownBuf    string
+	editFocus     int // 0=none, 1=socks5 port, 2=http port, 3=bw up mbps, 4=bw down mbps, 5=node remark
+	portSocksBuf  string
+	portHTTPBuf   string
+	bwUpBuf       string
+	bwDownBuf     string
+	nodeRemarkBuf string
 
 	toastMu      sync.Mutex
 	toastText    string
@@ -347,7 +352,8 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 				changed = true
 			}
 			if a.editFocus != 0 && hid != hitPortSocks && hid != hitPortHTTP && hid != hitPortSave && hid != hitPortCapsule &&
-				hid != hitBWUp && hid != hitBWDown && hid != hitBWSave {
+				hid != hitBWUp && hid != hitBWDown && hid != hitBWSave &&
+				hid != hitNodeRename && hid != hitNodeRenameBox && hid != hitNodeRenameSave {
 				a.cancelPortEdit()
 				changed = true
 			}
@@ -387,7 +393,9 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 				a.invalidate()
 				return 0
 			case 0x0D: // VK_RETURN
-				if a.editFocus == 3 || a.editFocus == 4 {
+				if a.editFocus == 5 {
+					a.commitNodeRename()
+				} else if a.editFocus == 3 || a.editFocus == 4 {
 					a.commitBWEdit()
 				} else {
 					a.commitPortEdit()
@@ -420,7 +428,12 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	case wmChar:
 		if a.editFocus != 0 {
 			ch := rune(wParam)
-			if ch >= '0' && ch <= '9' {
+			if a.editFocus == 5 {
+				if ch >= 0x20 && ch != 0x7f && utf8.RuneCountInString(a.nodeRemarkBuf) < 40 {
+					a.nodeRemarkBuf += string(ch)
+					a.invalidate()
+				}
+			} else if ch >= '0' && ch <= '9' {
 				a.appendPortDigit(byte(ch))
 				a.invalidate()
 			}
@@ -651,7 +664,29 @@ func (a *appUI) backspacePortDigit() {
 		if len(a.bwDownBuf) > 0 {
 			a.bwDownBuf = a.bwDownBuf[:len(a.bwDownBuf)-1]
 		}
+	case 5:
+		if len(a.nodeRemarkBuf) > 0 {
+			_, size := utf8.DecodeLastRuneInString(a.nodeRemarkBuf)
+			if size > 0 {
+				a.nodeRemarkBuf = a.nodeRemarkBuf[:len(a.nodeRemarkBuf)-size]
+			}
+		}
 	}
+}
+
+func (a *appUI) commitNodeRename() {
+	if a.eng == nil {
+		return
+	}
+	st := a.eng.Status()
+	activeIdx := intVal(st["active_node"])
+	rem := strings.TrimSpace(a.nodeRemarkBuf)
+	if err := a.eng.RenameNode(activeIdx, rem); err != nil {
+		a.setToast("修改备注失败: "+err.Error(), true)
+		return
+	}
+	a.editFocus = 0
+	a.setToastSuccess("节点备注已保存")
 }
 
 func (a *appUI) commitBWEdit() {
@@ -728,7 +763,8 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 	state := client.ConnState(strVal(st["state"]))
 	activeIdx := intVal(st["active_node"])
 	if a.editFocus != 0 && k != hitPortSocks && k != hitPortHTTP && k != hitPortSave && k != hitPortCapsule &&
-		k != hitBWUp && k != hitBWDown && k != hitBWSave {
+		k != hitBWUp && k != hitBWDown && k != hitBWSave &&
+		k != hitNodeRename && k != hitNodeRenameBox && k != hitNodeRenameSave {
 		a.cancelPortEdit()
 	}
 
@@ -761,6 +797,19 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 		a.importFromClipboard()
 	case hitNodeDrop:
 		a.nodeDropOpen = !a.nodeDropOpen
+	case hitNodeRename:
+		a.nodeDropOpen = false
+		nodes, _ := st["nodes"].([]client.NodeSummary)
+		if len(nodes) == 0 {
+			a.setToast("请先导入节点", true)
+			break
+		}
+		a.nodeRemarkBuf = strVal(st["node_name"])
+		a.editFocus = 5
+	case hitNodeRenameBox:
+		a.editFocus = 5
+	case hitNodeRenameSave:
+		a.commitNodeRename()
 	case hitNodeOption:
 		a.nodeDropOpen = false
 		go func(i int) {
@@ -790,13 +839,13 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 	case hitTransAuto:
 		go func() {
 			_ = a.eng.SetTransport("auto")
-			a.setToast("传输通道: Auto (GFT-RTC+TCP)", false)
+			a.setToast("传输通道: Auto (Kestrel-RTC+TCP)", false)
 			a.postRefresh()
 		}()
 	case hitTransRTC:
 		go func() {
 			_ = a.eng.SetTransport("rtc")
-			a.setToast("传输通道: GFT-RTC (WebRTC拟态/XOR-FEC)", false)
+			a.setToast("传输通道: Kestrel-RTC (WebRTC拟态/XOR-FEC)", false)
 			a.postRefresh()
 		}()
 	case hitTransTCP:
@@ -1073,10 +1122,10 @@ func (a *appUI) drawHeroCard(r rect, st map[string]any) {
 		btnText = "●  已加密连接 — 点击断开"
 	case client.StateConnecting:
 		c0, c1 = colBtnWaitA, colBtnWaitB
-		btnText = "◌  正在建立 GFT-RTC 双栈通道..."
+		btnText = "◌  正在建立 Kestrel-RTC 双栈通道..."
 	default:
 		c0, c1 = colBtnIdleA, colBtnIdleB
-		btnText = "▶  连接安全隧道 (v4.0 GFT-RTC)"
+		btnText = "▶  连接安全隧道 (v4.0 Kestrel-RTC)"
 	}
 	if a.hoverID == hitConnect {
 		c0 = lerpColor(c0, 0xFFFFFFFF, 0.10)
@@ -1152,21 +1201,32 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Left + s(140), y + s(18)}, colTextSub, "当前节点")
 	y += s(20)
 
-	delR := rect{r.Right - s(66), y, r.Right - s(16), y + s(32)}
-	dropR := rect{r.Left + s(16), y, delR.Left - s(8), y + s(32)}
-	dropBg := colBg
-	if a.hoverID == hitNodeDrop || a.nodeDropOpen {
-		dropBg = colCardAlt
+	delR := rect{r.Right - s(58), y, r.Right - s(16), y + s(32)}
+	renR := rect{delR.Left - s(64), y, delR.Left - s(6), y + s(32)}
+	dropR := rect{r.Left + s(16), y, renR.Left - s(6), y + s(32)}
+	if a.editFocus == 5 {
+		a.buf.fillRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), colCardAlt)
+		a.buf.strokeRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), 1.4, colCyan)
+		disp := a.nodeRemarkBuf + "|"
+		f.drawText(f.fBody, f.fmtLeft, rect{dropR.Left + s(10), dropR.Top, dropR.Right - s(8), dropR.Bottom}, colTextMain, disp)
+		a.hits = append(a.hits, hitBox{id: hitNodeRenameBox, rect: dropR})
+		a.drawButton(renR, hitNodeRenameSave, "保存", colCardAlt, colBorderHi, colEmerald)
+	} else {
+		dropBg := colBg
+		if a.hoverID == hitNodeDrop || a.nodeDropOpen {
+			dropBg = colCardAlt
+		}
+		a.buf.fillRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), dropBg)
+		a.buf.strokeRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), 1, colBorderHi)
+		f.drawText(f.fBody, f.fmtLeft, rect{dropR.Left + s(10), dropR.Top, dropR.Right - s(24), dropR.Bottom}, colTextMain, nodeName)
+		arrow := "▾"
+		if a.nodeDropOpen {
+			arrow = "▴"
+		}
+		f.drawText(f.fBody, f.fmtCent, rect{dropR.Right - s(24), dropR.Top, dropR.Right - s(4), dropR.Bottom}, colTextSub, arrow)
+		a.hits = append(a.hits, hitBox{id: hitNodeDrop, rect: dropR})
+		a.drawButton(renR, hitNodeRename, "改备注", colCardAlt, colBorderHi, colCyan)
 	}
-	a.buf.fillRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), dropBg)
-	a.buf.strokeRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), 1, colBorderHi)
-	f.drawText(f.fBody, f.fmtLeft, rect{dropR.Left + s(10), dropR.Top, dropR.Right - s(24), dropR.Bottom}, colTextMain, nodeName)
-	arrow := "▾"
-	if a.nodeDropOpen {
-		arrow = "▴"
-	}
-	f.drawText(f.fBody, f.fmtCent, rect{dropR.Right - s(24), dropR.Top, dropR.Right - s(4), dropR.Bottom}, colTextSub, arrow)
-	a.hits = append(a.hits, hitBox{id: hitNodeDrop, rect: dropR})
 
 	a.drawButton(delR, hitNodeDelete, "删除", colBg, colBorderHi, colRed)
 

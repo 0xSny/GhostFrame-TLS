@@ -123,7 +123,7 @@ func runMenu(args []string) {
 func runUpgrade(args []string) {
 	fs := flag.NewFlagSet("upgrade", flag.ExitOnError)
 	ver := fs.String("version", "latest", "target release tag or 'latest'")
-	mirror := fs.String("mirror", os.Getenv("GFT_MIRROR"), "optional GitHub mirror/proxy URL prefix")
+	mirror := fs.String("mirror", os.Getenv("KSL_MIRROR"), "optional GitHub mirror/proxy URL prefix")
 	force := fs.Bool("force", false, "reinstall even if remote version matches current")
 	conf := fs.String("config", tui.DefaultConfigPath, "config file")
 	_ = fs.Parse(args)

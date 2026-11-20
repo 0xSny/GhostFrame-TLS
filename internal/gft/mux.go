@@ -63,7 +63,7 @@ type UDPHandler func(s *Session, id uint16, target string, data []byte)
 // UDPCloseHandler is invoked when a client closes a UDP association (CmdUDPClose).
 type UDPCloseHandler func(s *Session, id uint16)
 
-// UDPPacket represents a decoded UDP payload received over CmdUDPDatagram or GFT-RTC.
+// UDPPacket represents a decoded UDP payload received over CmdUDPDatagram or Kestrel-RTC.
 type UDPPacket = gftrtc.UDPPacket
 
 // StreamInfo is a snapshot of a stream for monitoring.

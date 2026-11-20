@@ -191,7 +191,7 @@ textarea{min-height:74px;resize:vertical;font-family:ui-monospace,SFMono-Regular
         <label>传输协议偏好</label>
         <div class="seg" id="transSeg">
           <button data-t="auto" onclick="setTransport('auto')">Auto 双栈自动</button>
-          <button data-t="rtc" onclick="setTransport('rtc')">GFT-RTC 强制 UDP</button>
+          <button data-t="rtc" onclick="setTransport('rtc')">Kestrel-RTC 强制 UDP</button>
           <button data-t="tcp" onclick="setTransport('tcp')">TCP-uTLS 强制 TCP</button>
         </div>
 
@@ -324,6 +324,12 @@ function importNode(){
     });
 }
 function selectNode(i){ api('/api/node/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})}).then(refresh); }
+function renameNode(i, cur){
+  const val = prompt('请输入新的节点备注（留空恢复默认 IP:端口）:', cur || '');
+  if(val === null) return;
+  api('/api/node/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i, remark:val})})
+    .then(d => { if(d && d.ok === false){ alert(d.error || '修改备注失败'); return; } refresh(); });
+}
 function deleteNode(i){ api('/api/node/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i})}).then(refresh); }
 
 function saveGatewaySettings(){
@@ -471,10 +477,14 @@ function refresh(){
     document.getElementById('nodeCount').textContent = `${nodes.length} 节点`;
     const nl = document.getElementById('nodeList');
     nl.innerHTML = nodes.length === 0 ? '<div style="color:var(--muted);font-size:12px">暂无节点，请在上方粘贴 ksl4:// 链接导入</div>' :
-      nodes.map(n => `<div class="node-item ${n.index===s.active_node?'active':''}">
-        <div><div style="font-weight:700">${n.name}</div><div style="font-size:11px;color:var(--muted)">${n.host}:${n.port} · ${n.transport} ${n.hop_range?('· '+n.hop_range):''}</div></div>
-        <div style="display:flex;gap:6px">${n.index===s.active_node?'<span class="pill" style="border-color:var(--emerald);color:#6ee7b7">当前</span>':`<button class="btn sm" onclick="selectNode(${n.index})">切换</button>`}<button class="btn sm danger" onclick="deleteNode(${n.index})">删</button></div>
-      </div>`).join('');
+      nodes.map(n => {
+        const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        const safeJs = JSON.stringify(String(n.name||'')).replace(/'/g, "\\'");
+        return `<div class="node-item ${n.index===s.active_node?'active':''}">
+        <div><div style="font-weight:700">${esc(n.name)}</div><div style="font-size:11px;color:var(--muted)">${esc(n.host)}:${n.port} · ${esc(n.transport)} ${n.hop_range?('· '+esc(n.hop_range)):''}</div></div>
+        <div style="display:flex;gap:6px">${n.index===s.active_node?'<span class="pill" style="border-color:var(--emerald);color:#6ee7b7">当前</span>':`<button class="btn sm" onclick="selectNode(${n.index})">切换</button>`}<button class="btn sm" onclick="renameNode(${n.index}, ${safeJs})">改备注</button><button class="btn sm danger" onclick="deleteNode(${n.index})">删</button></div>
+      </div>`;
+      }).join('');
 
     drawSpark(s.history || []);
     const rb = document.getElementById('recentRoutesBox');

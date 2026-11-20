@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	sessionCookieName  = "gft_session"
+	sessionCookieName  = "ksl_session"
 	sessionTTL         = 24 * time.Hour
 	panelMaxLoginFails = 5
 	panelLockoutDur    = 10 * time.Minute
@@ -368,6 +368,7 @@ func (p *Panel) handleStats(w http.ResponseWriter, r *http.Request) {
 	pubHost := p.srv.cfg.PublicHost
 	listen := p.srv.cfg.Listen
 	sni := p.srv.cfg.SNI
+	remark := strings.TrimSpace(p.srv.cfg.Remark)
 	rtcCfgEnabled := !p.srv.cfg.DisableRTC && !p.srv.cfg.DisableQUIC
 	p.srv.cfgMu.RUnlock()
 
@@ -386,6 +387,7 @@ func (p *Panel) handleStats(w http.ResponseWriter, r *http.Request) {
 		"public_host": pubHost,
 		"listen":      listen,
 		"sni":         sni,
+		"remark":      remark,
 		"traffic":     snap,
 		"system": map[string]any{
 			"alloc_mb":   m.Alloc / 1024 / 1024,
@@ -488,6 +490,7 @@ func (p *Panel) handleRTC(w http.ResponseWriter, r *http.Request) {
 			"up_mbps":     p.srv.cfg.UpMbps,
 			"down_mbps":   p.srv.cfg.DownMbps,
 			"tx_mbps":     p.srv.cfg.TxMbps,
+			"remark":      strings.TrimSpace(p.srv.cfg.Remark),
 		}
 		p.srv.cfgMu.RUnlock()
 		_ = json.NewEncoder(w).Encode(res)
@@ -495,9 +498,10 @@ func (p *Panel) handleRTC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		HopRange string `json:"hop_range"`
-		UpMbps   int    `json:"up_mbps"`
-		DownMbps int    `json:"down_mbps"`
+		HopRange string  `json:"hop_range"`
+		UpMbps   int     `json:"up_mbps"`
+		DownMbps int     `json:"down_mbps"`
+		Remark   *string `json:"remark,omitempty"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -521,20 +525,30 @@ func (p *Panel) handleRTC(w http.ResponseWriter, r *http.Request) {
 	oldHop := p.srv.cfg.HopRange
 	oldUp := p.srv.cfg.UpMbps
 	oldDown := p.srv.cfg.DownMbps
+	oldRemark := p.srv.cfg.Remark
 	p.srv.cfg.HopRange = normHop
 	p.srv.cfg.UpMbps = req.UpMbps
 	p.srv.cfg.DownMbps = req.DownMbps
+	if req.Remark != nil {
+		rem := strings.TrimSpace(*req.Remark)
+		if runes := []rune(rem); len(runes) > 64 {
+			rem = string(runes[:64])
+		}
+		p.srv.cfg.Remark = rem
+	}
 	if p.srv.cfgPath != "" {
 		if err := SaveConfigAtomic(p.srv.cfgPath, p.srv.cfg); err != nil {
 			p.srv.cfg.HopRange = oldHop
 			p.srv.cfg.UpMbps = oldUp
 			p.srv.cfg.DownMbps = oldDown
+			p.srv.cfg.Remark = oldRemark
 			p.srv.cfgMu.Unlock()
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
 			return
 		}
 	}
+	newRemark := p.srv.cfg.Remark
 	linkObj := p.srv.cfg.Link(curParams)
 	p.srv.cfgMu.Unlock()
 
@@ -545,6 +559,7 @@ func (p *Panel) handleRTC(w http.ResponseWriter, r *http.Request) {
 		"hop_range": normHop,
 		"up_mbps":   req.UpMbps,
 		"down_mbps": req.DownMbps,
+		"remark":    newRemark,
 		"uri":       uri,
 		"qr_svg":    qrSVG,
 	})

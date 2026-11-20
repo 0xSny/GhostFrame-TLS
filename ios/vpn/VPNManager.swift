@@ -167,7 +167,7 @@ final class VPNManager: GhostBackend {
                                         self.pollStatusOnce()
                                     }
                                 } else if let body = cfgJSON.data(using: .utf8) {
-                                    self.fetchLoopbackHTTP(method: "POST", path: "/_gft/reload", body: body) { [weak self] data, _ in
+                                    self.fetchLoopbackHTTP(method: "POST", path: "/_ksl/reload", body: body) { [weak self] data, _ in
                                         Task { @MainActor in
                                             if data != nil {
                                                 self?.pollStatusOnce()
@@ -195,7 +195,7 @@ final class VPNManager: GhostBackend {
                         completion("VPN manager unavailable")
                         return
                     }
-                    self.fetchLoopbackHTTP(method: "GET", path: "/_gft/diag", body: nil) { data, _ in
+                    self.fetchLoopbackHTTP(method: "GET", path: "/_ksl/diag", body: nil) { data, _ in
                         Task { @MainActor in
                             if let data = data, let text = String(data: data, encoding: .utf8), !text.isEmpty {
                                 completion(text)
@@ -213,7 +213,7 @@ final class VPNManager: GhostBackend {
 
     func clearLogs() {
         sendIPC(action: "clearLogs", configJSON: nil) { _ in }
-        fetchLoopbackHTTP(method: "POST", path: "/_gft/clear-logs", body: nil) { _, _ in }
+        fetchLoopbackHTTP(method: "POST", path: "/_ksl/clear-logs", body: nil) { _, _ in }
     }
 
     private func localFallbackDiagnostic() -> String {
@@ -221,14 +221,14 @@ final class VPNManager: GhostBackend {
         let neStatus = Self.statusName(manager?.connection.status ?? .invalid)
         let lastErr = lastDisconnectErrorText.isEmpty ? "none" : lastDisconnectErrorText
         return """
-        Kestrel Duo App Diagnostic (v4.0.20-LTS)
+        Kestrel Duo App Diagnostic (v4.0-LTS)
         MainBundleID: \(mainID)
         ResolvedExtensionBundleID: \(detectedExtensionBundleID)
-        TunnelState: \(backendStateLabel) (NEVPNStatus=\(neStatus))
+        TunnelState: \(backendStateLabel) (NEStatus=\(neStatus))
         TelemetryChannel: \(telemetryChannel) (HTTP=127.0.0.1:\(currentHTTPPort))
         LastDisconnectError: \(lastErr)
         ConfigDelivery: NETunnelProviderProtocol.providerConfiguration (Zero App Group)
-        IPCChannel: NETunnelProviderSession.sendProviderMessage + Loopback /_gft/*
+        IPCChannel: NETunnelProviderSession.sendProviderMessage + Loopback /_ksl/*
         """
     }
 
@@ -420,9 +420,9 @@ final class VPNManager: GhostBackend {
                         self.onLogMessage?("VPN system error: none (NEVPNConnection returned nil)")
                         if triggerReport {
                             let fallbackErr = NSError(
-                                domain: "com.ghostframe.vpn",
+                                domain: "com.kestrel.duo",
                                 code: -2,
-                                userInfo: [NSLocalizedDescriptionKey: "系统未拉起或立即终止了 PacketTunnel 扩展（无附加系统错误码）。若个人证书或重签工具未真正授予扩展 Network Extensions 权限，请切换同批次产出的 GhostFrame-Companion 伴侣版。"]
+                                userInfo: [NSLocalizedDescriptionKey: "系统未拉起或立即终止了 PacketTunnel 扩展（无附加系统错误码）。若个人证书或重签工具未真正授予扩展 Network Extensions 权限，请切换同批次产出的 Kestrel Air 版本。"]
                             )
                             self.handleError(fallbackErr, stage: "PacketTunnel 扩展未能保持运行")
                         }
@@ -433,7 +433,7 @@ final class VPNManager: GhostBackend {
         }
         if triggerReport {
             let err = NSError(
-                domain: "com.ghostframe.vpn",
+                domain: "com.kestrel.duo",
                 code: -2,
                 userInfo: [NSLocalizedDescriptionKey: "PacketTunnel 状态回落至未连接，当前系统版本不支持 fetchLastDisconnectError。"]
             )
@@ -489,7 +489,7 @@ final class VPNManager: GhostBackend {
     }
 
     private func fetchStatusViaHTTP() {
-        fetchLoopbackHTTP(method: "GET", path: "/_gft/status", body: nil) { [weak self] data, err in
+        fetchLoopbackHTTP(method: "GET", path: "/_ksl/status", body: nil) { [weak self] data, err in
             Task { @MainActor in
                 guard let self = self else { return }
                 if let data = data, let json = String(data: data, encoding: .utf8) {
@@ -497,12 +497,12 @@ final class VPNManager: GhostBackend {
                     self.telemetryChannel = "HTTP(127.0.0.1:\(self.currentHTTPPort))"
                     if !self.loggedHTTPTelemetry {
                         self.loggedHTTPTelemetry = true
-                        self.onLogMessage?("VPN telemetry: connected via 127.0.0.1:\(self.currentHTTPPort)/_gft/status")
+                        self.onLogMessage?("Tunnel telemetry: connected via 127.0.0.1:\(self.currentHTTPPort)/_ksl/status")
                     }
                     self.onStatusUpdate?(snapshot)
                 } else if let err = err {
                     self.loggedHTTPTelemetry = false
-                    self.logIPCWarningThrottled("VPN HTTP fallback failed (:\(self.currentHTTPPort)): \(err.localizedDescription)")
+                    self.logIPCWarningThrottled("Tunnel HTTP fallback failed (:\(self.currentHTTPPort)): \(err.localizedDescription)")
                 }
             }
         }
@@ -527,7 +527,7 @@ final class VPNManager: GhostBackend {
             }
             if let http = response as? HTTPURLResponse, http.statusCode != 200 {
                 let err = NSError(
-                    domain: "com.ghostframe.http",
+                    domain: "com.kestrel.http",
                     code: http.statusCode,
                     userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"]
                 )
@@ -552,7 +552,7 @@ final class VPNManager: GhostBackend {
             try session.sendProviderMessage(reqData) { [weak self] responseData in
                 guard let responseData = responseData else {
                     Task { @MainActor in
-                        self?.logIPCWarningThrottled("VPN IPC: nil response for \(action) (switching to localhost /_gft/*)")
+                        self?.logIPCWarningThrottled("Tunnel IPC: nil response for \(action) (switching to localhost /_ksl/*)")
                     }
                     completion(nil)
                     return
@@ -560,7 +560,7 @@ final class VPNManager: GhostBackend {
                 guard let resp = try? JSONDecoder().decode(TunnelIPCResponse.self, from: responseData) else {
                     let count = responseData.count
                     Task { @MainActor in
-                        self?.logIPCWarningThrottled("VPN IPC: unreadable response for \(action) (bytes=\(count))")
+                        self?.logIPCWarningThrottled("Tunnel IPC: unreadable response for \(action) (bytes=\(count))")
                     }
                     completion(nil)
                     return

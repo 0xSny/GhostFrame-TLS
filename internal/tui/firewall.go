@@ -162,29 +162,30 @@ func (f *FirewallManager) ApplyHopRule(hopRange string, targetPort int) error {
 
 	if f.hasCmd("nft") {
 		_, _ = f.RunCmd("nft", "delete", "table", "inet", "gft_hop")
+		_, _ = f.RunCmd("nft", "delete", "table", "inet", "ksl_hop")
 		var sb strings.Builder
-		sb.WriteString("add table inet gft_hop\n")
-		sb.WriteString("add chain inet gft_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }\n")
+		sb.WriteString("add table inet ksl_hop\n")
+		sb.WriteString("add chain inet ksl_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }\n")
 		if len(exempt) > 0 {
 			parts := make([]string, len(exempt))
 			for i, p := range exempt {
 				parts[i] = strconv.Itoa(p)
 			}
-			sb.WriteString("add rule inet gft_hop prerouting udp dport { ")
+			sb.WriteString("add rule inet ksl_hop prerouting udp dport { ")
 			sb.WriteString(strings.Join(parts, ", "))
 			sb.WriteString(" } return\n")
 		}
-		fmt.Fprintf(&sb, "add rule inet gft_hop prerouting udp dport %d-%d redirect to :%d\n", lo, hi, targetPort)
+		fmt.Fprintf(&sb, "add rule inet ksl_hop prerouting udp dport %d-%d redirect to :%d\n", lo, hi, targetPort)
 		if f.HasCmdFn != nil {
 			if out, err := f.RunCmd("nft", "-f", "-", sb.String()); err != nil {
-				return fmt.Errorf("nft apply gft_hop failed: %v (%s)", err, strings.TrimSpace(string(out)))
+				return fmt.Errorf("nft apply ksl_hop failed: %v (%s)", err, strings.TrimSpace(string(out)))
 			}
 			return nil
 		}
 		cmd := exec.Command("nft", "-f", "-")
 		cmd.Stdin = strings.NewReader(sb.String())
 		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("nft apply gft_hop failed: %v (%s)", err, strings.TrimSpace(string(out)))
+			return fmt.Errorf("nft apply ksl_hop failed: %v (%s)", err, strings.TrimSpace(string(out)))
 		}
 		return nil
 	}
@@ -192,12 +193,14 @@ func (f *FirewallManager) ApplyHopRule(hopRange string, targetPort int) error {
 	if f.hasCmd("iptables") {
 		portSpec := fmt.Sprintf("%d:%d", lo, hi)
 		dstSpec := strconv.Itoa(targetPort)
-		_, _ = f.RunCmd("iptables", "-t", "nat", "-N", "GFT_HOP")
-		_, _ = f.RunCmd("iptables", "-t", "nat", "-F", "GFT_HOP")
+		_, _ = f.RunCmd("iptables", "-t", "nat", "-N", "KSL_HOP")
+		_, _ = f.RunCmd("iptables", "-t", "nat", "-F", "KSL_HOP")
+		_, _ = f.RunCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-j", "KSL_HOP")
+		_, _ = f.RunCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "udp", "-j", "GFT_HOP")
 		_, _ = f.RunCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-j", "GFT_HOP")
-		if _, err := f.RunCmd("iptables", "-t", "nat", "-C", "PREROUTING", "-p", "udp", "-j", "GFT_HOP"); err != nil {
-			if out, ierr := f.RunCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp", "-j", "GFT_HOP"); ierr != nil {
-				return fmt.Errorf("iptables link GFT_HOP failed: %v (%s)", ierr, strings.TrimSpace(string(out)))
+		if _, err := f.RunCmd("iptables", "-t", "nat", "-C", "PREROUTING", "-p", "udp", "-j", "KSL_HOP"); err != nil {
+			if out, ierr := f.RunCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp", "-j", "KSL_HOP"); ierr != nil {
+				return fmt.Errorf("iptables link KSL_HOP failed: %v (%s)", ierr, strings.TrimSpace(string(out)))
 			}
 		}
 		for i := 0; i < len(exempt); i += 15 {
@@ -207,21 +210,21 @@ func (f *FirewallManager) ApplyHopRule(hopRange string, targetPort int) error {
 			}
 			chunk := exempt[i:end]
 			if len(chunk) == 1 {
-				if out, err := f.RunCmd("iptables", "-t", "nat", "-A", "GFT_HOP", "-p", "udp", "--dport", strconv.Itoa(chunk[0]), "-j", "RETURN"); err != nil {
-					return fmt.Errorf("iptables add GFT_HOP RETURN failed: %v (%s)", err, strings.TrimSpace(string(out)))
+				if out, err := f.RunCmd("iptables", "-t", "nat", "-A", "KSL_HOP", "-p", "udp", "--dport", strconv.Itoa(chunk[0]), "-j", "RETURN"); err != nil {
+					return fmt.Errorf("iptables add KSL_HOP RETURN failed: %v (%s)", err, strings.TrimSpace(string(out)))
 				}
 			} else {
 				parts := make([]string, len(chunk))
 				for j, p := range chunk {
 					parts[j] = strconv.Itoa(p)
 				}
-				if out, err := f.RunCmd("iptables", "-t", "nat", "-A", "GFT_HOP", "-p", "udp", "-m", "multiport", "--dports", strings.Join(parts, ","), "-j", "RETURN"); err != nil {
-					return fmt.Errorf("iptables add GFT_HOP multiport RETURN failed: %v (%s)", err, strings.TrimSpace(string(out)))
+				if out, err := f.RunCmd("iptables", "-t", "nat", "-A", "KSL_HOP", "-p", "udp", "-m", "multiport", "--dports", strings.Join(parts, ","), "-j", "RETURN"); err != nil {
+					return fmt.Errorf("iptables add KSL_HOP multiport RETURN failed: %v (%s)", err, strings.TrimSpace(string(out)))
 				}
 			}
 		}
-		if out, err := f.RunCmd("iptables", "-t", "nat", "-A", "GFT_HOP", "-p", "udp", "--dport", portSpec, "-j", "REDIRECT", "--to-ports", dstSpec); err != nil {
-			return fmt.Errorf("iptables add GFT_HOP rule failed: %v (%s)", err, strings.TrimSpace(string(out)))
+		if out, err := f.RunCmd("iptables", "-t", "nat", "-A", "KSL_HOP", "-p", "udp", "--dport", portSpec, "-j", "REDIRECT", "--to-ports", dstSpec); err != nil {
+			return fmt.Errorf("iptables add KSL_HOP rule failed: %v (%s)", err, strings.TrimSpace(string(out)))
 		}
 		if f.hasCmd("netfilter-persistent") {
 			_, _ = f.RunCmd("netfilter-persistent", "save")
@@ -231,13 +234,18 @@ func (f *FirewallManager) ApplyHopRule(hopRange string, targetPort int) error {
 	return nil
 }
 
-// RemoveHopRules removes only the isolated `gft_hop` table / `GFT_HOP` chain.
+// RemoveHopRules removes only the isolated `ksl_hop` (and legacy `gft_hop`) table / chain.
 func (f *FirewallManager) RemoveHopRules() error {
 	var firstErr error
 	if f.hasCmd("nft") {
+		_, _ = f.RunCmd("nft", "delete", "table", "inet", "ksl_hop")
 		_, _ = f.RunCmd("nft", "delete", "table", "inet", "gft_hop")
 	}
 	if f.hasCmd("iptables") {
+		_, _ = f.RunCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "udp", "-j", "KSL_HOP")
+		_, _ = f.RunCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-j", "KSL_HOP")
+		_, _ = f.RunCmd("iptables", "-t", "nat", "-F", "KSL_HOP")
+		_, _ = f.RunCmd("iptables", "-t", "nat", "-X", "KSL_HOP")
 		_, _ = f.RunCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "udp", "-j", "GFT_HOP")
 		_, _ = f.RunCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-j", "GFT_HOP")
 		_, _ = f.RunCmd("iptables", "-t", "nat", "-F", "GFT_HOP")
@@ -249,7 +257,7 @@ func (f *FirewallManager) RemoveHopRules() error {
 	return firstErr
 }
 
-// HighBDPSysctlConf contains BBR + fq + 32MB UDP buffer tuning for GFT-RTC servers.
+// HighBDPSysctlConf contains BBR + fq + 32MB UDP buffer tuning for Kestrel-RTC servers.
 const HighBDPSysctlConf = "net.core.default_qdisc = fq\n" +
 	"net.ipv4.tcp_congestion_control = bbr\n" +
 	"net.core.rmem_max = 33554432\n" +

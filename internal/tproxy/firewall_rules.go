@@ -50,7 +50,7 @@ func EffectiveCNIPv4CIDRs(overridePath string) []string {
 }
 
 // BuildNFTablesScript builds the complete atomic nftables ruleset inside
-// `table inet ghost0` so start/reload/stop remain 100% isolated and leak-free.
+// `table inet kestrel0` so start/reload/stop remain 100% isolated and leak-free.
 func BuildNFTablesScript(spec FirewallSpec) string {
 	markHex := fmt.Sprintf("0x%x", spec.FWMark)
 	tproxyMarkHex := fmt.Sprintf("0x%x", spec.TProxyMark)
@@ -82,7 +82,9 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 	var b strings.Builder
 	b.WriteString("table inet ghost0\n")
 	b.WriteString("delete table inet ghost0\n")
-	b.WriteString("table inet ghost0 {\n")
+	b.WriteString("table inet kestrel0\n")
+	b.WriteString("delete table inet kestrel0\n")
+	b.WriteString("table inet kestrel0 {\n")
 
 	// 1. Reserved & LAN bypass ranges (RFC1918 + loopback + multicast + broadcast + CGNAT).
 	b.WriteString("  set lan_bypass_v4 {\n")
@@ -164,7 +166,8 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 	b.WriteString("  chain dns_output {\n")
 	b.WriteString("    type nat hook output priority dstnat - 10; policy accept;\n")
 	b.WriteString(fmt.Sprintf("    meta mark %s return\n", markHex))
-	b.WriteString("    ip daddr 127.0.0.0/8 return\n")
+	b.WriteString("    ip daddr @lan_bypass_v4 return\n")
+	b.WriteString("    ip6 daddr { ::1/128, fe80::/10, fc00::/7 } return\n")
 	if len(vpsIPs) > 0 {
 		b.WriteString("    ip daddr @vps_bypass_v4 return\n")
 	}

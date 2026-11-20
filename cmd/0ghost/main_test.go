@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"ghostframe/internal/gft"
 )
 
 func TestGatewayConsoleRoutesAndSettings(t *testing.T) {
@@ -52,6 +54,36 @@ func TestGatewayConsoleRoutesAndSettings(t *testing.T) {
 	cfg := svc.getGatewayConfig()
 	if cfg.DeviceMode != "only" || len(cfg.DeviceIPs) != 1 || cfg.DeviceIPs[0] != "192.168.1.60" || !cfg.LANMasquerade {
 		t.Fatalf("unexpected updated gateway config: %+v", cfg)
+	}
+
+	// Import a node and verify POST /api/node/rename updates node remark
+	nodeURI := (&gft.Link{V: 3, Host: "n1.example", Port: 443, SNI: "ftp.jaist.ac.jp", PSK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", Verify: "ca", Remark: "OldNode"}).Encode()
+	impBody := `{"uri":"` + nodeURI + `"}`
+	reqImp := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:19080/api/import", strings.NewReader(impBody))
+	reqImp.Header.Set("Origin", "http://127.0.0.1:19080")
+	recImp := httptest.NewRecorder()
+	mux.ServeHTTP(recImp, reqImp)
+	if recImp.Code != http.StatusOK {
+		t.Fatalf("node import failed: %d %s", recImp.Code, recImp.Body.String())
+	}
+
+	reqRen := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:19080/api/node/rename", strings.NewReader(`{"index":0,"remark":"N1-Renamed"}`))
+	reqRen.Header.Set("Origin", "http://127.0.0.1:19080")
+	recRen := httptest.NewRecorder()
+	mux.ServeHTTP(recRen, reqRen)
+	if recRen.Code != http.StatusOK {
+		t.Fatalf("node rename failed: %d %s", recRen.Code, recRen.Body.String())
+	}
+
+	reqSt2 := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:19080/api/status", nil)
+	recSt2 := httptest.NewRecorder()
+	mux.ServeHTTP(recSt2, reqSt2)
+	var renSnap map[string]any
+	if err := json.Unmarshal(recSt2.Body.Bytes(), &renSnap); err != nil {
+		t.Fatalf("invalid status json after rename: %v", err)
+	}
+	if renSnap["node_name"] != "N1-Renamed" {
+		t.Fatalf("expected renamed node_name=N1-Renamed, got %v", renSnap["node_name"])
 	}
 }
 

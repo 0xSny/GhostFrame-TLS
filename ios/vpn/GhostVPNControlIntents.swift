@@ -95,7 +95,7 @@ enum GhostVPNControlBridge {
         let session = URLSession(configuration: cfg)
         defer { session.invalidateAndCancel() }
         for port in ports {
-            guard let url = URL(string: "http://127.0.0.1:\(port)/_gft/ping") else { continue }
+            guard let url = URL(string: "http://127.0.0.1:\(port)/_ksl/ping") else { continue }
             if let (_, resp) = try? await session.data(from: url),
                (resp as? HTTPURLResponse)?.statusCode == 200 {
                 return true

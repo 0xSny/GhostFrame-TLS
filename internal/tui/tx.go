@@ -77,7 +77,7 @@ func (t *TransactionRunner) acquireLock() (func(), error) {
 	_ = os.MkdirAll(filepath.Dir(t.LockPath), 0o755)
 	f, err := os.OpenFile(t.LockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("another gft session holds lock %s", t.LockPath)
+		return nil, fmt.Errorf("another ksl session holds lock %s", t.LockPath)
 	}
 	_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
 	_ = f.Close()

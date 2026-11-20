@@ -2,7 +2,7 @@ import AppIntents
 import SwiftUI
 
 @main
-struct GhostFrameVPNApp: App {
+struct KestrelDuoApp: App {
     @StateObject private var viewModel = GhostAppViewModel(
         edition: .vpn,
         backend: VPNManager()

@@ -216,7 +216,7 @@ UNCONN 0      0                  *:25555            *:*    users:(("gft-server",
 }
 
 func TestApplyKernelSysctlWritesAndExecutes(t *testing.T) {
-	confPath := filepath.Join(t.TempDir(), "99-gft-rtc.conf")
+	confPath := filepath.Join(t.TempDir(), "99-ksl-rtc.conf")
 	var cmds []string
 	err := ApplyKernelSysctl(confPath, func(name string, args ...string) ([]byte, error) {
 		cmds = append(cmds, name+" "+strings.Join(args, " "))

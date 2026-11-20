@@ -93,7 +93,7 @@ func TestNAT64DialAndHopResolutionLoop(t *testing.T) {
 		t.Fatalf("unexpected TCP NAT64 target: %s", hp)
 	}
 
-	// 2. GFT-RTC initial Dial & HopWithPortRange UDP resolution must synthesize NAT64 IPv6 for every new hop port.
+	// 2. Kestrel-RTC initial Dial & HopWithPortRange UDP resolution must synthesize NAT64 IPv6 for every new hop port.
 	u1, err := ResolveUDPAddr(context.Background(), "198.51.100.42", 30868)
 	if err != nil {
 		t.Fatalf("ResolveUDPAddr initial failed: %v", err)
