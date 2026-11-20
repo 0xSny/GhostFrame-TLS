@@ -57,6 +57,7 @@ jobs:
       - name: Build & Package Edition A (GhostFrame-VPN-Unsigned.ipa)
         run: |
           (cd ios && xcodegen generate --spec project-vpn.yml)
+          git diff --exit-code ios/vpn
           xcodebuild \
             -project ios/GhostFrameVPN.xcodeproj \
             -scheme GhostFrameVPN \
@@ -76,18 +77,21 @@ jobs:
           APPEX="$VPN_APP/PlugIns/GhostPacketTunnel.appex"
           test -d "$APPEX"
 
+          plutil -p "$APPEX/Info.plist" | grep -q "com.apple.networkextension.packet-tunnel"
+          plutil -p "$APPEX/Info.plist" | grep -q "PacketTunnelProvider"
+
           # Inside-out ad-hoc entitlement stamping (strictly packet-tunnel-provider only, zero hardcoded App Group)
           codesign --force --sign - --entitlements ios/vpn/Tunnel.entitlements --timestamp=none "$APPEX"
           codesign --force --sign - --entitlements ios/vpn/App.entitlements --timestamp=none "$VPN_APP"
 
           echo "=== Verifying GhostPacketTunnel.appex entitlements ==="
-          APPEX_ENT="$(codesign -d --entitlements :- "$APPEX" 2>&1)"
+          APPEX_ENT="$(codesign -d --entitlements - --xml "$APPEX" 2>&1)"
           echo "$APPEX_ENT"
           echo "$APPEX_ENT" | grep -q "packet-tunnel-provider"
           ! echo "$APPEX_ENT" | grep -q "application-groups"
 
           echo "=== Verifying GhostFrameVPN.app entitlements ==="
-          APP_ENT="$(codesign -d --entitlements :- "$VPN_APP" 2>&1)"
+          APP_ENT="$(codesign -d --entitlements - --xml "$VPN_APP" 2>&1)"
           echo "$APP_ENT"
           echo "$APP_ENT" | grep -q "packet-tunnel-provider"
           ! echo "$APP_ENT" | grep -q "application-groups"
@@ -102,6 +106,7 @@ jobs:
       - name: Build & Package Edition B (GhostFrame-Companion-Unsigned.ipa)
         run: |
           (cd ios && xcodegen generate --spec project-companion.yml)
+          git diff --exit-code ios/companion
           xcodebuild \
             -project ios/GhostFrameCompanion.xcodeproj \
             -scheme GhostFrameCompanion \
@@ -120,10 +125,13 @@ jobs:
           test -n "$COMP_APP" && test -d "$COMP_APP"
           test ! -d "$COMP_APP/PlugIns"
 
+          plutil -p "$COMP_APP/Info.plist" | grep -q "audio"
+          plutil -p "$COMP_APP/Info.plist" | grep -q "shadowrocket"
+
           # Single-process pure ad-hoc signature with ZERO restricted entitlements
           codesign --force --deep --sign - --timestamp=none "$COMP_APP"
 
-          COMP_ENT="$(codesign -d --entitlements :- "$COMP_APP" 2>&1 || true)"
+          COMP_ENT="$(codesign -d --entitlements - --xml "$COMP_APP" 2>&1 || true)"
           echo "=== Companion entitlements check ==="
           echo "$COMP_ENT"
           ! echo "$COMP_ENT" | grep -q "networkextension"

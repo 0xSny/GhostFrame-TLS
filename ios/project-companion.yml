@@ -30,8 +30,6 @@ targets:
       - path: companion/SilentAudioKeepAlive.swift
       - path: companion/CompanionManager.swift
       - path: companion/CompanionApp.swift
-    info:
-      path: companion/CompanionInfo.plist
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.companion

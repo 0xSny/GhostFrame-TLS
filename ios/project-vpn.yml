@@ -29,10 +29,6 @@ targets:
       - path: Shared
       - path: vpn/VPNManager.swift
       - path: vpn/VPNApp.swift
-    info:
-      path: vpn/AppInfo.plist
-    entitlements:
-      path: vpn/App.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.vpn
@@ -61,10 +57,6 @@ targets:
       - path: Shared/GhostModels.swift
       - path: Shared/GhostMobileBridge.swift
       - path: vpn/PacketTunnelProvider.swift
-    info:
-      path: vpn/TunnelInfo.plist
-    entitlements:
-      path: vpn/Tunnel.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.vpn.tunnel
