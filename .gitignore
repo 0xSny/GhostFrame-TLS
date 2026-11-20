@@ -6,9 +6,11 @@
 *.dylib
 *.syso
 *-linux-*
+*.tar.gz
 /gft-client-gui
 /gft-server
 /gft-core
+/0ghost
 dist/
 build/
 bin/
@@ -21,6 +23,7 @@ __debug_bin*
 # Runtime configs & sensitive credentials (use configs/client.example.json)
 client.json
 server.json
+0ghost.json
 sysproxy_backup.json
 deploy_record.json
 .gft/

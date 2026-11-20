@@ -1,0 +1,85 @@
+name: Build Windows Client (GhostFrame-Pro)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "cmd/gft-client-gui/**"
+      - "internal/winui/**"
+      - "internal/gft/**"
+      - "internal/gftrtc/**"
+      - "internal/netbind/**"
+      - "internal/client/**"
+      - "configs/client.example.json"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build-client.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "cmd/gft-client-gui/**"
+      - "internal/winui/**"
+      - "internal/gft/**"
+      - "internal/gftrtc/**"
+      - "internal/netbind/**"
+      - "internal/client/**"
+      - "configs/client.example.json"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build-client.yml"
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    env:
+      GFT_NO_SYSPROXY: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Audit Tracked Files for Secrets & Artifacts
+        run: |
+          if git ls-files | grep -E '(^|/)(client\.json|server\.json|0ghost\.json|sysproxy_backup\.json|deploy_record\.json|\.local/|\.ios-dist/|dist/)|\.(exe|ipa|syso|log)$'; then
+            echo "ERROR: Forbidden runtime config, secret path, or binary tracked in repository!"
+            exit 1
+          fi
+
+      - name: Verify GhostFrame-Pro Never Links gVisor
+        run: |
+          if GOOS=windows GOARCH=amd64 go list -deps ./cmd/gft-client-gui | grep -q "gvisor.dev/gvisor"; then
+            echo "ERROR: Windows client unexpectedly links gvisor.dev/gvisor!"
+            exit 1
+          fi
+
+      - name: Vet and Test Client Packages (-race)
+        run: |
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./cmd/gft-client-gui ./internal/winui
+          go vet ./internal/client ./internal/gft ./internal/gftrtc ./internal/netbind ./internal/winui
+          CGO_ENABLED=1 go test -race -count=1 -v ./internal/client ./internal/gft ./internal/gftrtc ./internal/netbind ./internal/winui
+
+      - name: Go Fuzz Smoke Checks (3s per target)
+        run: |
+          go test -run='^$' -fuzz=FuzzSTUNBindingReqAndPreScreen -fuzztime=3s ./internal/gftrtc
+          go test -run='^$' -fuzz=FuzzRTPAndFrameDecode -fuzztime=3s ./internal/gftrtc
+          go test -run='^$' -fuzz=FuzzExtractTLSClientHelloSNI -fuzztime=3s ./internal/gft
+          go test -run='^$' -fuzz=FuzzParseDNSResponse -fuzztime=3s ./internal/client
+
+      - name: Build Clean Single-File GhostFrame-Pro.exe (CGO_ENABLED=0)
+        run: |
+          mkdir -p dist
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H=windowsgui" -o dist/GhostFrame-Pro.exe ./cmd/gft-client-gui
+          ls -lh dist/GhostFrame-Pro.exe
+
+      - name: Upload Windows Client Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: GhostFrame-Pro-windows-amd64
+          path: dist/GhostFrame-Pro.exe
+          if-no-files-found: error

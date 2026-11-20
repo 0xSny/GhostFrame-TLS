@@ -1,0 +1,99 @@
+name: Build 0Ghost Side-Router (N1 iStoreOS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "cmd/0ghost/**"
+      - "internal/tproxy/**"
+      - "internal/gft/**"
+      - "internal/gftrtc/**"
+      - "internal/netbind/**"
+      - "internal/client/**"
+      - "openwrt/**"
+      - "scripts/build_0ghost.ps1"
+      - "scripts/install-0ghost.sh"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build-0ghost.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "cmd/0ghost/**"
+      - "internal/tproxy/**"
+      - "internal/gft/**"
+      - "internal/gftrtc/**"
+      - "internal/netbind/**"
+      - "internal/client/**"
+      - "openwrt/**"
+      - "scripts/build_0ghost.ps1"
+      - "scripts/install-0ghost.sh"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build-0ghost.yml"
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    env:
+      GFT_NO_SYSPROXY: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify 0Ghost Never Links gVisor
+        run: |
+          if GOOS=linux GOARCH=arm64 go list -deps ./cmd/0ghost | grep -q "gvisor.dev/gvisor"; then
+            echo "ERROR: 0ghost binary unexpectedly links gvisor.dev/gvisor!"
+            exit 1
+          fi
+
+      - name: Vet and Test 0Ghost Packages (-race)
+        run: |
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go vet ./cmd/0ghost ./internal/tproxy ./internal/client ./internal/gft ./internal/gftrtc ./internal/netbind
+          CGO_ENABLED=1 go test -race -count=1 -v ./internal/netbind ./internal/client ./internal/tproxy ./cmd/0ghost
+
+      - name: Build 0ghost (linux/arm64 & linux/amd64) & Package luci-app-0ghost
+        run: |
+          set -euo pipefail
+          mkdir -p dist _stage_0ghost/usr/bin
+
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/0ghost-linux-arm64 ./cmd/0ghost
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/0ghost-linux-amd64 ./cmd/0ghost
+
+          cp dist/0ghost-linux-arm64 _stage_0ghost/usr/bin/0ghost
+          cp -r openwrt/luci-app-0ghost/etc _stage_0ghost/
+          cp -r openwrt/luci-app-0ghost/usr/* _stage_0ghost/usr/
+          cp -r openwrt/luci-app-0ghost/www _stage_0ghost/
+          cp openwrt/luci-app-0ghost/install-local.sh _stage_0ghost/install-local.sh
+          chmod 0755 _stage_0ghost/usr/bin/0ghost _stage_0ghost/etc/init.d/0ghost \
+                     _stage_0ghost/etc/hotplug.d/iface/99-0ghost _stage_0ghost/etc/hotplug.d/firewall/99-0ghost \
+                     _stage_0ghost/install-local.sh
+
+          sh -n _stage_0ghost/install-local.sh
+          sh -n _stage_0ghost/etc/hotplug.d/iface/99-0ghost
+          sh -n _stage_0ghost/etc/hotplug.d/firewall/99-0ghost
+          sh -n scripts/install-0ghost.sh
+
+          tar -czf dist/0ghost-istoreos-arm64.tar.gz -C _stage_0ghost .
+          rm -rf _stage_0ghost
+          (cd dist && sha256sum 0ghost-linux-arm64 0ghost-linux-amd64 0ghost-istoreos-arm64.tar.gz > checksums.txt)
+          ls -lh dist/
+
+      - name: Upload 0Ghost & luci-app-0ghost Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 0Ghost-iStoreOS-arm64
+          path: |
+            dist/0ghost-linux-arm64
+            dist/0ghost-linux-amd64
+            dist/0ghost-istoreos-arm64.tar.gz
+            dist/checksums.txt
+          if-no-files-found: error

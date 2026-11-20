@@ -1,10 +1,41 @@
-name: CI
+name: CI (Core & Server)
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
+    paths:
+      - "cmd/gft-server/**"
+      - "cmd/gft-core/**"
+      - "internal/gft/**"
+      - "internal/gftrtc/**"
+      - "internal/netbind/**"
+      - "internal/client/**"
+      - "internal/server/**"
+      - "internal/sni/**"
+      - "internal/tui/**"
+      - "internal/qr/**"
+      - "install.sh"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/ci.yml"
   pull_request:
     branches: [main]
+    paths:
+      - "cmd/gft-server/**"
+      - "cmd/gft-core/**"
+      - "internal/gft/**"
+      - "internal/gftrtc/**"
+      - "internal/netbind/**"
+      - "internal/client/**"
+      - "internal/server/**"
+      - "internal/sni/**"
+      - "internal/tui/**"
+      - "internal/qr/**"
+      - "install.sh"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/ci.yml"
 
 jobs:
   test:
@@ -25,11 +56,19 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Vet and Test (with Race Detector)
+      - name: Verify Core & Server Never Link gVisor
         shell: bash
         run: |
-          go vet ./...
-          CGO_ENABLED=1 go test -race -count=1 -v ./...
+          if go list -deps ./cmd/gft-server ./cmd/gft-core | grep -q "gvisor.dev/gvisor"; then
+            echo "ERROR: Server/Core binary unexpectedly links gvisor.dev/gvisor!"
+            exit 1
+          fi
+
+      - name: Vet and Test Core & Server Packages (with Race Detector)
+        shell: bash
+        run: |
+          go vet ./cmd/gft-server ./cmd/gft-core ./internal/gft ./internal/gftrtc ./internal/netbind ./internal/client ./internal/server ./internal/sni ./internal/tui ./internal/qr
+          CGO_ENABLED=1 go test -race -count=1 -v ./cmd/gft-server ./cmd/gft-core ./internal/gft ./internal/gftrtc ./internal/netbind ./internal/client ./internal/server ./internal/sni ./internal/tui ./internal/qr
 
       - name: Go Fuzz Smoke Checks (3s per target)
         if: runner.os == 'Linux'
@@ -46,10 +85,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p /tmp/gft-ci-build
-          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./internal/... ./mobile/...
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/gft-ci-build/gft-server ./cmd/gft-server
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/gft-ci-build/gft-core ./cmd/gft-core
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -H=windowsgui" -o /tmp/gft-ci-build/GhostFrame-Pro.exe ./cmd/gft-client-gui
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/gft-ci-build/gft-server-amd64 ./cmd/gft-server
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/gft-ci-build/gft-server-arm64 ./cmd/gft-server
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/gft-ci-build/gft-core-amd64 ./cmd/gft-core
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/gft-ci-build/gft-core-arm64 ./cmd/gft-core
           rm -rf /tmp/gft-ci-build
 
       - name: Verify install.sh Syntax (Linux)

@@ -1,0 +1,296 @@
+name: Unified Release & Dist Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v4.0.2-lts; auto-generated if empty)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    runs-on: ubuntu-latest
+    env:
+      GFT_NO_SYSPROXY: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build Server, Core CLI, Windows GUI & 0Ghost Side-Router
+        run: |
+          set -euo pipefail
+          mkdir -p dist _stage_0ghost/usr/bin
+
+          export CGO_ENABLED=0
+          FLAGS=(-trimpath -ldflags="-s -w")
+
+          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/gft-server-linux-amd64 ./cmd/gft-server
+          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/gft-server-linux-arm64 ./cmd/gft-server
+          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/gft-core-linux-amd64   ./cmd/gft-core
+          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/gft-core-linux-arm64   ./cmd/gft-core
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H=windowsgui" -o dist/GhostFrame-Pro-windows-amd64.exe ./cmd/gft-client-gui
+          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/0ghost-linux-amd64     ./cmd/0ghost
+          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/0ghost-linux-arm64     ./cmd/0ghost
+
+          cp dist/0ghost-linux-arm64 _stage_0ghost/usr/bin/0ghost
+          cp -r openwrt/luci-app-0ghost/etc _stage_0ghost/
+          cp -r openwrt/luci-app-0ghost/usr/* _stage_0ghost/usr/
+          cp -r openwrt/luci-app-0ghost/www _stage_0ghost/
+          cp openwrt/luci-app-0ghost/install-local.sh _stage_0ghost/install-local.sh
+          chmod 0755 _stage_0ghost/usr/bin/0ghost _stage_0ghost/etc/init.d/0ghost \
+                     _stage_0ghost/etc/hotplug.d/iface/99-0ghost _stage_0ghost/etc/hotplug.d/firewall/99-0ghost \
+                     _stage_0ghost/install-local.sh
+          tar -czf dist/0ghost-istoreos-arm64.tar.gz -C _stage_0ghost .
+          rm -rf _stage_0ghost
+
+          cp install.sh dist/install.sh
+          cp scripts/install-0ghost.sh dist/install-0ghost.sh
+          chmod 0755 dist/install.sh dist/install-0ghost.sh
+          ls -lh dist/
+
+      - name: Upload Linux/Windows/Router Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-windows-router
+          path: dist/*
+          if-no-files-found: error
+
+  build-ios:
+    runs-on: macos-15
+    env:
+      GFT_NO_SYSPROXY: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build GhostMobile.xcframework & Dual Unsigned IPAs
+        run: |
+          set -euo pipefail
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile init
+          go get golang.org/x/mobile/bind
+          mkdir -p ios/Frameworks dist
+
+          gomobile bind \
+            -target=ios/arm64 \
+            -iosversion=15.0 \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o ios/Frameworks/GhostMobile.xcframework \
+            ./mobile
+          git checkout -- go.mod go.sum
+
+          (cd ios && xcodegen generate --spec project-vpn.yml)
+          xcodebuild \
+            -project ios/GhostFrameVPN.xcodeproj \
+            -scheme GhostFrameVPN \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            BUILD_DIR="$PWD/ios/build-vpn" \
+            build
+
+          VPN_APP="$(find ios/build-vpn -maxdepth 4 -type d -name 'GhostFrameVPN.app' | head -n 1)"
+          APPEX="$VPN_APP/PlugIns/GhostPacketTunnel.appex"
+          CTRL_APPEX="$VPN_APP/PlugIns/GhostControlWidget.appex"
+          codesign --force --sign - --entitlements ios/vpn/Tunnel.entitlements --timestamp=none "$APPEX"
+          codesign --force --sign - --entitlements ios/vpn/Control.entitlements --timestamp=none "$CTRL_APPEX"
+          codesign --force --sign - --entitlements ios/vpn/App.entitlements --timestamp=none "$VPN_APP"
+          STAGE_VPN="$(mktemp -d)"
+          mkdir -p "$STAGE_VPN/Payload"
+          cp -R "$VPN_APP" "$STAGE_VPN/Payload/GhostFrameVPN.app"
+          (cd "$STAGE_VPN" && zip -qry "$GITHUB_WORKSPACE/dist/GhostFrame-VPN-Unsigned.ipa" Payload)
+          rm -rf "$STAGE_VPN"
+
+          (cd ios && xcodegen generate --spec project-companion.yml)
+          xcodebuild \
+            -project ios/GhostFrameCompanion.xcodeproj \
+            -scheme GhostFrameCompanion \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            BUILD_DIR="$PWD/ios/build-companion" \
+            build
+
+          COMP_APP="$(find ios/build-companion -maxdepth 4 -type d -name 'GhostFrameCompanion.app' | head -n 1)"
+          codesign --force --deep --sign - --timestamp=none "$COMP_APP"
+          STAGE_COMP="$(mktemp -d)"
+          mkdir -p "$STAGE_COMP/Payload"
+          cp -R "$COMP_APP" "$STAGE_COMP/Payload/GhostFrameCompanion.app"
+          (cd "$STAGE_COMP" && zip -qry "$GITHUB_WORKSPACE/dist/GhostFrame-Companion-Unsigned.ipa" Payload)
+          rm -rf "$STAGE_COMP"
+
+          ls -lh dist/*.ipa
+
+      - name: Upload iOS Dual IPAs
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-ios-ipas
+          path: dist/*.ipa
+          if-no-files-found: error
+
+  publish-release:
+    needs: [build-binaries, build-ios]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download All Built Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-stage
+
+      - name: Assemble Unified Release Bundle, Checksums & Cloud OmniSign source.json
+        env:
+          HAS_DIST_TOKEN: ${{ secrets.DIST_PUSH_TOKEN != '' }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          RUN_NUM: ${{ github.run_number }}
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-out
+          cp dist-stage/release-linux-windows-router/* release-out/
+          cp dist-stage/release-ios-ipas/*.ipa release-out/
+
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+          else
+            TAG="v4.0.2-lts-r${RUN_NUM}"
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+          TARGET_REPO="$SOURCE_REPO"
+          if [ "$HAS_DIST_TOKEN" = "true" ]; then
+            TARGET_REPO="Spittingjiu/GhostFrame-Dist"
+          fi
+          echo "TARGET_REPO=$TARGET_REPO" >> "$GITHUB_ENV"
+
+          VPN_SIZE="$(stat -c%s release-out/GhostFrame-VPN-Unsigned.ipa)"
+          COMP_SIZE="$(stat -c%s release-out/GhostFrame-Companion-Unsigned.ipa)"
+          NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          APP_VER="4.0.2.${RUN_NUM}"
+          BASE_DL="https://github.com/${TARGET_REPO}/releases/download/${TAG}"
+
+          python3 - <<PY
+          import json
+          manifest = {
+              "name": "GhostFrame Official Release Source",
+              "identifier": "com.ghostframe.official.source",
+              "sourceURL": f"${BASE_DL}/source.json",
+              "apps": [
+                  {
+                      "name": "GhostFrame VPN",
+                      "bundleIdentifier": "com.ghostframe.vpn",
+                      "developerName": "GhostFrame Project",
+                      "subtitle": "GFT-RTC v4.0.2 LTS (True TUN + iOS 18 Widget)",
+                      "localizedDescription": "GhostFrame iOS True TUN L3/L4 edition built from ${TAG}.",
+                      "tintColor": "#0F62FE",
+                      "version": "${APP_VER}",
+                      "versionDate": "${NOW_ISO}",
+                      "versionDescription": "Release ${TAG}",
+                      "downloadURL": f"${BASE_DL}/GhostFrame-VPN-Unsigned.ipa",
+                      "size": int("${VPN_SIZE}"),
+                      "versions": [{
+                          "version": "${APP_VER}",
+                          "date": "${NOW_ISO}",
+                          "localizedDescription": "Release ${TAG}",
+                          "downloadURL": f"${BASE_DL}/GhostFrame-VPN-Unsigned.ipa",
+                          "size": int("${VPN_SIZE}"),
+                      }],
+                  },
+                  {
+                      "name": "GhostFrame Companion",
+                      "bundleIdentifier": "com.ghostframe.companion",
+                      "developerName": "GhostFrame Project",
+                      "subtitle": "Portable Local Proxy (Zero VPN Profile)",
+                      "localizedDescription": "GhostFrame iOS Companion portable proxy built from ${TAG}.",
+                      "tintColor": "#10B981",
+                      "version": "${APP_VER}",
+                      "versionDate": "${NOW_ISO}",
+                      "versionDescription": "Release ${TAG}",
+                      "downloadURL": f"${BASE_DL}/GhostFrame-Companion-Unsigned.ipa",
+                      "size": int("${COMP_SIZE}"),
+                      "versions": [{
+                          "version": "${APP_VER}",
+                          "date": "${NOW_ISO}",
+                          "localizedDescription": "Release ${TAG}",
+                          "downloadURL": f"${BASE_DL}/GhostFrame-Companion-Unsigned.ipa",
+                          "size": int("${COMP_SIZE}"),
+                      }],
+                  },
+              ],
+          }
+          with open("release-out/source.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2, ensure_ascii=False)
+          PY
+
+          (cd release-out && sha256sum * > checksums.txt && cat checksums.txt)
+
+      - name: Upload Unified Release Bundle Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GhostFrame-Unified-Release
+          path: release-out/*
+          if-no-files-found: error
+
+      - name: Publish Pure-Binary Release to Spittingjiu/GhostFrame-Dist (if DIST_PUSH_TOKEN configured)
+        if: ${{ secrets.DIST_PUSH_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.DIST_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo Spittingjiu/GhostFrame-Dist >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-out/* --clobber --repo Spittingjiu/GhostFrame-Dist
+          else
+            gh release create "$RELEASE_TAG" release-out/* \
+              --repo Spittingjiu/GhostFrame-Dist \
+              --title "GhostFrame ${RELEASE_TAG} (All Platforms)" \
+              --notes "Automated pure-binary multi-platform release (${RELEASE_TAG}). Includes Linux Server/Core, Windows Client, iStoreOS 0Ghost, Dual iOS IPAs, OmniSign source.json, and sha256 checksums."
+          fi
+
+      - name: Fallback Release on Current Repository (when DIST_PUSH_TOKEN not set)
+        if: ${{ secrets.DIST_PUSH_TOKEN == '' && (github.ref_type == 'tag' || inputs.tag != '') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          files: release-out/*
