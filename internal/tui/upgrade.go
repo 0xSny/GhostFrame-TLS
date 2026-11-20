@@ -21,13 +21,13 @@ import (
 )
 
 // CurrentVersion is the canonical release identifier compiled into server & TUI binaries (overridable via -ldflags -X).
-var CurrentVersion = "v4.0.20-LTS"
+var CurrentVersion = "v4.0.21-LTS"
 
 const (
 	defaultGitHubAPIBase   = "https://api.github.com"
 	defaultGitHubWebBase   = "https://github.com"
-	defaultTargetBinary    = "/opt/ghostframe/gft-server"
-	defaultSystemdUnit     = "/etc/systemd/system/ghostframe.service"
+	defaultTargetBinary    = "/opt/kestrel/kestrel-server"
+	defaultSystemdUnit     = "/etc/systemd/system/kestrel.service"
 	maxUpgradeBinarySize   = 128 << 20 // 128 MiB safety cap
 	minUpgradeDiskFreeByte = 64 << 20  // 64 MiB free space preflight
 )
@@ -101,6 +101,7 @@ func applyMirrorURL(mirror, rawURL string) string {
 
 func normalizeVersionTag(v string) string {
 	s := strings.TrimSpace(v)
+	s = strings.TrimPrefix(s, "kestrel-server ")
 	s = strings.TrimPrefix(s, "gft-server ")
 	return strings.TrimSpace(s)
 }
@@ -216,7 +217,7 @@ func resolveReleaseQueryOptions(opts UpgradeOptions) UpgradeOptions {
 // to the web /releases/latest 302 redirect if the REST API is rate-limited or unreachable.
 func CheckLatestRelease(ctx context.Context, opts UpgradeOptions) (*ReleaseInfo, error) {
 	opts = resolveReleaseQueryOptions(opts)
-	assetName := fmt.Sprintf("gft-server-linux-%s", opts.Arch)
+	assetName := fmt.Sprintf("kestrel-server-linux-%s", opts.Arch)
 	target := strings.TrimSpace(opts.TargetVersion)
 
 	if target != "" && !strings.EqualFold(target, "latest") {
@@ -249,7 +250,7 @@ func fetchReleaseFromAPI(ctx context.Context, client *http.Client, apiURL, asset
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "GhostFrame-Updater/"+CurrentVersion)
+	req.Header.Set("User-Agent", "Kestrel-Updater/"+CurrentVersion)
 	req.Header.Set("Accept", "application/vnd.github+json")
 
 	resp, err := client.Do(req)
@@ -319,7 +320,7 @@ func fetchReleaseFromRedirect(ctx context.Context, baseClient *http.Client, webB
 			lastErr = err
 			continue
 		}
-		req.Header.Set("User-Agent", "GhostFrame-Updater/"+CurrentVersion)
+		req.Header.Set("User-Agent", "Kestrel-Updater/"+CurrentVersion)
 		resp, err := noFollow.Do(req)
 		if err != nil {
 			lastErr = err
@@ -372,7 +373,7 @@ func httpGetBytesWithProgress(ctx context.Context, client *http.Client, u string
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "GhostFrame-Updater/"+CurrentVersion)
+	req.Header.Set("User-Agent", "Kestrel-Updater/"+CurrentVersion)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -623,7 +624,7 @@ func (c *Controller) PerformOTAUpgrade(opts UpgradeOptions) (*UpgradeResult, err
 		ensureLocalSymlink()
 	}
 
-	opts.ProgressFn("正在重启 GhostFrame 服务端并执行启动与端口健康检查...")
+	opts.ProgressFn("正在重启 Kestrel 服务端并执行启动与端口健康检查...")
 	if startErr := verifyRestartHealthy(opts.RestartFn, opts.ActiveFn, opts.PortProbeFn, listenPort); startErr != nil {
 		if bakPath != "" {
 			if bakBytes, rerr := os.ReadFile(bakPath); rerr == nil {
@@ -693,7 +694,7 @@ func (c *Controller) PerformOTARollback(opts UpgradeOptions) (*RollbackResult, e
 		return nil, fmt.Errorf("恢复备份文件失败: %w", err)
 	}
 
-	opts.ProgressFn("正在重启 GhostFrame 服务端并校验回滚后健康状态...")
+	opts.ProgressFn("正在重启 Kestrel 服务端并校验回滚后健康状态...")
 	if startErr := verifyRestartHealthy(opts.RestartFn, opts.ActiveFn, opts.PortProbeFn, listenPort); startErr != nil {
 		if prePath != "" {
 			if preBytes, rerr := os.ReadFile(prePath); rerr == nil {
@@ -716,10 +717,11 @@ func ensureLocalSymlink() {
 	if _, serr := os.Stat("/usr/local/bin"); serr != nil {
 		return
 	}
-	linkPath := "/usr/local/bin/gft"
-	if dst, lerr := os.Readlink(linkPath); lerr != nil || dst != defaultTargetBinary {
-		_ = os.Remove(linkPath)
-		_ = os.Symlink(defaultTargetBinary, linkPath)
+	for _, linkPath := range []string{"/usr/local/bin/ksl", "/usr/local/bin/gft"} {
+		if dst, lerr := os.Readlink(linkPath); lerr != nil || dst != defaultTargetBinary {
+			_ = os.Remove(linkPath)
+			_ = os.Symlink(defaultTargetBinary, linkPath)
+		}
 	}
 }
 
@@ -729,14 +731,14 @@ func refreshSystemdUnitDescription(unitPath string) {
 		return
 	}
 	raw := string(b)
-	if !strings.Contains(raw, "v3.2") {
+	if !strings.Contains(raw, "v3.2") && !strings.Contains(raw, "GhostFrame") {
 		return
 	}
 	lines := strings.Split(raw, "\n")
 	changed := false
 	for i, ln := range lines {
-		if strings.HasPrefix(ln, "Description=") && strings.Contains(ln, "v3.2") {
-			lines[i] = "Description=GhostFrame-RTC (GFT) v4.0 LTS Dual-Stack Server"
+		if strings.HasPrefix(ln, "Description=") {
+			lines[i] = "Description=Kestrel-RTC (KRTC) v4.0 LTS Dual-Stack Server"
 			changed = true
 		}
 	}

@@ -137,7 +137,7 @@ func TestIdleLifecycleAndStatusJSON(t *testing.T) {
 	if m["state"] != "disconnected" {
 		t.Fatalf("expected disconnected state, got %v", m["state"])
 	}
-	if diag := GetDiagnosticSnapshot(); !strings.Contains(diag, "GhostFrame Mobile Diagnostic") {
+	if diag := GetDiagnosticSnapshot(); !strings.Contains(diag, "Kestrel Mobile Diagnostic") {
 		t.Fatalf("unexpected idle diagnostic snapshot: %s", diag)
 	}
 

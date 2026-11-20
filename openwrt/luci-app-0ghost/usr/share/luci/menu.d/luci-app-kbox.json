@@ -1,0 +1,13 @@
+{
+	"admin/services/kbox": {
+		"title": "KestrelBox",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "kbox/index"
+		},
+		"depends": {
+			"acl": [ "luci-app-kbox" ]
+		}
+	}
+}

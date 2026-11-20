@@ -49,7 +49,7 @@ private final class PacketFlowTunWriter: NSObject, MobileTunPacketWriterProtocol
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pathMonitor: NWPathMonitor?
-    private let monitorQueue = DispatchQueue(label: "com.ghostframe.tunnel.pathmonitor")
+    private let monitorQueue = DispatchQueue(label: "com.kestrel.duo.tunnel.pathmonitor")
     private var lastPhysicalIface: String = ""
     private var lastPathSignature: String = ""
     private var pathDebounceWorkItem: DispatchWorkItem?
@@ -94,7 +94,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             startConfigJSON = configJSON
         }
 
-        let supportDir = GhostNetworkHelper.appSupportDirectory(subdir: "GhostFrameTunnel")
+        let supportDir = GhostNetworkHelper.appSupportDirectory(subdir: "KestrelTunnel")
         GhostMobileBridge.initCore(dataDir: supportDir, isTunnelExt: true)
         let initialIface = startNetworkMonitorAndDetectInitialInterface(timeout: 0.35)
         if !initialIface.isEmpty {
@@ -211,7 +211,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func notifyControlCenterReload() {
         if #available(iOS 18.0, *) {
-            ControlCenter.shared.reloadControls(ofKind: "GhostFrameVPNControlToggle")
+            ControlCenter.shared.reloadControls(ofKind: "KestrelDuoControlToggle")
             ControlCenter.shared.reloadAllControls()
         }
     }

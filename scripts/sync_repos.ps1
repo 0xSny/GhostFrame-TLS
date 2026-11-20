@@ -1,7 +1,7 @@
 ﻿param(
     [string]$MainSrc = "C:\Users\64520\Desktop\GhostFrame_Project",
     [string]$TlsWork = "C:\Users\64520\Desktop\自研协议工作站\GhostFrame-TLS-main",
-    [string]$ProExeOut = "C:\Users\64520\Desktop\自研协议工作站\GhostFrame-Pro.exe"
+    [string]$ProExeOut = "C:\Users\64520\Desktop\自研协议工作站\Kestrel-Pro.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -111,13 +111,13 @@ if ($mismatch -gt 0) {
     throw "Sync verification failed: mismatch=$mismatch"
 }
 
-$builtExe = Join-Path $MainSrc "dist\GhostFrame-Pro.exe"
+$builtExe = Join-Path $MainSrc "dist\Kestrel-Pro.exe"
 if (Test-Path -LiteralPath $builtExe) {
     try {
         Copy-ExactFile $builtExe $ProExeOut
         Write-Host "Updated $ProExeOut ($((Get-Item $ProExeOut).Length) bytes)"
     } catch {
-        Write-Warning "Skipped overwriting locked $ProExeOut (close running GhostFrame-Pro.exe to replace): $($_.Exception.Message)"
+        Write-Warning "Skipped overwriting locked $ProExeOut (close running Kestrel-Pro.exe to replace): $($_.Exception.Message)"
     }
 }
 

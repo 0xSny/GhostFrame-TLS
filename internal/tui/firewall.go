@@ -56,7 +56,7 @@ func ParseProcNetUDPPorts(content string, lo, hi, excludePort int) []int {
 func ParseSSUDPOutput(content string, lo, hi, excludePort int) []int {
 	seen := make(map[int]struct{})
 	for _, ln := range strings.Split(content, "\n") {
-		if ln == "" || strings.Contains(ln, "gft-server") {
+		if ln == "" || strings.Contains(ln, "kestrel-server") || strings.Contains(ln, "gft-server") {
 			continue
 		}
 		fields := strings.Fields(ln)

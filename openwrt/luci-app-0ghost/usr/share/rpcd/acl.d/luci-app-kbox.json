@@ -1,0 +1,11 @@
+{
+	"luci-app-kbox": {
+		"description": "KestrelBox Kestrel-RTC Side-Router Gateway",
+		"read": {
+			"uci": [ "uhttpd" ]
+		},
+		"write": {
+			"uci": [ "uhttpd" ]
+		}
+	}
+}

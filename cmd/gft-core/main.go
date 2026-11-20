@@ -14,11 +14,11 @@ import (
 	"ghostframe/internal/gft"
 )
 
-var version = "v4.0.20-LTS"
+var version = "v4.0.21-LTS"
 
 func main() {
-	cfgFlag := flag.String("config", "", "optional path to client.json (e.g. /etc/gft/client.json)")
-	linkFlag := flag.String("link", "", "gft3:// node URI (runs directly without a config file)")
+	cfgFlag := flag.String("config", "", "optional path to client.json (e.g. /etc/kestrel/client.json)")
+	linkFlag := flag.String("link", "", "ksl4:// (or gft3://) node URI (runs directly without a config file)")
 	socksFlag := flag.String("socks", "", "override SOCKS5 listen address (e.g. 0.0.0.0:10808)")
 	httpFlag := flag.String("http", "", "override HTTP proxy listen address (e.g. 127.0.0.1:10809)")
 	routeFlag := flag.String("route", "", "routing mode: rule, global, or direct")
@@ -31,7 +31,7 @@ func main() {
 	flag.Parse()
 
 	if *showVer {
-		fmt.Printf("gft-core %s (%s/%s chacha20_priority=%v)\n",
+		fmt.Printf("kestrel-core %s (%s/%s chacha20_priority=%v)\n",
 			version, runtime.GOOS, runtime.GOARCH, gft.PrioritizeChaCha20())
 		return
 	}

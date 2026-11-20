@@ -28,7 +28,7 @@ import (
 )
 
 // Version is the canonical server build identifier (overridable via -ldflags -X).
-var Version = "v4.0.20-LTS"
+var Version = "v4.0.21-LTS"
 
 const (
 	MaxUDPAssocPerClient = 256
@@ -348,7 +348,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}
 
-	s.logger.Printf("GhostFrame %s Apex listening tcp=%s rtc=%v (cert=%s fallback=%s target=%s)",
+	s.logger.Printf("Kestrel %s Apex listening tcp=%s rtc=%v (cert=%s fallback=%s target=%s)",
 		Version, ln.Addr(), rtcLn != nil, s.cfg.CertMode, s.cfg.FallbackMode, s.cfg.CamouflageTarget)
 
 	// Public HTTP/1.1 fallback server (reverse_proxy or builtin_blog)

@@ -24,13 +24,13 @@ var version = tui.CurrentVersion
 
 func main() {
 	base := strings.TrimSuffix(filepath.Base(os.Args[0]), filepath.Ext(os.Args[0]))
-	if strings.EqualFold(base, "gft") && (len(os.Args) < 2 || strings.HasPrefix(os.Args[1], "-")) {
+	if (strings.EqualFold(base, "ksl") || strings.EqualFold(base, "gft")) && (len(os.Args) < 2 || strings.HasPrefix(os.Args[1], "-")) {
 		runMenu(os.Args[1:])
 		return
 	}
 
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: gft-server <run|init|link|menu|upgrade|rollback|show-card|sni-test|version> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: kestrel-server <run|init|link|menu|upgrade|rollback|show-card|sni-test|version> [flags]")
 		os.Exit(2)
 	}
 
@@ -47,7 +47,8 @@ func main() {
 		fs := flag.NewFlagSet("link", flag.ExitOnError)
 		conf := fs.String("config", tui.DefaultConfigPath, "config file")
 		_ = fs.Parse(os.Args[2:])
-		c, err := server.LoadConfig(*conf)
+		cfgPath := resolveServerConfigPath(*conf)
+		c, err := server.LoadConfig(cfgPath)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -60,7 +61,7 @@ func main() {
 		fs := flag.NewFlagSet("show-card", flag.ExitOnError)
 		conf := fs.String("config", tui.DefaultConfigPath, "config file")
 		_ = fs.Parse(os.Args[2:])
-		if err := tui.ShowDeliveryCard(*conf, os.Stdout); err != nil {
+		if err := tui.ShowDeliveryCard(resolveServerConfigPath(*conf), os.Stdout); err != nil {
 			log.Fatal(err)
 		}
 	case "sni-test":
@@ -69,39 +70,52 @@ func main() {
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
 		conf := fs.String("config", tui.DefaultConfigPath, "config file")
 		_ = fs.Parse(os.Args[2:])
-		c, err := server.LoadConfig(*conf)
+		cfgPath := resolveServerConfigPath(*conf)
+		c, err := server.LoadConfig(cfgPath)
 		if err != nil {
 			log.Fatal(err)
 		}
 		if os.Getenv("GOMEMLIMIT") == "" {
 			debug.SetMemoryLimit(int64(c.EffectiveMaxMemoryMB()) << 20)
 		}
-		logger := log.New(os.Stderr, "gft ", log.LstdFlags)
+		logger := log.New(os.Stderr, "ksl ", log.LstdFlags)
 		s, err := server.New(c, logger)
 		if err != nil {
 			log.Fatal(err)
 		}
-		s.SetConfigPath(*conf)
+		s.SetConfigPath(cfgPath)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		if err := s.Run(ctx); err != nil {
 			log.Fatal(err)
 		}
 	case "version", "-v", "--version":
-		fmt.Printf("gft-server %s\n", version)
+		fmt.Printf("kestrel-server %s\n", version)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		os.Exit(2)
 	}
 }
 
+func resolveServerConfigPath(path string) string {
+	if path == tui.DefaultConfigPath {
+		if _, err := os.Stat(path); err != nil {
+			const legacy = "/etc/gft/server.json"
+			if _, err2 := os.Stat(legacy); err2 == nil {
+				return legacy
+			}
+		}
+	}
+	return path
+}
+
 func runMenu(args []string) {
 	fs := flag.NewFlagSet("menu", flag.ExitOnError)
 	conf := fs.String("config", tui.DefaultConfigPath, "config file")
 	_ = fs.Parse(args)
-	ctrl := tui.NewController(*conf)
+	ctrl := tui.NewController(resolveServerConfigPath(*conf))
 	if err := ctrl.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "gft menu error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "ksl menu error: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -114,21 +128,21 @@ func runUpgrade(args []string) {
 	conf := fs.String("config", tui.DefaultConfigPath, "config file")
 	_ = fs.Parse(args)
 
-	ctrl := tui.NewController(*conf)
+	ctrl := tui.NewController(resolveServerConfigPath(*conf))
 	res, err := ctrl.PerformOTAUpgrade(tui.UpgradeOptions{
 		TargetVersion: *ver,
 		MirrorPrefix:  *mirror,
 		Force:         *force,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gft upgrade error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "ksl upgrade error: %v\n", err)
 		os.Exit(1)
 	}
 	if res.AlreadyLatest {
-		fmt.Printf("GhostFrame server is already up to date (%s).\n", res.ToVersion)
+		fmt.Printf("Kestrel server is already up to date (%s).\n", res.ToVersion)
 		return
 	}
-	fmt.Printf("Upgraded GhostFrame server: %s -> %s (SHA-256: %s)\n", res.FromVersion, res.ToVersion, res.SHA256)
+	fmt.Printf("Upgraded Kestrel server: %s -> %s (SHA-256: %s)\n", res.FromVersion, res.ToVersion, res.SHA256)
 }
 
 func runRollback(args []string) {
@@ -139,16 +153,16 @@ func runRollback(args []string) {
 	ctrl := tui.NewController(*conf)
 	res, err := ctrl.PerformOTARollback(tui.UpgradeOptions{})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gft rollback error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "ksl rollback error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Rolled back GhostFrame server to: %s (from %s)\n", res.RestoredBanner, res.BackupPath)
+	fmt.Printf("Rolled back Kestrel server to: %s (from %s)\n", res.RestoredBanner, res.BackupPath)
 }
 
 func runInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
-	confDir := fs.String("conf-dir", "/etc/gft", "config directory")
-	stateDir := fs.String("state-dir", "/var/lib/gft", "state directory")
+	confDir := fs.String("conf-dir", "/etc/kestrel", "config directory")
+	stateDir := fs.String("state-dir", "/var/lib/kestrel", "state directory")
 	host := fs.String("host", "", "public host or domain (auto-detected if omitted)")
 	sniFlag := fs.String("sni", "", "TLS server name (empty or 'auto' selects lowest-latency non-CDN origin)")
 	autoSNI := fs.Bool("auto-sni", false, "concurrently probe non-CDN regional pools and randomize among Top-5")

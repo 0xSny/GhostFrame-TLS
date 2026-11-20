@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct GhostFrameCompanionApp: App {
+struct KestrelAirApp: App {
     @StateObject private var viewModel = GhostAppViewModel(
         edition: .companion,
         backend: CompanionManager()

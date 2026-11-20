@@ -1,4 +1,4 @@
-name: Build 0Ghost Side-Router (N1 iStoreOS)
+name: Build KestrelBox Side-Router (N1 iStoreOS)
 
 on:
   workflow_dispatch:
@@ -13,6 +13,7 @@ on:
       - "internal/client/**"
       - "openwrt/**"
       - "scripts/build_0ghost.ps1"
+      - "scripts/install-kbox.sh"
       - "scripts/install-0ghost.sh"
       - "go.mod"
       - "go.sum"
@@ -28,6 +29,7 @@ on:
       - "internal/client/**"
       - "openwrt/**"
       - "scripts/build_0ghost.ps1"
+      - "scripts/install-kbox.sh"
       - "scripts/install-0ghost.sh"
       - "go.mod"
       - "go.sum"
@@ -48,54 +50,55 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Verify 0Ghost Never Links gVisor
+      - name: Verify KestrelBox Never Links gVisor
         run: |
           if GOOS=linux GOARCH=arm64 go list -deps ./cmd/0ghost | grep -q "gvisor.dev/gvisor"; then
-            echo "ERROR: 0ghost binary unexpectedly links gvisor.dev/gvisor!"
+            echo "ERROR: kbox binary unexpectedly links gvisor.dev/gvisor!"
             exit 1
           fi
 
-      - name: Vet and Test 0Ghost Packages (-race)
+      - name: Vet and Test KestrelBox Packages (-race)
         run: |
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go vet ./cmd/0ghost ./internal/tproxy ./internal/client ./internal/gft ./internal/gftrtc ./internal/netbind
           CGO_ENABLED=1 go test -race -count=1 -v ./internal/netbind ./internal/client ./internal/tproxy ./cmd/0ghost
 
-      - name: Build 0ghost (linux/arm64 & linux/amd64) & Package luci-app-0ghost
+      - name: Build kbox (linux/arm64 & linux/amd64) & Package KestrelBox LuCI bundle
         run: |
           set -euo pipefail
-          mkdir -p dist _stage_0ghost/usr/bin
+          mkdir -p dist _stage_kbox/usr/bin
 
-          REL_VER="v4.0.20-LTS"
+          REL_VER="v4.0.21-LTS"
           VER_X="-X ghostframe/internal/client.Version=${REL_VER} -X main.gatewayVersion=${REL_VER}"
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w ${VER_X}" -o dist/0ghost-linux-arm64 ./cmd/0ghost
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w ${VER_X}" -o dist/0ghost-linux-amd64 ./cmd/0ghost
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w ${VER_X}" -o dist/kbox-linux-arm64 ./cmd/0ghost
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w ${VER_X}" -o dist/kbox-linux-amd64 ./cmd/0ghost
 
-          cp dist/0ghost-linux-arm64 _stage_0ghost/usr/bin/0ghost
-          cp -r openwrt/luci-app-0ghost/etc _stage_0ghost/
-          cp -r openwrt/luci-app-0ghost/usr/* _stage_0ghost/usr/
-          cp -r openwrt/luci-app-0ghost/www _stage_0ghost/
-          cp openwrt/luci-app-0ghost/install-local.sh _stage_0ghost/install-local.sh
-          chmod 0755 _stage_0ghost/usr/bin/0ghost _stage_0ghost/etc/init.d/0ghost \
-                     _stage_0ghost/etc/hotplug.d/iface/99-0ghost _stage_0ghost/etc/hotplug.d/firewall/99-0ghost \
-                     _stage_0ghost/install-local.sh
+          cp dist/kbox-linux-arm64 _stage_kbox/usr/bin/kbox
+          cp -r openwrt/luci-app-0ghost/etc _stage_kbox/
+          cp -r openwrt/luci-app-0ghost/usr/* _stage_kbox/usr/
+          cp -r openwrt/luci-app-0ghost/www _stage_kbox/
+          cp openwrt/luci-app-0ghost/install-local.sh _stage_kbox/install-local.sh
+          chmod 0755 _stage_kbox/usr/bin/kbox _stage_kbox/etc/init.d/kbox \
+                     _stage_kbox/etc/hotplug.d/iface/99-kbox _stage_kbox/etc/hotplug.d/firewall/99-kbox \
+                     _stage_kbox/install-local.sh
 
-          sh -n _stage_0ghost/install-local.sh
-          sh -n _stage_0ghost/etc/hotplug.d/iface/99-0ghost
-          sh -n _stage_0ghost/etc/hotplug.d/firewall/99-0ghost
+          sh -n _stage_kbox/install-local.sh
+          sh -n _stage_kbox/etc/hotplug.d/iface/99-kbox
+          sh -n _stage_kbox/etc/hotplug.d/firewall/99-kbox
+          sh -n scripts/install-kbox.sh
           sh -n scripts/install-0ghost.sh
 
-          tar -czf dist/0ghost-istoreos-arm64.tar.gz -C _stage_0ghost .
-          rm -rf _stage_0ghost
-          (cd dist && sha256sum 0ghost-linux-arm64 0ghost-linux-amd64 0ghost-istoreos-arm64.tar.gz > checksums.txt)
+          tar -czf dist/kbox-istoreos-arm64.tar.gz -C _stage_kbox .
+          rm -rf _stage_kbox
+          (cd dist && sha256sum kbox-linux-arm64 kbox-linux-amd64 kbox-istoreos-arm64.tar.gz > checksums.txt)
           ls -lh dist/
 
-      - name: Upload 0Ghost & luci-app-0ghost Artifacts
+      - name: Upload KestrelBox & LuCI Bundle Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: 0Ghost-iStoreOS-arm64
+          name: KestrelBox-iStoreOS-arm64
           path: |
-            dist/0ghost-linux-arm64
-            dist/0ghost-linux-amd64
-            dist/0ghost-istoreos-arm64.tar.gz
+            dist/kbox-linux-arm64
+            dist/kbox-linux-amd64
+            dist/kbox-istoreos-arm64.tar.gz
             dist/checksums.txt
           if-no-files-found: error

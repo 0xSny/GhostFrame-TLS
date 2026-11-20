@@ -18,7 +18,7 @@ struct GhostVPNControlWidget: ControlWidget {
             provider: GhostVPNControlValueProvider()
         ) { isConnected in
             ControlWidgetToggle(
-                "GhostFrame VPN",
+                "Kestrel Duo",
                 isOn: isConnected,
                 action: ToggleGhostVPNIntent()
             ) { isOn in
@@ -29,8 +29,8 @@ struct GhostVPNControlWidget: ControlWidget {
             }
             .tint(.cyan)
         }
-        .displayName("GhostFrame VPN")
-        .description("在控制中心、锁屏或操作按钮一键开启/关闭 GhostFrame VPN。")
+        .displayName("Kestrel Duo")
+        .description("在控制中心、锁屏或操作按钮一键开启/关闭 Kestrel 隧道。")
     }
 }
 

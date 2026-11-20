@@ -75,7 +75,7 @@ func (r *LogRingBuffer) Len() int {
 }
 
 var (
-	reGFTLink = regexp.MustCompile(`(?i)gft3://[^\s"'<>]+`)
+	reGFTLink = regexp.MustCompile(`(?i)(?:ksl4|gft3|gft2)://[^\s"'<>]+`)
 	reIPv4    = regexp.MustCompile(`\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b`)
 	rePSKJson = regexp.MustCompile(`(?i)("?(?:psk|password|secret|token|pin)"?\s*[:=]\s*"?)([A-Za-z0-9+/=_-]{8,})("?)`)
 )
@@ -131,7 +131,7 @@ func (e *Engine) BuildDiagnosticSnapshot() string {
 	runtime.ReadMemStats(&ms)
 
 	var sb strings.Builder
-	sb.WriteString("=== GhostFrame-Pro Diagnostic Snapshot (Sanitized) ===\n")
+	sb.WriteString("=== Kestrel Pro Diagnostic Snapshot (Sanitized) ===\n")
 	fmt.Fprintf(&sb, "Version: %s (%s/%s, %s)\n", Version, runtime.GOOS, runtime.GOARCH, runtime.Version())
 	fmt.Fprintf(&sb, "State: %v | ActiveTransport: %v | Pref: %v | RouteMode: %v\n",
 		st["state"], st["active_transport"], st["transport_pref"], st["route_mode"])

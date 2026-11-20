@@ -21,7 +21,7 @@ func TestGatewayConsoleRoutesAndSettings(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:19080/", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "0Ghost") {
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "KestrelBox") {
 		t.Fatalf("expected HTTP 200 HTML console, got code=%d", rec.Code)
 	}
 

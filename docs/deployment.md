@@ -15,12 +15,12 @@ bash <(curl -fsSL https://github.com/Spittingjiu/Ghost/releases/latest/download/
   --unattended --port 443 --hop 25000-32000
 ```
 
-Manage the server anytime with the `gft` interactive TUI:
+Manage the server anytime with the `ksl` interactive TUI:
 
 ```bash
-gft
-systemctl status ghostframe
-journalctl -u ghostframe -f
+ksl
+systemctl status kestrel
+journalctl -u kestrel -f
 ```
 
 ### Recommended High-BDP Kernel Tuning (`/etc/sysctl.d/99-gft-rtc.conf`)
@@ -41,10 +41,10 @@ Apply with `sysctl --system`.
 
 ---
 
-## 2. Windows Desktop Client (`GhostFrame-Pro.exe`)
+## 2. Windows Desktop Client (`Kestrel-Pro.exe`)
 
-1. Launch `GhostFrame-Pro.exe` (no external runtime or browser required).
-2. Copy a `gft3://` link from the server `gft` menu and press `Ctrl+V` (or click **导入 gft3://**), or place your configuration in `%USERPROFILE%\.gft\client.json` based on [configs/client.example.json](../configs/client.example.json).
+1. Launch `Kestrel-Pro.exe` (no external runtime or browser required).
+2. Copy a `ksl4://` (or legacy `gft3://`) link from the server `ksl` menu and press `Ctrl+V` (or click **导入 ksl4://**), or place your configuration in `%USERPROFILE%\.kestrel\client.json` based on [configs/client.example.json](../configs/client.example.json).
 3. Default local listeners are SOCKS5 `127.0.0.1:10808` (TCP + UDP ASSOCIATE) and HTTP `127.0.0.1:10809`.
 4. To hot-swap local ports while connected without dropping active listeners, click the top port pill (`S5 :10808 · HTTP :10809`) or edit the **本地端口** fields and press `Enter` / **保存**.
 5. Closing the window minimizes to the system tray; use the tray context menu to switch nodes/modes or quit cleanly (restoring the pre-connection system proxy snapshot from `sysproxy_backup.json`).
@@ -53,24 +53,24 @@ For automated testing or sandboxed runs without touching Windows Registry proxy 
 
 ```powershell
 $env:GFT_NO_SYSPROXY = "1"
-.\GhostFrame-Pro.exe -no-sysproxy
+.\Kestrel-Pro.exe -no-sysproxy
 ```
 
 ---
 
-## 3. Linux / ARM64 Router (`gft-core`) & Clash Meta
+## 3. Linux / ARM64 Router (`kestrel-core`) & Clash Meta
 
-Start `gft-core` as a headless daemon (use `-low-mem` on memory-constrained routers such as Phicomm N1 / S905D):
+Start `kestrel-core` as a headless daemon (use `-low-mem` on memory-constrained routers such as Phicomm N1 / S905D):
 
 ```bash
-./gft-core -link "gft3://..." -socks 0.0.0.0:10808 -http 0.0.0.0:10809 -low-mem
+./kestrel-core -link "ksl4://..." -socks 0.0.0.0:10808 -http 0.0.0.0:10809 -low-mem
 ```
 
 Clash Meta / Mihomo outbound snippet (click **复制 Clash YAML** in the Windows UI to copy automatically):
 
 ```yaml
 proxies:
-  - name: "GhostFrame-Apex"
+  - name: "Kestrel-Apex"
     type: socks5
     server: 127.0.0.1
     port: 10808

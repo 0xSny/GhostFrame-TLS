@@ -1,6 +1,6 @@
-name: GhostFrameVPN
+name: KestrelDuo
 options:
-  bundleIdPrefix: com.ghostframe
+  bundleIdPrefix: com.kestrel
   deploymentTarget:
     iOS: "15.0"
   createIntermediateGroups: true
@@ -21,7 +21,7 @@ settings:
       - "$(PROJECT_DIR)/Frameworks"
 
 targets:
-  GhostFrameVPN:
+  KestrelDuo:
     type: application
     platform: iOS
     deploymentTarget: "15.0"
@@ -32,8 +32,8 @@ targets:
       - path: vpn/GhostVPNControlIntents.swift
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.vpn
-        PRODUCT_NAME: GhostFrameVPN
+        PRODUCT_BUNDLE_IDENTIFIER: com.kestrel.duo
+        PRODUCT_NAME: KestrelDuo
         INFOPLIST_FILE: vpn/AppInfo.plist
         CODE_SIGN_ENTITLEMENTS: vpn/App.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -43,9 +43,9 @@ targets:
           - "-ObjC"
           - "-lresolv"
     dependencies:
-      - target: GhostPacketTunnel
+      - target: KestrelTunnel
         embed: true
-      - target: GhostControlWidget
+      - target: KestrelControlWidget
         embed: true
       - framework: Frameworks/GhostMobile.xcframework
         embed: false
@@ -55,7 +55,7 @@ targets:
       - sdk: Security.framework
       - sdk: WidgetKit.framework
 
-  GhostPacketTunnel:
+  KestrelTunnel:
     type: app-extension
     platform: iOS
     deploymentTarget: "15.0"
@@ -65,8 +65,8 @@ targets:
       - path: vpn/PacketTunnelProvider.swift
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.vpn.tunnel
-        PRODUCT_NAME: GhostPacketTunnel
+        PRODUCT_BUNDLE_IDENTIFIER: com.kestrel.duo.tunnel
+        PRODUCT_NAME: KestrelTunnel
         INFOPLIST_FILE: vpn/TunnelInfo.plist
         CODE_SIGN_ENTITLEMENTS: vpn/Tunnel.entitlements
         APPLICATION_EXTENSION_API_ONLY: "YES"
@@ -87,7 +87,7 @@ targets:
       - sdk: Security.framework
       - sdk: WidgetKit.framework
 
-  GhostControlWidget:
+  KestrelControlWidget:
     type: app-extension
     platform: iOS
     deploymentTarget: "18.0"
@@ -96,8 +96,8 @@ targets:
       - path: vpn/GhostControlWidget.swift
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.vpn.control
-        PRODUCT_NAME: GhostControlWidget
+        PRODUCT_BUNDLE_IDENTIFIER: com.kestrel.duo.control
+        PRODUCT_NAME: KestrelControlWidget
         INFOPLIST_FILE: vpn/ControlInfo.plist
         CODE_SIGN_ENTITLEMENTS: vpn/Control.entitlements
         APPLICATION_EXTENSION_API_ONLY: "YES"

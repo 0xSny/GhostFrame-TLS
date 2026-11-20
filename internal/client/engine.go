@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.0.20-LTS"
+var Version = "v4.0.21-LTS"
 
 type ConnState string
 
@@ -1436,7 +1436,7 @@ func (e *Engine) ClashYAML() string {
 	}
 	name := l.Remark
 	if name == "" {
-		name = "GhostFrame-Apex"
+		name = "Kestrel-Apex"
 	}
 	return fmt.Sprintf(`proxies:
   - name: "%s"

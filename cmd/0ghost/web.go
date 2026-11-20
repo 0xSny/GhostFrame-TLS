@@ -65,7 +65,7 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		}
 		if want != "" {
 			http.SetCookie(w, &http.Cookie{
-				Name:     "ghost0_auth",
+				Name:     "kbox_auth",
 				Value:    computeWebAuthToken(want),
 				Path:     "/",
 				HttpOnly: true,
@@ -83,7 +83,7 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 	mux.HandleFunc("/api/connect", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			if err := s.engine.Connect(); err != nil {
-				s.engine.Logf("[0Ghost] 连接失败: %v", err)
+				s.engine.Logf("[KestrelBox] 连接失败: %v", err)
 			}
 			s.SyncFirewall()
 		}()
@@ -118,7 +118,7 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 			}
 		}
 		if imported == 0 {
-			msg := "未发现有效 gft3:// 或 gft2:// 节点链接"
+			msg := "未发现有效 ksl4:// 或 gft3:// 节点链接"
 			if lastErr != nil {
 				msg = lastErr.Error()
 			}
@@ -277,7 +277,7 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 	mux.HandleFunc("/api/conflicts/resolve", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		rep := tproxy.ResolveConflicts()
 		for _, act := range rep.Actions {
-			s.engine.Logf("[0Ghost] %s", act)
+			s.engine.Logf("[KestrelBox] %s", act)
 		}
 		_ = s.engine.StartServers()
 		s.SyncFirewall()
@@ -334,7 +334,15 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		w.Header().Set("Referrer-Policy", "same-origin")
 
 		rNorm := r
-		if strings.HasPrefix(r.URL.Path, "/0ghost") {
+		if strings.HasPrefix(r.URL.Path, "/kbox") {
+			r2 := r.Clone(r.Context())
+			trimmed := strings.TrimPrefix(r.URL.Path, "/kbox")
+			if trimmed == "" {
+				trimmed = "/"
+			}
+			r2.URL.Path = trimmed
+			rNorm = r2
+		} else if strings.HasPrefix(r.URL.Path, "/0ghost") {
 			r2 := r.Clone(r.Context())
 			trimmed := strings.TrimPrefix(r.URL.Path, "/0ghost")
 			if trimmed == "" {
@@ -473,7 +481,7 @@ func (s *GatewayService) isAuthorizedRequest(r *http.Request, password string) b
 			return true
 		}
 	}
-	if c, err := r.Cookie("ghost0_auth"); err == nil && c.Value != "" {
+	if c, err := r.Cookie("kbox_auth"); err == nil && c.Value != "" {
 		expectedTok := computeWebAuthToken(want)
 		if subtle.ConstantTimeCompare([]byte(c.Value), []byte(expectedTok)) == 1 {
 			return true

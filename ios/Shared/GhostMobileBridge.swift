@@ -83,7 +83,7 @@ enum GhostMobileBridge {
         if env.ok, let node = env.data {
             return .success(node)
         }
-        return .failure(GhostBridgeError(message: env.error ?? "Invalid gft3:// link"))
+        return .failure(GhostBridgeError(message: env.error ?? "Invalid ksl4:// link"))
     }
 
     static func buildShadowrocketAddURL(socksPort: Int, remark: String) -> String {

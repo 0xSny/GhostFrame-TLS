@@ -194,7 +194,7 @@ func Run(eng *client.Engine) error {
 	}
 	_ = sysDPI
 
-	titlePtr := utf16Ptr("GhostFrame-Pro " + client.Version)
+	titlePtr := utf16Ptr("Kestrel Pro " + client.Version)
 	hwnd, _, err := pCreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(clsPtr)),
@@ -829,7 +829,7 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 		if uri == "" {
 			a.setToast("当前没有可复制的节点链接", true)
 		} else if SetClipboardText(a.hwnd, uri) {
-			a.setToast("已复制 gft3:// 节点链接到剪贴板", false)
+			a.setToast("已复制 ksl4:// 节点链接到剪贴板", false)
 		} else {
 			a.setToast("写入剪贴板失败", true)
 		}
@@ -865,7 +865,7 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 func (a *appUI) importFromClipboard() {
 	raw := strings.TrimSpace(GetClipboardText(a.hwnd))
 	if raw == "" {
-		a.setToast("剪贴板为空，请先复制 gft3:// 链接", true)
+		a.setToast("剪贴板为空，请先复制 ksl4:// 链接", true)
 		return
 	}
 	lines := strings.Split(raw, "\n")
@@ -873,7 +873,7 @@ func (a *appUI) importFromClipboard() {
 	var lastErr error
 	for _, ln := range lines {
 		ln = strings.TrimSpace(ln)
-		if ln == "" || (!strings.HasPrefix(ln, "gft3://") && !strings.HasPrefix(ln, "gft://")) {
+		if ln == "" || (!strings.HasPrefix(ln, "ksl4://") && !strings.HasPrefix(ln, "gft3://") && !strings.HasPrefix(ln, "gft2://") && !strings.HasPrefix(ln, "gft://")) {
 			continue
 		}
 		if _, err := a.eng.ImportLink(ln, imported == 0); err != nil {
@@ -994,7 +994,7 @@ func (a *appUI) drawHeader(rc *rect, st map[string]any, pad int32) {
 		dotCol = colTextMuted
 	}
 	a.buf.fillCircle(float32(pad+s(9)), float32(s(35)), float32(s(6)), dotCol)
-	f.drawText(f.fTitle, f.fmtLeft, rect{pad + s(22), s(16), pad + s(225), s(52)}, colTextMain, "GhostFrame-Pro")
+	f.drawText(f.fTitle, f.fmtLeft, rect{pad + s(22), s(16), pad + s(225), s(52)}, colTextMain, "Kestrel Pro")
 
 	// Active transport badge
 	badgeR := rect{pad + s(192), s(23), pad + s(324), s(47)}
@@ -1008,7 +1008,7 @@ func (a *appUI) drawHeader(rc *rect, st map[string]any, pad int32) {
 
 	// Right header buttons: [Import] [Ping] [Port Pill]
 	impR := rect{rc.Right - pad - s(106), s(20), rc.Right - pad, s(50)}
-	a.drawButton(impR, hitImport, "导入 gft3://", colCardAlt, colBorderHi, colTextMain)
+	a.drawButton(impR, hitImport, "导入 ksl4://", colCardAlt, colBorderHi, colTextMain)
 
 	pingLabel := "测速"
 	if pingMs > 0 {
@@ -1258,7 +1258,7 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 	c1R := rect{r.Left + s(16), btnY, r.Left + s(16) + halfW, btnY + s(34)}
 	c2R := rect{c1R.Right + s(8), btnY, r.Right - s(16), btnY + s(34)}
 	a.drawButton(c1R, hitCopyClash, "复制 Clash YAML", colCardAlt, colBorderHi, colSky)
-	a.drawButton(c2R, hitCopyLink, "复制 gft3://", colCardAlt, colBorderHi, colEmerald)
+	a.drawButton(c2R, hitCopyLink, "复制 ksl4://", colCardAlt, colBorderHi, colEmerald)
 }
 
 func (a *appUI) drawPortBox(r rect, id hitKind, val string, focused bool) {

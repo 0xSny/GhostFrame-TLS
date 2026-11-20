@@ -169,7 +169,7 @@ func newTrayManager(hwnd uintptr) *trayManager {
 			client.StateError:        CreateVectorIcon(client.StateError),
 		},
 	}
-	tm.addOrModify(client.StateDisconnected, "GhostFrame-Pro | 未连接")
+	tm.addOrModify(client.StateDisconnected, "Kestrel Pro | 未连接")
 	return tm
 }
 
@@ -228,16 +228,16 @@ func (tm *trayManager) update(st map[string]any) {
 	switch state {
 	case client.StateConnected:
 		if ping > 0 {
-			tip = fmt.Sprintf("GhostFrame-Pro | 已连接 (%s %dms)\n节点: %s", mode, ping, node)
+			tip = fmt.Sprintf("Kestrel Pro | 已连接 (%s %dms)\n节点: %s", mode, ping, node)
 		} else {
-			tip = fmt.Sprintf("GhostFrame-Pro | 已连接 (%s)\n节点: %s", mode, node)
+			tip = fmt.Sprintf("Kestrel Pro | 已连接 (%s)\n节点: %s", mode, node)
 		}
 	case client.StateConnecting:
-		tip = fmt.Sprintf("GhostFrame-Pro | 正在连接 %s...", node)
+		tip = fmt.Sprintf("Kestrel Pro | 正在连接 %s...", node)
 	case client.StateError:
-		tip = "GhostFrame-Pro | 连接异常（点击查看日志）"
+		tip = "Kestrel Pro | 连接异常（点击查看日志）"
 	default:
-		tip = "GhostFrame-Pro | 未连接（待机中）"
+		tip = "Kestrel Pro | 未连接（待机中）"
 	}
 	tm.addOrModify(state, tip)
 }
@@ -286,7 +286,7 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 		runtime.KeepAlive(txt)
 	}
 
-	appendItem(hMenu, mfString, cmdOpen, "打开 GhostFrame-Pro 控制台")
+	appendItem(hMenu, mfString, cmdOpen, "打开 Kestrel Pro 控制台")
 	if state == client.StateConnected || state == client.StateConnecting {
 		appendItem(hMenu, mfString, cmdToggle, "断开安全隧道")
 	} else {
@@ -349,9 +349,9 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 		}
 	}
 	appendItem(hMenu, mfPopup, hNodes, "切换节点")
-	appendItem(hMenu, mfString, cmdImport, "从剪贴板导入节点 (gft3://)")
+	appendItem(hMenu, mfString, cmdImport, "从剪贴板导入节点 (ksl4://)")
 	appendItem(hMenu, mfSeparator, 0, "")
-	appendItem(hMenu, mfString, cmdQuit, "彻底退出 GhostFrame-Pro")
+	appendItem(hMenu, mfString, cmdQuit, "彻底退出 Kestrel Pro")
 
 	var pt point
 	_, _, _ = pGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))

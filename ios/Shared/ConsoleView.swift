@@ -134,12 +134,12 @@ struct ConsoleView: View {
                     .fill(statusColor)
                     .frame(width: 10, height: 10)
 
-                Text("GhostFrame")
+                Text("Kestrel")
                     .font(.system(size: 17, weight: .bold))
                     .foregroundColor(GhostPalette.textPrimary)
                     .lineLimit(1)
 
-                Text(viewModel.edition == .vpn ? "VPN" : "伴侣")
+                Text(viewModel.edition == .vpn ? "Duo" : "Air")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundColor(GhostPalette.cyan)
                     .padding(.horizontal, 6)
@@ -161,7 +161,7 @@ struct ConsoleView: View {
                 }
 
                 Button(action: {
-                    if let clip = UIPasteboard.general.string, clip.hasPrefix("gft") {
+                    if let clip = UIPasteboard.general.string, clip.hasPrefix("ksl") || clip.hasPrefix("gft") {
                         importURIText = clip
                     }
                     showImportSheet = true
@@ -426,9 +426,9 @@ struct ConsoleView: View {
                     drawerItem(icon: "qrcode.viewfinder", title: "扫码导入节点") {
                         closeDrawerThen { showQRScanner = true }
                     }
-                    drawerItem(icon: "link.badge.plus", title: "链接导入节点 (gft3://)") {
+                    drawerItem(icon: "link.badge.plus", title: "链接导入节点 (ksl4://)") {
                         closeDrawerThen {
-                            if let clip = UIPasteboard.general.string, clip.hasPrefix("gft") {
+                            if let clip = UIPasteboard.general.string, clip.hasPrefix("ksl") || clip.hasPrefix("gft") {
                                 importURIText = clip
                             }
                             showImportSheet = true
@@ -854,7 +854,7 @@ struct ConsoleView: View {
     private var importNodeSheet: some View {
         NavigationView {
             VStack(alignment: .leading, spacing: 14) {
-                Text("粘贴 GhostFrame 分享链接 (gft3:// 或 gft2://)")
+                Text("粘贴 Kestrel 分享链接 (ksl4:// 或 gft3://)")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(GhostPalette.textPrimary)
 
@@ -1042,7 +1042,7 @@ struct ConsoleView: View {
         if viewModel.isTransitioning {
             return "正在建立通道... (点击取消)"
         }
-        return "连接 GhostFrame (v4.0 LTS)"
+        return "连接 Kestrel (v4.0 LTS)"
     }
 
     private var rttText: String {

@@ -21,7 +21,7 @@ import (
 )
 
 // Version is the mobile runtime identifier (overridable via -ldflags -X).
-var Version = "v4.0.20-LTS"
+var Version = "v4.0.21-LTS"
 
 const (
 	defaultSocksPort = 10808
@@ -459,7 +459,7 @@ func GetDiagnosticSnapshot() string {
 		phys = netbind.PreferredInterface()
 	}
 	return fmt.Sprintf(
-		"GhostFrame Mobile Diagnostic (%s)\nState: disconnected\nTunnelExtension: %v\nLowMemMode: %v\nPhysicalInterface: %s\nMemAllocMB: %.2f\nMemSysMB: %.2f\n",
+		"Kestrel Mobile Diagnostic (%s)\nState: disconnected\nTunnelExtension: %v\nLowMemMode: %v\nPhysicalInterface: %s\nMemAllocMB: %.2f\nMemSysMB: %.2f\n",
 		Version,
 		isTunnel,
 		gft.IsLowMemMode(),

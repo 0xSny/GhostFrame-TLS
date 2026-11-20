@@ -47,10 +47,10 @@ func TestBuildSourceManifestAndServeEndpoints(t *testing.T) {
 		t.Fatalf("unexpected manifest header: %+v", got)
 	}
 	if got.Apps[0].Version != "4.0.42" || got.Apps[0].Size != int64(len(vpnPayload)) || len(got.Apps[0].Versions) != 1 {
-		t.Fatalf("unexpected VPN app entry: %+v", got.Apps[0])
+		t.Fatalf("unexpected Kestrel Duo entry: %+v", got.Apps[0])
 	}
-	if got.Apps[1].BundleIdentifier != "com.ghostframe.companion" || got.Apps[1].Size != int64(len(compPayload)) {
-		t.Fatalf("unexpected Companion app entry: %+v", got.Apps[1])
+	if got.Apps[1].BundleIdentifier != "com.kestrel.air" || got.Apps[1].Size != int64(len(compPayload)) {
+		t.Fatalf("unexpected Kestrel Air entry: %+v", got.Apps[1])
 	}
 
 	// 2. Check browser fallback page /
@@ -74,7 +74,7 @@ func TestBuildSourceManifestAndServeEndpoints(t *testing.T) {
 func TestExtractIPAFromZipAndRedirectHeaderStrip(t *testing.T) {
 	var zbuf bytes.Buffer
 	zw := zip.NewWriter(&zbuf)
-	fw, err := zw.Create("nested/GhostFrame-VPN-Unsigned.ipa")
+	fw, err := zw.Create("nested/Kestrel-Duo-Unsigned.ipa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestExtractIPAFromZipAndRedirectHeaderStrip(t *testing.T) {
 	_, _ = fw.Write(want)
 	_ = zw.Close()
 
-	dst := filepath.Join(t.TempDir(), "GhostFrame-VPN-Unsigned.ipa")
+	dst := filepath.Join(t.TempDir(), "Kestrel-Duo-Unsigned.ipa")
 	n, err := extractIPAFromZip(zbuf.Bytes(), dst)
 	if err != nil || n != int64(len(want)) {
 		t.Fatalf("extractIPAFromZip failed: n=%d err=%v", n, err)

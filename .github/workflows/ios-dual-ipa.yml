@@ -61,13 +61,13 @@ jobs:
           git checkout -- go.mod go.sum
           test -d ios/Frameworks/GhostMobile.xcframework/ios-arm64/GhostMobile.framework
 
-      - name: Build & Package Edition A (GhostFrame-VPN-Unsigned.ipa)
+      - name: Build & Package Edition A (Kestrel-Duo-Unsigned.ipa)
         run: |
           (cd ios && xcodegen generate --spec project-vpn.yml)
           git diff --exit-code ios/vpn
           xcodebuild \
-            -project ios/GhostFrameVPN.xcodeproj \
-            -scheme GhostFrameVPN \
+            -project ios/KestrelDuo.xcodeproj \
+            -scheme KestrelDuo \
             -configuration Release \
             -sdk iphoneos \
             ARCHS=arm64 \
@@ -79,19 +79,19 @@ jobs:
             BUILD_DIR="$PWD/ios/build-vpn" \
             build
 
-          VPN_APP="$(find ios/build-vpn -maxdepth 4 -type d -name 'GhostFrameVPN.app' | head -n 1)"
+          VPN_APP="$(find ios/build-vpn -maxdepth 4 -type d -name 'KestrelDuo.app' | head -n 1)"
           test -n "$VPN_APP" && test -d "$VPN_APP"
-          APPEX="$VPN_APP/PlugIns/GhostPacketTunnel.appex"
+          APPEX="$VPN_APP/PlugIns/KestrelTunnel.appex"
           test -d "$APPEX"
-          CTRL_APPEX="$VPN_APP/PlugIns/GhostControlWidget.appex"
+          CTRL_APPEX="$VPN_APP/PlugIns/KestrelControlWidget.appex"
           test -d "$CTRL_APPEX"
 
-          echo "=== Verifying GhostPacketTunnel Info.plist ==="
+          echo "=== Verifying KestrelTunnel Info.plist ==="
           plutil -p "$APPEX/Info.plist"
           plutil -p "$APPEX/Info.plist" | grep -q "com.apple.networkextension.packet-tunnel"
           plutil -p "$APPEX/Info.plist" | grep -q "PacketTunnelProvider"
 
-          echo "=== Verifying GhostControlWidget Info.plist ==="
+          echo "=== Verifying KestrelControlWidget Info.plist ==="
           plutil -p "$CTRL_APPEX/Info.plist"
           plutil -p "$CTRL_APPEX/Info.plist" | grep -q "com.apple.widgetkit-extension"
 
@@ -102,7 +102,7 @@ jobs:
             /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUM}" "$plist"
           done
 
-          # Inside-out ad-hoc entitlement stamping (strictly no --deep on GhostFrameVPN.app)
+          # Inside-out ad-hoc entitlement stamping (strictly no --deep on KestrelDuo.app)
           codesign --force --sign - --entitlements ios/vpn/Tunnel.entitlements --timestamp=none "$APPEX"
           codesign --force --sign - --entitlements ios/vpn/Control.entitlements --timestamp=none "$CTRL_APPEX"
           codesign --force --sign - --entitlements ios/vpn/App.entitlements --timestamp=none "$VPN_APP"
@@ -111,20 +111,20 @@ jobs:
           codesign --verify --strict "$CTRL_APPEX"
           codesign --verify --strict "$VPN_APP"
 
-          echo "=== Verifying GhostPacketTunnel.appex entitlements ==="
+          echo "=== Verifying KestrelTunnel.appex entitlements ==="
           APPEX_ENT="$(codesign -d --entitlements - --xml "$APPEX" 2>&1)"
           echo "$APPEX_ENT"
           echo "$APPEX_ENT" | grep -q "packet-tunnel-provider"
           ! echo "$APPEX_ENT" | grep -q "application-groups"
 
-          echo "=== Verifying GhostControlWidget.appex isolation & entitlements ==="
+          echo "=== Verifying KestrelControlWidget.appex isolation & entitlements ==="
           CTRL_ENT="$(codesign -d --entitlements - --xml "$CTRL_APPEX" 2>&1 || true)"
           echo "$CTRL_ENT"
           ! echo "$CTRL_ENT" | grep -q "packet-tunnel-provider"
           ! echo "$CTRL_ENT" | grep -q "application-groups"
-          ! otool -L "$CTRL_APPEX/GhostControlWidget" | grep -q "GhostMobile"
+          ! otool -L "$CTRL_APPEX/KestrelControlWidget" | grep -q "GhostMobile"
 
-          echo "=== Verifying GhostFrameVPN.app entitlements & AppIcon Assets.car ==="
+          echo "=== Verifying KestrelDuo.app entitlements & AppIcon Assets.car ==="
           APP_ENT="$(codesign -d --entitlements - --xml "$VPN_APP" 2>&1)"
           echo "$APP_ENT"
           echo "$APP_ENT" | grep -q "packet-tunnel-provider"
@@ -133,18 +133,18 @@ jobs:
 
           STAGE_VPN="$(mktemp -d)"
           mkdir -p "$STAGE_VPN/Payload"
-          cp -R "$VPN_APP" "$STAGE_VPN/Payload/GhostFrameVPN.app"
-          (cd "$STAGE_VPN" && zip -qry "$GITHUB_WORKSPACE/dist/GhostFrame-VPN-Unsigned.ipa" Payload)
+          cp -R "$VPN_APP" "$STAGE_VPN/Payload/KestrelDuo.app"
+          (cd "$STAGE_VPN" && zip -qry "$GITHUB_WORKSPACE/dist/Kestrel-Duo-Unsigned.ipa" Payload)
           rm -rf "$STAGE_VPN"
-          ls -lh dist/GhostFrame-VPN-Unsigned.ipa
+          ls -lh dist/Kestrel-Duo-Unsigned.ipa
 
-      - name: Build & Package Edition B (GhostFrame-Companion-Unsigned.ipa)
+      - name: Build & Package Edition B (Kestrel-Air-Unsigned.ipa)
         run: |
           (cd ios && xcodegen generate --spec project-companion.yml)
           git diff --exit-code ios/companion
           xcodebuild \
-            -project ios/GhostFrameCompanion.xcodeproj \
-            -scheme GhostFrameCompanion \
+            -project ios/KestrelAir.xcodeproj \
+            -scheme KestrelAir \
             -configuration Release \
             -sdk iphoneos \
             ARCHS=arm64 \
@@ -156,7 +156,7 @@ jobs:
             BUILD_DIR="$PWD/ios/build-companion" \
             build
 
-          COMP_APP="$(find ios/build-companion -maxdepth 4 -type d -name 'GhostFrameCompanion.app' | head -n 1)"
+          COMP_APP="$(find ios/build-companion -maxdepth 4 -type d -name 'KestrelAir.app' | head -n 1)"
           test -n "$COMP_APP" && test -d "$COMP_APP"
           test ! -d "$COMP_APP/PlugIns"
 
@@ -173,30 +173,30 @@ jobs:
           test -f "$COMP_APP/Assets.car"
 
           COMP_ENT="$(codesign -d --entitlements - --xml "$COMP_APP" 2>&1 || true)"
-          echo "=== Companion entitlements check ==="
+          echo "=== KestrelAir entitlements check ==="
           echo "$COMP_ENT"
           ! echo "$COMP_ENT" | grep -q "networkextension"
           ! echo "$COMP_ENT" | grep -q "application-groups"
 
           STAGE_COMP="$(mktemp -d)"
           mkdir -p "$STAGE_COMP/Payload"
-          cp -R "$COMP_APP" "$STAGE_COMP/Payload/GhostFrameCompanion.app"
-          (cd "$STAGE_COMP" && zip -qry "$GITHUB_WORKSPACE/dist/GhostFrame-Companion-Unsigned.ipa" Payload)
+          cp -R "$COMP_APP" "$STAGE_COMP/Payload/KestrelAir.app"
+          (cd "$STAGE_COMP" && zip -qry "$GITHUB_WORKSPACE/dist/Kestrel-Air-Unsigned.ipa" Payload)
           rm -rf "$STAGE_COMP"
-          ls -lh dist/GhostFrame-Companion-Unsigned.ipa
+          ls -lh dist/Kestrel-Air-Unsigned.ipa
 
-      - name: Upload GhostFrame-VPN-Unsigned.ipa
+      - name: Upload Kestrel-Duo-Unsigned.ipa
         uses: actions/upload-artifact@v4
         with:
-          name: GhostFrame-VPN-Unsigned-IPA
-          path: dist/GhostFrame-VPN-Unsigned.ipa
+          name: Kestrel-Duo-Unsigned-IPA
+          path: dist/Kestrel-Duo-Unsigned.ipa
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload GhostFrame-Companion-Unsigned.ipa
+      - name: Upload Kestrel-Air-Unsigned.ipa
         uses: actions/upload-artifact@v4
         with:
-          name: GhostFrame-Companion-Unsigned-IPA
-          path: dist/GhostFrame-Companion-Unsigned.ipa
+          name: Kestrel-Air-Unsigned-IPA
+          path: dist/Kestrel-Air-Unsigned.ipa
           if-no-files-found: error
           retention-days: 30

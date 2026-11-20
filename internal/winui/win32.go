@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	windowClassName = "GhostFrameProWndClass"
-	singleMutexName = `Local\GhostFrameTLSPro_SingleInstance`
+	windowClassName = "KestrelProWndClass"
+	singleMutexName = `Local\KestrelPro_SingleInstance`
 
 	wmAppWake    = 0x8001 // WM_APP + 1
 	wmAppTray    = 0x8002 // WM_APP + 2

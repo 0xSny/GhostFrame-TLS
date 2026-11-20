@@ -80,7 +80,7 @@ final class GhostAppViewModel: ObservableObject {
         loadPreferences()
         bindBackend()
         syncFromBackendState()
-        appendLocalLog("GhostFrame \(edition.title) v4.0.20-LTS initialized")
+        appendLocalLog("Kestrel \(edition.title) v4.0.20-LTS initialized")
     }
 
     var activeNode: GhostNode? {
@@ -135,7 +135,7 @@ final class GhostAppViewModel: ObservableObject {
             return
         }
         guard let node = activeNode else {
-            errorBanner = "请先点击右上角“导入 gft3://”添加节点"
+            errorBanner = "请先点击右上角「导入」添加节点"
             showToast(errorBanner)
             return
         }
@@ -149,7 +149,7 @@ final class GhostAppViewModel: ObservableObject {
     func importLink(_ rawURI: String) -> Bool {
         let trimmed = rawURI.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            errorBanner = "请输入有效的 gft3:// 节点链接"
+            errorBanner = "请输入有效的 ksl4:// 或 gft3:// 节点链接"
             return false
         }
         switch GhostMobileBridge.parseLink(uri: trimmed) {
@@ -244,7 +244,7 @@ final class GhostAppViewModel: ObservableObject {
     }
 
     func buildShadowrocketURLString() -> String {
-        let remark = activeNode?.remark ?? "GhostFrame Local"
+        let remark = activeNode?.remark ?? "Kestrel Local"
         return GhostMobileBridge.buildShadowrocketAddURL(socksPort: effectiveSocksPort, remark: remark)
     }
 

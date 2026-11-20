@@ -14,7 +14,7 @@ final class VPNManager: GhostBackend {
 
     private(set) var isConnected: Bool = false
     private(set) var isTransitioning: Bool = false
-    private(set) var backendStateLabel: String = "VPN 待机"
+    private(set) var backendStateLabel: String = "隧道待机"
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
@@ -80,7 +80,7 @@ final class VPNManager: GhostBackend {
                 }
             }
         }
-        let mainID = Bundle.main.bundleIdentifier ?? "com.ghostframe.vpn"
+        let mainID = Bundle.main.bundleIdentifier ?? "com.kestrel.duo"
         return mainID + ".tunnel"
     }
 
@@ -97,13 +97,13 @@ final class VPNManager: GhostBackend {
         isTransitioning = true
         backendStateLabel = "准备配置..."
         onStateChange?()
-        onLogMessage?("VPN: loading preferences (ext=\(resolveAndCacheExtensionID()))")
+        onLogMessage?("Duo: loading preferences (ext=\(resolveAndCacheExtensionID()))")
 
         loadOrCreateManager { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .failure(let err):
-                self.handleError(err, stage: "加载 VPN 配置失败")
+                self.handleError(err, stage: "加载系统隧道配置失败")
             case .success(let mgr):
                 self.saveAndStart(manager: mgr, config: config, node: node, attemptToken: attemptToken)
             }
@@ -115,7 +115,7 @@ final class VPNManager: GhostBackend {
         hasAttemptedConnect = false
         connectAttemptToken &+= 1
         stopPolling()
-        onLogMessage?("VPN: disabling OnDemand before stopVPNTunnel...")
+        onLogMessage?("Duo: disabling OnDemand before stopVPNTunnel...")
 
         if let mgr = manager {
             mgr.isOnDemandEnabled = false
@@ -123,11 +123,11 @@ final class VPNManager: GhostBackend {
             mgr.saveToPreferences { [weak self] _ in
                 Task { @MainActor in
                     guard let self = self else { return }
-                    self.onLogMessage?("VPN: stopVPNTunnel requested")
+                    self.onLogMessage?("Duo: stopVPNTunnel requested")
                     mgr.connection.stopVPNTunnel()
                     self.isConnected = false
                     self.isTransitioning = false
-                    self.backendStateLabel = "VPN 已断开"
+                    self.backendStateLabel = "隧道已断开"
                     self.onStateChange?()
                 }
             }
@@ -136,7 +136,7 @@ final class VPNManager: GhostBackend {
 
         isConnected = false
         isTransitioning = false
-        backendStateLabel = "VPN 已断开"
+        backendStateLabel = "隧道已断开"
         onStateChange?()
     }
 
@@ -146,7 +146,7 @@ final class VPNManager: GhostBackend {
             guard let self = self else { return }
             switch result {
             case .failure(let err):
-                self.handleError(err, stage: "更新 VPN 配置失败")
+                self.handleError(err, stage: "更新系统隧道配置失败")
             case .success(let mgr):
                 self.writeProviderConfiguration(on: mgr, config: config, node: node)
                 mgr.saveToPreferences { [weak self] saveErr in
@@ -221,10 +221,10 @@ final class VPNManager: GhostBackend {
         let neStatus = Self.statusName(manager?.connection.status ?? .invalid)
         let lastErr = lastDisconnectErrorText.isEmpty ? "none" : lastDisconnectErrorText
         return """
-        GhostFrame VPN App Diagnostic (v4.0.0-LTS)
+        Kestrel Duo App Diagnostic (v4.0.20-LTS)
         MainBundleID: \(mainID)
         ResolvedExtensionBundleID: \(detectedExtensionBundleID)
-        VPNState: \(backendStateLabel) (NEVPNStatus=\(neStatus))
+        TunnelState: \(backendStateLabel) (NEVPNStatus=\(neStatus))
         TelemetryChannel: \(telemetryChannel) (HTTP=127.0.0.1:\(currentHTTPPort))
         LastDisconnectError: \(lastErr)
         ConfigDelivery: NETunnelProviderProtocol.providerConfiguration (Zero App Group)
@@ -283,7 +283,7 @@ final class VPNManager: GhostBackend {
             "transport": config.transport
         ]
         mgr.protocolConfiguration = proto
-        mgr.localizedDescription = "GhostFrame VPN (\(node.remark))"
+        mgr.localizedDescription = "Kestrel Duo (\(node.remark))"
         mgr.onDemandRules = [NEOnDemandRuleConnect()]
         mgr.isOnDemandEnabled = true
         mgr.isEnabled = true
@@ -291,26 +291,26 @@ final class VPNManager: GhostBackend {
 
     private func saveAndStart(manager mgr: NETunnelProviderManager, config: GhostEngineConfig, node: GhostNode, attemptToken: UInt64) {
         writeProviderConfiguration(on: mgr, config: config, node: node)
-        onLogMessage?("VPN: saving profile (server=\(node.host):\(node.port), http=\(config.httpPort))")
+        onLogMessage?("Duo: saving profile (server=\(node.host):\(node.port), http=\(config.httpPort))")
 
         mgr.saveToPreferences { [weak self] saveError in
             Task { @MainActor in
                 guard let self = self else { return }
                 if let saveError = saveError {
-                    self.handleError(saveError, stage: "写入系统 VPN Profile 失败")
+                    self.handleError(saveError, stage: "写入系统隧道配置失败")
                     return
                 }
-                self.onLogMessage?("VPN: saveToPreferences ok, reloading...")
+                self.onLogMessage?("Duo: saveToPreferences ok, reloading...")
                 mgr.loadFromPreferences { [weak self] loadError in
                     Task { @MainActor in
                         guard let self = self else { return }
                         if let loadError = loadError {
-                            self.handleError(loadError, stage: "重载系统 VPN Profile 失败")
+                            self.handleError(loadError, stage: "重载系统隧道配置失败")
                             return
                         }
                         self.manager = mgr
                         self.hasAttemptedConnect = true
-                        self.onLogMessage?("VPN: calling startVPNTunnel...")
+                        self.onLogMessage?("Duo: calling startVPNTunnel...")
                         do {
                             if let session = mgr.connection as? NETunnelProviderSession {
                                 try session.startVPNTunnel(options: [
@@ -370,13 +370,13 @@ final class VPNManager: GhostBackend {
             lastDisconnectErrorText = ""
             isConnected = true
             isTransitioning = false
-            backendStateLabel = "VPN 已连接"
+            backendStateLabel = "隧道已连接"
             startPolling()
             pollStatusOnce()
         case .connecting, .reasserting:
             isConnected = false
             isTransitioning = true
-            backendStateLabel = (status == .reasserting) ? "VPN 重连中..." : "VPN 连接中..."
+            backendStateLabel = (status == .reasserting) ? "隧道重连中..." : "隧道连接中..."
             startPolling()
         case .disconnecting:
             isConnected = false
@@ -385,7 +385,7 @@ final class VPNManager: GhostBackend {
         case .disconnected, .invalid:
             isConnected = false
             isTransitioning = false
-            backendStateLabel = (status == .invalid) ? "VPN 配置无效" : "VPN 待机"
+            backendStateLabel = (status == .invalid) ? "隧道配置无效" : "隧道待机"
             stopPolling()
             if hasAttemptedConnect && !userInitiatedDisconnect {
                 let triggerPopup = (status == .invalid || lastObservedStatus == .disconnected)
@@ -587,13 +587,13 @@ final class VPNManager: GhostBackend {
         stopPolling()
         isConnected = false
         isTransitioning = false
-        backendStateLabel = "VPN 启动失败"
+        backendStateLabel = "隧道启动失败"
 
         let nsErr = error as NSError
         lastDisconnectErrorText = "[\(nsErr.domain):\(nsErr.code)] \(nsErr.localizedDescription)"
         let hint: String
         if nsErr.domain == NEVPNErrorDomain && (nsErr.code == NEVPNError.configurationInvalid.rawValue || nsErr.code == NEVPNError.configurationReadWriteFailed.rawValue) {
-            hint = "系统返回 NEVPNError (Code \(nsErr.code))。如果个人证书实际无 Network Extensions 高权或全能签未保留 packet-tunnel-provider 权限，请改用同包产出的 GhostFrame-Companion 伴侣版。"
+            hint = "系统返回 NEVPNError (Code \(nsErr.code))。如果个人证书实际无 Network Extensions 高权或全能签未保留 packet-tunnel-provider 权限，请改用同包产出的 Kestrel Air 伴侣版。"
         } else {
             hint = "请检查全能签重签配置是否保留了 packet-tunnel-provider 权限，或查看下方扩展 Bundle ID 是否一致。"
         }

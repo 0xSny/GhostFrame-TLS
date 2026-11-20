@@ -17,12 +17,12 @@ final class CompanionManager: GhostBackend {
 
     private let keepAlive = SilentAudioKeepAlive()
     private var pathMonitor: NWPathMonitor?
-    private let monitorQueue = DispatchQueue(label: "com.ghostframe.companion.pathmonitor")
+    private let monitorQueue = DispatchQueue(label: "com.kestrel.air.pathmonitor")
     private var lastPhysicalIface: String = ""
     private var pollTimer: Timer?
 
     init() {
-        let supportDir = GhostNetworkHelper.appSupportDirectory(subdir: "GhostFrameCompanion")
+        let supportDir = GhostNetworkHelper.appSupportDirectory(subdir: "KestrelAir")
         GhostMobileBridge.initCore(dataDir: supportDir, isTunnelExt: false)
         startNetworkMonitor()
     }

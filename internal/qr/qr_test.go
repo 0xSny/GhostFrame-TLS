@@ -7,7 +7,7 @@ import (
 
 func TestQRVersions16To20AndLongGFT3SVG(t *testing.T) {
 	for _, n := range []int{40, 220, 545, 620, 820} {
-		payload := "gft3://" + strings.Repeat("A", n-7)
+		payload := "ksl4://" + strings.Repeat("A", n-7)
 		svg, err := RenderSVG(payload)
 		if err != nil {
 			t.Fatalf("RenderSVG(len=%d) failed: %v", n, err)

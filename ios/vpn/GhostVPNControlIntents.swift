@@ -10,13 +10,13 @@ enum GhostVPNIntentError: Error, CustomLocalizedStringResourceConvertible {
     var localizedStringResource: LocalizedStringResource {
         switch self {
         case .noProfileConfigured:
-            return "请先打开 GhostFrame VPN 导入节点并连接一次，完成系统 VPN 授权后再使用控制中心开关。"
+            return "请先打开 Kestrel Duo 导入节点并连接一次，完成系统隧道授权后再使用控制中心开关。"
         }
     }
 }
 
 enum GhostVPNControlBridge {
-    static let controlKind = "GhostFrameVPNControlToggle"
+    static let controlKind = "KestrelDuoControlToggle"
 
     static func loadAllManagers() async throws -> [NETunnelProviderManager] {
         try await withCheckedThrowingContinuation { continuation in
@@ -112,7 +112,7 @@ enum GhostVPNControlBridge {
             if bid.hasSuffix(".control") {
                 return false
             }
-            return bid.hasSuffix(".tunnel") || desc.contains("ghostframe") || bid.contains("ghost")
+            return bid.hasSuffix(".tunnel") || desc.contains("kestrel") || desc.contains("ghostframe") || bid.contains("kestrel") || bid.contains("ghost")
         }) {
             return matched
         }
@@ -132,9 +132,9 @@ enum GhostVPNControlBridge {
                 throw GhostVPNIntentError.noProfileConfigured
             }
             throw NSError(
-                domain: "com.ghostframe.vpn",
+                domain: "com.kestrel.duo",
                 code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "请先打开 GhostFrame VPN 导入节点并连接一次，完成系统 VPN 授权后再使用控制中心开关。"]
+                userInfo: [NSLocalizedDescriptionKey: "请先打开 Kestrel Duo 导入节点并连接一次，完成系统隧道授权后再使用控制中心开关。"]
             )
         }
 
@@ -178,12 +178,12 @@ enum GhostVPNControlBridge {
 
 @available(iOS 18.0, *)
 struct ToggleGhostVPNIntent: SetValueIntent, AudioPlaybackIntent {
-    static var title: LocalizedStringResource = "切换 GhostFrame VPN"
-    static var description = IntentDescription("快速开启或关闭 GhostFrame VPN 安全隧道。")
+    static var title: LocalizedStringResource = "切换 Kestrel Duo"
+    static var description = IntentDescription("快速开启或关闭 Kestrel Duo 安全隧道。")
     static var openAppWhenRun: Bool = false
     static var isDiscoverable: Bool = true
 
-    @Parameter(title: "开启 VPN")
+    @Parameter(title: "开启隧道")
     var value: Bool
 
     init() {}
@@ -200,8 +200,8 @@ struct ToggleGhostVPNIntent: SetValueIntent, AudioPlaybackIntent {
 
 @available(iOS 16.0, *)
 struct ConnectGhostVPNIntent: AudioPlaybackIntent {
-    static var title: LocalizedStringResource = "开启 GhostFrame VPN"
-    static var description = IntentDescription("在后台连接 GhostFrame VPN 安全隧道。")
+    static var title: LocalizedStringResource = "开启 Kestrel Duo"
+    static var description = IntentDescription("在后台连接 Kestrel Duo 安全隧道。")
     static var openAppWhenRun: Bool = false
     static var isDiscoverable: Bool = true
 
@@ -213,8 +213,8 @@ struct ConnectGhostVPNIntent: AudioPlaybackIntent {
 
 @available(iOS 16.0, *)
 struct DisconnectGhostVPNIntent: AudioPlaybackIntent {
-    static var title: LocalizedStringResource = "关闭 GhostFrame VPN"
-    static var description = IntentDescription("断开 GhostFrame VPN 安全隧道。")
+    static var title: LocalizedStringResource = "关闭 Kestrel Duo"
+    static var description = IntentDescription("断开 Kestrel Duo 安全隧道。")
     static var openAppWhenRun: Bool = false
     static var isDiscoverable: Bool = true
 

@@ -37,7 +37,7 @@ jobs:
           RUN_NUM: ${{ github.run_number }}
         run: |
           set -euo pipefail
-          mkdir -p dist _stage_0ghost/usr/bin
+          mkdir -p dist _stage_kbox/usr/bin
 
           if [ -n "$INPUT_TAG" ]; then
             REL_VER="$INPUT_TAG"
@@ -51,28 +51,29 @@ jobs:
           VER_X="-X ghostframe/internal/tui.CurrentVersion=${REL_VER} -X ghostframe/internal/client.Version=${REL_VER} -X ghostframe/internal/server.Version=${REL_VER} -X main.gatewayVersion=${REL_VER} -X main.version=${REL_VER}"
           FLAGS=(-trimpath -ldflags="-s -w ${VER_X}")
 
-          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/gft-server-linux-amd64 ./cmd/gft-server
-          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/gft-server-linux-arm64 ./cmd/gft-server
-          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/gft-core-linux-amd64   ./cmd/gft-core
-          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/gft-core-linux-arm64   ./cmd/gft-core
-          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H=windowsgui ${VER_X}" -o dist/GhostFrame-Pro-windows-amd64.exe ./cmd/gft-client-gui
-          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/0ghost-linux-amd64     ./cmd/0ghost
-          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/0ghost-linux-arm64     ./cmd/0ghost
+          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kestrel-server-linux-amd64 ./cmd/gft-server
+          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kestrel-server-linux-arm64 ./cmd/gft-server
+          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kestrel-core-linux-amd64   ./cmd/gft-core
+          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kestrel-core-linux-arm64   ./cmd/gft-core
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H=windowsgui ${VER_X}" -o dist/Kestrel-Pro-windows-amd64.exe ./cmd/gft-client-gui
+          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kbox-linux-amd64     ./cmd/0ghost
+          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kbox-linux-arm64     ./cmd/0ghost
 
-          cp dist/0ghost-linux-arm64 _stage_0ghost/usr/bin/0ghost
-          cp -r openwrt/luci-app-0ghost/etc _stage_0ghost/
-          cp -r openwrt/luci-app-0ghost/usr/* _stage_0ghost/usr/
-          cp -r openwrt/luci-app-0ghost/www _stage_0ghost/
-          cp openwrt/luci-app-0ghost/install-local.sh _stage_0ghost/install-local.sh
-          chmod 0755 _stage_0ghost/usr/bin/0ghost _stage_0ghost/etc/init.d/0ghost \
-                     _stage_0ghost/etc/hotplug.d/iface/99-0ghost _stage_0ghost/etc/hotplug.d/firewall/99-0ghost \
-                     _stage_0ghost/install-local.sh
-          tar -czf dist/0ghost-istoreos-arm64.tar.gz -C _stage_0ghost .
-          rm -rf _stage_0ghost
+          cp dist/kbox-linux-arm64 _stage_kbox/usr/bin/kbox
+          cp -r openwrt/luci-app-0ghost/etc _stage_kbox/
+          cp -r openwrt/luci-app-0ghost/usr/* _stage_kbox/usr/
+          cp -r openwrt/luci-app-0ghost/www _stage_kbox/
+          cp openwrt/luci-app-0ghost/install-local.sh _stage_kbox/install-local.sh
+          chmod 0755 _stage_kbox/usr/bin/kbox _stage_kbox/etc/init.d/kbox \
+                     _stage_kbox/etc/hotplug.d/iface/99-kbox _stage_kbox/etc/hotplug.d/firewall/99-kbox \
+                     _stage_kbox/install-local.sh
+          tar -czf dist/kbox-istoreos-arm64.tar.gz -C _stage_kbox .
+          rm -rf _stage_kbox
 
           cp install.sh dist/install.sh
+          cp scripts/install-kbox.sh dist/install-kbox.sh
           cp scripts/install-0ghost.sh dist/install-0ghost.sh
-          chmod 0755 dist/install.sh dist/install-0ghost.sh
+          chmod 0755 dist/install.sh dist/install-kbox.sh dist/install-0ghost.sh
           ls -lh dist/
 
       - name: Upload Linux/Windows/Router Artifacts
@@ -140,8 +141,8 @@ jobs:
 
           (cd ios && xcodegen generate --spec project-vpn.yml)
           xcodebuild \
-            -project ios/GhostFrameVPN.xcodeproj \
-            -scheme GhostFrameVPN \
+            -project ios/KestrelDuo.xcodeproj \
+            -scheme KestrelDuo \
             -configuration Release \
             -sdk iphoneos \
             ARCHS=arm64 \
@@ -153,9 +154,9 @@ jobs:
             BUILD_DIR="$PWD/ios/build-vpn" \
             build
 
-          VPN_APP="$(find ios/build-vpn -maxdepth 4 -type d -name 'GhostFrameVPN.app' | head -n 1)"
-          APPEX="$VPN_APP/PlugIns/GhostPacketTunnel.appex"
-          CTRL_APPEX="$VPN_APP/PlugIns/GhostControlWidget.appex"
+          VPN_APP="$(find ios/build-vpn -maxdepth 4 -type d -name 'KestrelDuo.app' | head -n 1)"
+          APPEX="$VPN_APP/PlugIns/KestrelTunnel.appex"
+          CTRL_APPEX="$VPN_APP/PlugIns/KestrelControlWidget.appex"
           for plist in "$VPN_APP/Info.plist" "$APPEX/Info.plist" "$CTRL_APPEX/Info.plist"; do
             /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${IOS_APP_VER}" "$plist"
             /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${DIST_BUILD_NUM}" "$plist"
@@ -165,14 +166,14 @@ jobs:
           codesign --force --sign - --entitlements ios/vpn/App.entitlements --timestamp=none "$VPN_APP"
           STAGE_VPN="$(mktemp -d)"
           mkdir -p "$STAGE_VPN/Payload"
-          cp -R "$VPN_APP" "$STAGE_VPN/Payload/GhostFrameVPN.app"
-          (cd "$STAGE_VPN" && zip -qry "$GITHUB_WORKSPACE/dist/GhostFrame-VPN-Unsigned.ipa" Payload)
+          cp -R "$VPN_APP" "$STAGE_VPN/Payload/KestrelDuo.app"
+          (cd "$STAGE_VPN" && zip -qry "$GITHUB_WORKSPACE/dist/Kestrel-Duo-Unsigned.ipa" Payload)
           rm -rf "$STAGE_VPN"
 
           (cd ios && xcodegen generate --spec project-companion.yml)
           xcodebuild \
-            -project ios/GhostFrameCompanion.xcodeproj \
-            -scheme GhostFrameCompanion \
+            -project ios/KestrelAir.xcodeproj \
+            -scheme KestrelAir \
             -configuration Release \
             -sdk iphoneos \
             ARCHS=arm64 \
@@ -184,14 +185,14 @@ jobs:
             BUILD_DIR="$PWD/ios/build-companion" \
             build
 
-          COMP_APP="$(find ios/build-companion -maxdepth 4 -type d -name 'GhostFrameCompanion.app' | head -n 1)"
+          COMP_APP="$(find ios/build-companion -maxdepth 4 -type d -name 'KestrelAir.app' | head -n 1)"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${IOS_APP_VER}" "$COMP_APP/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${DIST_BUILD_NUM}" "$COMP_APP/Info.plist"
           codesign --force --deep --sign - --timestamp=none "$COMP_APP"
           STAGE_COMP="$(mktemp -d)"
           mkdir -p "$STAGE_COMP/Payload"
-          cp -R "$COMP_APP" "$STAGE_COMP/Payload/GhostFrameCompanion.app"
-          (cd "$STAGE_COMP" && zip -qry "$GITHUB_WORKSPACE/dist/GhostFrame-Companion-Unsigned.ipa" Payload)
+          cp -R "$COMP_APP" "$STAGE_COMP/Payload/KestrelAir.app"
+          (cd "$STAGE_COMP" && zip -qry "$GITHUB_WORKSPACE/dist/Kestrel-Air-Unsigned.ipa" Payload)
           rm -rf "$STAGE_COMP"
 
           ls -lh dist/*.ipa
@@ -248,8 +249,8 @@ jobs:
           echo "TARGET_REPO=$TARGET_REPO" >> "$GITHUB_ENV"
           echo "has_dist_token=${HAS_DIST}" >> "$GITHUB_OUTPUT"
 
-          VPN_SIZE="$(stat -c%s release-out/GhostFrame-VPN-Unsigned.ipa)"
-          COMP_SIZE="$(stat -c%s release-out/GhostFrame-Companion-Unsigned.ipa)"
+          DUO_SIZE="$(stat -c%s release-out/Kestrel-Duo-Unsigned.ipa)"
+          AIR_SIZE="$(stat -c%s release-out/Kestrel-Air-Unsigned.ipa)"
           NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           if [[ "$TAG" =~ ^v?(4\.0\.([0-9]+)) ]]; then
             APP_VER="${BASH_REMATCH[1]}"
@@ -261,48 +262,48 @@ jobs:
           python3 - <<PY
           import json
           manifest = {
-              "name": "GhostFrame Official Release Source",
-              "identifier": "com.ghostframe.official.source",
+              "name": "Kestrel Official Release Source",
+              "identifier": "com.kestrel.official.source",
               "sourceURL": f"${BASE_DL}/source.json",
               "apps": [
                   {
-                      "name": "GhostFrame VPN",
-                      "bundleIdentifier": "com.ghostframe.vpn",
-                      "developerName": "GhostFrame Project",
-                      "subtitle": "GFT-RTC v4.0.2 LTS (True TUN + iOS 18 Widget)",
-                      "localizedDescription": "GhostFrame iOS True TUN L3/L4 edition built from ${TAG}.",
+                      "name": "Kestrel Duo",
+                      "bundleIdentifier": "com.kestrel.duo",
+                      "developerName": "Kestrel Project",
+                      "subtitle": "Kestrel-RTC v4.0 LTS (System Tunnel + Control Center)",
+                      "localizedDescription": "Kestrel Duo iOS system tunnel edition built from ${TAG}.",
                       "tintColor": "#0F62FE",
                       "version": "${APP_VER}",
                       "versionDate": "${NOW_ISO}",
                       "versionDescription": "Release ${TAG}",
-                      "downloadURL": f"${BASE_DL}/GhostFrame-VPN-Unsigned.ipa",
-                      "size": int("${VPN_SIZE}"),
+                      "downloadURL": f"${BASE_DL}/Kestrel-Duo-Unsigned.ipa",
+                      "size": int("${DUO_SIZE}"),
                       "versions": [{
                           "version": "${APP_VER}",
                           "date": "${NOW_ISO}",
                           "localizedDescription": "Release ${TAG}",
-                          "downloadURL": f"${BASE_DL}/GhostFrame-VPN-Unsigned.ipa",
-                          "size": int("${VPN_SIZE}"),
+                          "downloadURL": f"${BASE_DL}/Kestrel-Duo-Unsigned.ipa",
+                          "size": int("${DUO_SIZE}"),
                       }],
                   },
                   {
-                      "name": "GhostFrame Companion",
-                      "bundleIdentifier": "com.ghostframe.companion",
-                      "developerName": "GhostFrame Project",
-                      "subtitle": "Portable Local Proxy (Zero VPN Profile)",
-                      "localizedDescription": "GhostFrame iOS Companion portable proxy built from ${TAG}.",
+                      "name": "Kestrel Air",
+                      "bundleIdentifier": "com.kestrel.air",
+                      "developerName": "Kestrel Project",
+                      "subtitle": "Portable Single-Process Proxy Edition",
+                      "localizedDescription": "Kestrel Air portable proxy edition built from ${TAG}.",
                       "tintColor": "#10B981",
                       "version": "${APP_VER}",
                       "versionDate": "${NOW_ISO}",
                       "versionDescription": "Release ${TAG}",
-                      "downloadURL": f"${BASE_DL}/GhostFrame-Companion-Unsigned.ipa",
-                      "size": int("${COMP_SIZE}"),
+                      "downloadURL": f"${BASE_DL}/Kestrel-Air-Unsigned.ipa",
+                      "size": int("${AIR_SIZE}"),
                       "versions": [{
                           "version": "${APP_VER}",
                           "date": "${NOW_ISO}",
                           "localizedDescription": "Release ${TAG}",
-                          "downloadURL": f"${BASE_DL}/GhostFrame-Companion-Unsigned.ipa",
-                          "size": int("${COMP_SIZE}"),
+                          "downloadURL": f"${BASE_DL}/Kestrel-Air-Unsigned.ipa",
+                          "size": int("${AIR_SIZE}"),
                       }],
                   },
               ],
@@ -316,7 +317,7 @@ jobs:
       - name: Upload Unified Release Bundle Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GhostFrame-Unified-Release
+          name: Kestrel-Unified-Release
           path: release-out/*
           if-no-files-found: error
 
@@ -331,8 +332,8 @@ jobs:
           else
             gh release create "$RELEASE_TAG" release-out/* \
               --repo Spittingjiu/Ghost \
-              --title "GhostFrame ${RELEASE_TAG} (All Platforms)" \
-              --notes "Automated pure-binary multi-platform release (${RELEASE_TAG}). Includes Linux Server/Core, Windows Client, iStoreOS 0Ghost, Dual iOS IPAs, OmniSign source.json, and sha256 checksums."
+              --title "Kestrel ${RELEASE_TAG} (All Platforms)" \
+              --notes "Automated pure-binary multi-platform release (${RELEASE_TAG}). Includes Kestrel Server/Core, Kestrel Pro (Windows), KestrelBox (iStoreOS arm64/amd64), Kestrel Duo & Kestrel Air (iOS), OmniSign source.json, and sha256 checksums."
           fi
 
       - name: Fallback Release on Current Repository (when DIST_PUSH_TOKEN not set)

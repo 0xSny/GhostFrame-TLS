@@ -179,12 +179,15 @@ func TestGFT3LinkRoundTrip(t *testing.T) {
 		Remark:    "ApexNode",
 	}
 	enc := l.Encode()
-	if !bytes.HasPrefix([]byte(enc), []byte("gft3://")) {
-		t.Fatalf("expected gft3:// prefix, got %s", enc)
+	if !bytes.HasPrefix([]byte(enc), []byte("ksl4://")) {
+		t.Fatalf("expected ksl4:// prefix, got %s", enc)
 	}
 	dec, err := ParseLink(enc)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := ParseLink("gft3://" + enc[len("ksl4://"):]); err != nil {
+		t.Fatalf("legacy gft3:// backward compatibility failed: %v", err)
 	}
 	lo, hi, ok := dec.ParseHopRange()
 	if !ok || lo != 20000 || hi != 40000 || !dec.SplitSNI || dec.EffectiveTransport() != "auto" || dec.UpMbps != 30 || dec.DownMbps != 100 {

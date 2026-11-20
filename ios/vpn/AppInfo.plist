@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>GhostFrame VPN</string>
+	<string>Kestrel Duo</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -28,9 +28,9 @@
 		<true/>
 	</dict>
 	<key>NSCameraUsageDescription</key>
-	<string>GhostFrame 需要相机权限以扫描节点分享二维码（gft3://）。</string>
+	<string>Kestrel Duo 需要相机权限以扫描节点分享二维码（ksl4:// / gft3://）。</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>GhostFrame needs local network access to bind the in-app proxy and communicate with local routes.</string>
+	<string>Kestrel Duo needs local network access to bind the in-app proxy and communicate with local routes.</string>
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIColorName</key>

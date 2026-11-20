@@ -1,4 +1,4 @@
-# GhostFrame-RTC (v3.4) Architecture
+# Kestrel-RTC (v4) Architecture
 
 ## Overview
 
@@ -6,14 +6,14 @@
 [Apps / Games / Clash Meta]
         │  SOCKS5 (TCP + UDP ASSOCIATE) / HTTP CONNECT
         ▼
-[GhostFrame-Pro.exe (Win32) | gft-core (Linux / ARM64)]
-  ├─ Router: Built-in CN-IP & CN-Domain direct bypass (no local DNS leak)
+[Kestrel-Pro.exe (Win32) | kestrel-core (Linux / ARM64)]
+  ├─ Router: Built-in APNIC CN-IP/CN-Domain bypass + 350ms CN DNS pre-probe
   ├─ ApexScheduler (ClientID NAT Preservation + Isolated rtcLimiter / tcpLimiter)
-  │    ├─ [GFT-RTC Pool]:  2 concurrent UDP 5-tuples, STUN+SRTP AEAD mimicry,
-  │    │                   uint64 XOR-FEC, zero-HOL SACK, Smart-Brutal CC, 0ms Hop
-  │    └─ [TCP uTLS Pool]: Chrome PQ ClientHello + SNI record split + 4MB->16MB Mux
+  │    ├─ [Kestrel-RTC Pool]: 2 concurrent UDP 5-tuples, STUN+SRTP AEAD mimicry,
+  │    │                      uint64 XOR-FEC, zero-HOL SACK, Smart-Brutal CC, 0ms Hop
+  │    └─ [TCP uTLS Pool]:    Chrome PQ ClientHello + SNI record split + 4MB->16MB Mux
         ▼  TCP/UDP :443 (+ optional UDP hop range -> :443)
-[gft-server (Dual-Stack)]
+[kestrel-server (Dual-Stack)]
   ├─ TCP MirrorInspector ──► Valid: TLS 1.3 + ClientAuth(ClientID) ──► Shared NAT Pool
   │                      └── Probe: 0ms RewindConn mirror ──► Probed Non-CDN SNI
   └─ UDP RTCListener     ──► Valid: STUN+SRTP+FEC+SACK ──► Shared NAT Pool
@@ -22,7 +22,7 @@
 
 ## Protocol & Transport Layers
 
-### 1. GFT-RTC UDP Protocol Engine (`internal/gftrtc`)
+### 1. Kestrel-RTC UDP Protocol Engine (`internal/gftrtc`)
 
 - **Phase 1 — 1-RTT RFC 5389 ICE-STUN Handshake (`wire.go`)**:
   - Clients send standard `Binding Request (0x0001)` packets containing `USERNAME`, `ICE-CONTROLLING`, `PRIORITY`, `ATTR_GFT_TICKET (0xC057)` (`ClientEphPub(X25519) || SealedAuth`), and trailing RFC 5389 Section 15.5 CRC32 `FINGERPRINT (0x8028)`.

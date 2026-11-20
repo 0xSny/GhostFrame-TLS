@@ -1,4 +1,4 @@
-name: Build Windows Client (GhostFrame-Pro)
+name: Build Windows Client (Kestrel-Pro)
 
 on:
   workflow_dispatch:
@@ -51,7 +51,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify GhostFrame-Pro Never Links gVisor
+      - name: Verify Kestrel Pro Never Links gVisor
         run: |
           if GOOS=windows GOARCH=amd64 go list -deps ./cmd/gft-client-gui | grep -q "gvisor.dev/gvisor"; then
             echo "ERROR: Windows client unexpectedly links gvisor.dev/gvisor!"
@@ -71,16 +71,16 @@ jobs:
           go test -run='^$' -fuzz=FuzzExtractTLSClientHelloSNI -fuzztime=3s ./internal/gft
           go test -run='^$' -fuzz=FuzzParseDNSResponse -fuzztime=3s ./internal/client
 
-      - name: Build Clean Single-File GhostFrame-Pro.exe (CGO_ENABLED=0)
+      - name: Build Clean Single-File Kestrel-Pro.exe (CGO_ENABLED=0)
         run: |
           mkdir -p dist
-          REL_VER="v4.0.20-LTS"
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H=windowsgui -X ghostframe/internal/client.Version=${REL_VER}" -o dist/GhostFrame-Pro.exe ./cmd/gft-client-gui
-          ls -lh dist/GhostFrame-Pro.exe
+          REL_VER="v4.0.21-LTS"
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H=windowsgui -X ghostframe/internal/client.Version=${REL_VER}" -o dist/Kestrel-Pro.exe ./cmd/gft-client-gui
+          ls -lh dist/Kestrel-Pro.exe
 
       - name: Upload Windows Client Binary
         uses: actions/upload-artifact@v4
         with:
-          name: GhostFrame-Pro-windows-amd64
-          path: dist/GhostFrame-Pro.exe
+          name: Kestrel-Pro-windows-amd64
+          path: dist/Kestrel-Pro.exe
           if-no-files-found: error

@@ -92,8 +92,8 @@ func TestServerInitNoIPInSANAnd90dValidity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(sec.Link, "gft3://") {
-		t.Fatalf("expected gft3:// link, got %s", sec.Link)
+	if !strings.HasPrefix(sec.Link, "ksl4://") {
+		t.Fatalf("expected ksl4:// link, got %s", sec.Link)
 	}
 	certBytes, err := os.ReadFile(filepath.Join(dir, "conf", "cert.pem"))
 	if err != nil {
@@ -374,8 +374,8 @@ func TestServerHTTP2FallbackBlogAndPanelCSRF(t *testing.T) {
 	}
 	_ = json.NewDecoder(linkResp.Body).Decode(&linkData)
 	linkResp.Body.Close()
-	if !strings.HasPrefix(linkData.URI, "gft3://") {
-		t.Fatalf("expected gft3:// link from /api/link, got %s", linkData.URI)
+	if !strings.HasPrefix(linkData.URI, "ksl4://") {
+		t.Fatalf("expected ksl4:// link from /api/link, got %s", linkData.URI)
 	}
 }
 
@@ -597,8 +597,8 @@ func TestWebPanelRTCConfigUpdateAndSVGQR(t *testing.T) {
 	if okResp.StatusCode != 200 || !putData.OK || putData.HopRange != "20000-40000" || putData.UpMbps != 30 || putData.DownMbps != 100 {
 		t.Fatalf("unexpected PUT /api/rtc response status=%d body=%+v", okResp.StatusCode, putData)
 	}
-	if !strings.HasPrefix(putData.URI, "gft3://") || !strings.Contains(putData.QRSVG, "<svg") {
-		t.Fatalf("expected gft3 URI + inline SVG QR from PUT /api/rtc")
+	if !strings.HasPrefix(putData.URI, "ksl4://") || !strings.Contains(putData.QRSVG, "<svg") {
+		t.Fatalf("expected ksl4:// URI + inline SVG QR from PUT /api/rtc")
 	}
 
 	// Verify atomic persistence to server.json

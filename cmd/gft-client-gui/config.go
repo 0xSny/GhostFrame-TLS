@@ -19,5 +19,17 @@ func resolveConfigPath(flagVal string) string {
 		return "client.json"
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".gft", "client.json")
+	newPath := filepath.Join(home, ".kestrel", "client.json")
+	if _, err := os.Stat(newPath); err == nil {
+		return newPath
+	}
+	legacyPath := filepath.Join(home, ".gft", "client.json")
+	if b, err := os.ReadFile(legacyPath); err == nil {
+		_ = os.MkdirAll(filepath.Dir(newPath), 0o700)
+		if werr := os.WriteFile(newPath, b, 0o600); werr == nil {
+			return newPath
+		}
+		return legacyPath
+	}
+	return newPath
 }

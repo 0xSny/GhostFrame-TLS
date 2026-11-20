@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	DefaultConfigPath = "/etc/gft/server.json"
+	DefaultConfigPath = "/etc/kestrel/server.json"
 	ReleaseRepo       = "Spittingjiu/Ghost"
 	SysctlConfPath    = "/etc/sysctl.d/99-gft-rtc.conf"
 )
@@ -83,7 +83,7 @@ func (c *Controller) pause(sc *bufio.Scanner) {
 func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState string, snap server.RuntimeSnapshot, sniRTT time.Duration) string {
 	b := c.Box
 	var sb strings.Builder
-	sb.WriteString(b.Top(fmt.Sprintf("GhostFrame-RTC (GFT) %s Apex 交互控制中心", CurrentVersion)) + "\n")
+	sb.WriteString(b.Top(fmt.Sprintf("Kestrel-RTC %s Apex 交互控制中心", CurrentVersion)) + "\n")
 
 	svcBadge := b.c("\x1b[31m", "[○] 已停止")
 	if active {
@@ -121,7 +121,7 @@ func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState s
 		"[3] 修改监听端口与双栈通道开关          [9] 网络环境自检与内核加速调优",
 		"[4] 配置 UDP 动态端口跳跃 (PortHop)     [10] 一键升级服务端 (OTA 热更新)",
 		"[5] 轮换密钥、SPKI 证书与管理凭据       [11] 配置备份与灾难恢复",
-		"[6] 调整流量整形与硬件性能档位          [12] 彻底卸载 GFT 服务端",
+		"[6] 调整流量整形与硬件性能档位          [12] 彻底卸载 Kestrel 服务端",
 		"[0] 退出控制面板",
 	}
 	for _, it := range items {
@@ -147,21 +147,21 @@ func ShowDeliveryCard(cfgPath string, out io.Writer) error {
 	qr, qerr := RenderTerminalQR(uri, c.Box.UTF8)
 
 	b := c.Box
-	c.printf("%s\n", b.Top(fmt.Sprintf("GhostFrame-RTC (GFT) %s 多端部署交付卡", CurrentVersion)))
+	c.printf("%s\n", b.Top(fmt.Sprintf("Kestrel-RTC %s 多端部署交付卡", CurrentVersion)))
 	c.printf("%s\n", b.Line(fmt.Sprintf("节点地址: %s:%d   SNI: %s   Hop: %s   Smart-Brutal: ↑%d/↓%d Mbps",
 		cfg.PublicHost, ConfigListenPort(cfg.Listen), cfg.SNI, nonEmpty(cfg.HopRange, "未开启"), cfg.UpMbps, cfg.DownMbps)))
 	c.printf("%s\n", b.Bottom())
 
-	c.printf("\n[1] 通用导入链接 (Windows GhostFrame-Pro.exe 按 Ctrl+V 直接导入):\n%s\n", uri)
+	c.printf("\n[1] 通用导入链接 (Windows Kestrel Pro / iOS Kestrel Duo 直接导入):\n%s\n", uri)
 	if qerr == nil {
 		c.printf("\n[2] 终端扫描二维码:\n%s", qr)
 	}
 	c.printf("\n[3] 斐讯 N1 (S905D) / OpenWrt / Linux 无头内核启动命令:\n")
-	c.printf("gft-core -low-mem -socks 0.0.0.0:10808 -link %q\n", uri)
+	c.printf("kestrel-core -low-mem -socks 0.0.0.0:10808 -link %q\n", uri)
 
 	c.printf("\n[4] OpenClash / Mihomo 上游节点配置片段:\n")
-	c.printf("proxies:\n  - name: \"GhostFrame-Apex\"\n    type: socks5\n    server: 127.0.0.1\n    port: 10808\n    udp: true\n")
-	c.printf("\n提示: 在终端随时输入 `gft` 即可打开交互式管理控制中心。\n")
+	c.printf("proxies:\n  - name: \"Kestrel-Apex\"\n    type: socks5\n    server: 127.0.0.1\n    port: 10808\n    udp: true\n")
+	c.printf("\n提示: 在终端随时输入 `ksl` 即可打开交互式管理控制中心。\n")
 	return nil
 }
 
@@ -187,7 +187,7 @@ func (c *Controller) Run() error {
 
 		switch choice {
 		case "0", "q", "exit":
-			c.printf("已退出 GhostFrame-TLS 控制中心。\n")
+			c.printf("已退出 Kestrel 控制中心。\n")
 			return nil
 		case "1":
 			_ = ShowDeliveryCard(c.CfgPath, c.Out)
@@ -466,7 +466,7 @@ func (c *Controller) handleHopMenu(sc *bufio.Scanner, cfg *server.Config) {
 		}); err != nil {
 			c.errMsg(err.Error())
 		} else {
-			c.okMsg(fmt.Sprintf("默认 Smart-Brutal 导出带宽已更新为 ↑%d / ↓%d Mbps（下次导出 gft3:// 生效）", upVal, downVal))
+			c.okMsg(fmt.Sprintf("默认 Smart-Brutal 导出带宽已更新为 ↑%d / ↓%d Mbps（下次导出 ksl4:// 生效）", upVal, downVal))
 		}
 	}
 	c.pause(sc)
@@ -660,7 +660,7 @@ func (c *Controller) handleSelfCheckMenu(sc *bufio.Scanner, cfg *server.Config) 
 }
 
 func (c *Controller) handleOneClickUpgradeMenu(sc *bufio.Scanner) {
-	c.printf("\n--- 一键升级 GhostFrame 服务端 (OTA 热更新) ---\n")
+	c.printf("\n--- 一键升级 Kestrel 服务端 (OTA 热更新) ---\n")
 	c.printf("  当前版本: %s  |  目标架构: linux/%s\n", CurrentVersion, runtime.GOARCH)
 	if bak, ok := InspectBackup(defaultTargetBinary); ok {
 		c.printf("  可回滚旧版: %s (备份于 %s)\n", nonEmpty(bak.Banner, bak.Path), bak.ModTime.Format("2006-01-02 15:04"))
@@ -783,12 +783,12 @@ func (c *Controller) finishSelfReplacingFlow(sc *bufio.Scanner) {
 
 func (c *Controller) handleBackupRestoreMenu(sc *bufio.Scanner, cfg *server.Config) {
 	c.printf("\n--- 配置备份与灾难恢复 ---\n")
-	c.printf("  [1] 备份 /etc/gft 至 /root/gft-backup-%s.tar.gz\n", time.Now().Format("20060102"))
+	c.printf("  [1] 备份 %s 至 /root/kestrel-backup-%s.tar.gz\n", filepath.Dir(c.CfgPath), time.Now().Format("20060102"))
 	c.printf("  [2] 从 .tar.gz 备份包恢复配置\n")
 	c.printf("  [0] 返回\n")
 	switch c.prompt(sc, "请选择:") {
 	case "1":
-		dst := fmt.Sprintf("/root/gft-backup-%s.tar.gz", time.Now().Format("20060102"))
+		dst := fmt.Sprintf("/root/kestrel-backup-%s.tar.gz", time.Now().Format("20060102"))
 		out, err := exec.Command("tar", "-czf", dst, "-C", filepath.Dir(c.CfgPath), ".").CombinedOutput()
 		if err != nil {
 			c.errMsg(fmt.Sprintf("%v: %s", err, string(out)))
@@ -814,28 +814,32 @@ func (c *Controller) handleBackupRestoreMenu(sc *bufio.Scanner, cfg *server.Conf
 }
 
 func (c *Controller) handleUninstallMenu(sc *bufio.Scanner) bool {
-	c.warnMsg("此操作将停止 GhostFrame 服务、清理 gft_hop 防火墙表并删除全部程序与配置。")
+	c.warnMsg("此操作将停止 Kestrel 服务、清理 gft_hop 防火墙表并删除全部程序与配置。")
 	if c.prompt(sc, "请输入 yes 确认彻底卸载:") != "yes" {
 		c.printf("已取消卸载。\n")
 		c.pause(sc)
 		return false
 	}
-	_, _ = exec.Command("systemctl", "stop", c.Tx.ServiceName).CombinedOutput()
-	_, _ = exec.Command("systemctl", "disable", c.Tx.ServiceName).CombinedOutput()
+	for _, svc := range []string{c.Tx.ServiceName, "kestrel", "ghostframe"} {
+		_, _ = exec.Command("systemctl", "stop", svc).CombinedOutput()
+		_, _ = exec.Command("systemctl", "disable", svc).CombinedOutput()
+	}
 	_ = c.Tx.FW.RemoveHopRules()
 	_, _ = exec.Command("sysctl", "--system").CombinedOutput()
 	for _, p := range []string{
+		"/etc/systemd/system/kestrel.service",
 		"/etc/systemd/system/ghostframe.service",
 		SysctlConfPath,
+		"/usr/local/bin/ksl",
 		"/usr/local/bin/gft",
 	} {
 		_ = os.Remove(p)
 	}
 	_, _ = exec.Command("systemctl", "daemon-reload").CombinedOutput()
-	for _, dir := range []string{"/opt/ghostframe", "/etc/gft", "/var/lib/gft"} {
+	for _, dir := range []string{"/opt/kestrel", "/etc/kestrel", "/var/lib/kestrel", "/opt/ghostframe", "/etc/gft", "/var/lib/gft"} {
 		_ = os.RemoveAll(dir)
 	}
-	c.okMsg("GhostFrame-TLS 已彻底卸载，宿主机现有规则与 SSH 端口未受任何影响。")
+	c.okMsg("Kestrel 已彻底卸载，宿主机现有规则与 SSH 端口未受任何影响。")
 	return true
 }
 

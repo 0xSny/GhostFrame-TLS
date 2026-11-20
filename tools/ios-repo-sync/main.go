@@ -32,12 +32,12 @@ const (
 	defaultWorkflow     = "ios-dual-ipa.yml"
 	defaultDistDir      = ".ios-dist"
 	defaultListenAddr   = "0.0.0.0:18080"
-	vpnArtifactName     = "GhostFrame-VPN-Unsigned-IPA"
-	compArtifactName    = "GhostFrame-Companion-Unsigned-IPA"
-	vpnIPAFileName      = "GhostFrame-VPN-Unsigned.ipa"
-	compIPAFileName     = "GhostFrame-Companion-Unsigned.ipa"
-	vpnIconFileName     = "icon-vpn.png"
-	compIconFileName    = "icon-companion.png"
+	vpnArtifactName     = "Kestrel-Duo-Unsigned-IPA"
+	compArtifactName    = "Kestrel-Air-Unsigned-IPA"
+	vpnIPAFileName      = "Kestrel-Duo-Unsigned.ipa"
+	compIPAFileName     = "Kestrel-Air-Unsigned.ipa"
+	vpnIconFileName     = "icon-duo.png"
+	compIconFileName    = "icon-air.png"
 	maxArtifactZipBytes = 256 << 20
 )
 
@@ -807,18 +807,18 @@ func buildSourceManifest(baseURL string, meta *RepoMetadata) SourceManifest {
 	compIcon := baseURL + "/" + compIconFileName
 
 	return SourceManifest{
-		Name:       "GhostFrame-TLS iOS Repo",
-		Identifier: "com.ghostframe.ios.repo",
-		Subtitle:   fmt.Sprintf("Build #%d · GFT-RTC v4", meta.RunNumber),
+		Name:       "Kestrel iOS Repo",
+		Identifier: "com.kestrel.ios.repo",
+		Subtitle:   fmt.Sprintf("Build #%d · Kestrel-RTC v4", meta.RunNumber),
 		SourceURL:  baseURL + "/source.json",
 		IconURL:    vpnIcon,
 		Apps: []SourceApp{
 			{
-				Name:                 "GhostFrame VPN",
-				BundleIdentifier:     "com.ghostframe.vpn",
-				DeveloperName:        "GhostFrame Project",
-				Subtitle:             "系统级 VPN + iOS 18 控制中心开关",
-				LocalizedDescription: "GhostFrame-RTC 双栈 VPN 正式版（零 App Group，适配全能签重签与 iOS 18 控制中心开关 + 内置 RuleSet 分流）。",
+				Name:                 "Kestrel Duo",
+				BundleIdentifier:     "com.kestrel.duo",
+				DeveloperName:        "Kestrel Project",
+				Subtitle:             "系统级全局通道 + iOS 18 控制中心开关",
+				LocalizedDescription: "Kestrel-RTC 双栈系统通道正式版（零 App Group，适配全能签重签与 iOS 18 控制中心开关 + 智能分流引擎）。",
 				IconURL:              vpnIcon,
 				TintColor:            "00D4FF",
 				Version:              ver,
@@ -835,11 +835,11 @@ func buildSourceManifest(baseURL string, meta *RepoMetadata) SourceManifest {
 				}},
 			},
 			{
-				Name:                 "GhostFrame Companion",
-				BundleIdentifier:     "com.ghostframe.companion",
-				DeveloperName:        "GhostFrame Project",
-				Subtitle:             "免 VPN 权限单进程本地代理伴侣版",
-				LocalizedDescription: "单进程静音保活版（无需 NetworkExtension 权限，适配免费个人签/重签工具，内置 RuleSet 分流）。",
+				Name:                 "Kestrel Air",
+				BundleIdentifier:     "com.kestrel.air",
+				DeveloperName:        "Kestrel Project",
+				Subtitle:             "免扩展权限单进程轻量版",
+				LocalizedDescription: "单进程静音保活版（无需额外通道权限，适配免费个人签/重签工具，内置智能分流引擎）。",
 				IconURL:              compIcon,
 				TintColor:            "10B981",
 				Version:              ver,
@@ -950,7 +950,7 @@ var indexHTMLTmpl = template.Must(template.New("index").Parse(`<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>GhostFrame iOS 软件源</title>
+<title>Kestrel iOS 软件源</title>
 <style>
 :root{color-scheme:dark;--bg:#090d16;--card:#111827;--bd:#1f2937;--cyan:#00d4ff;--green:#10b981;--txt:#f3f4f6;--muted:#9ca3af}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -981,7 +981,7 @@ h1{font-size:20px;font-weight:700;letter-spacing:.3px}
 <div class="wrap">
   <div class="hero">
     <div class="top">
-      <h1>GhostFrame-TLS iOS 源</h1>
+      <h1>Kestrel iOS 源</h1>
       <span class="badge">{{.Version}} · #{{.RunNumber}}</span>
     </div>
     <div class="meta">Commit: {{.ShortSHA}} — {{.CommitTitle}}</div>
@@ -992,26 +992,26 @@ h1{font-size:20px;font-weight:700;letter-spacing:.3px}
 
   <div class="card">
     <div class="app">
-      <img src="/icon-vpn.png" alt="VPN">
+      <img src="/icon-duo.png" alt="Kestrel Duo">
       <div>
-        <h2>GhostFrame VPN</h2>
-        <p>系统级 VPN + iOS 18 控制中心开关（免 App Group）</p>
+        <h2>Kestrel Duo</h2>
+        <p>系统级全局通道 + iOS 18 控制中心开关（免 App Group）</p>
         <div class="size">{{.VPNSizeStr}}</div>
       </div>
     </div>
-    <a class="btn btn-outline" href="/GhostFrame-VPN-Unsigned.ipa">直接下载 GhostFrame-VPN-Unsigned.ipa</a>
+    <a class="btn btn-outline" href="/Kestrel-Duo-Unsigned.ipa">直接下载 Kestrel-Duo-Unsigned.ipa</a>
   </div>
 
   <div class="card">
     <div class="app">
-      <img src="/icon-companion.png" alt="Companion">
+      <img src="/icon-air.png" alt="Kestrel Air">
       <div>
-        <h2>GhostFrame Companion</h2>
-        <p>免 VPN 权限单进程静音保活版（适合普通个人证书）</p>
+        <h2>Kestrel Air</h2>
+        <p>免扩展权限单进程静音保活版（适合普通个人证书）</p>
         <div class="size">{{.CompSizeStr}}</div>
       </div>
     </div>
-    <a class="btn btn-green" href="/GhostFrame-Companion-Unsigned.ipa">直接下载 GhostFrame-Companion-Unsigned.ipa</a>
+    <a class="btn btn-green" href="/Kestrel-Air-Unsigned.ipa">直接下载 Kestrel-Air-Unsigned.ipa</a>
   </div>
 
   <div class="card">

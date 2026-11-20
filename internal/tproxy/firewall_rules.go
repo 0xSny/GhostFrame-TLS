@@ -9,14 +9,19 @@ import (
 	"ghostframe/internal/client"
 )
 
-const DefaultCNIPv4OverridePath = "/etc/0ghost/cn_ipv4.txt"
+const DefaultCNIPv4OverridePath = "/etc/kbox/cn_ipv4.txt"
 
 // EffectiveCNIPv4CIDRs returns external override CIDRs from overridePath (defaulting to
-// /etc/0ghost/cn_ipv4.txt if present and non-empty), or the embedded complete APNIC table.
+// /etc/kbox/cn_ipv4.txt or legacy /etc/0ghost/cn_ipv4.txt if present and non-empty), or the embedded complete APNIC table.
 func EffectiveCNIPv4CIDRs(overridePath string) []string {
 	path := strings.TrimSpace(overridePath)
 	if path == "" {
 		path = DefaultCNIPv4OverridePath
+		if _, err := os.Stat(path); err != nil {
+			if _, err2 := os.Stat("/etc/0ghost/cn_ipv4.txt"); err2 == nil {
+				path = "/etc/0ghost/cn_ipv4.txt"
+			}
+		}
 	}
 	if b, err := os.ReadFile(path); err == nil {
 		var custom []string

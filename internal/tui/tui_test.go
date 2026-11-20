@@ -239,7 +239,7 @@ func TestApplyKernelSysctlWritesAndExecutes(t *testing.T) {
 
 func newMockOTAServer(t *testing.T, tag string, newBin []byte, checksumOverride string, apiStatus int) *httptest.Server {
 	t.Helper()
-	assetName := "gft-server-linux-" + runtime.GOARCH
+	assetName := "kestrel-server-linux-" + runtime.GOARCH
 	sum := sha256.Sum256(newBin)
 	sumHex := hex.EncodeToString(sum[:])
 	if checksumOverride != "" {

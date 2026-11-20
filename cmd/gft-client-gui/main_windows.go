@@ -20,7 +20,7 @@ func initCrashLog() *os.File {
 	if err != nil || home == "" {
 		return nil
 	}
-	dir := filepath.Join(home, ".gft")
+	dir := filepath.Join(home, ".kestrel")
 	_ = os.MkdirAll(dir, 0o755)
 	f, err := os.OpenFile(filepath.Join(dir, "crash.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -73,7 +73,7 @@ func main() {
 	if err := eng.StartServersAutoFallback(); err != nil {
 		eng.Logf("本地代理端口监听失败（请在界面修改本地端口后点击保存）: %v", err)
 	}
-	eng.Logf("GhostFrame-Pro %s (GFT-RTC) native desktop initialized", client.Version)
+	eng.Logf("Kestrel Pro %s (Kestrel-RTC) native desktop initialized", client.Version)
 
 	if *autoConnect {
 		go func() { _ = eng.Connect() }()

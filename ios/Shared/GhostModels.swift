@@ -8,9 +8,9 @@ enum GhostEdition: String {
     var title: String {
         switch self {
         case .vpn:
-            return "GhostFrame VPN"
+            return "Kestrel Duo"
         case .companion:
-            return "GhostFrame Companion"
+            return "Kestrel Air"
         }
     }
 

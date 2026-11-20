@@ -8,7 +8,7 @@ struct QRScannerSheetView: View {
 
     @State private var permissionStatus: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
     @State private var torchOn = false
-    @State private var statusHint = "将节点二维码（gft3://）放入框内"
+    @State private var statusHint = "将节点二维码（ksl4:// / gft3://）放入框内"
 
     var body: some View {
         ZStack {

@@ -48,7 +48,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "ghostframe start servers failed: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("GhostFrame-RTC %s headless client listening (config: %s)\n", client.Version, cfgPath)
+	fmt.Printf("Kestrel-RTC %s headless client listening (config: %s)\n", client.Version, cfgPath)
 
 	if *autoConnect {
 		if err := eng.Connect(); err != nil {

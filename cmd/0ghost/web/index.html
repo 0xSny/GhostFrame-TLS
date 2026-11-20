@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
-<title>0Ghost 旁路由透明网关 · v4.0 LTS</title>
+<title>KestrelBox 旁路由透明网关 · v4.0 LTS</title>
 <style>
 :root{
   --bg:#060913;--card:#0c1324;--card2:#10192f;--border:#1d2a49;
@@ -183,7 +183,7 @@ textarea{min-height:74px;resize:vertical;font-family:ui-monospace,SFMono-Regular
       <div class="card">
         <h3><span>节点导入与传输内核调优</span><span style="font-size:11px;color:var(--muted)" id="nodeCount">0 节点</span></h3>
         <div class="row">
-          <input id="importInput" onkeydown="if(event.key==='Enter')importNode()" placeholder="粘贴 gft3:// 节点链接，回车或点击导入" />
+          <input id="importInput" onkeydown="if(event.key==='Enter')importNode()" placeholder="粘贴 ksl4:// 或 gft3:// 节点链接，回车或点击导入" />
           <button class="btn primary" style="flex:0 0 auto" onclick="importNode()">导入节点</button>
         </div>
         <div class="node-list" id="nodeList"></div>
@@ -251,7 +251,7 @@ let loginPending = false;
 function promptLogin(){
   if (loginPending) return;
   loginPending = true;
-  const pwd = window.prompt('0Ghost 控制台已启用访问口令，请输入口令：');
+  const pwd = window.prompt('KestrelBox 控制台已启用访问口令，请输入口令：');
   if (pwd !== null) {
     fetch(apiBase + '/api/auth/login', {
       method:'POST',
@@ -470,7 +470,7 @@ function refresh(){
     const nodes = s.nodes || [];
     document.getElementById('nodeCount').textContent = `${nodes.length} 节点`;
     const nl = document.getElementById('nodeList');
-    nl.innerHTML = nodes.length === 0 ? '<div style="color:var(--muted);font-size:12px">暂无节点，请在上方粘贴 gft3:// 链接导入</div>' :
+    nl.innerHTML = nodes.length === 0 ? '<div style="color:var(--muted);font-size:12px">暂无节点，请在上方粘贴 ksl4:// 链接导入</div>' :
       nodes.map(n => `<div class="node-item ${n.index===s.active_node?'active':''}">
         <div><div style="font-weight:700">${n.name}</div><div style="font-size:11px;color:var(--muted)">${n.host}:${n.port} · ${n.transport} ${n.hop_range?('· '+n.hop_range):''}</div></div>
         <div style="display:flex;gap:6px">${n.index===s.active_node?'<span class="pill" style="border-color:var(--emerald);color:#6ee7b7">当前</span>':`<button class="btn sm" onclick="selectNode(${n.index})">切换</button>`}<button class="btn sm danger" onclick="deleteNode(${n.index})">删</button></div>

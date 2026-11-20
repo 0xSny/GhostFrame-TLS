@@ -154,7 +154,7 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 
 	if !s.engine.IsConnected() {
 		s.logDisconnectedThrottled()
-		resp := "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nGhostFrame not connected to server\r\n"
+		resp := "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nKestrel not connected to server\r\n"
 		_, _ = c.Write([]byte(resp))
 		return
 	}

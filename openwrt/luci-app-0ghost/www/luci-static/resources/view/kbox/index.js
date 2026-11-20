@@ -17,7 +17,7 @@ return view.extend({
 	handleReset: null,
 
 	load: function() {
-		return callServiceList('0ghost').catch(function() { return {}; });
+		return callServiceList('kbox').catch(function() { return {}; });
 	},
 
 	getDirectConsoleURL: function() {
@@ -25,7 +25,7 @@ return view.extend({
 	},
 
 	execService: function(action) {
-		return fs.exec('/etc/init.d/0ghost', [action]).then(function() {
+		return fs.exec('/etc/init.d/kbox', [action]).then(function() {
 			window.setTimeout(function() {
 				window.location.reload();
 			}, 900);
@@ -36,8 +36,8 @@ return view.extend({
 
 	render: function(data) {
 		var running = false;
-		if (data && data['0ghost'] && data['0ghost'].instances) {
-			var insts = data['0ghost'].instances;
+		if (data && data['kbox'] && data['kbox'].instances) {
+			var insts = data['kbox'].instances;
 			for (var k in insts) {
 				if (insts[k] && insts[k].running) {
 					running = true;
@@ -47,19 +47,19 @@ return view.extend({
 		}
 
 		var directUrl = this.getDirectConsoleURL();
-		var iframeSrc = '/0ghost/';
+		var iframeSrc = '/kbox/';
 
 		var badge = E('span', {
 			style: 'display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;' +
 				(running ? 'background:rgba(16,185,129,.16);color:#10b981;border:1px solid rgba(16,185,129,.45);'
 				         : 'background:rgba(244,63,94,.16);color:#f43f5e;border:1px solid rgba(244,63,94,.45);')
-		}, running ? '● 0Ghost 运行中' : '○ 0Ghost 已停止');
+		}, running ? '● KestrelBox 运行中' : '○ KestrelBox 已停止');
 
 		var toolbar = E('div', {
 			style: 'display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;background:#0c1324;color:#e6eefc;border:1px solid #1d2a49;border-radius:12px;padding:12px 16px;margin-bottom:12px;'
 		}, [
 			E('div', { style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;' }, [
-				E('strong', { style: 'font-size:15px;' }, '0Ghost 旁路由透明网关'),
+				E('strong', { style: 'font-size:15px;' }, 'KestrelBox 旁路由透明网关'),
 				badge
 			]),
 			E('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' }, [
@@ -90,18 +90,18 @@ return view.extend({
 		}, [
 			E('h3', { style: 'margin:0 0 10px;color:#fbbf24;' }, 'HTTPS 混合内容安全拦截提示'),
 			E('p', { style: 'margin:0 0 16px;color:#94a3b8;font-size:14px;line-height:1.7;' },
-				'当前正通过 HTTPS 访问 LuCI，但同源反代 /0ghost/ 未响应；浏览器安全策略会拦截在 HTTPS iframe 内嵌入 HTTP :19080 页面（防止空白页）。'),
+				'当前正通过 HTTPS 访问 LuCI，但同源反代 /kbox/ 未响应；浏览器安全策略会拦截在 HTTPS iframe 内嵌入 HTTP :19080 页面（防止空白页）。'),
 			E('a', {
 				href: directUrl,
 				target: '_blank',
 				rel: 'noopener noreferrer',
 				class: 'cbi-button cbi-button-action',
 				style: 'padding:8px 18px;font-weight:700;'
-			}, '在新标签页打开 0Ghost 独立控制台 (' + directUrl + ')')
+			}, '在新标签页打开 KestrelBox 独立控制台 (' + directUrl + ')')
 		]);
 
-		// Verify uhttpd same-origin proxy /0ghost/; never inject http:// into an https:// iframe.
-		fetch('/0ghost/api/auth/info', { cache: 'no-store' }).then(function(res) {
+		// Verify uhttpd same-origin proxy /kbox/; never inject http:// into an https:// iframe.
+		fetch('/kbox/api/auth/info', { cache: 'no-store' }).then(function(res) {
 			if (!res.ok) throw new Error('proxy unavailable');
 		}).catch(function() {
 			if (window.location.protocol === 'https:') {

@@ -33,13 +33,19 @@ type TransactionRunner struct {
 }
 
 func NewTransactionRunner(cfgPath string) *TransactionRunner {
-	lockPath := "/run/gft-menu.lock"
+	lockPath := "/run/kestrel-menu.lock"
 	if _, err := os.Stat("/run"); err != nil {
-		lockPath = filepath.Join(os.TempDir(), "gft-menu.lock")
+		lockPath = filepath.Join(os.TempDir(), "kestrel-menu.lock")
+	}
+	svc := "kestrel"
+	if _, err := os.Stat("/etc/systemd/system/kestrel.service"); err != nil {
+		if _, err2 := os.Stat("/etc/systemd/system/ghostframe.service"); err2 == nil {
+			svc = "ghostframe"
+		}
 	}
 	tr := &TransactionRunner{
 		CfgPath:      cfgPath,
-		ServiceName:  "ghostframe",
+		ServiceName:  svc,
 		LockPath:     lockPath,
 		FW:           NewFirewallManager(),
 		ProbeTimeout: 2500 * time.Millisecond,

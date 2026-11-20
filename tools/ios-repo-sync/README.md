@@ -1,6 +1,6 @@
-# GhostFrame iOS 全能签本地软件源自动同步工具 (`tools/ios-repo-sync`)
+# Kestrel iOS 全能签本地软件源自动同步工具 (`tools/ios-repo-sync`)
 
-零外部依赖的纯 Go 标准库工具：自动从 GitHub Actions `Build iOS Dual Unsigned IPAs` 拉取最新成功的 `GhostFrame-VPN-Unsigned.ipa` 与 `GhostFrame-Companion-Unsigned.ipa`，生成兼容全能签（OmniSign / ESign）与 AltStore 的 `source.json`，并在局域网开放 HTTP 服务供 iPhone 直接下拉刷新重签安装。
+零外部依赖的纯 Go 标准库工具：自动从 GitHub Actions `Build Kestrel iOS Dual IPAs` 拉取最新成功的 `Kestrel-Duo-Unsigned.ipa` 与 `Kestrel-Air-Unsigned.ipa`，生成兼容全能签（OmniSign / ESign）与 AltStore 的 `source.json`，并在局域网开放 HTTP 服务供 iPhone 直接下拉刷新重签安装。
 
 ## 常用命令
 

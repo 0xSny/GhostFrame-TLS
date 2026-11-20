@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>GhostFrame Companion</string>
+	<string>Kestrel Air</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -32,9 +32,9 @@
 		<true/>
 	</dict>
 	<key>NSCameraUsageDescription</key>
-	<string>GhostFrame Companion 需要相机权限以扫描节点分享二维码（gft3://）。</string>
+	<string>Kestrel Air 需要相机权限以扫描节点分享二维码（ksl4:// / gft3://）。</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>GhostFrame Companion listens on 127.0.0.1 for local proxy chaining with Shadowrocket.</string>
+	<string>Kestrel Air listens on 127.0.0.1 for local proxy chaining with Shadowrocket.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

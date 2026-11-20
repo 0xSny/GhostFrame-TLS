@@ -26,7 +26,7 @@ import (
 	"ghostframe/internal/tproxy"
 )
 
-var gatewayVersion = "v4.0.20-LTS"
+var gatewayVersion = "v4.0.21-LTS"
 
 type GatewayService struct {
 	cfgPath string
@@ -127,14 +127,14 @@ func (s *GatewayService) Start() {
 	rep := tproxy.DetectConflicts()
 	if rep.HasConflict {
 		if cfg.AutoYieldConflicts {
-			s.engine.Logf("[0Ghost] 检测到冲突代理 (%d 项)，正在安全停用并让路...", len(rep.Items))
+			s.engine.Logf("[KestrelBox] 检测到冲突代理 (%d 项)，正在安全停用并让路...", len(rep.Items))
 			rep = tproxy.ResolveConflicts()
 			for _, act := range rep.Actions {
-				s.engine.Logf("[0Ghost] %s", act)
+				s.engine.Logf("[KestrelBox] %s", act)
 			}
 			time.Sleep(350 * time.Millisecond)
 		} else {
-			s.engine.Logf("[0Ghost] 检测到冲突代理，自动接管未开启；已暂停透明防火墙挂载以防止死锁")
+			s.engine.Logf("[KestrelBox] 检测到冲突代理，自动接管未开启；已暂停透明防火墙挂载以防止死锁")
 		}
 	}
 	s.mu.Lock()
@@ -143,9 +143,9 @@ func (s *GatewayService) Start() {
 
 	// 2. Start explicit LAN proxy servers (:10808 / :10809).
 	if err := s.engine.StartServers(); err != nil {
-		s.engine.Logf("[0Ghost] 局域网显式代理端口启动告警: %v", err)
+		s.engine.Logf("[KestrelBox] 局域网显式代理端口启动告警: %v", err)
 	} else {
-		s.engine.Logf("[0Ghost] 局域网代理已监听 SOCKS5 0.0.0.0:10808 / HTTP 0.0.0.0:10809")
+		s.engine.Logf("[KestrelBox] 局域网代理已监听 SOCKS5 0.0.0.0:10808 / HTTP 0.0.0.0:10809")
 	}
 
 	// 3. Start Split-DNS (:7853 dual-stack so both LAN nft redirect and local host queries succeed),
@@ -158,9 +158,9 @@ func (s *GatewayService) Start() {
 		func() tproxy.GatewayMode { return s.getGatewayConfig().GatewayMode },
 	)
 	if err := dnsSrv.Start(); err != nil {
-		s.engine.Logf("[0Ghost] Split-DNS 启动失败: %v", err)
+		s.engine.Logf("[KestrelBox] Split-DNS 启动失败: %v", err)
 	} else {
-		s.engine.Logf("[0Ghost] Split-DNS 已监听 :%d", cfg.DNSPort)
+		s.engine.Logf("[KestrelBox] Split-DNS 已监听 :%d", cfg.DNSPort)
 	}
 
 	tcpSrv, err := tproxy.NewTCPServer(
@@ -170,9 +170,9 @@ func (s *GatewayService) Start() {
 	)
 	if err == nil {
 		if serr := tcpSrv.Start(); serr != nil {
-			s.engine.Logf("[0Ghost] TCP TPROXY 启动告警: %v", serr)
+			s.engine.Logf("[KestrelBox] TCP TPROXY 启动告警: %v", serr)
 		} else {
-			s.engine.Logf("[0Ghost] TCP 透明接管已监听 127.0.0.1:%d", cfg.TCPPort)
+			s.engine.Logf("[KestrelBox] TCP 透明接管已监听 127.0.0.1:%d", cfg.TCPPort)
 		}
 	}
 
@@ -183,9 +183,9 @@ func (s *GatewayService) Start() {
 	)
 	if err == nil {
 		if serr := udpSrv.Start(); serr != nil {
-			s.engine.Logf("[0Ghost] UDP TPROXY 启动告警: %v", serr)
+			s.engine.Logf("[KestrelBox] UDP TPROXY 启动告警: %v", serr)
 		} else {
-			s.engine.Logf("[0Ghost] UDP TPROXY 已监听 127.0.0.1:%d", cfg.UDPPort)
+			s.engine.Logf("[KestrelBox] UDP TPROXY 已监听 127.0.0.1:%d", cfg.UDPPort)
 		}
 	}
 
@@ -200,18 +200,18 @@ func (s *GatewayService) Start() {
 	if host, _ := st["node_host"].(string); strings.TrimSpace(host) != "" {
 		go func() {
 			if err := s.engine.Connect(); err != nil {
-				s.engine.Logf("[0Ghost] 节点连接失败: %v", err)
+				s.engine.Logf("[KestrelBox] 节点连接失败: %v", err)
 			}
 			s.SyncFirewall()
 		}()
 	} else {
-		s.engine.Logf("[0Ghost] 当前无可用节点，处于纯净待机模式（可访问 :19080 控制台粘贴 gft3:// 链接）")
+		s.engine.Logf("[KestrelBox] 当前无可用节点，处于纯净待机模式（可访问 :19080 控制台粘贴 ksl4:// 或 gft3:// 链接）")
 		s.SyncFirewall()
 	}
 
 	go s.watchLoop()
 	startFirewallSignalWatcher(s.stopCh, func() {
-		s.engine.Logf("[0Ghost] 收到热插拔重载信号 (SIGUSR1)，正在自愈重挂防火墙规则...")
+		s.engine.Logf("[KestrelBox] 收到热插拔重载信号 (SIGUSR1)，正在自愈重挂防火墙规则...")
 		s.SyncFirewall()
 	})
 }
@@ -242,7 +242,7 @@ func (s *GatewayService) watchLoop() {
 				s.mu.RUnlock()
 				if active && connected && cfg.GatewayMode != tproxy.ModePort {
 					if !tproxy.CheckFirewallHealthy(cfg.GatewayMode, 1, 100) {
-						s.engine.Logf("[0Ghost] 巡检发现防火墙规则或策略路由异常脱落，立即自动修复...")
+						s.engine.Logf("[KestrelBox] 巡检发现防火墙规则或策略路由异常脱落，立即自动修复...")
 						s.SyncFirewall()
 					}
 				}
@@ -319,12 +319,12 @@ func (s *GatewayService) SyncFirewall() {
 		s.fwActive = false
 		s.fwBackend = "error"
 		s.fwErr = err.Error()
-		s.engine.Logf("[0Ghost] 防火墙挂载失败: %v", err)
+		s.engine.Logf("[KestrelBox] 防火墙挂载失败: %v", err)
 	} else {
 		s.fwActive = true
 		s.fwBackend = backend
 		s.fwErr = ""
-		s.engine.Logf("[0Ghost] 透明防火墙已就绪 [%s] (mode=%s, devices=%s)", backend, cfg.GatewayMode, cfg.DeviceMode)
+		s.engine.Logf("[KestrelBox] 透明防火墙已就绪 [%s] (mode=%s, devices=%s)", backend, cfg.GatewayMode, cfg.DeviceMode)
 	}
 	s.mu.Unlock()
 }

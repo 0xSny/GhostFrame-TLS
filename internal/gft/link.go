@@ -134,7 +134,7 @@ func (l *Link) ParseHopRange() (int, int, bool) {
 
 // Validate checks link version and all field legalities.
 func (l *Link) Validate() error {
-	if l.V != 1 && l.V != 2 && l.V != 3 {
+	if l.V < 1 || l.V > 4 {
 		return fmt.Errorf("unsupported link version %d", l.V)
 	}
 	if net.ParseIP(l.Host) == nil && !hostRe.MatchString(l.Host) {
@@ -191,14 +191,14 @@ func (l *Link) Validate() error {
 	return nil
 }
 
-// Encode serializes the link as a gft3:// URI (or gft2:// if explicitly set V == 2 with no v3 options).
+// Encode serializes the link as a ksl4:// URI (or legacy gft2:// if explicitly set V == 2 with no v3+ options).
 func (l *Link) Encode() string {
 	cp := *l
-	scheme := "gft3://"
+	scheme := "ksl4://"
 	if cp.V == 2 && !cp.SplitSNI && cp.HopRange == "" && (cp.Transport == "" || cp.Transport == "tcp") {
 		scheme = "gft2://"
 	} else {
-		cp.V = 3
+		cp.V = 4
 		if cp.Transport == "" {
 			cp.Transport = "auto"
 		}
@@ -217,10 +217,12 @@ func (l *Link) Encode() string {
 	return s
 }
 
-// ParseLink decodes a gft3://, gft2://, or legacy gft:// link.
+// ParseLink decodes a ksl4://, gft3://, gft2://, or legacy gft:// link.
 func ParseLink(s string) (*Link, error) {
 	s = strings.TrimSpace(s)
 	switch {
+	case strings.HasPrefix(s, "ksl4://"):
+		s = s[len("ksl4://"):]
 	case strings.HasPrefix(s, "gft3://"):
 		s = s[len("gft3://"):]
 	case strings.HasPrefix(s, "gft2://"):
@@ -228,7 +230,7 @@ func ParseLink(s string) (*Link, error) {
 	case strings.HasPrefix(s, "gft://"):
 		s = s[len("gft://"):]
 	default:
-		return nil, errors.New("not a gft3:// or gft2:// link")
+		return nil, errors.New("not a ksl4:// or gft3:// link")
 	}
 	remark := ""
 	if i := strings.IndexByte(s, '#'); i >= 0 {

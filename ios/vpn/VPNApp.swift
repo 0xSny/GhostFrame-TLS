@@ -16,7 +16,7 @@ struct GhostFrameVPNApp: App {
 }
 
 @available(iOS 17.0, *)
-struct GhostFrameAppShortcuts: AppShortcutsProvider {
+struct KestrelAppShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(
             intent: ConnectGhostVPNIntent(),
@@ -25,7 +25,7 @@ struct GhostFrameAppShortcuts: AppShortcutsProvider {
                 "打开 \(.applicationName)",
                 "Connect \(.applicationName)"
             ],
-            shortTitle: "连接 VPN",
+            shortTitle: "连接 Kestrel",
             systemImageName: "lock.shield.fill"
         )
         AppShortcut(
@@ -35,7 +35,7 @@ struct GhostFrameAppShortcuts: AppShortcutsProvider {
                 "关闭 \(.applicationName)",
                 "Disconnect \(.applicationName)"
             ],
-            shortTitle: "断开 VPN",
+            shortTitle: "断开 Kestrel",
             systemImageName: "lock.shield"
         )
     }

@@ -11,6 +11,9 @@
 /gft-server
 /gft-core
 /0ghost
+/kestrel-server
+/kestrel-core
+/kbox
 dist/
 build/
 bin/
@@ -27,6 +30,7 @@ server.json
 sysproxy_backup.json
 deploy_record.json
 .gft/
+.kestrel/
 .local/
 *.log
 

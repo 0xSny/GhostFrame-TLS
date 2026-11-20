@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# GhostFrame-RTC (GFT) v4.0 LTS Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
+# Kestrel (Kestrel-RTC) v4.0 LTS Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
 REPO="Spittingjiu/Ghost"
 ROLE="server"
 UNATTENDED=0
@@ -14,25 +14,25 @@ LOW_MEM=0
 MIRROR_PREFIX=""
 TARGET_VER="latest"
 
-log()  { printf "\033[1;36m[GFT]\033[0m %s\n" "$*"; }
+log()  { printf "\033[1;36m[KSL]\033[0m %s\n" "$*"; }
 ok()   { printf "\033[1;32m[✓]\033[0m %s\n" "$*"; }
 warn() { printf "\033[1;33m[!]\033[0m %s\n" "$*"; }
 die()  { printf "\033[1;31m[×]\033[0m %s\n" "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-GhostFrame-RTC (GFT) v4.0 LTS Installer
+Kestrel (Kestrel-RTC) v4.0 LTS Installer
 
 Usage:
   install.sh [options]
 
 Options:
-  --role <server|client>   Install server + `gft` TUI or `gft-core` client daemon (default: server)
+  --role <server|client>   Install server + `ksl` TUI or `kestrel-core` client daemon (default: server)
   --unattended             Non-interactive server deployment
   --port <1-65535>         Server main TCP/RTC listen port (default: 443)
   --hop <min-max>          Server UDP port hopping range (e.g. 20000-30000)
   --sni <domain>           Override auto-selected non-CDN camouflage SNI
-  --link <gft3://...>      Client gft3:// URI for --role client
+  --link <ksl4://...>      Client ksl4:// URI (or legacy gft3://) for --role client
   --socks <addr:port>      Client SOCKS5 listen address (default: 127.0.0.1:10808)
   --low-mem                Enable low-memory router mode (<35MB RSS, ideal for N1/S905D)
   --mirror <url-prefix>    Optional download mirror prefix for GitHub URLs
@@ -197,7 +197,7 @@ check_port_and_guide() {
   local fallback_target=""
   if command -v ss >/dev/null 2>&1; then
     local busy
-    busy="$(ss -tulpn 2>/dev/null | grep -E ":${LISTEN_PORT}[[:space:]]" | grep -v "gft-server" || true)"
+    busy="$(ss -tulpn 2>/dev/null | grep -E ":${LISTEN_PORT}[[:space:]]" | grep -vE "kestrel-server|gft-server" || true)"
     if [[ -n "$busy" ]]; then
       warn "Port ${LISTEN_PORT} is already in use by another process:"
       printf "%s\n" "$busy"
@@ -205,7 +205,7 @@ check_port_and_guide() {
         die "Port ${LISTEN_PORT} conflict in --unattended mode; pass --port <alt> to avoid disrupting existing services."
       fi
       printf "\nChoose how to proceed without stopping your existing service:\n"
-      printf "  [1] Switch GhostFrame listen port to an alternate port (e.g. 8443) and coexist\n"
+      printf "  [1] Switch Kestrel listen port to an alternate port (e.g. 8443) and coexist\n"
       printf "  [2] Abort installation manually\n"
       read -r -p "Select [1/2]: " choice
       case "$choice" in
@@ -239,7 +239,7 @@ apply_hop_firewall() {
       if (( p >= lo && p <= hi && p != dst )); then
         exempt_ports+=("$p")
       fi
-    done < <(ss -ulnp 2>/dev/null | grep -v 'gft-server' | awk 'NR>1 {print $4}' | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | sort -nu)
+    done < <(ss -ulnp 2>/dev/null | grep -vE 'kestrel-server|gft-server' | awk 'NR>1 {print $4}' | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | sort -nu)
   fi
 
   if command -v nft >/dev/null 2>&1; then
@@ -285,41 +285,61 @@ apply_hop_firewall() {
 
 install_server() {
   [[ "$INIT_SYS" == "systemd" ]] || die "Server role currently requires systemd (detected: $INIT_SYS)."
-  check_port_and_guide
   apply_sysctl_tuning
 
-  download_verified_asset "gft-server-linux-${ARCH}" "/opt/ghostframe/gft-server"
-  ln -sf /opt/ghostframe/gft-server /usr/local/bin/gft
+  download_verified_asset "kestrel-server-linux-${ARCH}" "/opt/kestrel/kestrel-server"
+  ln -sf /opt/kestrel/kestrel-server /usr/local/bin/ksl
+  ln -sf /opt/kestrel/kestrel-server /usr/local/bin/gft
 
   if ! id -u gft >/dev/null 2>&1; then
     useradd -r -s /usr/sbin/nologin -M gft || useradd -r -s /bin/false -M gft
   fi
-  mkdir -p /etc/gft /var/lib/gft
+  mkdir -p /etc/kestrel /var/lib/kestrel
 
-  local init_args=(init --conf-dir /etc/gft --state-dir /var/lib/gft --listen ":${LISTEN_PORT}")
-  if [[ -n "$SNI_OVERRIDE" ]]; then
-    init_args+=(--sni "$SNI_OVERRIDE")
+  # Lossless migration from legacy GhostFrame (/etc/gft) if present
+  if [[ ! -f /etc/kestrel/server.json ]] && [[ -f /etc/gft/server.json ]]; then
+    cp -a /etc/gft/server.json /etc/kestrel/server.json
+    if [[ -d /var/lib/gft ]]; then
+      cp -an /var/lib/gft/. /var/lib/kestrel/ 2>/dev/null || true
+    fi
+    log "Migrated existing node configuration /etc/gft/server.json -> /etc/kestrel/server.json"
+  fi
+
+  if [[ -f /etc/kestrel/server.json ]]; then
+    log "Preserving existing /etc/kestrel/server.json (lossless binary upgrade)."
   else
-    init_args+=(--auto-sni)
-  fi
-  if [[ -n "$HOP_RANGE" ]]; then
-    init_args+=(--hop-range "$HOP_RANGE")
-  fi
-  if [[ -n "$CHOSEN_FALLBACK_MODE" ]]; then
-    init_args+=(--fallback-mode "$CHOSEN_FALLBACK_MODE")
-  fi
-  if [[ -n "$CHOSEN_FALLBACK_TARGET" ]]; then
-    init_args+=(--fallback-target "$CHOSEN_FALLBACK_TARGET")
+    check_port_and_guide
+    local init_args=(init --conf-dir /etc/kestrel --state-dir /var/lib/kestrel --listen ":${LISTEN_PORT}")
+    if [[ -n "$SNI_OVERRIDE" ]]; then
+      init_args+=(--sni "$SNI_OVERRIDE")
+    else
+      init_args+=(--auto-sni)
+    fi
+    if [[ -n "$HOP_RANGE" ]]; then
+      init_args+=(--hop-range "$HOP_RANGE")
+    fi
+    if [[ -n "$CHOSEN_FALLBACK_MODE" ]]; then
+      init_args+=(--fallback-mode "$CHOSEN_FALLBACK_MODE")
+    fi
+    if [[ -n "$CHOSEN_FALLBACK_TARGET" ]]; then
+      init_args+=(--fallback-target "$CHOSEN_FALLBACK_TARGET")
+    fi
+
+    log "Initializing server credentials & running non-CDN origin probe..."
+    /opt/kestrel/kestrel-server "${init_args[@]}" >/dev/null
   fi
 
-  log "Initializing server credentials & running non-CDN origin probe..."
-  /opt/ghostframe/gft-server "${init_args[@]}" >/dev/null
-  chown -R gft:gft /etc/gft /var/lib/gft
-  chmod 0750 /etc/gft /var/lib/gft
+  chown -R gft:gft /etc/kestrel /var/lib/kestrel
+  chmod 0750 /etc/kestrel /var/lib/kestrel
 
-  cat > /etc/systemd/system/ghostframe.service <<'EOF'
+  if systemctl list-unit-files 2>/dev/null | grep -q '^ghostframe\.service'; then
+    systemctl stop ghostframe >/dev/null 2>&1 || true
+    systemctl disable ghostframe >/dev/null 2>&1 || true
+  fi
+
+  cat > /etc/systemd/system/kestrel.service <<'EOF'
 [Unit]
-Description=GhostFrame-RTC (GFT) v4.0 LTS Dual-Stack Server
+Description=Kestrel (Kestrel-RTC) v4.0 LTS Dual-Stack Server
 After=network-online.target
 Wants=network-online.target
 
@@ -327,7 +347,7 @@ Wants=network-online.target
 Type=simple
 User=gft
 Group=gft
-ExecStart=/opt/ghostframe/gft-server run -config /etc/gft/server.json
+ExecStart=/opt/kestrel/kestrel-server run -config /etc/kestrel/server.json
 Restart=always
 RestartSec=2s
 LimitNOFILE=1048576
@@ -342,20 +362,21 @@ EOF
   apply_hop_firewall "$HOP_RANGE" "$LISTEN_PORT"
 
   systemctl daemon-reload
-  systemctl enable ghostframe >/dev/null 2>&1
-  systemctl restart ghostframe
+  systemctl enable kestrel >/dev/null 2>&1
+  systemctl restart kestrel
   sleep 1.5
-  systemctl is-active --quiet ghostframe || die "ghostframe failed to start; inspect: journalctl -u ghostframe -n 30"
+  systemctl is-active --quiet kestrel || die "kestrel failed to start; inspect: journalctl -u kestrel -n 30"
 
   echo ""
-  /opt/ghostframe/gft-server show-card -config /etc/gft/server.json
-  ok "Installation complete! Type 'gft' anytime to open the interactive control center."
+  /opt/kestrel/kestrel-server show-card -config /etc/kestrel/server.json
+  ok "Installation complete! Type 'ksl' (or 'gft') anytime to open the interactive control center."
 }
 
 install_client() {
-  [[ -n "$CLIENT_LINK" ]] || die "--role client requires --link \"gft3://...\""
-  download_verified_asset "gft-core-linux-${ARCH}" "/usr/local/bin/gft-core"
-  mkdir -p /etc/gft
+  [[ -n "$CLIENT_LINK" ]] || die "--role client requires --link \"ksl4://...\" (or legacy \"gft3://...\")"
+  download_verified_asset "kestrel-core-linux-${ARCH}" "/usr/local/bin/kestrel-core"
+  ln -sf /usr/local/bin/kestrel-core /usr/local/bin/gft-core
+  mkdir -p /etc/kestrel
 
   local extra_flags="-no-sysproxy"
   if [[ "$LOW_MEM" -eq 1 ]]; then
@@ -363,15 +384,19 @@ install_client() {
   fi
 
   if [[ "$INIT_SYS" == "systemd" ]]; then
-    cat > /etc/systemd/system/gft-core.service <<EOF
+    if systemctl list-unit-files 2>/dev/null | grep -q '^gft-core\.service'; then
+      systemctl stop gft-core >/dev/null 2>&1 || true
+      systemctl disable gft-core >/dev/null 2>&1 || true
+    fi
+    cat > /etc/systemd/system/kestrel-core.service <<EOF
 [Unit]
-Description=GhostFrame-RTC (GFT) v4.0 LTS Headless Core Daemon
+Description=Kestrel (Kestrel-RTC) v4.0 LTS Headless Core Daemon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/gft-core ${extra_flags} -socks "${SOCKS_ADDR}" -link "${CLIENT_LINK}"
+ExecStart=/usr/local/bin/kestrel-core ${extra_flags} -socks "${SOCKS_ADDR}" -link "${CLIENT_LINK}"
 Restart=always
 RestartSec=3s
 LimitNOFILE=65536
@@ -380,11 +405,11 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable gft-core >/dev/null 2>&1
-    systemctl restart gft-core
-    ok "gft-core systemd service installed and started (SOCKS5: ${SOCKS_ADDR})"
+    systemctl enable kestrel-core >/dev/null 2>&1
+    systemctl restart kestrel-core
+    ok "kestrel-core systemd service installed and started (SOCKS5: ${SOCKS_ADDR})"
   elif [[ "$INIT_SYS" == "procd" ]]; then
-    cat > /etc/init.d/gft-core <<EOF
+    cat > /etc/init.d/kestrel-core <<EOF
 #!/bin/sh /etc/rc.common
 START=95
 STOP=10
@@ -392,20 +417,20 @@ USE_PROCD=1
 
 start_service() {
   procd_open_instance
-  procd_set_param command /usr/local/bin/gft-core ${extra_flags} -socks "${SOCKS_ADDR}" -link "${CLIENT_LINK}"
+  procd_set_param command /usr/local/bin/kestrel-core ${extra_flags} -socks "${SOCKS_ADDR}" -link "${CLIENT_LINK}"
   procd_set_param respawn 3600 5 5
   procd_set_param stdout 1
   procd_set_param stderr 1
   procd_close_instance
 }
 EOF
-    chmod 0755 /etc/init.d/gft-core
-    /etc/init.d/gft-core enable
-    /etc/init.d/gft-core restart
-    ok "gft-core OpenWrt procd service installed and started (SOCKS5: ${SOCKS_ADDR})"
+    chmod 0755 /etc/init.d/kestrel-core
+    /etc/init.d/kestrel-core enable
+    /etc/init.d/kestrel-core restart
+    ok "kestrel-core OpenWrt procd service installed and started (SOCKS5: ${SOCKS_ADDR})"
   else
     warn "Neither systemd nor procd detected; run manually:"
-    printf "/usr/local/bin/gft-core %s -socks %q -link %q\n" "$extra_flags" "$SOCKS_ADDR" "$CLIENT_LINK"
+    printf "/usr/local/bin/kestrel-core %s -socks %q -link %q\n" "$extra_flags" "$SOCKS_ADDR" "$CLIENT_LINK"
   fi
 }
 
