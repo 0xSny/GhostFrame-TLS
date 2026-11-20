@@ -184,8 +184,9 @@ jobs:
           path: dist-stage
 
       - name: Assemble Unified Release Bundle, Checksums & Cloud OmniSign source.json
+        id: prep
         env:
-          HAS_DIST_TOKEN: ${{ secrets.DIST_PUSH_TOKEN != '' }}
+          DIST_PUSH_TOKEN: ${{ secrets.DIST_PUSH_TOKEN }}
           INPUT_TAG: ${{ inputs.tag }}
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
@@ -207,10 +208,13 @@ jobs:
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
 
           TARGET_REPO="$SOURCE_REPO"
-          if [ "$HAS_DIST_TOKEN" = "true" ]; then
+          HAS_DIST="false"
+          if [ -n "${DIST_PUSH_TOKEN}" ]; then
             TARGET_REPO="Spittingjiu/GhostFrame-Dist"
+            HAS_DIST="true"
           fi
           echo "TARGET_REPO=$TARGET_REPO" >> "$GITHUB_ENV"
+          echo "has_dist_token=${HAS_DIST}" >> "$GITHUB_OUTPUT"
 
           VPN_SIZE="$(stat -c%s release-out/GhostFrame-VPN-Unsigned.ipa)"
           COMP_SIZE="$(stat -c%s release-out/GhostFrame-Companion-Unsigned.ipa)"
@@ -282,7 +286,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish Pure-Binary Release to Spittingjiu/GhostFrame-Dist (if DIST_PUSH_TOKEN configured)
-        if: ${{ secrets.DIST_PUSH_TOKEN != '' }}
+        if: steps.prep.outputs.has_dist_token == 'true'
         env:
           GH_TOKEN: ${{ secrets.DIST_PUSH_TOKEN }}
         run: |
@@ -297,7 +301,7 @@ jobs:
           fi
 
       - name: Fallback Release on Current Repository (when DIST_PUSH_TOKEN not set)
-        if: ${{ secrets.DIST_PUSH_TOKEN == '' && (github.ref_type == 'tag' || inputs.tag != '') }}
+        if: steps.prep.outputs.has_dist_token != 'true' && (github.ref_type == 'tag' || inputs.tag != '')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}

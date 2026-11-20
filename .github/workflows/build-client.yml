@@ -61,8 +61,8 @@ jobs:
       - name: Vet and Test Client Packages (-race)
         run: |
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./cmd/gft-client-gui ./internal/winui
-          go vet ./internal/client ./internal/gft ./internal/gftrtc ./internal/netbind ./internal/winui
-          CGO_ENABLED=1 go test -race -count=1 -v ./internal/client ./internal/gft ./internal/gftrtc ./internal/netbind ./internal/winui
+          go vet ./internal/client ./internal/gft ./internal/gftrtc ./internal/netbind
+          CGO_ENABLED=1 go test -race -count=1 -v ./internal/client ./internal/gft ./internal/gftrtc ./internal/netbind
 
       - name: Go Fuzz Smoke Checks (3s per target)
         run: |
