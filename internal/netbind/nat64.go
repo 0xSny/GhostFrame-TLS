@@ -59,7 +59,10 @@ func ResetNAT64Cache() {
 
 // IsPureIPv6Physical reports whether the active physical interface is pure-IPv6.
 func IsPureIPv6Physical() bool {
-	return isPureIPv6PhysicalFn()
+	nat64Mu.RLock()
+	fn := isPureIPv6PhysicalFn
+	nat64Mu.RUnlock()
+	return fn()
 }
 
 // SetNAT64TestHooks overrides NAT64 detection/DNS64 hooks for cross-package tests
@@ -136,6 +139,7 @@ func SynthesizeNAT64IPv4(prefix [12]byte, ip4 net.IP) net.IP {
 // is cached only for 2s so handoffs retry quickly. Cleared on ResetNAT64Cache().
 func DiscoverNAT64Prefix(ctx context.Context) ([12]byte, bool) {
 	nat64Mu.RLock()
+	lookupFn := lookupIPv6Fn
 	if nat64HasPrefix && time.Now().Before(nat64ExpiresAt) {
 		p := nat64Prefix
 		nat64Mu.RUnlock()
@@ -152,7 +156,7 @@ func DiscoverNAT64Prefix(ctx context.Context) ([12]byte, bool) {
 
 	var discovered [12]byte
 	found := false
-	if ips, err := lookupIPv6Fn(lookupCtx, "ipv4only.arpa"); err == nil {
+	if ips, err := lookupFn(lookupCtx, "ipv4only.arpa"); err == nil {
 		for _, ip := range ips {
 			if p, ok := ExtractNAT64Prefix(ip); ok {
 				discovered = p
@@ -181,7 +185,11 @@ func DiscoverNAT64Prefix(ctx context.Context) ([12]byte, bool) {
 func ResolveTargetHost(ctx context.Context, host string) string {
 	h := strings.TrimSpace(host)
 	h = strings.Trim(h, "[]")
-	if h == "" || !isPureIPv6PhysicalFn() {
+	nat64Mu.RLock()
+	isPureV6Fn := isPureIPv6PhysicalFn
+	hostLookupFn := lookupHostIPsFn
+	nat64Mu.RUnlock()
+	if h == "" || !isPureV6Fn() {
 		return h
 	}
 
@@ -197,7 +205,7 @@ func ResolveTargetHost(ctx context.Context, host string) string {
 		return ip.String()
 	}
 
-	if ips, err := lookupHostIPsFn(ctx, h); err == nil && len(ips) > 0 {
+	if ips, err := hostLookupFn(ctx, h); err == nil && len(ips) > 0 {
 		for _, ip := range ips {
 			if ip.To4() == nil && ip.To16() != nil {
 				return ip.String()

@@ -2260,7 +2260,7 @@ func (s *RTCSession) HopValidated(pickPort func() int, maxAttempts int, probeTim
 		}
 		candPC, err := listenClientUDP(network, raddr.IP)
 		if err != nil {
-			lastErr = err
+			lastErr = fmt.Errorf("gftrtc: listen %s for %s: %w", network, raddr.String(), err)
 			continue
 		}
 		if perr := s.HopWithProbePC(candPC, true, raddr, port, probeTimeout); perr != nil {
@@ -2541,7 +2541,7 @@ func Dial(ctx context.Context, opts DialOptions) (*RTCSession, time.Duration, er
 	}
 	pc, err := listenClientUDP(network, addr.IP)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("gftrtc: listen %s for %s: %w", network, addr.String(), err)
 	}
 	sess, rtt, err := DialWithPacketConn(ctx, pc, true, addr, opts)
 	if err != nil {

@@ -286,14 +286,14 @@ func defaultDirectCNProbe(ctx context.Context, host string) ([]net.IP, []byte, e
 	}
 	ch := make(chan probeRes, len(servers))
 
+	cnProbeTargetMu.Lock()
+	hook := cnProbeTargetHook
+	cnProbeTargetMu.Unlock()
 	for _, srv := range servers {
+		if hook != nil {
+			hook("udp", srv)
+		}
 		go func(target string) {
-			cnProbeTargetMu.Lock()
-			hook := cnProbeTargetHook
-			cnProbeTargetMu.Unlock()
-			if hook != nil {
-				hook("udp", target)
-			}
 			d := net.Dialer{Timeout: smartDNSProbeTimeout, Control: netbind.Control}
 			c, dialErr := d.DialContext(ctx, "udp", target)
 			if dialErr != nil {

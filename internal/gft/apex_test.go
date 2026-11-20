@@ -1052,9 +1052,13 @@ func TestEmergencyProbeFixedPortRebind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	acceptedCh := make(chan *gftrtc.RTCSession, 1)
 	go func() {
-		if srvSess, aerr := ln.Accept(context.Background()); aerr == nil && srvSess != nil {
-			t.Cleanup(func() { srvSess.Close() })
+		srvSess, aerr := ln.Accept(context.Background())
+		if aerr == nil && srvSess != nil {
+			acceptedCh <- srvSess
+		} else {
+			acceptedCh <- nil
 		}
 	}()
 	sess, _, err := gftrtc.DialWithPacketConn(context.Background(), cPC, false, sPC.LocalAddr(), gftrtc.DialOptions{
@@ -1068,6 +1072,9 @@ func TestEmergencyProbeFixedPortRebind(t *testing.T) {
 		t.Fatalf("DialWithPacketConn failed: %v", err)
 	}
 	defer sess.Close()
+	if srvSess := <-acceptedCh; srvSess != nil {
+		defer srvSess.Close()
+	}
 	ln.Close() // now ProbeRTT will time out cleanly
 
 	sched.mu.Lock()
