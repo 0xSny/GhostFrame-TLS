@@ -37,8 +37,8 @@ func TestLowMemModeAndHardwareCipherOrder(t *testing.T) {
 	if gftrtc.EffectiveMaxStreamWindow() != 4*1024*1024 {
 		t.Fatalf("expected 4MB RTC stream window in LowMemMode, got %d", gftrtc.EffectiveMaxStreamWindow())
 	}
-	if EffectiveUDPSocketBuffer() != 1024*1024 {
-		t.Fatalf("expected 1MB UDP socket buffer in LowMemMode, got %d", EffectiveUDPSocketBuffer())
+	if EffectiveUDPSocketBuffer() != 512*1024 {
+		t.Fatalf("expected 512KB UDP socket buffer in LowMemMode, got %d", EffectiveUDPSocketBuffer())
 	}
 
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")

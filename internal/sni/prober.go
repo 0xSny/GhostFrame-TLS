@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"ghostframe/internal/netbind"
 )
 
 const (
@@ -202,7 +204,7 @@ func observeLiveOrigin(ctx context.Context, domain string) ProbeObservation {
 		return obs
 	}
 
-	dialer := &net.Dialer{Timeout: 2500 * time.Millisecond}
+	dialer := &net.Dialer{Timeout: 2500 * time.Millisecond, Control: netbind.Control}
 	t0 := time.Now()
 	raw, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(dialIP.String(), "443"))
 	if err != nil {
@@ -240,7 +242,7 @@ func observeLiveOrigin(ctx context.Context, domain string) ProbeObservation {
 	hc := &http.Client{
 		Timeout: 1800 * time.Millisecond,
 		Transport: &http.Transport{
-			DialContext: (&net.Dialer{Timeout: 1200 * time.Millisecond}).DialContext,
+			DialContext: (&net.Dialer{Timeout: 1200 * time.Millisecond, Control: netbind.Control}).DialContext,
 			TLSClientConfig: &tls.Config{
 				ServerName: domain,
 				MinVersion: tls.VersionTLS13,

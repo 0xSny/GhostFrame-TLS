@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"ghostframe/internal/gft"
+	"ghostframe/internal/netbind"
 )
 
 type ConnState string
@@ -593,7 +594,8 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 	}
 	act := e.router.Decide(mode, routeTarget)
 	if act == ActionDirect {
-		c, err := net.DialTimeout("tcp", dialTarget, 8*time.Second)
+		d := net.Dialer{Timeout: 8 * time.Second, Control: netbind.Control}
+		c, err := d.Dial("tcp", dialTarget)
 		if err != nil {
 			return nil, ActionDirect, err
 		}

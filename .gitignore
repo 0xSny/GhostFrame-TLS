@@ -30,3 +30,10 @@ deploy_record.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# iOS build & xcframework artifacts
+*.ipa
+*.xcarchive
+*.xcodeproj/
+ios/Frameworks/
+ios/build*/

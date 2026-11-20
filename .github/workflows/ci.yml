@@ -46,6 +46,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p /tmp/gft-ci-build
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./internal/... ./mobile/...
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/gft-ci-build/gft-server ./cmd/gft-server
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/gft-ci-build/gft-core ./cmd/gft-core
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -H=windowsgui" -o /tmp/gft-ci-build/GhostFrame-Pro.exe ./cmd/gft-client-gui

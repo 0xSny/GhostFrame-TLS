@@ -252,6 +252,9 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 }
 
 func (a *ApexScheduler) rtcPoolTarget() int {
+	if IsLowMemMode() {
+		return 1
+	}
 	return DefaultRTCPoolSize // 2 concurrent striped UDP 5-tuples
 }
 

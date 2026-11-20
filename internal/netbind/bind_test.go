@@ -1,0 +1,73 @@
+package netbind
+
+import "testing"
+
+func TestIsExcludedInterfaceName(t *testing.T) {
+	excluded := []string{"lo0", "utun0", "utun4", "ipsec0", "ppp0", "awdl0", "llw0", "bridge100", "ap1", ""}
+	for _, name := range excluded {
+		if !IsExcludedInterfaceName(name) {
+			t.Fatalf("expected %q to be excluded", name)
+		}
+	}
+
+	allowed := []string{"en0", "en1", "pdp_ip0", "pdp_ip1", "eth0"}
+	for _, name := range allowed {
+		if IsExcludedInterfaceName(name) {
+			t.Fatalf("expected %q to be allowed", name)
+		}
+	}
+}
+
+func TestIsLoopbackAddress(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:443", "127.0.1.1:80", "[::1]:443", "::1", "localhost:7890"} {
+		if !isLoopbackAddress(addr) {
+			t.Fatalf("expected %q to be detected as loopback", addr)
+		}
+	}
+	for _, addr := range []string{"", ":0", "0.0.0.0:443", "38.105.30.170:443", "[2001:4860:4860::8888]:443"} {
+		if isLoopbackAddress(addr) {
+			t.Fatalf("expected %q NOT to be loopback", addr)
+		}
+	}
+}
+
+func TestSelectBestInterface(t *testing.T) {
+	candidates := []InterfaceCandidate{
+		{Name: "lo0", Up: true, Loopback: true, HasUnicast: true},
+		{Name: "utun4", Up: true, Loopback: false, HasUnicast: true},
+		{Name: "awdl0", Up: true, Loopback: false, HasUnicast: true},
+		{Name: "llw0", Up: true, Loopback: false, HasUnicast: true},
+		{Name: "bridge0", Up: true, Loopback: false, HasUnicast: true},
+		{Name: "ap1", Up: true, Loopback: false, HasUnicast: true},
+		{Name: "pdp_ip0", Up: true, Loopback: false, HasUnicast: true},
+		{Name: "en0", Up: true, Loopback: false, HasUnicast: true},
+	}
+
+	if got := SelectBestInterface(candidates, ""); got != "en0" {
+		t.Fatalf("expected en0 priority, got %q", got)
+	}
+	if got := SelectBestInterface(candidates, "pdp_ip0"); got != "pdp_ip0" {
+		t.Fatalf("expected preferred pdp_ip0, got %q", got)
+	}
+	if got := SelectBestInterface(candidates, "utun4"); got != "en0" {
+		t.Fatalf("expected excluded utun4 preference to be ignored, got %q", got)
+	}
+
+	// Wi-Fi down -> fall back to cellular pdp_ip0
+	cellularOnly := []InterfaceCandidate{
+		{Name: "utun3", Up: true, Loopback: false, HasUnicast: true},
+		{Name: "en0", Up: false, Loopback: false, HasUnicast: false},
+		{Name: "pdp_ip0", Up: true, Loopback: false, HasUnicast: true},
+	}
+	if got := SelectBestInterface(cellularOnly, "en0"); got != "pdp_ip0" {
+		t.Fatalf("expected cellular fallback pdp_ip0 when en0 down, got %q", got)
+	}
+}
+
+func TestPreferredInterfaceRoundTrip(t *testing.T) {
+	SetPreferredInterface("pdp_ip0")
+	t.Cleanup(func() { SetPreferredInterface("") })
+	if got := PreferredInterface(); got != "pdp_ip0" {
+		t.Fatalf("expected pdp_ip0, got %q", got)
+	}
+}

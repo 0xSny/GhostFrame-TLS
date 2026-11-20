@@ -43,10 +43,10 @@ func EffectiveMaxStreamWindow() int {
 }
 
 // EffectiveUDPSocketBuffer returns the OS UDP socket receive/send buffer target
-// (1MB in low-memory mode or 8MB by default).
+// (512KB in low-memory mode or 8MB by default).
 func EffectiveUDPSocketBuffer() int {
 	if lowMemMode.Load() {
-		return 1024 * 1024
+		return 512 * 1024
 	}
 	return 8 * 1024 * 1024
 }

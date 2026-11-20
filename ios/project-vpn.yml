@@ -1,0 +1,89 @@
+name: GhostFrameVPN
+options:
+  bundleIdPrefix: com.ghostframe
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    ENABLE_BITCODE: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_STYLE: "Manual"
+    CODE_SIGN_IDENTITY: ""
+    DEVELOPMENT_TEAM: ""
+    FRAMEWORK_SEARCH_PATHS:
+      - "$(inherited)"
+      - "$(PROJECT_DIR)/Frameworks"
+
+targets:
+  GhostFrameVPN:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Shared
+      - path: vpn/VPNManager.swift
+      - path: vpn/VPNApp.swift
+    info:
+      path: vpn/AppInfo.plist
+    entitlements:
+      path: vpn/App.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.vpn
+        PRODUCT_NAME: GhostFrameVPN
+        INFOPLIST_FILE: vpn/AppInfo.plist
+        CODE_SIGN_ENTITLEMENTS: vpn/App.entitlements
+        ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: "YES"
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-ObjC"
+          - "-lresolv"
+    dependencies:
+      - target: GhostPacketTunnel
+        embed: true
+      - framework: Frameworks/GhostMobile.xcframework
+        embed: false
+      - sdk: NetworkExtension.framework
+      - sdk: Network.framework
+      - sdk: Security.framework
+
+  GhostPacketTunnel:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Shared/GhostModels.swift
+      - path: Shared/GhostMobileBridge.swift
+      - path: vpn/PacketTunnelProvider.swift
+    info:
+      path: vpn/TunnelInfo.plist
+    entitlements:
+      path: vpn/Tunnel.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.vpn.tunnel
+        PRODUCT_NAME: GhostPacketTunnel
+        INFOPLIST_FILE: vpn/TunnelInfo.plist
+        CODE_SIGN_ENTITLEMENTS: vpn/Tunnel.entitlements
+        APPLICATION_EXTENSION_API_ONLY: "YES"
+        SKIP_INSTALL: "YES"
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+          - "@executable_path/../../Frameworks"
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-ObjC"
+          - "-lresolv"
+    dependencies:
+      - framework: Frameworks/GhostMobile.xcframework
+        embed: false
+      - sdk: NetworkExtension.framework
+      - sdk: Network.framework
+      - sdk: Security.framework

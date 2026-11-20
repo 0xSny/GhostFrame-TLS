@@ -13,7 +13,7 @@ $ForbiddenNames = @(
     "sysproxy_backup.json",
     "deploy_record.json"
 )
-$ForbiddenExts = @(".exe", ".dll", ".syso", ".log", ".test", ".out")
+$ForbiddenExts = @(".exe", ".dll", ".syso", ".log", ".test", ".out", ".ipa")
 $ForbiddenDirs = @("dist", "build", ".gft")
 
 function Assert-NoForbiddenFiles([string]$Root, [bool]$AllowDistInMain) {
@@ -84,14 +84,18 @@ if (-not (Test-Path $ProWork)) {
     New-Item -ItemType Directory -Path $ProWork -Force | Out-Null
 }
 $SharedDirs = @(
+    "internal\netbind",
     "internal\gftrtc",
     "internal\gft",
     "internal\client",
     "internal\winui",
-    "cmd\gft-client-gui"
+    "cmd\gft-client-gui",
+    "mobile",
+    "ios"
 )
 $SharedSingleFiles = @(
     "configs\client.example.json",
+    ".github\workflows\ios-dual-ipa.yml",
     "go.mod",
     "go.sum",
     "LICENSE"

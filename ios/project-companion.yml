@@ -1,0 +1,50 @@
+name: GhostFrameCompanion
+options:
+  bundleIdPrefix: com.ghostframe
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    ENABLE_BITCODE: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_STYLE: "Manual"
+    CODE_SIGN_IDENTITY: ""
+    DEVELOPMENT_TEAM: ""
+    FRAMEWORK_SEARCH_PATHS:
+      - "$(inherited)"
+      - "$(PROJECT_DIR)/Frameworks"
+
+targets:
+  GhostFrameCompanion:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Shared
+      - path: companion/SilentAudioKeepAlive.swift
+      - path: companion/CompanionManager.swift
+      - path: companion/CompanionApp.swift
+    info:
+      path: companion/CompanionInfo.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ghostframe.companion
+        PRODUCT_NAME: GhostFrameCompanion
+        INFOPLIST_FILE: companion/CompanionInfo.plist
+        ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: "YES"
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-ObjC"
+          - "-lresolv"
+    dependencies:
+      - framework: Frameworks/GhostMobile.xcframework
+        embed: false
+      - sdk: AVFoundation.framework
+      - sdk: Network.framework
+      - sdk: Security.framework

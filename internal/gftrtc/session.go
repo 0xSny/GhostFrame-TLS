@@ -16,6 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"ghostframe/internal/netbind"
 )
 
 const (
@@ -2121,12 +2123,11 @@ func (s *RTCSession) HopValidated(pickPort func() int, maxAttempts int, probeTim
 		if raddr.IP != nil && raddr.IP.To4() != nil {
 			network = "udp4"
 		}
-		candPC, err := net.ListenUDP(network, nil)
+		candPC, err := listenClientUDP(network, raddr.IP)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		TuneUDPSocketBuffers(candPC)
 		if perr := s.HopWithProbePC(candPC, true, raddr, port, probeTimeout); perr != nil {
 			lastErr = perr
 			continue
@@ -2371,7 +2372,25 @@ type DialOptions struct {
 	Timeout    time.Duration
 }
 
-// Dial opens an OS UDP socket with 8MB buffers and connects to a GhostFrame-RTC server.
+func listenClientUDP(network string, targetIP net.IP) (*net.UDPConn, error) {
+	var lc net.ListenConfig
+	if targetIP == nil || !targetIP.IsLoopback() {
+		lc.Control = netbind.Control
+	}
+	pc, err := lc.ListenPacket(context.Background(), network, "")
+	if err != nil {
+		return nil, err
+	}
+	upc, ok := pc.(*net.UDPConn)
+	if !ok {
+		pc.Close()
+		return nil, errors.New("gftrtc: unexpected non-UDP socket from ListenPacket")
+	}
+	TuneUDPSocketBuffers(upc)
+	return upc, nil
+}
+
+// Dial opens an OS UDP socket with tuned buffers and connects to a GhostFrame-RTC server.
 func Dial(ctx context.Context, opts DialOptions) (*RTCSession, time.Duration, error) {
 	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port)))
 	if err != nil {
@@ -2381,11 +2400,10 @@ func Dial(ctx context.Context, opts DialOptions) (*RTCSession, time.Duration, er
 	if addr.IP != nil && addr.IP.To4() != nil {
 		network = "udp4"
 	}
-	pc, err := net.ListenUDP(network, nil)
+	pc, err := listenClientUDP(network, addr.IP)
 	if err != nil {
 		return nil, 0, err
 	}
-	TuneUDPSocketBuffers(pc)
 	sess, rtt, err := DialWithPacketConn(ctx, pc, true, addr, opts)
 	if err != nil {
 		_ = pc.Close()

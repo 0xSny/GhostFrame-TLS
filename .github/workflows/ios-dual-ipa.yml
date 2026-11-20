@@ -1,0 +1,153 @@
+name: Build iOS Dual Unsigned IPAs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "mobile/**"
+      - "ios/**"
+      - "internal/netbind/**"
+      - "internal/gftrtc/**"
+      - "internal/gft/**"
+      - "internal/client/**"
+      - ".github/workflows/ios-dual-ipa.yml"
+
+jobs:
+  build-ios-dual:
+    runs-on: macos-15
+    env:
+      GFT_NO_SYSPROXY: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Verify Darwin Go Core & Mobile Bridge
+        run: |
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./internal/... ./mobile/...
+          CGO_ENABLED=0 go test -count=1 ./internal/netbind ./mobile
+
+      - name: Build Shared GhostMobile.xcframework (gomobile)
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile init
+          go get golang.org/x/mobile/bind
+          mkdir -p ios/Frameworks dist
+          gomobile bind \
+            -target=ios/arm64 \
+            -iosversion=15.0 \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o ios/Frameworks/GhostMobile.xcframework \
+            ./mobile
+          git checkout -- go.mod go.sum
+          test -d ios/Frameworks/GhostMobile.xcframework/ios-arm64/GhostMobile.framework
+
+      - name: Build & Package Edition A (GhostFrame-VPN-Unsigned.ipa)
+        run: |
+          (cd ios && xcodegen generate --spec project-vpn.yml)
+          xcodebuild \
+            -project ios/GhostFrameVPN.xcodeproj \
+            -scheme GhostFrameVPN \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            BUILD_DIR="$PWD/ios/build-vpn" \
+            build
+
+          VPN_APP="$(find ios/build-vpn -maxdepth 4 -type d -name 'GhostFrameVPN.app' | head -n 1)"
+          test -n "$VPN_APP" && test -d "$VPN_APP"
+          APPEX="$VPN_APP/PlugIns/GhostPacketTunnel.appex"
+          test -d "$APPEX"
+
+          # Inside-out ad-hoc entitlement stamping (strictly packet-tunnel-provider only, zero hardcoded App Group)
+          codesign --force --sign - --entitlements ios/vpn/Tunnel.entitlements --timestamp=none "$APPEX"
+          codesign --force --sign - --entitlements ios/vpn/App.entitlements --timestamp=none "$VPN_APP"
+
+          echo "=== Verifying GhostPacketTunnel.appex entitlements ==="
+          APPEX_ENT="$(codesign -d --entitlements :- "$APPEX" 2>&1)"
+          echo "$APPEX_ENT"
+          echo "$APPEX_ENT" | grep -q "packet-tunnel-provider"
+          ! echo "$APPEX_ENT" | grep -q "application-groups"
+
+          echo "=== Verifying GhostFrameVPN.app entitlements ==="
+          APP_ENT="$(codesign -d --entitlements :- "$VPN_APP" 2>&1)"
+          echo "$APP_ENT"
+          echo "$APP_ENT" | grep -q "packet-tunnel-provider"
+          ! echo "$APP_ENT" | grep -q "application-groups"
+
+          STAGE_VPN="$(mktemp -d)"
+          mkdir -p "$STAGE_VPN/Payload"
+          cp -R "$VPN_APP" "$STAGE_VPN/Payload/GhostFrameVPN.app"
+          (cd "$STAGE_VPN" && zip -qry "$GITHUB_WORKSPACE/dist/GhostFrame-VPN-Unsigned.ipa" Payload)
+          rm -rf "$STAGE_VPN"
+          ls -lh dist/GhostFrame-VPN-Unsigned.ipa
+
+      - name: Build & Package Edition B (GhostFrame-Companion-Unsigned.ipa)
+        run: |
+          (cd ios && xcodegen generate --spec project-companion.yml)
+          xcodebuild \
+            -project ios/GhostFrameCompanion.xcodeproj \
+            -scheme GhostFrameCompanion \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            BUILD_DIR="$PWD/ios/build-companion" \
+            build
+
+          COMP_APP="$(find ios/build-companion -maxdepth 4 -type d -name 'GhostFrameCompanion.app' | head -n 1)"
+          test -n "$COMP_APP" && test -d "$COMP_APP"
+          test ! -d "$COMP_APP/PlugIns"
+
+          # Single-process pure ad-hoc signature with ZERO restricted entitlements
+          codesign --force --deep --sign - --timestamp=none "$COMP_APP"
+
+          COMP_ENT="$(codesign -d --entitlements :- "$COMP_APP" 2>&1 || true)"
+          echo "=== Companion entitlements check ==="
+          echo "$COMP_ENT"
+          ! echo "$COMP_ENT" | grep -q "networkextension"
+          ! echo "$COMP_ENT" | grep -q "application-groups"
+
+          STAGE_COMP="$(mktemp -d)"
+          mkdir -p "$STAGE_COMP/Payload"
+          cp -R "$COMP_APP" "$STAGE_COMP/Payload/GhostFrameCompanion.app"
+          (cd "$STAGE_COMP" && zip -qry "$GITHUB_WORKSPACE/dist/GhostFrame-Companion-Unsigned.ipa" Payload)
+          rm -rf "$STAGE_COMP"
+          ls -lh dist/GhostFrame-Companion-Unsigned.ipa
+
+      - name: Upload GhostFrame-VPN-Unsigned.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: GhostFrame-VPN-Unsigned-IPA
+          path: dist/GhostFrame-VPN-Unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload GhostFrame-Companion-Unsigned.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: GhostFrame-Companion-Unsigned-IPA
+          path: dist/GhostFrame-Companion-Unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30

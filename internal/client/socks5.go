@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"ghostframe/internal/gft"
+	"ghostframe/internal/netbind"
 )
 
 // SOCKS5Server handles SOCKS5 CONNECT (0x01) and UDP ASSOCIATE (0x03) requests.
@@ -320,7 +322,8 @@ func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
 		if directPC != nil {
 			return directPC, nil
 		}
-		pc, err := net.ListenPacket("udp", ":0")
+		lc := net.ListenConfig{Control: netbind.Control}
+		pc, err := lc.ListenPacket(context.Background(), "udp", ":0")
 		if err != nil {
 			return nil, err
 		}

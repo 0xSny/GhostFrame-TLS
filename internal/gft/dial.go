@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"ghostframe/internal/netbind"
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -80,7 +81,7 @@ func DialV3StealthWithID(ctx context.Context, l *Link, timeout time.Duration, cl
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	d := net.Dialer{Timeout: timeout}
+	d := net.Dialer{Timeout: timeout, Control: netbind.Control}
 	raw, err := d.DialContext(ctx, "tcp", net.JoinHostPort(l.Host, strconv.Itoa(l.Port)))
 	if err != nil {
 		return nil, nil, 0, err
@@ -131,7 +132,7 @@ func DialKnock(ctx context.Context, l *Link, poolFlags uint16, timeout time.Dura
 		return nil, salt, 0, err
 	}
 
-	d := net.Dialer{Timeout: timeout}
+	d := net.Dialer{Timeout: timeout, Control: netbind.Control}
 	raw, err := d.DialContext(ctx, "tcp", net.JoinHostPort(l.Host, strconv.Itoa(l.Port)))
 	if err != nil {
 		return nil, salt, 0, err
