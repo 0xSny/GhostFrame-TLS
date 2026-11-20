@@ -741,7 +741,7 @@ func buildMetadata(repo, workflow string, runID, runNum int64, sha, title, vDate
 		Workflow:      workflow,
 		RunID:         runID,
 		RunNumber:     runNum,
-		Version:       fmt.Sprintf("4.0.0.%d", runNum),
+		Version:       fmt.Sprintf("4.0.%d", runNum),
 		SHA:           sha,
 		CommitTitle:   title,
 		VersionDate:   vDate,
@@ -766,7 +766,7 @@ func loadMetadata(distDir string) *RepoMetadata {
 	meta := &RepoMetadata{
 		Repo:        defaultRepo,
 		Workflow:    defaultWorkflow,
-		Version:     "4.0.0.1",
+		Version:     "4.0.15",
 		VersionDate: time.Now().UTC().Format(time.RFC3339),
 		CommitTitle: "GhostFrame-RTC iOS Build",
 	}
@@ -786,7 +786,7 @@ func buildSourceManifest(baseURL string, meta *RepoMetadata) SourceManifest {
 	baseURL = strings.TrimRight(baseURL, "/")
 	ver := meta.Version
 	if ver == "" {
-		ver = "4.0.0.1"
+		ver = "4.0.15"
 	}
 	vDate := meta.VersionDate
 	if vDate == "" {

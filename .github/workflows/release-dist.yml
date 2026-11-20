@@ -122,6 +122,12 @@ jobs:
           VPN_APP="$(find ios/build-vpn -maxdepth 4 -type d -name 'GhostFrameVPN.app' | head -n 1)"
           APPEX="$VPN_APP/PlugIns/GhostPacketTunnel.appex"
           CTRL_APPEX="$VPN_APP/PlugIns/GhostControlWidget.appex"
+          DIST_BUILD_NUM=$((14 + GITHUB_RUN_NUMBER))
+          IOS_APP_VER="4.0.${DIST_BUILD_NUM}"
+          for plist in "$VPN_APP/Info.plist" "$APPEX/Info.plist" "$CTRL_APPEX/Info.plist"; do
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${IOS_APP_VER}" "$plist"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${DIST_BUILD_NUM}" "$plist"
+          done
           codesign --force --sign - --entitlements ios/vpn/Tunnel.entitlements --timestamp=none "$APPEX"
           codesign --force --sign - --entitlements ios/vpn/Control.entitlements --timestamp=none "$CTRL_APPEX"
           codesign --force --sign - --entitlements ios/vpn/App.entitlements --timestamp=none "$VPN_APP"
@@ -147,6 +153,8 @@ jobs:
             build
 
           COMP_APP="$(find ios/build-companion -maxdepth 4 -type d -name 'GhostFrameCompanion.app' | head -n 1)"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${IOS_APP_VER}" "$COMP_APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${DIST_BUILD_NUM}" "$COMP_APP/Info.plist"
           codesign --force --deep --sign - --timestamp=none "$COMP_APP"
           STAGE_COMP="$(mktemp -d)"
           mkdir -p "$STAGE_COMP/Payload"
@@ -207,7 +215,8 @@ jobs:
           VPN_SIZE="$(stat -c%s release-out/GhostFrame-VPN-Unsigned.ipa)"
           COMP_SIZE="$(stat -c%s release-out/GhostFrame-Companion-Unsigned.ipa)"
           NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          APP_VER="4.0.2.${RUN_NUM}"
+          DIST_BUILD_NUM=$((14 + RUN_NUM))
+          APP_VER="4.0.${DIST_BUILD_NUM}"
           BASE_DL="https://github.com/${TARGET_REPO}/releases/download/${TAG}"
 
           python3 - <<PY

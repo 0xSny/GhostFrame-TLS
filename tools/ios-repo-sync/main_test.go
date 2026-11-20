@@ -46,7 +46,7 @@ func TestBuildSourceManifestAndServeEndpoints(t *testing.T) {
 	if got.SourceURL != "http://192.168.1.7:18080/source.json" || len(got.Apps) != 2 {
 		t.Fatalf("unexpected manifest header: %+v", got)
 	}
-	if got.Apps[0].Version != "4.0.0.42" || got.Apps[0].Size != int64(len(vpnPayload)) || len(got.Apps[0].Versions) != 1 {
+	if got.Apps[0].Version != "4.0.42" || got.Apps[0].Size != int64(len(vpnPayload)) || len(got.Apps[0].Versions) != 1 {
 		t.Fatalf("unexpected VPN app entry: %+v", got.Apps[0])
 	}
 	if got.Apps[1].BundleIdentifier != "com.ghostframe.companion" || got.Apps[1].Size != int64(len(compPayload)) {
@@ -57,7 +57,7 @@ func TestBuildSourceManifestAndServeEndpoints(t *testing.T) {
 	reqHTML := httptest.NewRequest(http.MethodGet, "http://192.168.1.7:18080/", nil)
 	recHTML := httptest.NewRecorder()
 	h.ServeHTTP(recHTML, reqHTML)
-	if recHTML.Code != http.StatusOK || !strings.Contains(recHTML.Body.String(), "4.0.0.42") || !strings.Contains(recHTML.Body.String(), vpnIPAFileName) {
+	if recHTML.Code != http.StatusOK || !strings.Contains(recHTML.Body.String(), "4.0.42") || !strings.Contains(recHTML.Body.String(), vpnIPAFileName) {
 		t.Fatalf("unexpected HTML root page status=%d", recHTML.Code)
 	}
 
