@@ -383,7 +383,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         pathMonitor = nil
     }
 
-    private static func buildPathSignature(path: NWPath, iface: String) -> String {
+    private static func buildPathSignature(path: Network.NWPath, iface: String) -> String {
         let statusStr: String
         switch path.status {
         case .satisfied: statusStr = "satisfied"
