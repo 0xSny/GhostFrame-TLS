@@ -4,6 +4,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var excludedPrefixes = []string{
@@ -25,9 +26,26 @@ var excludedPrefixes = []string{
 }
 
 var (
-	preferredMu    sync.RWMutex
-	preferredIface string
+	preferredMu       sync.RWMutex
+	preferredIface    string
+	directBindEnabled atomic.Bool
 )
+
+func init() {
+	directBindEnabled.Store(true)
+}
+
+// SetDirectBindEnabled controls whether netbind.Control pins outbound sockets to a
+// physical interface via IP_BOUND_IF/IPV6_BOUND_IF. Inside iOS NEPacketTunnelProvider,
+// disable direct binding so the kernel's default physical route & NAT64 work natively.
+func SetDirectBindEnabled(enabled bool) {
+	directBindEnabled.Store(enabled)
+}
+
+// DirectBindEnabled reports whether physical interface socket pinning is enabled.
+func DirectBindEnabled() bool {
+	return directBindEnabled.Load()
+}
 
 // SetPreferredInterface sets the preferred physical outbound interface name (e.g. "en0", "pdp_ip0").
 // Passing an empty string clears the preference and falls back to automatic detection.

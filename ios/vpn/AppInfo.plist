@@ -22,6 +22,8 @@
 	<string>1</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>GhostFrame 需要相机权限以扫描节点分享二维码（gft3://）。</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>GhostFrame needs local network access to bind the in-app proxy and communicate with local routes.</string>
 	<key>UILaunchScreen</key>

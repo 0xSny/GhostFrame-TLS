@@ -23,6 +23,7 @@ final class VPNManager: GhostBackend {
     private var connectAttemptToken: UInt64 = 0
     private var lastObservedStatus: NEVPNStatus?
     private var lastDisconnectErrorText: String = ""
+    private var lastIPCLogAt: Date = .distantPast
 
     init() {
         detectedExtensionBundleID = Self.resolveTunnelProviderBundleIdentifier()
@@ -75,7 +76,7 @@ final class VPNManager: GhostBackend {
     }
 
     func connect(config: GhostEngineConfig, node: GhostNode) {
-        hasAttemptedConnect = true
+        hasAttemptedConnect = false
         userInitiatedDisconnect = false
         lastDisconnectErrorText = ""
         connectAttemptToken &+= 1
@@ -247,6 +248,7 @@ final class VPNManager: GhostBackend {
                             return
                         }
                         self.manager = mgr
+                        self.hasAttemptedConnect = true
                         self.onLogMessage?("VPN: calling startVPNTunnel...")
                         do {
                             if let session = mgr.connection as? NETunnelProviderSession {
@@ -341,6 +343,10 @@ final class VPNManager: GhostBackend {
             conn.fetchLastDisconnectError { [weak self] err in
                 Task { @MainActor in
                     guard let self = self else { return }
+                    let liveStatus = self.manager?.connection.status ?? .invalid
+                    if liveStatus == .connected || liveStatus == .connecting || liveStatus == .reasserting {
+                        return
+                    }
                     if let nsErr = err as NSError? {
                         let summary = "[\(nsErr.domain):\(nsErr.code)] \(nsErr.localizedDescription)"
                         self.lastDisconnectErrorText = summary
@@ -420,16 +426,28 @@ final class VPNManager: GhostBackend {
             return
         }
         do {
-            try session.sendProviderMessage(reqData) { responseData in
+            try session.sendProviderMessage(reqData) { [weak self] responseData in
                 guard let responseData = responseData,
                       let resp = try? JSONDecoder().decode(TunnelIPCResponse.self, from: responseData) else {
+                    Task { @MainActor in
+                        self?.logIPCWarningThrottled("VPN IPC: empty/unreadable response for \(action)")
+                    }
                     completion(nil)
                     return
                 }
                 completion(resp)
             }
         } catch {
+            logIPCWarningThrottled("VPN IPC send failed (\(action)): \(error.localizedDescription)")
             completion(nil)
+        }
+    }
+
+    private func logIPCWarningThrottled(_ msg: String) {
+        let now = Date()
+        if now.timeIntervalSince(lastIPCLogAt) >= 10.0 {
+            lastIPCLogAt = now
+            onLogMessage?(msg)
         }
     }
 

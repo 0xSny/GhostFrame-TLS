@@ -242,6 +242,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
     var nodePort: Int
     var isTunnelExt: Bool
     var lowMemMode: Bool
+    var netbindEnabled: Bool
     var physicalIface: String
     var memAllocMB: Double
     var memSysMB: Double
@@ -284,6 +285,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         nodePort = 0
         isTunnelExt = false
         lowMemMode = false
+        netbindEnabled = false
         physicalIface = ""
         memAllocMB = 0
         memSysMB = 0
@@ -325,6 +327,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         case nodePort = "node_port"
         case isTunnelExt = "is_tunnel_ext"
         case lowMemMode = "low_mem_mode"
+        case netbindEnabled = "netbind_enabled"
         case physicalIface = "physical_iface"
         case memAllocMB = "mem_alloc_mb"
         case memSysMB = "mem_sys_mb"
@@ -368,6 +371,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         nodePort = (try? c.decode(Int.self, forKey: .nodePort)) ?? 0
         isTunnelExt = (try? c.decode(Bool.self, forKey: .isTunnelExt)) ?? false
         lowMemMode = (try? c.decode(Bool.self, forKey: .lowMemMode)) ?? false
+        netbindEnabled = (try? c.decode(Bool.self, forKey: .netbindEnabled)) ?? false
         physicalIface = (try? c.decode(String.self, forKey: .physicalIface)) ?? ""
         memAllocMB = (try? c.decode(Double.self, forKey: .memAllocMB)) ?? 0
         memSysMB = (try? c.decode(Double.self, forKey: .memSysMB)) ?? 0
@@ -399,21 +403,15 @@ struct GhostTunnelErrorReport: Identifiable, Equatable {
 }
 
 enum GhostNetworkHelper {
-    private static let excludedPrefixes = ["lo", "utun", "ipsec", "ppp", "awdl", "llw", "bridge", "ap"]
+    private static let excludedPrefixes = [
+        "lo", "utun", "ipsec", "ppp", "awdl", "llw", "bridge", "ap",
+        "anpi", "xhc", "pktap", "stf", "gif", "feth", "vmenet"
+    ]
 
     static func preferredPhysicalInterface(from path: NWPath) -> String {
         let candidates = path.availableInterfaces.filter { iface in
             let lower = iface.name.lowercased()
             return !excludedPrefixes.contains(where: { lower.hasPrefix($0) })
-        }
-        if let wifi = candidates.first(where: { $0.type == .wifi || $0.name == "en0" }) {
-            return wifi.name
-        }
-        if let wired = candidates.first(where: { $0.type == .wiredEthernet || $0.name.hasPrefix("en") }) {
-            return wired.name
-        }
-        if let cell = candidates.first(where: { $0.type == .cellular || $0.name.hasPrefix("pdp_ip") }) {
-            return cell.name
         }
         return candidates.first?.name ?? ""
     }

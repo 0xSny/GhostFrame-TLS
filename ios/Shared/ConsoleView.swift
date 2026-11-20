@@ -18,6 +18,7 @@ struct ConsoleView: View {
     @ObservedObject var viewModel: GhostAppViewModel
 
     @State private var showImportSheet = false
+    @State private var showQRScanner = false
     @State private var importURIText = ""
     @State private var showDiagnosticSheet = false
 
@@ -25,18 +26,27 @@ struct ConsoleView: View {
         ZStack(alignment: .bottom) {
             GhostPalette.background.ignoresSafeArea()
 
-            ScrollView {
-                VStack(spacing: 14) {
-                    headerCard
-                    connectionHeroCard
-                    editionSpecificCard
-                    waveformCard
-                    nodesCard
-                    controlsCard
-                    logsCard
+            VStack(spacing: 0) {
+                headerCard
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
+                    .padding(.bottom, 10)
+                    .background(GhostPalette.background)
+
+                ScrollView {
+                    VStack(spacing: 14) {
+                        connectionHeroCard
+                        editionSpecificCard
+                        waveformCard
+                        nodesCard
+                        controlsCard
+                        logsCard
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.top, 4)
+                    .padding(.bottom, 16)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
+                .clipped()
             }
 
             if !viewModel.toastMessage.isEmpty {
@@ -49,6 +59,19 @@ struct ConsoleView: View {
         .sheet(isPresented: $showImportSheet) {
             importNodeSheet
         }
+        .sheet(isPresented: $showQRScanner) {
+            QRScannerSheetView { scanned in
+                showQRScanner = false
+                if viewModel.importLink(scanned) {
+                    importURIText = ""
+                    showImportSheet = false
+                } else {
+                    importURIText = scanned
+                    showImportSheet = true
+                }
+            }
+            .preferredColorScheme(.dark)
+        }
         .sheet(isPresented: $showDiagnosticSheet) {
             diagnosticSheet
         }
@@ -58,61 +81,93 @@ struct ConsoleView: View {
     }
 
     private var headerCard: some View {
-        HStack(spacing: 10) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 11, height: 11)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 11, height: 11)
 
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(viewModel.edition.title)
-                        .font(.system(size: 18, weight: .bold))
-                        .foregroundColor(GhostPalette.textPrimary)
-                    Text("v4.0-LTS")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundColor(GhostPalette.cyan)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(GhostPalette.cyan.opacity(0.15))
-                        .cornerRadius(6)
-                }
-                Text("S5 :\(viewModel.effectiveSocksPort) · HTTP :\(viewModel.effectiveHttpPort) · \(viewModel.backendStateLabel)")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(GhostPalette.textMuted)
-            }
+                Text(viewModel.edition.title)
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundColor(GhostPalette.textPrimary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
 
-            Spacer()
+                Text("v4.0-LTS")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(GhostPalette.cyan)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(GhostPalette.cyan.opacity(0.15))
+                    .cornerRadius(6)
 
-            Button(action: {
-                viewModel.refreshDiagnostic()
-                showDiagnosticSheet = true
-            }) {
-                Text("诊断")
+                Spacer()
+
+                Button(action: { showQRScanner = true }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "qrcode.viewfinder")
+                        Text("扫码")
+                    }
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(GhostPalette.textPrimary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
                     .background(GhostPalette.cardAlt)
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(GhostPalette.border, lineWidth: 1))
                     .cornerRadius(8)
+                }
+
+                Button(action: {
+                    viewModel.refreshDiagnostic()
+                    showDiagnosticSheet = true
+                }) {
+                    Text("诊断")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(GhostPalette.textPrimary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .background(GhostPalette.cardAlt)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(GhostPalette.border, lineWidth: 1))
+                        .cornerRadius(8)
+                }
+
+                Button(action: {
+                    if let clip = UIPasteboard.general.string, clip.hasPrefix("gft") {
+                        importURIText = clip
+                    }
+                    showImportSheet = true
+                }) {
+                    Text("导入")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(GhostPalette.cyan)
+                        .cornerRadius(8)
+                }
             }
 
-            Button(action: {
-                if let clip = UIPasteboard.general.string, clip.hasPrefix("gft") {
-                    importURIText = clip
+            HStack(spacing: 8) {
+                Text("S5 :\(viewModel.effectiveSocksPort) · HTTP :\(viewModel.effectiveHttpPort) · \(viewModel.backendStateLabel)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(GhostPalette.textMuted)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+
+                Spacer()
+
+                if viewModel.isConnected || viewModel.isTransitioning {
+                    Text("内核:\(viewModel.status.state)")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(viewModel.status.state == "connected" ? GhostPalette.emerald : GhostPalette.amber)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background((viewModel.status.state == "connected" ? GhostPalette.emerald : GhostPalette.amber).opacity(0.14))
+                        .cornerRadius(5)
                 }
-                showImportSheet = true
-            }) {
-                Text("导入 gft3://")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.black)
-                    .padding(.horizontal, 11)
-                    .padding(.vertical, 7)
-                    .background(GhostPalette.cyan)
-                    .cornerRadius(8)
             }
         }
-        .padding(14)
+        .padding(12)
         .background(GhostPalette.card)
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(GhostPalette.border, lineWidth: 1))
         .cornerRadius(14)
@@ -503,6 +558,25 @@ struct ConsoleView: View {
                     .cornerRadius(10)
 
                 HStack(spacing: 10) {
+                    Button(action: {
+                        showImportSheet = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            showQRScanner = true
+                        }
+                    }) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "qrcode.viewfinder")
+                            Text("扫描二维码")
+                        }
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(GhostPalette.textPrimary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 11)
+                        .background(GhostPalette.cardAlt)
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(GhostPalette.border, lineWidth: 1))
+                        .cornerRadius(10)
+                    }
+
                     Button("从剪贴板粘贴") {
                         if let clip = UIPasteboard.general.string {
                             importURIText = clip
@@ -514,20 +588,20 @@ struct ConsoleView: View {
                     .padding(.vertical, 11)
                     .background(GhostPalette.cardAlt)
                     .cornerRadius(10)
-
-                    Button("解析并保存") {
-                        if viewModel.importLink(importURIText) {
-                            importURIText = ""
-                            showImportSheet = false
-                        }
-                    }
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(.black)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 11)
-                    .background(GhostPalette.emerald)
-                    .cornerRadius(10)
                 }
+
+                Button("解析并保存") {
+                    if viewModel.importLink(importURIText) {
+                        importURIText = ""
+                        showImportSheet = false
+                    }
+                }
+                .font(.system(size: 14, weight: .bold))
+                .foregroundColor(.black)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(GhostPalette.emerald)
+                .cornerRadius(10)
 
                 Spacer()
             }

@@ -18,13 +18,20 @@ func TestInitCoreGuardrails(t *testing.T) {
 	if !gft.IsLowMemMode() {
 		t.Fatal("expected LowMemMode=true for PacketTunnel extension")
 	}
+	if netbind.DirectBindEnabled() {
+		t.Fatal("expected DirectBindEnabled=false inside PacketTunnel extension")
+	}
 	if got := gft.EffectiveUDPSocketBuffer(); got != 512*1024 {
 		t.Fatalf("expected 512KB UDP socket buffer in tunnel ext mode, got %d", got)
 	}
 
 	InitCore(tmp, false)
+	t.Cleanup(func() { netbind.SetDirectBindEnabled(true) })
 	if gft.IsLowMemMode() {
 		t.Fatal("expected LowMemMode=false for Companion single-process mode")
+	}
+	if !netbind.DirectBindEnabled() {
+		t.Fatal("expected DirectBindEnabled=true in Companion single-process mode")
 	}
 	if got := gft.EffectiveUDPSocketBuffer(); got != 8*1024*1024 {
 		t.Fatalf("expected 8MB UDP socket buffer in companion mode, got %d", got)

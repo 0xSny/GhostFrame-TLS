@@ -36,7 +36,8 @@ func resolveTargetInterface() (*net.Interface, bool) {
 		if iface, err := net.InterfaceByName(pref); err == nil &&
 			iface.Index > 0 &&
 			iface.Flags&net.FlagUp != 0 &&
-			iface.Flags&net.FlagLoopback == 0 {
+			iface.Flags&net.FlagLoopback == 0 &&
+			interfaceHasValidUnicast(*iface) {
 			return iface, true
 		}
 	}
@@ -51,15 +52,51 @@ func resolveTargetInterface() (*net.Interface, bool) {
 	return iface, true
 }
 
+func interfaceHasRoutableFamily(iface *net.Interface, wantV4 bool) bool {
+	if iface == nil {
+		return false
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return false
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if !isRoutableUnicastIP(ip) {
+			continue
+		}
+		if wantV4 && ip.To4() != nil {
+			return true
+		}
+		if !wantV4 && ip.To4() == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // Control implements net.Dialer.Control and net.ListenConfig.Control on Darwin/iOS.
-// It pins outbound sockets directly to the physical interface via IP_BOUND_IF / IPV6_BOUND_IF
-// so traffic inside PacketTunnel / utun never loops back into the virtual VPN interface.
+// When direct binding is enabled (e.g., Companion app running alongside an external utun),
+// it best-effort pins outbound sockets to the physical interface carrying the matching IP family.
+// Inside iOS NEPacketTunnelProvider (DirectBindEnabled == false), it leaves routing to the OS
+// so 4G/5G cellular (including NAT64/CLAT46) and Wi-Fi work seamlessly without EPERM/blackholes.
 func Control(network, address string, c syscall.RawConn) error {
-	if isLoopbackAddress(address) {
+	if !DirectBindEnabled() || isLoopbackAddress(address) {
 		return nil
 	}
 	iface, ok := resolveTargetInterface()
 	if !ok {
+		return nil
+	}
+	hasV4 := interfaceHasRoutableFamily(iface, true)
+	hasV6 := interfaceHasRoutableFamily(iface, false)
+	if !hasV4 && !hasV6 {
 		return nil
 	}
 
@@ -68,32 +105,34 @@ func Control(network, address string, c syscall.RawConn) error {
 		hostIP = net.ParseIP(host)
 	}
 
-	var sockErr error
-	ctrlErr := c.Control(func(fd uintptr) {
+	_ = c.Control(func(fd uintptr) {
 		switch network {
 		case "tcp4", "udp4":
-			sockErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, ipBoundIF, iface.Index)
+			if hasV4 {
+				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, ipBoundIF, iface.Index)
+			}
 		case "tcp6", "udp6":
-			sockErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, ipv6BoundIF, iface.Index)
+			if hasV6 {
+				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, ipv6BoundIF, iface.Index)
+			}
 		default:
 			if hostIP != nil {
 				if hostIP.To4() != nil {
-					sockErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, ipBoundIF, iface.Index)
-				} else {
-					sockErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, ipv6BoundIF, iface.Index)
+					if hasV4 {
+						_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, ipBoundIF, iface.Index)
+					}
+				} else if hasV6 {
+					_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, ipv6BoundIF, iface.Index)
 				}
 				return
 			}
-			// Unqualified dual-stack network with unspecified/wildcard host (e.g., ListenConfig ":0").
-			err4 := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, ipBoundIF, iface.Index)
-			err6 := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, ipv6BoundIF, iface.Index)
-			if err4 != nil && err6 != nil {
-				sockErr = err4
+			if hasV4 {
+				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, ipBoundIF, iface.Index)
+			}
+			if hasV6 {
+				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, ipv6BoundIF, iface.Index)
 			}
 		}
 	})
-	if ctrlErr != nil {
-		return ctrlErr
-	}
-	return sockErr
+	return nil
 }

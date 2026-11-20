@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	"ghostframe/internal/client"
 	"ghostframe/internal/gft"
@@ -62,6 +63,7 @@ var (
 	tunnelExtState bool
 	engineInst     *client.Engine
 	lastConfigRaw  string
+	lastConnectErr string
 )
 
 // InitCore configures mobile runtime guardrails before starting the engine.
@@ -92,10 +94,12 @@ func initCoreLocked(dataDir string, isTunnelExt bool) {
 		debug.SetMemoryLimit(26 << 20)
 		debug.SetGCPercent(25)
 		gft.SetLowMemMode(true)
+		netbind.SetDirectBindEnabled(false)
 	} else {
 		debug.SetMemoryLimit(96 << 20)
 		debug.SetGCPercent(50)
 		gft.SetLowMemMode(false)
+		netbind.SetDirectBindEnabled(true)
 	}
 }
 
@@ -183,17 +187,17 @@ func StartEngine(configJSON string) error {
 
 	mu.Lock()
 	engineInst = eng
+	lastConnectErr = ""
 	mu.Unlock()
 
 	if cfg.AsyncConnect {
-		go func() {
-			_ = eng.Connect()
-		}()
+		go connectWithRetryAsync(eng)
 		return nil
 	}
 
 	if err := eng.Connect(); err != nil {
 		mu.Lock()
+		lastConnectErr = err.Error()
 		if engineInst == eng {
 			engineInst = nil
 		}
@@ -202,6 +206,36 @@ func StartEngine(configJSON string) error {
 		return fmt.Errorf("mobile: tunnel connect failed: %w", err)
 	}
 	return nil
+}
+
+func connectWithRetryAsync(eng *client.Engine) {
+	backoffs := []time.Duration{0, 2 * time.Second, 4 * time.Second, 6 * time.Second}
+	for attempt, wait := range backoffs {
+		if wait > 0 {
+			time.Sleep(wait)
+		}
+		mu.Lock()
+		stillActive := (engineInst == eng)
+		mu.Unlock()
+		if !stillActive {
+			return
+		}
+		err := eng.Connect()
+		if err == nil {
+			mu.Lock()
+			if engineInst == eng {
+				lastConnectErr = ""
+			}
+			mu.Unlock()
+			return
+		}
+		mu.Lock()
+		if engineInst == eng {
+			lastConnectErr = err.Error()
+		}
+		mu.Unlock()
+		eng.Logf("[Mobile] Connect attempt %d/%d failed: %v", attempt+1, len(backoffs), err)
+	}
 }
 
 // StartEngineJSON wraps StartEngine into a JSON envelope {"ok":bool,"error":string} for Swift callers.
@@ -214,6 +248,7 @@ func StopEngine() error {
 	mu.Lock()
 	eng := engineInst
 	engineInst = nil
+	lastConnectErr = ""
 	isTunnel := tunnelExtState
 	mu.Unlock()
 
@@ -248,12 +283,18 @@ func GetStatusJSON() string {
 	mu.Lock()
 	eng := engineInst
 	isTunnel := tunnelExtState
+	cachedErr := lastConnectErr
 	mu.Unlock()
 
 	var status map[string]any
 	var logs []client.LogEntry
 	if eng != nil {
 		status = eng.Status()
+		if curErr, _ := status["last_err"].(string); curErr == "" && cachedErr != "" {
+			if st, _ := status["state"].(string); st != string(client.StateConnected) {
+				status["last_err"] = cachedErr
+			}
+		}
 		allLogs := eng.Logs()
 		if len(allLogs) > maxMobileLogs {
 			allLogs = allLogs[len(allLogs)-maxMobileLogs:]
@@ -263,7 +304,7 @@ func GetStatusJSON() string {
 		status = map[string]any{
 			"version":          "v4.0.0-LTS",
 			"state":            string(client.StateDisconnected),
-			"last_err":         "",
+			"last_err":         cachedErr,
 			"active_transport": "",
 			"transport_pref":   "auto",
 			"route_mode":       string(client.RouteRule),
@@ -284,6 +325,7 @@ func GetStatusJSON() string {
 
 	status["is_tunnel_ext"] = isTunnel
 	status["low_mem_mode"] = gft.IsLowMemMode()
+	status["netbind_enabled"] = netbind.DirectBindEnabled()
 	status["physical_iface"] = physIface
 	status["mem_alloc_mb"] = float64(ms.Alloc) / (1024 * 1024)
 	status["mem_sys_mb"] = float64(ms.Sys) / (1024 * 1024)

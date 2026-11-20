@@ -45,6 +45,7 @@ targets:
         embed: true
       - framework: Frameworks/GhostMobile.xcframework
         embed: false
+      - sdk: AVFoundation.framework
       - sdk: NetworkExtension.framework
       - sdk: Network.framework
       - sdk: Security.framework

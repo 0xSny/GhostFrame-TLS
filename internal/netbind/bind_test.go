@@ -95,3 +95,18 @@ func TestIsRoutableUnicastIP(t *testing.T) {
 		t.Fatal("expected global unicast IPv6 to be accepted")
 	}
 }
+
+func TestDirectBindToggle(t *testing.T) {
+	if !DirectBindEnabled() {
+		t.Fatal("expected DirectBindEnabled to default to true")
+	}
+	SetDirectBindEnabled(false)
+	t.Cleanup(func() { SetDirectBindEnabled(true) })
+	if DirectBindEnabled() {
+		t.Fatal("expected DirectBindEnabled to be false after disabling")
+	}
+	SetDirectBindEnabled(true)
+	if !DirectBindEnabled() {
+		t.Fatal("expected DirectBindEnabled to be true after re-enabling")
+	}
+}

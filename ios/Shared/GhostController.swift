@@ -284,7 +284,7 @@ final class GhostAppViewModel: ObservableObject {
         backend.onStatusUpdate = { [weak self] snap in
             guard let self = self else { return }
             self.status = snap
-            if !snap.lastErr.isEmpty && !self.isConnected {
+            if !snap.lastErr.isEmpty && snap.state != "connected" {
                 self.errorBanner = snap.lastErr
             } else if snap.state == "connected" {
                 self.errorBanner = ""
