@@ -602,6 +602,8 @@ func (c *Controller) handleServiceAndLogsMenu(sc *bufio.Scanner) {
 	c.printf("  [1] 启动   [2] 重启   [3] 停止   [4] 查看实时滚动日志 (Ctrl+C 安全返回)\n")
 	switch c.prompt(sc, "请选择:") {
 	case "1":
+		server.HealConfigDirOwnership(c.CfgPath)
+		_ = exec.Command("systemctl", "reset-failed", c.Tx.ServiceName).Run()
 		out, err := exec.Command("systemctl", "start", c.Tx.ServiceName).CombinedOutput()
 		if err != nil {
 			c.errMsg(string(out))

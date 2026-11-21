@@ -74,7 +74,7 @@ jobs:
       - name: Build Clean Single-File Kestrel-Pro.exe (CGO_ENABLED=0)
         run: |
           mkdir -p dist
-          REL_VER="v4.0.26-LTS"
+          REL_VER="v4.0.27-LTS"
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H=windowsgui -X ghostframe/internal/client.Version=${REL_VER}" -o dist/Kestrel-Pro.exe ./cmd/gft-client-gui
           ls -lh dist/Kestrel-Pro.exe
 

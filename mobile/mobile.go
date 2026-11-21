@@ -21,7 +21,7 @@ import (
 )
 
 // Version is the mobile runtime identifier (overridable via -ldflags -X).
-var Version = "v4.0.26-LTS"
+var Version = "v4.0.27-LTS"
 
 const (
 	defaultSocksPort = 10808

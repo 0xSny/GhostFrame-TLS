@@ -357,6 +357,7 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	preserveFileOwnership(tmp, path, perm)
 	return os.Rename(tmp, path)
 }
 

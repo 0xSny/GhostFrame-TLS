@@ -51,6 +51,8 @@ func NewTransactionRunner(cfgPath string) *TransactionRunner {
 		ProbeTimeout: 2500 * time.Millisecond,
 	}
 	tr.RestartFn = func() error {
+		server.HealConfigDirOwnership(tr.CfgPath)
+		_ = exec.Command("systemctl", "reset-failed", tr.ServiceName).Run()
 		out, err := exec.Command("systemctl", "restart", tr.ServiceName).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("systemctl restart %s: %v (%s)", tr.ServiceName, err, strings.TrimSpace(string(out)))
