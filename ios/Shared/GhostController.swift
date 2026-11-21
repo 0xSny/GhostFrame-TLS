@@ -19,6 +19,7 @@ protocol GhostBackend: AnyObject {
     func applyLiveConfig(config: GhostEngineConfig, node: GhostNode)
     func fetchDiagnostic(completion: @escaping (String) -> Void)
     func clearLogs()
+    func updateRuleBundle(url: String?, completion: @escaping (Result<GhostRuleStats, Error>) -> Void)
 }
 
 @MainActor
@@ -44,6 +45,8 @@ final class GhostAppViewModel: ObservableObject {
     @Published var keepAliveActive: Bool = false
 
     @Published var localLogs: [GhostLogEntry] = []
+    @Published var ruleStats: GhostRuleStats = GhostMobileBridge.getRuleStats()
+    @Published var isUpdatingRules: Bool = false
     @Published var diagnosticText: String = ""
     @Published var errorBanner: String = ""
     @Published var tunnelErrorReport: GhostTunnelErrorReport?
@@ -80,7 +83,7 @@ final class GhostAppViewModel: ObservableObject {
         loadPreferences()
         bindBackend()
         syncFromBackendState()
-        appendLocalLog("Kestrel \(edition.title) v4.0.29-LTS initialized")
+        appendLocalLog("Kestrel \(edition.title) v4.0.30-LTS initialized")
     }
 
     var activeNode: GhostNode? {
@@ -253,6 +256,28 @@ final class GhostAppViewModel: ObservableObject {
         showToast("日志已清空")
     }
 
+    func updateRuleBundle() {
+        guard !isUpdatingRules else { return }
+        isUpdatingRules = true
+        showToast("正在拉取最新 10万+ KSLR 规则库...")
+        backend.updateRuleBundle(url: nil) { [weak self] result in
+            Task { @MainActor in
+                guard let self = self else { return }
+                self.isUpdatingRules = false
+                switch result {
+                case .success(let stats):
+                    self.ruleStats = stats
+                    self.status.ruleStats = stats
+                    self.appendLocalLog("Updated rule bundle: \(stats.builtinDomains) domains")
+                    self.showToast("分流规则已更新：共 \(stats.builtinDomains) 条域名")
+                case .failure(let err):
+                    self.appendLocalLog("Rule update failed: \(err.localizedDescription)")
+                    self.showToast(err.localizedDescription)
+                }
+            }
+        }
+    }
+
     func refreshDiagnostic() {
         backend.fetchDiagnostic { [weak self] text in
             Task { @MainActor in
@@ -342,6 +367,9 @@ final class GhostAppViewModel: ObservableObject {
         backend.onStatusUpdate = { [weak self] snap in
             guard let self = self else { return }
             self.status = snap
+            if snap.ruleStats.builtinDomains > 0 {
+                self.ruleStats = snap.ruleStats
+            }
             if !snap.lastErr.isEmpty && snap.state != "connected" {
                 self.errorBanner = snap.lastErr
             } else if snap.state == "connected" {

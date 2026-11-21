@@ -1,59 +1,13 @@
 package client
 
 import (
-	"bytes"
-	"compress/zlib"
-	_ "embed"
-	"io"
 	"net"
 	"os"
 	"strings"
-	"sync"
 )
-
-//go:embed cn_domains.zlib
-var cnDomainsZlib []byte
-
-var (
-	cnDomainsOnce sync.Once
-	cnDomainsMap  map[string]struct{}
-)
-
-func loadCNDomainsSet() map[string]struct{} {
-	cnDomainsOnce.Do(func() {
-		if len(cnDomainsZlib) == 0 {
-			return
-		}
-		zr, err := zlib.NewReader(bytes.NewReader(cnDomainsZlib))
-		if err != nil {
-			return
-		}
-		defer zr.Close()
-		raw, err := io.ReadAll(io.LimitReader(zr, 4<<20))
-		if err != nil || len(raw) == 0 {
-			return
-		}
-		s := string(raw)
-		m := make(map[string]struct{}, 4600)
-		start := 0
-		for i := 0; i <= len(s); i++ {
-			if i == len(s) || s[i] == '\n' {
-				if i > start {
-					line := strings.TrimSpace(s[start:i])
-					if line != "" {
-						m[line] = struct{}{}
-					}
-				}
-				start = i + 1
-			}
-		}
-		cnDomainsMap = m
-	})
-	return cnDomainsMap
-}
 
 // BuiltinRuleSetVersion identifies the embedded multi-category domain & CIDR rule engine.
-const BuiltinRuleSetVersion = "v4.2-SmartRuleSet"
+const BuiltinRuleSetVersion = "v4.3-KSLR100K"
 
 // RuleStats captures embedded rule capacities and cumulative per-action decision hits.
 type RuleStats struct {
@@ -64,6 +18,44 @@ type RuleStats struct {
 	DirectHits     uint64 `json:"direct_hits"`
 	ProxyHits      uint64 `json:"proxy_hits"`
 	RejectHits     uint64 `json:"reject_hits"`
+	ProxyDomains   int    `json:"proxy_domains,omitempty"`
+	DirectDomains  int    `json:"direct_domains,omitempty"`
+	RulesSource    string `json:"rules_source,omitempty"`
+	RulesUpdatedAt int64  `json:"rules_updated_at,omitempty"`
+}
+
+// BuiltinProxyDomains returns curated proxy/leak-check/DoH domains preserved in every rule bundle.
+func BuiltinProxyDomains() []string {
+	out := make([]string, len(builtinProxyRules))
+	for i, seed := range builtinProxyRules {
+		out[i] = seed.domain
+	}
+	return out
+}
+
+// BuiltinDirectDomains returns curated domestic/CDN/SDK direct domains preserved in every rule bundle.
+func BuiltinDirectDomains() []string {
+	out := make([]string, len(builtinDirectRules))
+	for i, seed := range builtinDirectRules {
+		out[i] = seed.domain
+	}
+	return out
+}
+
+// LeakAndDoHGuardDomains returns domains (public DoH endpoints & leak-check sites) that MUST NEVER
+// be promoted into the Direct set by upstream community lists.
+func LeakAndDoHGuardDomains() []string {
+	return []string{
+		"alidns.com", "dns.alidns.com",
+		"doh.pub", "sm2.doh.pub", "dot.pub", "dns.pub",
+		"doh.360.cn", "dns.rubyfish.cn",
+		"dns.google", "cloudflare-dns.com",
+		"ping0.cc", "ipleak.net", "dnsleaktest.com", "browserleaks.com",
+		"bash.ws", "whoer.net", "ip-api.com", "ipinfo.io", "ip.sb",
+		"ipify.org", "ident.me", "scamalytics.com", "ipdata.co",
+		"ipgeolocation.io", "astrill.com", "expressvpn.com",
+		"surfshark.com", "mullvad.net", "cloudflareclient.com",
+	}
 }
 
 // CustomRule defines a user-supplied override rule loaded from rules.txt or ClientConfig.CustomRules.

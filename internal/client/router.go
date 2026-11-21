@@ -51,7 +51,7 @@ type Router struct {
 	lanSuffixMap    map[string]string
 	proxySuffixMap  map[string]string
 	directSuffixMap map[string]string
-	cnDomainSet     map[string]struct{}
+	compact         atomic.Pointer[CompactRuleBundle]
 
 	customMu    sync.RWMutex
 	customRules []CustomRule
@@ -71,8 +71,13 @@ var privateIPv4CIDRs = []string{
 	"192.168.0.0/16",
 }
 
-// NewRouter constructs a Router preloaded with full APNIC CN IPv4 ranges and curated RuleSet suffix maps.
+// NewRouter constructs a Router preloaded with APNIC CN CIDRs, curated rules, and the embedded compact KSLR index.
 func NewRouter() *Router {
+	return NewRouterWithDataDir("")
+}
+
+// NewRouterWithDataDir constructs a Router preferring <dataDir>/rules_bundle.zlib when valid on disk.
+func NewRouterWithDataDir(dataDir string) *Router {
 	raw := make([]ipRange, 0, len(privateIPv4CIDRs)+6000)
 	for _, s := range privateIPv4CIDRs {
 		_, ipNet, err := net.ParseCIDR(s)
@@ -120,13 +125,23 @@ func NewRouter() *Router {
 		directMap[strings.ToLower(seed.domain)] = seed.tag
 	}
 
-	return &Router{
+	r := &Router{
 		cnRanges:        merged,
 		cnIPv6:          appendBuiltinCNIPv6Ranges(nil),
 		lanSuffixMap:    lanMap,
 		proxySuffixMap:  proxyMap,
 		directSuffixMap: directMap,
-		cnDomainSet:     loadCNDomainsSet(),
+	}
+	if b := LoadCompactRuleBundleFromDir(dataDir); b != nil {
+		r.compact.Store(b)
+	}
+	return r
+}
+
+// SetCompactBundle atomically swaps the zero-pointer 64-bit hash rule index at runtime.
+func (r *Router) SetCompactBundle(b *CompactRuleBundle) {
+	if b != nil {
+		r.compact.Store(b)
 	}
 }
 
@@ -144,14 +159,31 @@ func (r *Router) Stats() RuleStats {
 	r.customMu.RLock()
 	customN := len(r.customRules)
 	r.customMu.RUnlock()
+	b := r.compact.Load()
+	proxyN := len(r.proxySuffixMap)
+	directN := len(r.directSuffixMap)
+	src := "embedded"
+	var upd int64
+	if b != nil {
+		proxyN += len(b.ProxyHashes)
+		directN += len(b.DirectHashes)
+		if b.Source != "" {
+			src = b.Source
+		}
+		upd = b.UpdatedAt
+	}
 	return RuleStats{
 		Version:        BuiltinRuleSetVersion,
-		BuiltinDomains: len(r.proxySuffixMap) + len(r.directSuffixMap) + len(r.cnDomainSet),
+		BuiltinDomains: proxyN + directN,
 		BuiltinCIDRs:   len(r.cnRanges) + len(r.cnIPv6),
 		CustomRules:    customN,
 		DirectHits:     r.directHits.Load(),
 		ProxyHits:      r.proxyHits.Load(),
 		RejectHits:     r.rejectHits.Load(),
+		ProxyDomains:   proxyN,
+		DirectDomains:  directN,
+		RulesSource:    src,
+		RulesUpdatedAt: upd,
 	}
 }
 
@@ -200,23 +232,6 @@ func lookupSuffixMap(hostLower string, m map[string]string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func lookupSuffixSet(hostLower string, m map[string]struct{}) bool {
-	if hostLower == "" || len(m) == 0 {
-		return false
-	}
-	if _, ok := m[hostLower]; ok {
-		return true
-	}
-	for i := 0; i < len(hostLower); i++ {
-		if hostLower[i] == '.' && i+1 < len(hostLower) {
-			if _, ok := m[hostLower[i+1:]]; ok {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func isLANIP(ip net.IP) bool {
@@ -341,18 +356,25 @@ func (r *Router) evaluateStatic(mode RouteMode, hostport string) (act RouteActio
 		if tag, ok := lookupSuffixMap(hostLower, r.lanSuffixMap); ok {
 			return ActionDirect, tag, false
 		}
-		// Evaluate curated Proxy RuleSet BEFORE CN/GeoIP so overseas services never leak direct.
+		// Evaluate curated Proxy & Direct overrides before 100K compact hash tables.
 		if tag, ok := lookupSuffixMap(hostLower, r.proxySuffixMap); ok {
 			return ActionProxy, tag, false
 		}
 		if tag, ok := lookupSuffixMap(hostLower, r.directSuffixMap); ok {
 			return ActionDirect, tag, false
 		}
-		if strings.HasSuffix(hostLower, ".cn") {
+		if b := r.compact.Load(); b != nil {
+			if b.ContainsProxySuffix(hostLower) {
+				return ActionProxy, "proxy:ruleset", false
+			}
+			if strings.HasSuffix(hostLower, ".cn") {
+				return ActionDirect, "direct:cn", false
+			}
+			if b.ContainsDirectSuffix(hostLower) {
+				return ActionDirect, "direct:cn-ruleset", false
+			}
+		} else if strings.HasSuffix(hostLower, ".cn") {
 			return ActionDirect, "direct:cn", false
-		}
-		if lookupSuffixSet(hostLower, r.cnDomainSet) {
-			return ActionDirect, "direct:cn-list", false
 		}
 		// Unknown hostname: caller runs Tunnel-First GeoIP pre-probe or falls back directly to proxy.
 		return ActionProxy, "final:proxy", true

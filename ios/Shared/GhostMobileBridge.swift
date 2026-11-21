@@ -12,6 +12,12 @@ private struct MobileParseLinkEnvelope: Decodable {
     let data: GhostNode?
 }
 
+private struct MobileRuleStatsEnvelope: Decodable {
+    let ok: Bool
+    let error: String?
+    let data: GhostRuleStats?
+}
+
 struct GhostBridgeError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
@@ -72,6 +78,31 @@ enum GhostMobileBridge {
 
     static func clearLogs() {
         MobileClearLogs()
+    }
+
+    static func getRuleStats() -> GhostRuleStats {
+        let raw = MobileGetRuleStatsJSON()
+        guard let data = raw.data(using: .utf8),
+              let env = try? JSONDecoder().decode(MobileRuleStatsEnvelope.self, from: data),
+              let stats = env.data else {
+            return GhostRuleStats()
+        }
+        return stats
+    }
+
+    static func updateRuleBundleRaw(url: String = "") -> String {
+        MobileUpdateRuleBundleJSON(url)
+    }
+
+    static func decodeRuleStats(fromJSON raw: String) -> Result<GhostRuleStats, Error> {
+        guard let data = raw.data(using: .utf8),
+              let env = try? JSONDecoder().decode(MobileRuleStatsEnvelope.self, from: data) else {
+            return .failure(GhostBridgeError(message: "Unable to decode rule stats response"))
+        }
+        if env.ok, let stats = env.data {
+            return .success(stats)
+        }
+        return .failure(GhostBridgeError(message: env.error ?? "Rule bundle update failed"))
     }
 
     static func parseLink(uri: String) -> Result<GhostNode, Error> {

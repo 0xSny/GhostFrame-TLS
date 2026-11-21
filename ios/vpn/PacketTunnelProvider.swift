@@ -252,6 +252,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 GhostMobileBridge.clearLogs()
                 self.replyIPC(TunnelIPCResponse(ok: true, payload: nil, error: nil), completionHandler: completionHandler)
 
+            case "updateRules":
+                let raw = GhostMobileBridge.updateRuleBundleRaw(url: req.configJSON ?? "")
+                switch GhostMobileBridge.decodeRuleStats(fromJSON: raw) {
+                case .success:
+                    self.replyIPC(TunnelIPCResponse(ok: true, payload: raw, error: nil), completionHandler: completionHandler)
+                case .failure(let err):
+                    self.replyIPC(TunnelIPCResponse(ok: false, payload: raw, error: err.localizedDescription), completionHandler: completionHandler)
+                }
+
             case "networkWake":
                 GhostMobileBridge.onNetworkChanged(ifaceName: req.iface ?? self.lastPhysicalIface)
                 self.replyIPC(TunnelIPCResponse(ok: true, payload: nil, error: nil), completionHandler: completionHandler)

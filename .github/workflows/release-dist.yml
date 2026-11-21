@@ -73,6 +73,7 @@ jobs:
           cp install.sh dist/install.sh
           cp scripts/install-kbox.sh dist/install-kbox.sh
           cp scripts/install-0ghost.sh dist/install-0ghost.sh
+          cp internal/client/rules_bundle.zlib dist/rules_bundle.zlib
           chmod 0755 dist/install.sh dist/install-kbox.sh dist/install-0ghost.sh
           ls -lh dist/
 

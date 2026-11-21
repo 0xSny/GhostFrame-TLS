@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"ghostframe/internal/tproxy"
 )
@@ -339,6 +341,27 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		}
 		s.SyncFirewall()
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rule": ruleLine, "custom_rules": s.engine.CustomRules()})
+	}))
+
+	mux.HandleFunc("/api/rules/update", postOnly(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			URL string `json:"url"`
+		}
+		_ = readJSON(r, &req)
+		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		st, err := s.engine.UpdateRuleBundle(ctx, req.URL)
+		cancel()
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "rule_stats": st})
+			return
+		}
+		s.mu.RLock()
+		dnsSrv := s.dnsSrv
+		s.mu.RUnlock()
+		if dnsSrv != nil {
+			dnsSrv.ClearCache()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rule_stats": st})
 	}))
 
 	mux.HandleFunc("/api/logs/clear", postOnly(func(w http.ResponseWriter, r *http.Request) {

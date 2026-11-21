@@ -216,6 +216,39 @@ final class VPNManager: GhostBackend {
         fetchLoopbackHTTP(method: "POST", path: "/_ksl/clear-logs", body: nil) { _, _ in }
     }
 
+    func updateRuleBundle(url: String?, completion: @escaping (Result<GhostRuleStats, Error>) -> Void) {
+        if isConnected || isTransitioning {
+            sendIPC(action: "updateRules", configJSON: url) { [weak self] resp in
+                if let resp = resp {
+                    if resp.ok, let payload = resp.payload {
+                        completion(GhostMobileBridge.decodeRuleStats(fromJSON: payload))
+                        return
+                    }
+                    if let errMsg = resp.error, !errMsg.isEmpty {
+                        completion(.failure(GhostBridgeError(message: errMsg)))
+                        return
+                    }
+                }
+                Task { @MainActor in
+                    guard let self = self else {
+                        completion(.failure(GhostBridgeError(message: "VPN manager unavailable")))
+                        return
+                    }
+                    let body = try? JSONSerialization.data(withJSONObject: ["url": url ?? ""])
+                    self.fetchLoopbackHTTP(method: "POST", path: "/_ksl/update-rules", body: body) { data, err in
+                        if let data = data, let text = String(data: data, encoding: .utf8) {
+                            completion(GhostMobileBridge.decodeRuleStats(fromJSON: text))
+                        } else {
+                            completion(.failure(err ?? GhostBridgeError(message: "Rule update failed")))
+                        }
+                    }
+                }
+            }
+            return
+        }
+        completion(.failure(GhostBridgeError(message: "请先开启 VPN 连接后再在线热更新分流规则库")))
+    }
+
     private func localFallbackDiagnostic() -> String {
         let mainID = Bundle.main.bundleIdentifier ?? "unknown"
         let neStatus = Self.statusName(manager?.connection.status ?? .invalid)

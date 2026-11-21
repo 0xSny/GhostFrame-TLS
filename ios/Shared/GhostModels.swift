@@ -221,6 +221,42 @@ struct GhostRecentRoute: Codable, Identifiable, Equatable {
     var reason: String
 }
 
+struct GhostRuleStats: Codable, Equatable {
+    var rulesetVersion: String = "v4.3-KSLR100K"
+    var builtinDomains: Int = 0
+    var builtinCidrs: Int = 0
+    var customRules: Int = 0
+    var directHits: UInt64 = 0
+    var proxyHits: UInt64 = 0
+    var rejectHits: UInt64 = 0
+    var rulesSource: String = "embedded"
+
+    enum CodingKeys: String, CodingKey {
+        case rulesetVersion = "ruleset_version"
+        case builtinDomains = "builtin_domains"
+        case builtinCidrs = "builtin_cidrs"
+        case customRules = "custom_rules"
+        case directHits = "direct_hits"
+        case proxyHits = "proxy_hits"
+        case rejectHits = "reject_hits"
+        case rulesSource = "rules_source"
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        rulesetVersion = (try? c.decode(String.self, forKey: .rulesetVersion)) ?? rulesetVersion
+        builtinDomains = (try? c.decode(Int.self, forKey: .builtinDomains)) ?? 0
+        builtinCidrs = (try? c.decode(Int.self, forKey: .builtinCidrs)) ?? 0
+        customRules = (try? c.decode(Int.self, forKey: .customRules)) ?? 0
+        directHits = (try? c.decode(UInt64.self, forKey: .directHits)) ?? 0
+        proxyHits = (try? c.decode(UInt64.self, forKey: .proxyHits)) ?? 0
+        rejectHits = (try? c.decode(UInt64.self, forKey: .rejectHits)) ?? 0
+        rulesSource = (try? c.decode(String.self, forKey: .rulesSource)) ?? "embedded"
+    }
+}
+
 struct GhostStatusSnapshot: Codable, Equatable {
     var version: String
     var state: String
@@ -263,11 +299,12 @@ struct GhostStatusSnapshot: Codable, Equatable {
     var logs: [GhostLogEntry]
     var customRules: [String]
     var recentRoutes: [GhostRecentRoute]
+    var ruleStats: GhostRuleStats
 
     static let empty = GhostStatusSnapshot()
 
     init() {
-        version = "v4.0.29-LTS"
+        version = "v4.0.30-LTS"
         state = "disconnected"
         lastErr = ""
         activeTransport = ""
@@ -308,6 +345,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         logs = []
         customRules = []
         recentRoutes = []
+        ruleStats = GhostRuleStats()
     }
 
     enum CodingKeys: String, CodingKey {
@@ -352,6 +390,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         case logs
         case customRules = "custom_rules"
         case recentRoutes = "recent_routes"
+        case ruleStats = "rule_stats"
     }
 
     init(from decoder: Decoder) throws {
@@ -398,6 +437,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         logs = (try? c.decode([GhostLogEntry].self, forKey: .logs)) ?? []
         customRules = (try? c.decode([String].self, forKey: .customRules)) ?? []
         recentRoutes = (try? c.decode([GhostRecentRoute].self, forKey: .recentRoutes)) ?? []
+        ruleStats = (try? c.decode(GhostRuleStats.self, forKey: .ruleStats)) ?? GhostRuleStats()
     }
 }
 

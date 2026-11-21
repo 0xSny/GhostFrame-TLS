@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.0.29-LTS"
+var Version = "v4.0.30-LTS"
 
 type ConnState string
 
@@ -33,15 +33,16 @@ const (
 
 // ClientConfig holds saved client preferences, nodes, and routing mode.
 type ClientConfig struct {
-	Link        *gft.Link   `json:"link,omitempty"`
-	Nodes       []*gft.Link `json:"nodes,omitempty"`
-	ActiveNode  int         `json:"active_node,omitempty"`
-	RouteMode   RouteMode   `json:"route_mode,omitempty"` // "rule" (default), "global", "direct"
-	SocksAddr   string          `json:"socks_addr"`
-	HTTPAddr    string          `json:"http_addr"`
-	SysProxy    bool            `json:"sys_proxy"`
-	CustomRules []string        `json:"custom_rules,omitempty"`
-	Gateway     json.RawMessage `json:"gateway,omitempty"`
+	Link          *gft.Link       `json:"link,omitempty"`
+	Nodes         []*gft.Link     `json:"nodes,omitempty"`
+	ActiveNode    int             `json:"active_node,omitempty"`
+	RouteMode     RouteMode       `json:"route_mode,omitempty"` // "rule" (default), "global", "direct"
+	SocksAddr     string          `json:"socks_addr"`
+	HTTPAddr      string          `json:"http_addr"`
+	SysProxy      bool            `json:"sys_proxy"`
+	CustomRules   []string        `json:"custom_rules,omitempty"`
+	RuleBundleURL string          `json:"rule_bundle_url,omitempty"`
+	Gateway       json.RawMessage `json:"gateway,omitempty"`
 }
 
 // LogEntry is a single line in the client rolling log.
@@ -68,8 +69,9 @@ type PingSummary struct {
 type Engine struct {
 	mu              sync.RWMutex
 	portSwapMu      sync.Mutex
-	cfgPath         string
-	proxyBackupPath string
+	cfgPath            string
+	ruleDataDir        string
+	proxyBackupPath    string
 	config          ClientConfig
 	state           ConnState
 	lastErr         string
@@ -123,16 +125,19 @@ func (d *directStreamConn) RemoteTarget() string { return d.target }
 // NewEngine initializes the client engine and recovers any crash-orphaned system proxy.
 func NewEngine(cfgPath string) (*Engine, error) {
 	backupPath := ""
+	ruleDir := ""
 	if cfgPath != "" {
-		backupPath = filepath.Join(filepath.Dir(cfgPath), "sysproxy_backup.json")
+		ruleDir = filepath.Dir(cfgPath)
+		backupPath = filepath.Join(ruleDir, "sysproxy_backup.json")
 	}
 
 	e := &Engine{
 		cfgPath:         cfgPath,
+		ruleDataDir:     ruleDir,
 		proxyBackupPath: backupPath,
 		state:           StateDisconnected,
 		paramStore:      gft.NewParamStore(gft.DefaultParams()),
-		router:          NewRouter(),
+		router:          NewRouterWithDataDir(ruleDir),
 		tunnelDNS:       NewTunnelDNSResolver(),
 		smartCache:      newSmartRouteCache(smartRouteCacheCap),
 		recentRoutes:    newRecentRouteRing(defaultRecentRouteCap),
@@ -601,6 +606,35 @@ func (e *Engine) RouteDecision(hostport string) RouteAction {
 
 // TunnelDNS returns the client's encrypted over-tunnel DNS LRU resolver.
 func (e *Engine) TunnelDNS() *TunnelDNSResolver { return e.tunnelDNS }
+
+// SetRuleDataDir sets the directory used to persist and load hot-updated rules_bundle.zlib.
+func (e *Engine) SetRuleDataDir(dir string) {
+	clean := strings.TrimSpace(dir)
+	e.mu.Lock()
+	e.ruleDataDir = clean
+	e.mu.Unlock()
+	if clean != "" {
+		if b := LoadCompactRuleBundleFromDir(clean); b != nil && b.Source == "local" {
+			e.router.SetCompactBundle(b)
+			if e.smartCache != nil {
+				e.smartCache.Clear()
+			}
+		}
+	}
+}
+
+// RuleDataDir returns the directory storing hot-updated rules_bundle.zlib.
+func (e *Engine) RuleDataDir() string {
+	e.mu.RLock()
+	dir := e.ruleDataDir
+	e.mu.RUnlock()
+	return dir
+}
+
+// RuleStats returns current routing table capacities and hit counters.
+func (e *Engine) RuleStats() RuleStats {
+	return e.router.Stats()
+}
 
 // ShouldSniffSNI reports whether target is a raw non-private IP on a TLS port eligible
 // for 30ms ClientHello SNI sniffing under Rule mode.

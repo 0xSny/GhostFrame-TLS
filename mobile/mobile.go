@@ -1,6 +1,7 @@
 package mobile
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -21,7 +22,7 @@ import (
 )
 
 // Version is the mobile runtime identifier (overridable via -ldflags -X).
-var Version = "v4.0.29-LTS"
+var Version = "v4.0.30-LTS"
 
 const (
 	defaultSocksPort = 10808
@@ -479,6 +480,43 @@ func ClearLogs() {
 	}
 }
 
+// GetRuleStatsJSON returns the current KSLR rule bundle capacities as an envelope JSON.
+func GetRuleStatsJSON() string {
+	mu.Lock()
+	eng := engineInst
+	dir := dataDirState
+	mu.Unlock()
+	if eng != nil {
+		return marshalEnvelope(nil, eng.RuleStats())
+	}
+	r := client.NewRouterWithDataDir(dir)
+	return marshalEnvelope(nil, r.Stats())
+}
+
+// UpdateRuleBundleJSON downloads and hot-reloads rules_bundle.zlib (empty URL uses default Spittingjiu/Ghost release).
+func UpdateRuleBundleJSON(rawURL string) string {
+	mu.Lock()
+	eng := engineInst
+	dir := dataDirState
+	mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	if eng != nil {
+		st, err := eng.UpdateRuleBundle(ctx, rawURL)
+		return marshalEnvelope(err, st)
+	}
+	tmpEng, err := client.NewEngine("")
+	if err != nil {
+		return marshalEnvelope(err, nil)
+	}
+	defer tmpEng.Close()
+	tmpEng.SetRuleDataDir(dir)
+	st, uerr := tmpEng.UpdateRuleBundle(ctx, rawURL)
+	return marshalEnvelope(uerr, st)
+}
+
 // ParseLinkJSON validates a gft3:// or gft2:// URI and returns safe metadata as JSON.
 func ParseLinkJSON(uri string) (string, error) {
 	link, err := gft.ParseLink(strings.TrimSpace(uri))
@@ -562,6 +600,19 @@ func handleLocalMgmt(method, path string, body []byte) (int, string, []byte) {
 	case "/_ksl/clear-logs", "/_gft/clear-logs":
 		ClearLogs()
 		return 200, "application/json; charset=utf-8", []byte(`{"ok":true}`)
+	case "/_ksl/rule-stats":
+		return 200, "application/json; charset=utf-8", []byte(GetRuleStatsJSON())
+	case "/_ksl/update-rules":
+		if strings.ToUpper(strings.TrimSpace(method)) != "POST" {
+			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
+		}
+		var req struct {
+			URL string `json:"url"`
+		}
+		if len(body) > 0 {
+			_ = json.Unmarshal(body, &req)
+		}
+		return 200, "application/json; charset=utf-8", []byte(UpdateRuleBundleJSON(req.URL))
 	case "/_ksl/reload", "/_gft/reload":
 		if strings.ToUpper(strings.TrimSpace(method)) != "POST" {
 			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)

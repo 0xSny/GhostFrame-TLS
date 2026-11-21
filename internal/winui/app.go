@@ -3,11 +3,13 @@
 package winui
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -73,6 +75,7 @@ const (
 	hitCopyLink
 	hitClearLogs
 	hitDiagSnapshot
+	hitUpdateRules
 	hitRebindProxy
 	hitNodeOption
 )
@@ -119,7 +122,8 @@ type appUI struct {
 	toastSuccess bool
 	toastUntil   time.Time
 
-	shutOnce sync.Once
+	rulesUpdating atomic.Bool
+	shutOnce      sync.Once
 }
 
 var (
@@ -901,6 +905,24 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 			}
 			a.setToastSuccess(msg)
 		}
+	case hitUpdateRules:
+		if !a.rulesUpdating.CompareAndSwap(false, true) {
+			a.setToast("正在更新分流规则库，请稍候...", false)
+			break
+		}
+		a.setToast("正在拉取最新 10万+ KSLR 规则库...", false)
+		go func() {
+			defer a.rulesUpdating.Store(false)
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			st, err := a.eng.UpdateRuleBundle(ctx, "")
+			cancel()
+			if err != nil {
+				a.setToast("规则库更新失败: "+err.Error(), true)
+			} else {
+				a.setToastSuccess(fmt.Sprintf("分流规则已更新: %d 条域名 (0指针)", st.BuiltinDomains))
+			}
+			a.postRefresh()
+		}()
 	case hitRebindProxy:
 		if err := a.eng.RebindSystemProxy(); err != nil {
 			a.setToast("重绑系统代理失败: "+err.Error(), true)
@@ -1304,7 +1326,8 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 
 	// Unified Mode Status Hint (rendered when vertical space permits)
 	if btnY-(rowBot+s(6)) >= s(20) {
-		modeHint := "已启用联动：内置规则集分流 (AI/Google/外网代理 + CN/Apple/MS/SteamCDN 直连)"
+		rs := a.eng.RuleStats()
+		modeHint := fmt.Sprintf("已启用联动：KSLR %d 域(0指针) + %d CN段 智能分流", rs.BuiltinDomains, rs.BuiltinCIDRs)
 		if routeMode == "global" {
 			modeHint = "已启用联动：连接后自动全局代理所有非本地流量"
 		} else if isCore {
@@ -1475,6 +1498,16 @@ func (a *appUI) drawLogCard(r rect, logs []client.LogEntry) {
 
 	clrR := rect{r.Right - s(92), hdrY, r.Right - s(16), hdrY + s(26)}
 	diagR := rect{clrR.Left - s(92), hdrY, clrR.Left - s(8), hdrY + s(26)}
+	rs := a.eng.RuleStats()
+	updLabel := fmt.Sprintf("更新规则(%dK)", rs.BuiltinDomains/1000)
+	if rs.BuiltinDomains < 1000 {
+		updLabel = fmt.Sprintf("更新规则(%d)", rs.BuiltinDomains)
+	}
+	if a.rulesUpdating.Load() {
+		updLabel = "更新中..."
+	}
+	updR := rect{diagR.Left - s(112), hdrY, diagR.Left - s(8), hdrY + s(26)}
+	a.drawButton(updR, hitUpdateRules, updLabel, colCardAlt, colBorderHi, colEmerald)
 	a.drawButton(diagR, hitDiagSnapshot, "诊断快照", colCardAlt, colBorderHi, colSky)
 	a.drawButton(clrR, hitClearLogs, "清空日志", colBg, colBorderHi, colTextSub)
 

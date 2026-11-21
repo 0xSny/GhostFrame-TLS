@@ -662,6 +662,35 @@ struct ConsoleView: View {
                         labeledNumberField(title: "HTTP 端口", text: $viewModel.httpPortText)
                     }
 
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("离线紧凑规则库 (\(viewModel.ruleStats.rulesetVersion))")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundColor(GhostPalette.textPrimary)
+                                Text("已加载 \(viewModel.ruleStats.builtinDomains) 条域名 + \(viewModel.ruleStats.builtinCidrs) CN段 (0指针)")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(GhostPalette.textMuted)
+                            }
+                            Spacer()
+                            Button(action: { viewModel.updateRuleBundle() }) {
+                                Text(viewModel.isUpdatingRules ? "更新中..." : "更新分流规则库")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundColor(GhostPalette.cyan)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(GhostPalette.cardAlt)
+                                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(GhostPalette.cyan.opacity(0.6), lineWidth: 1))
+                                    .cornerRadius(8)
+                            }
+                            .disabled(viewModel.isUpdatingRules)
+                        }
+                    }
+                    .padding(10)
+                    .background(GhostPalette.card)
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(GhostPalette.border, lineWidth: 1))
+                    .cornerRadius(10)
+
                     VStack(alignment: .leading, spacing: 6) {
                         Text("自定义分流规则 (Clash/Surge 格式，一行一条)")
                             .font(.system(size: 12))

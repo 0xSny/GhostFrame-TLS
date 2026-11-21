@@ -107,6 +107,13 @@ final class CompanionManager: GhostBackend {
         GhostMobileBridge.clearLogs()
     }
 
+    func updateRuleBundle(url: String?, completion: @escaping (Result<GhostRuleStats, Error>) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let raw = GhostMobileBridge.updateRuleBundleRaw(url: url ?? "")
+            completion(GhostMobileBridge.decodeRuleStats(fromJSON: raw))
+        }
+    }
+
     private func startPolling() {
         guard pollTimer == nil else { return }
         pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in

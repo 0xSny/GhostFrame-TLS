@@ -5,6 +5,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 )
@@ -138,8 +143,8 @@ func TestCompleteAPNICAndDomesticCloudGeoIP(t *testing.T) {
 			t.Fatalf("expected ActionProxy for %s, got %v", d, act)
 		}
 	}
-	if rs := r.Stats(); rs.BuiltinDomains < 4000 {
-		t.Fatalf("expected >= 4000 embedded BuiltinDomains from cn_domains.zlib, got %d", rs.BuiltinDomains)
+	if rs := r.Stats(); rs.BuiltinDomains < 100000 {
+		t.Fatalf("expected >= 100000 embedded BuiltinDomains from rules_bundle.zlib, got %d", rs.BuiltinDomains)
 	}
 }
 
@@ -173,7 +178,7 @@ func TestSmartRouteUnknownDomainTunnelFirstZeroCNLeak(t *testing.T) {
 		switch host {
 		case "minigame.cn-thirdparty.example", "minigame-timeout.cn-thirdparty.example":
 			return []net.IP{net.ParseIP("81.68.10.20")}, nil // Tencent Cloud Shanghai
-		case "leak-check-9981.unknown-overseas-test.org":
+		case "leak-check-9981.unknown-overseas-test.org", "random-uuid.leaktest-example.com":
 			return []net.IP{net.ParseIP("104.18.20.30")}, nil // Overseas IP
 		case "poisoned.unknown.example":
 			return []net.IP{net.ParseIP("31.13.64.5"), net.ParseIP("198.18.0.5"), net.ParseIP("127.0.0.1")}, nil
@@ -207,12 +212,14 @@ func TestSmartRouteUnknownDomainTunnelFirstZeroCNLeak(t *testing.T) {
 	}
 
 	// 2. Random unknown overseas domain MUST query tunnel DNS ONLY and invoke directCNResolveFn STRICTLY 0 times!
-	actLeak, _, reasonLeak := eng.DecideSmartRoute(
+	for _, unknownHost := range []string{
 		"leak-check-9981.unknown-overseas-test.org:443",
-		"leak-check-9981.unknown-overseas-test.org:443",
-	)
-	if actLeak != ActionProxy || reasonLeak != "proxy:geoip-overseas" {
-		t.Fatalf("expected overseas smart proxy, got (%v, %q)", actLeak, reasonLeak)
+		"random-uuid.leaktest-example.com:443",
+	} {
+		actLeak, _, reasonLeak := eng.DecideSmartRoute(unknownHost, unknownHost)
+		if actLeak != ActionProxy || reasonLeak != "proxy:geoip-overseas" {
+			t.Fatalf("expected overseas smart proxy for %s, got (%v, %q)", unknownHost, actLeak, reasonLeak)
+		}
 	}
 	if calls := cnCalls.Load(); calls != 0 {
 		t.Fatalf("CRITICAL DNS LEAK: directCNResolveFn called %d times for unknown overseas domain (must be 0)!", calls)
@@ -269,5 +276,108 @@ func TestSmartRouteUnknownDomainTunnelFirstZeroCNLeak(t *testing.T) {
 	recent := eng.RecentRoutes()
 	if len(recent) != defaultRecentRouteCap {
 		t.Fatalf("expected recent_routes capped at %d, got %d", defaultRecentRouteCap, len(recent))
+	}
+}
+
+func TestCompactRuleSetMemoryUnder2MiBAndHotReload(t *testing.T) {
+	// 1. Verify HeapInuse delta for decoding the embedded >=100k zero-pointer KSLR bundle stays < 2 MiB.
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	bundle, err := DecodeCompactRuleBundle(embeddedRulesBundleZlib, "bench", 0)
+	if err != nil {
+		t.Fatalf("DecodeCompactRuleBundle failed: %v", err)
+	}
+	if bundle.TotalCount() < 100000 {
+		t.Fatalf("expected >= 100000 compact entries, got %d", bundle.TotalCount())
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	var deltaHeapInuse int64
+	if after.HeapInuse > before.HeapInuse {
+		deltaHeapInuse = int64(after.HeapInuse - before.HeapInuse)
+	}
+	if deltaHeapInuse >= 2<<20 {
+		t.Fatalf("compact rule bundle HeapInuse delta too large: %d bytes (>= 2 MiB)", deltaHeapInuse)
+	}
+	runtime.KeepAlive(bundle)
+
+	// 2. Verify online Rule-Provider hot reload persists to <dataDir>/rules_bundle.zlib and swaps Router immediately.
+	customBlob, _, _, _, err := EncodeCompactRuleBundle(
+		[]string{"hotreload-proxy.example"},
+		[]string{"hotreload-direct.example"},
+	)
+	if err != nil {
+		t.Fatalf("EncodeCompactRuleBundle failed: %v", err)
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(customBlob)
+	}))
+	defer ts.Close()
+
+	SetNoSysProxy(true)
+	cfgDir := t.TempDir()
+	eng, err := NewEngine(filepath.Join(cfgDir, "client.json"))
+	if err != nil {
+		t.Fatalf("NewEngine failed: %v", err)
+	}
+	defer eng.Close()
+
+	st, err := eng.UpdateRuleBundle(context.Background(), ts.URL+"/rules_bundle.zlib")
+	if err != nil {
+		t.Fatalf("UpdateRuleBundle failed: %v", err)
+	}
+	if st.RulesSource != "local" {
+		t.Fatalf("expected RulesSource=local after hot reload, got %q", st.RulesSource)
+	}
+	if _, statErr := os.Stat(filepath.Join(cfgDir, ruleBundleFileName)); statErr != nil {
+		t.Fatalf("expected persisted rules_bundle.zlib on disk: %v", statErr)
+	}
+	if act := eng.router.Decide(RouteRule, "cdn.hotreload-direct.example:443"); act != ActionDirect {
+		t.Fatalf("expected hot-reloaded ActionDirect, got %v", act)
+	}
+	if act := eng.router.Decide(RouteRule, "sub.hotreload-proxy.example:443"); act != ActionProxy {
+		t.Fatalf("expected hot-reloaded ActionProxy, got %v", act)
+	}
+
+	// Reloading NewEngine from the same cfgDir must automatically load local rules_bundle.zlib.
+	eng2, err := NewEngine(filepath.Join(cfgDir, "client.json"))
+	if err != nil {
+		t.Fatalf("NewEngine reload failed: %v", err)
+	}
+	defer eng2.Close()
+	if act := eng2.router.Decide(RouteRule, "cdn.hotreload-direct.example:443"); act != ActionDirect {
+		t.Fatalf("expected persisted ActionDirect after restart, got %v", act)
+	}
+}
+
+func BenchmarkCompactRuleSetMemory(b *testing.B) {
+	b.ReportAllocs()
+	var totalDelta uint64
+	for i := 0; i < b.N; i++ {
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		bundle, err := DecodeCompactRuleBundle(embeddedRulesBundleZlib, "bench", 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if bundle.TotalCount() < 100000 {
+			b.Fatalf("expected >= 100000 rules, got %d", bundle.TotalCount())
+		}
+		runtime.GC()
+		runtime.ReadMemStats(&after)
+		if after.HeapInuse > before.HeapInuse {
+			totalDelta += after.HeapInuse - before.HeapInuse
+		}
+		runtime.KeepAlive(bundle)
+	}
+	if b.N > 0 {
+		avgDelta := totalDelta / uint64(b.N)
+		b.ReportMetric(float64(avgDelta)/(1024*1024), "HeapInuseMiB")
+		if avgDelta >= 2<<20 {
+			b.Fatalf("HeapInuse delta %.2f MiB exceeds 2 MiB budget", float64(avgDelta)/(1024*1024))
+		}
 	}
 }
