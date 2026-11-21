@@ -72,7 +72,7 @@ func TestCompleteAPNICAndDomesticCloudGeoIP(t *testing.T) {
 		}
 	}
 
-	// Curated WeChat mini-game and domestic cloud RuleSet domains must hit direct without DNS.
+	// Curated WeChat mini-game, domestic SDKs, and embedded cn_domains.zlib must hit direct without DNS.
 	miniGameDomains := []string{
 		"servicewechat.com:443",
 		"sub.weixinbridge.com:443",
@@ -84,15 +84,66 @@ func TestCompleteAPNICAndDomesticCloudGeoIP(t *testing.T) {
 		"oss.myhuaweicloud.com:443",
 		"cdn.bytecdntp.com:443",
 		"static.tapimg.com:443",
+		"sdk.cocos.com:443",
+		"cdn.egret.com:443",
+		"res.layaair.com:443",
+		"e.tapdb.net:443",
+		"log.thinkingdata.cn:443",
+		"errlog.umeng.com:443",
+		"ulogs.umengcloud.com:443",
+		"sdk.getui.com:443",
+		"stats.jpush.cn:443",
+		"api.leancloud.cn:443",
+		"cloud.bmob.cn:443",
+		"dn-qbox.qbox.me:443",
+		"img.clouddn.com:443",
+		"static.qnssl.com:443",
+		"www.aixifan.com:443",
+		"www.acfun.cn:443",
+		"www.aliyun.com:443",
 	}
 	for _, d := range miniGameDomains {
 		if act := r.Decide(RouteRule, d); act != ActionDirect {
 			t.Fatalf("expected direct RuleSet match for %s, got %v", d, act)
 		}
 	}
+
+	// Leak-test sites and domestic DoH endpoints MUST NEVER route direct.
+	mustProxy := []string{
+		"ping0.cc:443",
+		"sub.ipleak.net:443",
+		"dnsleaktest.com:443",
+		"browserleaks.com:443",
+		"bash.ws:443",
+		"whoer.net:443",
+		"ip-api.com:443",
+		"ipinfo.io:443",
+		"ip.sb:443",
+		"ipify.org:443",
+		"ident.me:443",
+		"scamalytics.com:443",
+		"ipdata.co:443",
+		"ipgeolocation.io:443",
+		"astrill.com:443",
+		"expressvpn.com:443",
+		"surfshark.com:443",
+		"mullvad.net:443",
+		"cloudflareclient.com:443",
+		"dns.alidns.com:443",
+		"doh.pub:443",
+		"sm2.doh.pub:443",
+	}
+	for _, d := range mustProxy {
+		if act := r.Decide(RouteRule, d); act != ActionProxy {
+			t.Fatalf("expected ActionProxy for %s, got %v", d, act)
+		}
+	}
+	if rs := r.Stats(); rs.BuiltinDomains < 4000 {
+		t.Fatalf("expected >= 4000 embedded BuiltinDomains from cn_domains.zlib, got %d", rs.BuiltinDomains)
+	}
 }
 
-func TestSmartRouteUnknownDomainCNDNSPreProbeZeroProxyLeak(t *testing.T) {
+func TestSmartRouteUnknownDomainTunnelFirstZeroCNLeak(t *testing.T) {
 	SetNoSysProxy(true)
 	eng, err := NewEngine("")
 	if err != nil {
@@ -100,62 +151,106 @@ func TestSmartRouteUnknownDomainCNDNSPreProbeZeroProxyLeak(t *testing.T) {
 	}
 	defer eng.Close()
 
-	var dnsCalls atomic.Int32
+	// 0. When tunnel is offline and no test hook is installed, unknown domains MUST fall back to
+	// ActionProxy with 0 CN DNS calls and MUST NOT poison cache once tunnel connects later.
+	var cnCallsOffline atomic.Int32
 	eng.SetDirectCNResolverForTest(func(ctx context.Context, host string) ([]net.IP, []byte, error) {
-		dnsCalls.Add(1)
+		cnCallsOffline.Add(1)
+		return nil, nil, context.DeadlineExceeded
+	})
+	actOff, _, reasonOff := eng.DecideSmartRoute("minigame.cn-thirdparty.example:443", "minigame.cn-thirdparty.example:443")
+	if actOff != ActionProxy || reasonOff != "proxy:tunnel-offline" {
+		t.Fatalf("expected offline tunnel proxy fallback, got (%v, %q)", actOff, reasonOff)
+	}
+	if cnCallsOffline.Load() != 0 {
+		t.Fatalf("offline tunnel leaked %d CN DNS calls!", cnCallsOffline.Load())
+	}
+
+	var tunnelCalls atomic.Int32
+	var cnCalls atomic.Int32
+	eng.SetTunnelDNSResolverForTest(func(ctx context.Context, host string) ([]net.IP, error) {
+		tunnelCalls.Add(1)
+		switch host {
+		case "minigame.cn-thirdparty.example", "minigame-timeout.cn-thirdparty.example":
+			return []net.IP{net.ParseIP("81.68.10.20")}, nil // Tencent Cloud Shanghai
+		case "leak-check-9981.unknown-overseas-test.org":
+			return []net.IP{net.ParseIP("104.18.20.30")}, nil // Overseas IP
+		case "poisoned.unknown.example":
+			return []net.IP{net.ParseIP("31.13.64.5"), net.ParseIP("198.18.0.5"), net.ParseIP("127.0.0.1")}, nil
+		default:
+			return nil, context.DeadlineExceeded
+		}
+	})
+	eng.SetDirectCNResolverForTest(func(ctx context.Context, host string) ([]net.IP, []byte, error) {
+		cnCalls.Add(1)
 		switch host {
 		case "minigame.cn-thirdparty.example":
 			ip := net.ParseIP("43.132.88.9")
 			return []net.IP{ip}, buildMockAResponse(0xABCD, host, ip), nil
-		case "api.overseas-unknown.example":
-			ip := net.ParseIP("104.18.20.30")
-			return []net.IP{ip}, buildMockAResponse(0xABCE, host, ip), nil
-		case "poisoned.unknown.example":
-			return []net.IP{net.ParseIP("31.13.64.5"), net.ParseIP("198.18.0.5"), net.ParseIP("127.0.0.1")}, nil, nil
 		default:
 			return nil, nil, context.DeadlineExceeded
 		}
 	})
 
-	// 1. Known overseas builtinProxyRules MUST NOT trigger local CN DNS!
-	for _, proxyHost := range []string{"www.google.com:443", "api.openai.com:443", "github.com:443", "t.me:443"} {
+	// 1. Known overseas builtinProxyRules & leak-test sites MUST NOT trigger tunnel OR CN DNS!
+	for _, proxyHost := range []string{
+		"www.google.com:443", "api.openai.com:443", "github.com:443", "t.me:443",
+		"ping0.cc:443", "a1b2c3.ipleak.net:443", "browserleaks.com:443", "dns.alidns.com:443", "doh.pub:443",
+	} {
 		act, _, reason := eng.DecideSmartRoute(proxyHost, proxyHost)
 		if act != ActionProxy || reason == "" {
 			t.Fatalf("expected proxy for %s, got (%v, %q)", proxyHost, act, reason)
 		}
 	}
-	if calls := dnsCalls.Load(); calls != 0 {
-		t.Fatalf("known proxy domains leaked %d local DNS queries!", calls)
+	if tunnelCalls.Load() != 0 || cnCalls.Load() != 0 {
+		t.Fatalf("known proxy domains triggered pre-probes: tunnel=%d cn=%d", tunnelCalls.Load(), cnCalls.Load())
 	}
 
-	// 2. Unknown CN mini-game domain resolves within 350ms to Tencent 43.132.88.9 -> DIRECT + resolved IP.
+	// 2. Random unknown overseas domain MUST query tunnel DNS ONLY and invoke directCNResolveFn STRICTLY 0 times!
+	actLeak, _, reasonLeak := eng.DecideSmartRoute(
+		"leak-check-9981.unknown-overseas-test.org:443",
+		"leak-check-9981.unknown-overseas-test.org:443",
+	)
+	if actLeak != ActionProxy || reasonLeak != "proxy:geoip-overseas" {
+		t.Fatalf("expected overseas smart proxy, got (%v, %q)", actLeak, reasonLeak)
+	}
+	if calls := cnCalls.Load(); calls != 0 {
+		t.Fatalf("CRITICAL DNS LEAK: directCNResolveFn called %d times for unknown overseas domain (must be 0)!", calls)
+	}
+
+	// 3. Timeout/poisoned tunnel DNS results MUST also go ActionProxy with STRICTLY 0 CN DNS calls!
+	actTmo, _, _ := eng.DecideSmartRoute("timeout-999.unknown-overseas-test.org:443", "timeout-999.unknown-overseas-test.org:443")
+	actPois, _, reasonPois := eng.DecideSmartRoute("poisoned.unknown.example:443", "poisoned.unknown.example:443")
+	if actTmo != ActionProxy || actPois != ActionProxy || reasonPois != "proxy:dns-filtered" {
+		t.Fatalf("expected proxy for timeout/poisoned, got tmo=%v pois=(%v,%q)", actTmo, actPois, reasonPois)
+	}
+	if calls := cnCalls.Load(); calls != 0 {
+		t.Fatalf("CRITICAL DNS LEAK: directCNResolveFn called %d times on timeout/poisoned (must be 0)!", calls)
+	}
+
+	// 4. Unknown CN mini-game domain resolves via tunnel DNS to 81.68.10.20 (Tencent Shanghai),
+	// then refreshes nearby CN CDN IP 43.132.88.9 via directCNResolveFn -> ActionDirect.
 	act, resolvedDial, reason := eng.DecideSmartRoute("198.18.1.9:443", "minigame.cn-thirdparty.example:443")
 	if act != ActionDirect || reason != "direct:cn-dns" || resolvedDial != "43.132.88.9:443" {
-		t.Fatalf("expected smart direct for CN unknown domain, got (%v, %q, %q)", act, resolvedDial, reason)
+		t.Fatalf("expected smart direct with local CDN IP, got (%v, %q, %q)", act, resolvedDial, reason)
 	}
-	if calls := dnsCalls.Load(); calls != 1 {
-		t.Fatalf("expected 1 CN DNS probe, got %d", calls)
+	if calls := cnCalls.Load(); calls != 1 {
+		t.Fatalf("expected 1 CN CDN refresh probe for confirmed CN domain, got %d", calls)
 	}
 
-	// Subsequent query must hit 10m LRU cache without triggering another DNS probe.
+	// Subsequent query hits cache without triggering extra tunnel or CN probes.
 	act2, wire, _ := eng.ResolveSmartDNS(RouteRule, "minigame.cn-thirdparty.example", []byte{0x55, 0x66})
 	if act2 != ActionDirect || len(wire) < 12 || wire[0] != 0x55 || wire[1] != 0x66 {
 		t.Fatalf("expected cached direct DNS wire response with patched txID, got act=%v len=%d", act2, len(wire))
 	}
-	if calls := dnsCalls.Load(); calls != 1 {
-		t.Fatalf("expected cache hit with 0 extra DNS probes, got %d", calls)
+	if cnCalls.Load() != 1 {
+		t.Fatalf("expected cache hit with 0 extra CN DNS probes, got %d", cnCalls.Load())
 	}
 
-	// 3. Unknown overseas domain resolves to overseas IP -> ActionProxy.
-	actOver, _, reasonOver := eng.DecideSmartRoute("api.overseas-unknown.example:443", "api.overseas-unknown.example:443")
-	if actOver != ActionProxy || reasonOver != "proxy:geoip-overseas" {
-		t.Fatalf("expected overseas smart proxy, got (%v, %q)", actOver, reasonOver)
-	}
-
-	// 4. Poisoned/Fake-IP/Loopback answers must never qualify as CN direct.
-	actPois, _, reasonPois := eng.DecideSmartRoute("poisoned.unknown.example:443", "poisoned.unknown.example:443")
-	if actPois != ActionProxy || reasonPois != "proxy:dns-filtered" {
-		t.Fatalf("expected filtered proxy for poisoned DNS, got (%v, %q)", actPois, reasonPois)
+	// If local CN CDN refresh times out on a confirmed CN domain, keep ActionDirect and dial tunnel's CN IP (81.68.10.20).
+	actFallback, dialFallback, _ := eng.DecideSmartRoute("198.18.1.10:443", "minigame-timeout.cn-thirdparty.example:443")
+	if actFallback != ActionDirect || dialFallback != "81.68.10.20:443" {
+		t.Fatalf("expected fallback to tunnel CN IP 81.68.10.20:443 on CN CDN timeout, got (%v, %q)", actFallback, dialFallback)
 	}
 
 	// 5. AppendCustomRule overrides smart decision and clears cache immediately.

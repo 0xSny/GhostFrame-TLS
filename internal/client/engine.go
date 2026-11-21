@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.0.28-LTS"
+var Version = "v4.0.29-LTS"
 
 type ConnState string
 
@@ -78,10 +78,11 @@ type Engine struct {
 	connectGen      uint64
 	paramStore      *gft.ParamStore
 	router          *Router
-	tunnelDNS       *TunnelDNSResolver
-	smartCache        *smartRouteCache
-	recentRoutes      *recentRouteRing
-	directCNResolveFn DirectCNDNSFunc
+	tunnelDNS          *TunnelDNSResolver
+	smartCache         *smartRouteCache
+	recentRoutes       *recentRouteRing
+	directCNResolveFn  DirectCNDNSFunc
+	tunnelDNSResolveFn TunnelDNSFunc
 	socksSrv          *SOCKS5Server
 	httpSrv         *HTTPProxyServer
 	sysProxyApplied bool

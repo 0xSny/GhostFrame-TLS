@@ -15,10 +15,12 @@ import (
 )
 
 const (
-	smartRouteCacheCap     = 4096
-	smartRouteCacheTTL     = 10 * time.Minute
-	smartDNSProbeTimeout   = 350 * time.Millisecond
-	defaultRecentRouteCap  = 80
+	smartRouteCacheCap       = 4096
+	smartRouteProxyCacheTTL  = 15 * time.Minute
+	smartRouteDirectCacheTTL = 30 * time.Minute
+	smartTunnelDNSTimeout    = 800 * time.Millisecond
+	smartDNSProbeTimeout     = 250 * time.Millisecond
+	defaultRecentRouteCap    = 80
 )
 
 // RecentRouteEntry records a recent routing decision for the Connection Inspector UI.
@@ -148,7 +150,11 @@ func (c *smartRouteCache) Put(ent smartRouteEntry) {
 	if ent.host == "" {
 		return
 	}
-	ent.expires = c.nowFn().Add(smartRouteCacheTTL)
+	ttl := smartRouteProxyCacheTTL
+	if ent.act == ActionDirect {
+		ttl = smartRouteDirectCacheTTL
+	}
+	ent.expires = c.nowFn().Add(ttl)
 	if len(ent.wireResp) > 0 {
 		ent.wireResp = append([]byte(nil), ent.wireResp...)
 	}
@@ -237,10 +243,23 @@ func isValidPublicNonPoisonedIPv4(ip net.IP) (net.IP, bool) {
 // DirectCNDNSFunc resolves host via direct CN DNS and returns raw wire response + parsed A IPs.
 type DirectCNDNSFunc func(ctx context.Context, host string) (ips []net.IP, wireResp []byte, err error)
 
+// TunnelDNSFunc resolves host via encrypted tunnel DNS for Tunnel-First GeoIP classification.
+type TunnelDNSFunc func(ctx context.Context, host string) (ips []net.IP, err error)
+
 // SetDirectCNResolverForTest injects a deterministic CN DNS resolver for unit testing.
 func (e *Engine) SetDirectCNResolverForTest(fn DirectCNDNSFunc) {
 	e.mu.Lock()
 	e.directCNResolveFn = fn
+	e.mu.Unlock()
+	if e.smartCache != nil {
+		e.smartCache.Clear()
+	}
+}
+
+// SetTunnelDNSResolverForTest injects a deterministic encrypted tunnel DNS resolver for unit testing.
+func (e *Engine) SetTunnelDNSResolverForTest(fn TunnelDNSFunc) {
+	e.mu.Lock()
+	e.tunnelDNSResolveFn = fn
 	e.mu.Unlock()
 	if e.smartCache != nil {
 		e.smartCache.Clear()
@@ -371,21 +390,40 @@ func (e *Engine) probeUnknownDomainSmart(hostLower string) smartRouteEntry {
 	}()
 
 	e.mu.RLock()
-	fn := e.directCNResolveFn
+	state := e.state
+	sched := e.sched
+	tunnelFn := e.tunnelDNSResolveFn
+	cnFn := e.directCNResolveFn
 	e.mu.RUnlock()
-	if fn == nil {
-		fn = defaultDirectCNProbe
+
+	if tunnelFn == nil {
+		if state != StateConnected || sched == nil || e.tunnelDNS == nil {
+			ent := smartRouteEntry{
+				host:   hostLower,
+				act:    ActionProxy,
+				reason: "proxy:tunnel-offline",
+			}
+			call.res = ent
+			return ent
+		}
+		tunnelDNS := e.tunnelDNS
+		tunnelFn = func(ctx context.Context, host string) ([]net.IP, error) {
+			v4, _, err := tunnelDNS.ResolveThroughTunnel(ctx, sched, host)
+			return v4, err
+		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), smartDNSProbeTimeout)
-	ips, wireResp, err := fn(ctx, hostLower)
-	cancel()
+	// Step 1: Zero-leak encrypted tunnel DNS resolution (800ms timeout, no local ECS/DNS).
+	tctx, tcancel := context.WithTimeout(context.Background(), smartTunnelDNSTimeout)
+	ips, err := tunnelFn(tctx, hostLower)
+	tcancel()
 
 	ent := smartRouteEntry{
 		host:   hostLower,
 		act:    ActionProxy,
-		reason: "proxy:dns-timeout",
+		reason: "proxy:tunnel-dns-timeout",
 	}
+	var confirmedCNIP net.IP
 	if err == nil && len(ips) > 0 {
 		foundPublic := false
 		for _, ip := range ips {
@@ -395,19 +433,46 @@ func (e *Engine) probeUnknownDomainSmart(hostLower string) smartRouteEntry {
 			}
 			foundPublic = true
 			if e.router.IsDirectIPv4(ip4) {
-				ent.act = ActionDirect
-				ent.reason = "direct:cn-dns"
-				ent.directIP = ip4.String()
-				ent.wireResp = wireResp
-				ent.wireAt = time.Now()
+				confirmedCNIP = ip4
 				break
 			}
 		}
-		if ent.act != ActionDirect {
+		if confirmedCNIP == nil {
 			if foundPublic {
 				ent.reason = "proxy:geoip-overseas"
 			} else {
 				ent.reason = "proxy:dns-filtered"
+			}
+		}
+	}
+
+	// Step 2: Overseas / unresolved / filtered domains go directly through proxy (0 local DNS contact).
+	if confirmedCNIP == nil {
+		e.smartCache.Put(ent)
+		call.res = ent
+		return ent
+	}
+
+	// Step 3: Proven Mainland China domain -> cache ActionDirect (30m) and optionally refresh local ISP CDN IP (250ms).
+	ent.act = ActionDirect
+	ent.reason = "direct:cn-dns"
+	ent.directIP = confirmedCNIP.String()
+
+	if cnFn == nil {
+		cnFn = defaultDirectCNProbe
+	}
+	cctx, ccancel := context.WithTimeout(context.Background(), smartDNSProbeTimeout)
+	cnIPs, wireResp, cnErr := cnFn(cctx, hostLower)
+	ccancel()
+	if cnErr == nil && len(cnIPs) > 0 {
+		for _, ip := range cnIPs {
+			if cip4, valid := isValidPublicNonPoisonedIPv4(ip); valid && e.router.IsDirectIPv4(cip4) {
+				ent.directIP = cip4.String()
+				if len(wireResp) >= 12 {
+					ent.wireResp = wireResp
+					ent.wireAt = time.Now()
+				}
+				break
 			}
 		}
 	}
@@ -424,9 +489,9 @@ func splitHostPortSafe(target string) (host, port string) {
 	return strings.Trim(strings.TrimSpace(target), "[]"), ""
 }
 
-// DecideSmartRoute classifies routeTarget under active RouteMode, running a 350ms
-// direct CN DNS GeoIP pre-probe ONLY for unknown candidate domains under RouteRule.
-// Known proxy rules strictly skip local DNS queries (zero DNS leaks).
+// DecideSmartRoute classifies routeTarget under active RouteMode using Tunnel-First GeoIP
+// for unknown candidate domains under RouteRule (zero local/CN DNS queries on overseas hosts).
+// Known proxy rules strictly skip all DNS pre-probes.
 func (e *Engine) DecideSmartRoute(dialTarget, routeTarget string) (act RouteAction, resolvedDialTarget, reason string) {
 	e.mu.RLock()
 	mode := e.config.RouteMode
@@ -461,9 +526,9 @@ func (e *Engine) DecideSmartRoute(dialTarget, routeTarget string) (act RouteActi
 	return act, resolvedDialTarget, reason
 }
 
-// ResolveSmartDNS evaluates a LAN/router DNS query without leaking known overseas domains.
-// For unknown domains under Rule mode that resolve within 350ms to a valid Mainland China IP,
-// it returns ActionDirect along with the cached CN DNS wire packet (with txID patched).
+// ResolveSmartDNS evaluates a LAN/router DNS query without leaking known or unknown overseas domains.
+// Under Rule mode, unknown domains first resolve through the encrypted tunnel (800ms); only confirmed
+// Mainland China IPs qualify for ActionDirect and a 250ms local CN CDN wire-response refresh.
 func (e *Engine) ResolveSmartDNS(mode RouteMode, qname string, txID []byte) (act RouteAction, wireResp []byte, reason string) {
 	hostLower := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(qname), "."))
 	hostport := net.JoinHostPort(hostLower, "443")

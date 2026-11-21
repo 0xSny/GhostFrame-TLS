@@ -164,12 +164,26 @@ func (r *TunnelDNSResolver) ResolveThroughTunnel(ctx context.Context, sched *gft
 	defer assoc.Close()
 
 	var lastErr error
-	for _, srv := range r.servers {
+	for idx, srv := range r.servers {
 		if err := assoc.SendTo(srv, queryA); err != nil {
 			lastErr = err
 			continue
 		}
-		timer := time.NewTimer(2500 * time.Millisecond)
+		waitDur := 2500 * time.Millisecond
+		if dl, ok := ctx.Deadline(); ok {
+			rem := time.Until(dl)
+			if rem <= 0 {
+				return nil, nil, context.DeadlineExceeded
+			}
+			slice := rem / time.Duration(len(r.servers)-idx)
+			if slice < 250*time.Millisecond {
+				slice = rem
+			}
+			if slice < waitDur {
+				waitDur = slice
+			}
+		}
+		timer := time.NewTimer(waitDur)
 		for {
 			select {
 			case <-ctx.Done():

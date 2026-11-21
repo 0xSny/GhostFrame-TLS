@@ -1,10 +1,56 @@
 package client
 
 import (
+	"bytes"
+	"compress/zlib"
+	_ "embed"
+	"io"
 	"net"
 	"os"
 	"strings"
+	"sync"
 )
+
+//go:embed cn_domains.zlib
+var cnDomainsZlib []byte
+
+var (
+	cnDomainsOnce sync.Once
+	cnDomainsMap  map[string]struct{}
+)
+
+func loadCNDomainsSet() map[string]struct{} {
+	cnDomainsOnce.Do(func() {
+		if len(cnDomainsZlib) == 0 {
+			return
+		}
+		zr, err := zlib.NewReader(bytes.NewReader(cnDomainsZlib))
+		if err != nil {
+			return
+		}
+		defer zr.Close()
+		raw, err := io.ReadAll(io.LimitReader(zr, 4<<20))
+		if err != nil || len(raw) == 0 {
+			return
+		}
+		s := string(raw)
+		m := make(map[string]struct{}, 4600)
+		start := 0
+		for i := 0; i <= len(s); i++ {
+			if i == len(s) || s[i] == '\n' {
+				if i > start {
+					line := strings.TrimSpace(s[start:i])
+					if line != "" {
+						m[line] = struct{}{}
+					}
+				}
+				start = i + 1
+			}
+		}
+		cnDomainsMap = m
+	})
+	return cnDomainsMap
+}
 
 // BuiltinRuleSetVersion identifies the embedded multi-category domain & CIDR rule engine.
 const BuiltinRuleSetVersion = "v4.2-SmartRuleSet"
@@ -320,6 +366,35 @@ var builtinProxyRules = []ruleSeed{
 	{"mega.nz", "proxy:global"},
 	{"mask.icloud.com", "proxy:global"},
 	{"mask-h2.icloud.com", "proxy:global"},
+
+	// IP / DNS Leak Test & VPN Diagnostic Sites (must NEVER leak direct DNS)
+	{"ping0.cc", "proxy:leak-check"},
+	{"ipleak.net", "proxy:leak-check"},
+	{"dnsleaktest.com", "proxy:leak-check"},
+	{"browserleaks.com", "proxy:leak-check"},
+	{"bash.ws", "proxy:leak-check"},
+	{"whoer.net", "proxy:leak-check"},
+	{"ip-api.com", "proxy:leak-check"},
+	{"ipinfo.io", "proxy:leak-check"},
+	{"ip.sb", "proxy:leak-check"},
+	{"ipify.org", "proxy:leak-check"},
+	{"ident.me", "proxy:leak-check"},
+	{"scamalytics.com", "proxy:leak-check"},
+	{"ipdata.co", "proxy:leak-check"},
+	{"ipgeolocation.io", "proxy:leak-check"},
+	{"astrill.com", "proxy:leak-check"},
+	{"expressvpn.com", "proxy:leak-check"},
+	{"surfshark.com", "proxy:leak-check"},
+	{"mullvad.net", "proxy:leak-check"},
+	{"cloudflareclient.com", "proxy:leak-check"},
+
+	// Domestic Public DoH Endpoints (prevent browser DoH from bypassing tunnel rules)
+	{"dns.alidns.com", "proxy:doh-guard"},
+	{"doh.pub", "proxy:doh-guard"},
+	{"sm2.doh.pub", "proxy:doh-guard"},
+	{"dot.pub", "proxy:doh-guard"},
+	{"dns.pub", "proxy:doh-guard"},
+	{"doh.360.cn", "proxy:doh-guard"},
 }
 
 var builtinDirectRules = []ruleSeed{

@@ -2,6 +2,7 @@ package tproxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -312,5 +313,105 @@ func TestSplitDNSCacheBeforeSmartRouteAndClear(t *testing.T) {
 	_, d3, _, _ := srv.Counters()
 	if d3 != 2 || upstreamHits.Load() != 2 {
 		t.Fatalf("expected cache miss after ClearCache, got direct=%d upstream=%d", d3, upstreamHits.Load())
+	}
+}
+
+func TestSplitDNSTunnelFirstUnknownDomainZeroCNLeak(t *testing.T) {
+	client.SetNoSysProxy(true)
+	eng, err := client.NewEngine("")
+	if err != nil {
+		t.Fatalf("NewEngine failed: %v", err)
+	}
+	defer eng.Close()
+
+	dnsPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dnsPC.Close()
+	var localDirectUDPHits atomic.Int32
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		buf := make([]byte, 2048)
+		for {
+			n, addr, rerr := dnsPC.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			if n < 12 {
+				_, _ = dnsPC.WriteTo(buf[:n], addr)
+				continue
+			}
+			localDirectUDPHits.Add(1)
+			resp := make([]byte, n+16)
+			copy(resp, buf[:n])
+			resp[2] = 0x81
+			resp[3] = 0x80
+			binary.BigEndian.PutUint16(resp[6:8], 1)
+			off := n
+			binary.BigEndian.PutUint16(resp[off:off+2], 0xc00c)
+			binary.BigEndian.PutUint16(resp[off+2:off+4], 1)
+			binary.BigEndian.PutUint16(resp[off+4:off+6], 1)
+			binary.BigEndian.PutUint32(resp[off+6:off+10], 60)
+			binary.BigEndian.PutUint16(resp[off+10:off+12], 4)
+			copy(resp[off+12:off+16], []byte{81, 68, 10, 20})
+			_, _ = dnsPC.WriteTo(resp, addr)
+		}
+	}()
+	<-started
+	for attempt := 0; attempt < 3; attempt++ {
+		if wc, werr := net.Dial("udp4", dnsPC.LocalAddr().String()); werr == nil {
+			_ = wc.SetDeadline(time.Now().Add(80 * time.Millisecond))
+			_, _ = wc.Write([]byte("ping"))
+			var pong [8]byte
+			rn, _ := wc.Read(pong[:])
+			_ = wc.Close()
+			if rn > 0 {
+				break
+			}
+		}
+	}
+
+	var cnProbeCalls atomic.Int32
+	eng.SetTunnelDNSResolverForTest(func(ctx context.Context, host string) ([]net.IP, error) {
+		switch host {
+		case "minigame.cn-thirdparty.example":
+			return []net.IP{net.ParseIP("81.68.10.20")}, nil // Tencent Cloud Shanghai
+		case "leak-check-9981.unknown-overseas-test.org":
+			return []net.IP{net.ParseIP("104.18.20.30")}, nil
+		default:
+			return nil, context.DeadlineExceeded
+		}
+	})
+	eng.SetDirectCNResolverForTest(func(ctx context.Context, host string) ([]net.IP, []byte, error) {
+		cnProbeCalls.Add(1)
+		return nil, nil, context.DeadlineExceeded
+	})
+
+	srv := NewSplitDNSServer("127.0.0.1:0", eng, []string{dnsPC.LocalAddr().String()}, true, func() GatewayMode { return ModeRule })
+	srv.directMu.Lock()
+	srv.directDNS = []string{dnsPC.LocalAddr().String()}
+	srv.directMu.Unlock()
+
+	// 1. Unknown overseas domain: zero CN pre-probe AND zero local direct DNS socket hits.
+	qOver, _ := client.BuildDNSQuery(0x4444, "leak-check-9981.unknown-overseas-test.org", 1)
+	_ = srv.HandlePacket(qOver)
+	_, dir1, tun1, _ := srv.Counters()
+	if dir1 != 0 || tun1 != 1 || cnProbeCalls.Load() != 0 || localDirectUDPHits.Load() != 0 {
+		t.Fatalf("overseas unknown DNS leaked! dir=%d tun=%d cnProbe=%d localUDP=%d",
+			dir1, tun1, cnProbeCalls.Load(), localDirectUDPHits.Load())
+	}
+
+	// 2. Unknown CN domain returning 81.68.10.20 via tunnel DNS -> promoted to ActionDirect.
+	qCN, _ := client.BuildDNSQuery(0x5555, "minigame.cn-thirdparty.example", 1)
+	rCN := srv.HandlePacket(qCN)
+	if len(rCN) < 12 || (rCN[3]&0x0F) != 0 {
+		t.Fatalf("expected NOERROR direct DNS reply for confirmed CN domain, got len=%d", len(rCN))
+	}
+	_, dir2, tun2, _ := srv.Counters()
+	if dir2 != 1 || tun2 != 1 || cnProbeCalls.Load() != 1 || localDirectUDPHits.Load() != 1 {
+		t.Fatalf("expected confirmed CN promotion, got dir=%d tun=%d cnProbe=%d localUDP=%d",
+			dir2, tun2, cnProbeCalls.Load(), localDirectUDPHits.Load())
 	}
 }

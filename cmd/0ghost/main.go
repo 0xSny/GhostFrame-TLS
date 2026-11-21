@@ -26,7 +26,7 @@ import (
 	"ghostframe/internal/tproxy"
 )
 
-var gatewayVersion = "v4.0.28-LTS"
+var gatewayVersion = "v4.0.29-LTS"
 
 type GatewayService struct {
 	cfgPath string

@@ -51,6 +51,7 @@ type Router struct {
 	lanSuffixMap    map[string]string
 	proxySuffixMap  map[string]string
 	directSuffixMap map[string]string
+	cnDomainSet     map[string]struct{}
 
 	customMu    sync.RWMutex
 	customRules []CustomRule
@@ -125,6 +126,7 @@ func NewRouter() *Router {
 		lanSuffixMap:    lanMap,
 		proxySuffixMap:  proxyMap,
 		directSuffixMap: directMap,
+		cnDomainSet:     loadCNDomainsSet(),
 	}
 }
 
@@ -144,7 +146,7 @@ func (r *Router) Stats() RuleStats {
 	r.customMu.RUnlock()
 	return RuleStats{
 		Version:        BuiltinRuleSetVersion,
-		BuiltinDomains: len(r.proxySuffixMap) + len(r.directSuffixMap),
+		BuiltinDomains: len(r.proxySuffixMap) + len(r.directSuffixMap) + len(r.cnDomainSet),
 		BuiltinCIDRs:   len(r.cnRanges) + len(r.cnIPv6),
 		CustomRules:    customN,
 		DirectHits:     r.directHits.Load(),
@@ -198,6 +200,23 @@ func lookupSuffixMap(hostLower string, m map[string]string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func lookupSuffixSet(hostLower string, m map[string]struct{}) bool {
+	if hostLower == "" || len(m) == 0 {
+		return false
+	}
+	if _, ok := m[hostLower]; ok {
+		return true
+	}
+	for i := 0; i < len(hostLower); i++ {
+		if hostLower[i] == '.' && i+1 < len(hostLower) {
+			if _, ok := m[hostLower[i+1:]]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isLANIP(ip net.IP) bool {
@@ -332,7 +351,10 @@ func (r *Router) evaluateStatic(mode RouteMode, hostport string) (act RouteActio
 		if strings.HasSuffix(hostLower, ".cn") {
 			return ActionDirect, "direct:cn", false
 		}
-		// Unknown hostname: caller may run 350ms CN DNS GeoIP probe or fall back directly to proxy.
+		if lookupSuffixSet(hostLower, r.cnDomainSet) {
+			return ActionDirect, "direct:cn-list", false
+		}
+		// Unknown hostname: caller runs Tunnel-First GeoIP pre-probe or falls back directly to proxy.
 		return ActionProxy, "final:proxy", true
 	}
 }
