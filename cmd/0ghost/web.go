@@ -107,7 +107,7 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		imported := 0
 		var lastErr error
 		for _, ln := range strings.Split(strings.ReplaceAll(req.URI, "\r\n", "\n"), "\n") {
-			u := strings.TrimSpace(ln)
+			u := extractNodeURI(ln)
 			if u == "" {
 				continue
 			}
@@ -351,6 +351,7 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
+		w.Header().Set("Cache-Control", "no-store")
 
 		rNorm := r
 		if strings.HasPrefix(r.URL.Path, "/kbox") {
@@ -523,4 +524,21 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func extractNodeURI(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	for _, scheme := range []string{"ksl4://", "gft3://", "gft2://", "gft://"} {
+		if idx := strings.Index(s, scheme); idx >= 0 {
+			sub := s[idx:]
+			if end := strings.IndexAny(sub, "\"' \t\r\n"); end >= 0 {
+				sub = sub[:end]
+			}
+			return strings.TrimSpace(sub)
+		}
+	}
+	return s
 }

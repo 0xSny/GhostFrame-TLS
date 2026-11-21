@@ -67,7 +67,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist _stage_kbox/usr/bin
 
-          REL_VER="v4.0.27-LTS"
+          REL_VER="v4.0.28-LTS"
           VER_X="-X ghostframe/internal/client.Version=${REL_VER} -X main.gatewayVersion=${REL_VER}"
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w ${VER_X}" -o dist/kbox-linux-arm64 ./cmd/0ghost
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w ${VER_X}" -o dist/kbox-linux-amd64 ./cmd/0ghost

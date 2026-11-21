@@ -67,9 +67,9 @@ textarea{min-height:74px;resize:vertical;font-family:ui-monospace,SFMono-Regular
 <div class="wrap">
   <div class="topbar">
     <div class="brand">
-      <div class="logo">0G</div>
+      <div class="logo">KB</div>
       <div>
-        <div class="title">0Ghost 旁路由透明网关 <span style="font-size:12px;color:var(--cyan);font-weight:600" id="verTag">v4.0.1-LTS</span></div>
+        <div class="title">KestrelBox 旁路由透明网关 <span style="font-size:12px;color:var(--cyan);font-weight:600" id="verTag">v4.0.28-LTS</span></div>
         <div class="sub" id="lanSub">N1 ARM64 · 检测局域网信息中...</div>
       </div>
     </div>
@@ -420,6 +420,10 @@ function drawSpark(hist){
 
 function refresh(){
   api('/api/status').then(s => {
+    if (s.gateway_version) {
+      const vt = document.getElementById('verTag');
+      if (vt) vt.textContent = s.gateway_version;
+    }
     curState = s.state || 'disconnected';
     const dot = document.getElementById('stateDot');
     dot.className = 'dot ' + (curState==='connected'?'ok':curState==='connecting'?'warn':curState==='error'?'err':'');

@@ -26,7 +26,7 @@ import (
 	"ghostframe/internal/tproxy"
 )
 
-var gatewayVersion = "v4.0.27-LTS"
+var gatewayVersion = "v4.0.28-LTS"
 
 type GatewayService struct {
 	cfgPath string
@@ -433,7 +433,7 @@ func (s *GatewayService) ProbeDualConnectivity() map[string]any {
 			tunnelInfo = "TLS: " + err.Error()
 			return
 		}
-		req := "GET /generate_204 HTTP/1.1\r\nHost: cp.cloudflare.com\r\nUser-Agent: 0Ghost-Probe\r\nConnection: close\r\n\r\n"
+		req := "GET /generate_204 HTTP/1.1\r\nHost: cp.cloudflare.com\r\nUser-Agent: KestrelBox-Probe\r\nConnection: close\r\n\r\n"
 		if _, err := tc.Write([]byte(req)); err != nil {
 			tunnelInfo = err.Error()
 			return

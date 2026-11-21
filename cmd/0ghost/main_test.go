@@ -56,9 +56,9 @@ func TestGatewayConsoleRoutesAndSettings(t *testing.T) {
 		t.Fatalf("unexpected updated gateway config: %+v", cfg)
 	}
 
-	// Import a node and verify POST /api/node/rename updates node remark
+	// Import a node (also verifying accidental CLI wrapper around ksl4:// is cleanly stripped) and verify POST /api/node/rename updates node remark
 	nodeURI := (&gft.Link{V: 3, Host: "n1.example", Port: 443, SNI: "ftp.jaist.ac.jp", PSK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", Verify: "ca", Remark: "OldNode"}).Encode()
-	impBody := `{"uri":"` + nodeURI + `"}`
+	impBody := `{"uri":"kestrel-core -low-mem -socks 0.0.0.0:10808 -link \"` + nodeURI + `\""}`
 	reqImp := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:19080/api/import", strings.NewReader(impBody))
 	reqImp.Header.Set("Origin", "http://127.0.0.1:19080")
 	recImp := httptest.NewRecorder()

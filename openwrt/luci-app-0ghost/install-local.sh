@@ -18,7 +18,7 @@ fi
 if [ ! -f /etc/kbox/cn_ipv4.txt ] && [ -f /etc/0ghost/cn_ipv4.txt ]; then
 	cp -f /etc/0ghost/cn_ipv4.txt /etc/kbox/cn_ipv4.txt
 fi
-rm -f /etc/init.d/0ghost /etc/hotplug.d/iface/99-0ghost /etc/hotplug.d/firewall/99-0ghost \
+rm -f /usr/bin/0ghost /etc/init.d/0ghost /etc/hotplug.d/iface/99-0ghost /etc/hotplug.d/firewall/99-0ghost \
 	/usr/share/luci/menu.d/luci-app-0ghost.json /usr/share/rpcd/acl.d/luci-app-0ghost.json
 rm -rf /www/luci-static/resources/view/0ghost
 
