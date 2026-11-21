@@ -1108,3 +1108,131 @@ func TestReplayGuardAndListenerIdleSweep(t *testing.T) {
 		t.Fatalf("expected expired entry purged after 181s, got rem=%d len=%d", rem, rg.Len())
 	}
 }
+
+func TestPureUDPTrackingSACKLossAndFECSensitivity(t *testing.T) {
+	// 1. Verify interactive UDP FEC sensitivity threshold (0.002 -> K=8) and 5ms flush delay.
+	if SelectFECCountForTraffic(0.001, true) != 0 {
+		t.Fatal("expected FEC off below 0.2% even in interactive UDP mode")
+	}
+	if SelectFECCountForTraffic(0.002, true) != 8 {
+		t.Fatalf("expected K=8 at 0.2%% loss for interactive UDP, got %d", SelectFECCountForTraffic(0.002, true))
+	}
+	if SelectFECCountForTraffic(0.01, false) != 0 {
+		t.Fatal("expected non-UDP default threshold to stay at 1.5%")
+	}
+
+	enc := NewFECEncoder()
+	now := time.Now()
+	plainBuf := make([]byte, 1600)
+	sp, _, _ := enc.WrapPlaintextAdaptive(plainBuf, []byte("udp-game-pkt"), 0.005, true, now)
+	if sp[5] != 8 {
+		t.Fatalf("expected K=8 header in interactive UDP packet at 0.5%% loss, got %d", sp[5])
+	}
+	if _, flushed := enc.FlushIfDueWithDelay(now.Add(5*time.Millisecond), fecGameFlushDelay); !flushed {
+		t.Fatal("expected interactive UDP 5ms FlushIfDueWithDelay to flush shortened parity")
+	}
+
+	// 2. Verify LossTracker PollTimeouts retires pure-UDP (len(frames)==0) without bumping ptoBackoff.
+	lt := NewLossTracker()
+	for pn := uint64(1); pn <= 3; pn++ {
+		lt.OnPacketSent(pn, 200, []ReliableFrame{{Bytes: []byte("f")}}, now)
+	}
+	lt.OnSACK(3, 0, []SACKBlock{{Gap: 0, Len: 3}}, now.Add(20*time.Millisecond))
+	lt.OnPacketSent(4, 120, nil, now.Add(30*time.Millisecond))
+	lost, ptoCount, lossRate, _, _ := lt.PollTimeouts(now.Add(1 * time.Second))
+	_, totalLost, _ := lt.Stats()
+	if len(lost) != 0 || ptoCount != 0 || lt.InFlightBytes() != 0 || totalLost != 1 || lossRate <= 0 {
+		t.Fatalf("expected pure-UDP RTO to record loss without inflating ptoCount or queuing retransmit: lost=%d pto=%d inFlight=%d totalLost=%d lossRate=%.4f",
+			len(lost), ptoCount, lt.InFlightBytes(), totalLost, lossRate)
+	}
+
+	// 3. End-to-end pure UDP datagrams trigger SACK, update LossTracker/RTT/traffic, and stay zero-retransmit.
+	psk := make([]byte, 32)
+	_, _ = rand.Read(psk)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sw := NewLossyUDPSwitch("127.0.0.1:443", 0, 0, 0, 2*time.Millisecond)
+	defer sw.CloseAll()
+
+	ln, err := NewListener(sw.srvConn, false, psk, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	srvUDPCh := make(chan string, 16)
+	go func() {
+		for {
+			ss, aerr := ln.Accept(ctx)
+			if aerr != nil {
+				return
+			}
+			ss.SetHandlers(nil, func(sink UDPReplySink, assocID uint16, target string, data []byte) {
+				srvUDPCh <- string(data)
+				_ = sink.SendUDPReply(assocID, target, append([]byte("ack:"), data...))
+			}, nil)
+		}
+	}()
+
+	cli, _, err := DialWithPacketConn(ctx, sw.NewClientEnd(), true, sw.srvAddr, DialOptions{
+		Host: "127.0.0.1", Port: 443, PSK: psk, Timeout: 3 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	u, err := cli.OpenUDP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u.Close()
+
+	for i := 0; i < 10; i++ {
+		if err := u.SendTo("119.29.29.29:53", []byte("lol-tick")); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case pkt := <-u.Recv():
+			if string(pkt.Data) != "ack:lol-tick" {
+				t.Fatalf("unexpected udp echo: %q", pkt.Data)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for pure UDP reply")
+		}
+	}
+
+	// Wait briefly for server delayed/immediate SACK on pure UDP traffic.
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		st := cli.Stats()
+		if st.SRTTMs > 0 && st.Rate30sBps > 0 && cli.LastUDPTime().After(now) {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	st := cli.Stats()
+	if st.SRTTMs <= 0 || st.Rate30sBps == 0 {
+		t.Fatalf("expected pure UDP traffic to populate SRTT & Rate30sBps via SACK+recordTraffic, got SRTT=%dms Rate=%dB/s",
+			st.SRTTMs, st.Rate30sBps)
+	}
+
+	// 4. Verify small UDP fast-lane bypasses CC slice token exhaustion immediately (<10ms).
+	cli.cc.ConsumeBytes(1024 * 1024) // exhaust current 16ms micro-burst slice budget
+	startFast := time.Now()
+	if err := u.SendTo("119.29.29.29:53", []byte("fast-game-pkt")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case pkt := <-u.Recv():
+		if string(pkt.Data) != "ack:fast-game-pkt" {
+			t.Fatalf("unexpected fast-lane udp reply: %q", pkt.Data)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out on fast-lane small UDP packet")
+	}
+	if el := time.Since(startFast); el > 80*time.Millisecond {
+		t.Fatalf("small UDP packet was delayed despite fast lane: %v", el)
+	}
+}

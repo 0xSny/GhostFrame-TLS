@@ -1093,3 +1093,133 @@ func TestEmergencyProbeFixedPortRebind(t *testing.T) {
 		t.Fatalf("expected emergency rebind on fixed port %d, got %d", sPort, hoppedPort.Load())
 	}
 }
+
+func TestSchedulerUDPStickyPinnedSession(t *testing.T) {
+	ps := NewParamStore(DefaultParams())
+	link := &Link{
+		V:         3,
+		Host:      "127.0.0.1",
+		Port:      443,
+		SNI:       "ftp.jaist.ac.jp",
+		PSK:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		Verify:    "ca",
+		Transport: "rtc",
+	}
+	psk, _ := link.PSKBytes()
+
+	// Spin up two independent RTC server listeners simulating dual hopping tracks (RTC#0 & RTC#1).
+	makeTrack := func(cnt *atomic.Int32) (*gftrtc.RTCSession, func()) {
+		sPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			sPC.Close()
+			t.Fatal(err)
+		}
+		ln, err := gftrtc.NewListener(sPC, true, psk, 0, nil)
+		if err != nil {
+			sPC.Close()
+			cPC.Close()
+			t.Fatal(err)
+		}
+		srvCh := make(chan *gftrtc.RTCSession, 1)
+		go func() {
+			if ss, aerr := ln.Accept(context.Background()); aerr == nil && ss != nil {
+				ss.SetHandlers(nil, func(sink gftrtc.UDPReplySink, assocID uint16, target string, data []byte) {
+					cnt.Add(1)
+					_ = sink.SendUDPReply(assocID, target, data)
+				}, nil)
+				srvCh <- ss
+			}
+		}()
+		sPort := sPC.LocalAddr().(*net.UDPAddr).Port
+		cliSess, _, err := gftrtc.DialWithPacketConn(context.Background(), cPC, false, sPC.LocalAddr(), gftrtc.DialOptions{
+			Host:    "127.0.0.1",
+			Port:    sPort,
+			PSK:     psk,
+			Timeout: 2 * time.Second,
+		})
+		if err != nil {
+			ln.Close()
+			t.Fatal(err)
+		}
+		srvSess := <-srvCh
+		return cliSess, func() {
+			cliSess.Close()
+			if srvSess != nil {
+				srvSess.Close()
+			}
+			ln.Close()
+		}
+	}
+
+	var count0, count1 atomic.Int32
+	sess0, stop0 := makeTrack(&count0)
+	defer stop0()
+	sess1, stop1 := makeTrack(&count1)
+	defer stop1()
+
+	sched := NewApexScheduler(link, ps, 2, nil)
+	sched.SetDialJitterForTest(0, 0, 100)
+	sched.mu.Lock()
+	sched.rtcSlots = []*rtcSlot{
+		{sess: sess0, channelIdx: 0},
+		{sess: sess1, channelIdx: 1},
+	}
+	sched.mu.Unlock()
+	defer func() {
+		sched.mu.Lock()
+		sched.rtcSlots = nil
+		sched.mu.Unlock()
+		sched.Close()
+	}()
+
+	assoc, err := sched.OpenUDP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer assoc.Close()
+
+	// Send 100 packets sequentially: MUST 100% stick to a single RTCSession without round-robin bouncing.
+	for i := 0; i < 100; i++ {
+		if err := assoc.SendTo("119.29.29.29:53", []byte("game-udp")); err != nil {
+			t.Fatalf("SendTo(%d) failed: %v", i, err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if count0.Load()+count1.Load() >= 100 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c0, c1 := count0.Load(), count1.Load()
+	if !((c0 == 100 && c1 == 0) || (c0 == 0 && c1 == 100)) {
+		t.Fatalf("expected 100%% UDP pinning on one RTC track (no cross-port reordering), got track0=%d track1=%d", c0, c1)
+	}
+
+	// Close whichever track was pinned -> SchedulerUDPAssoc MUST fail over cleanly to the healthy second track.
+	if c0 == 100 {
+		sess0.Close()
+	} else {
+		sess1.Close()
+	}
+	beforeFail := count0.Load() + count1.Load()
+	for i := 0; i < 10; i++ {
+		if err := assoc.SendTo("119.29.29.29:53", []byte("failover")); err != nil {
+			t.Fatalf("SendTo after pinned close failed: %v", err)
+		}
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if count0.Load()+count1.Load() >= beforeFail+10 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := count0.Load() + count1.Load(); got < beforeFail+10 {
+		t.Fatalf("expected seamless failover to remaining healthy RTC track, got total=%d want=%d", got, beforeFail+10)
+	}
+}

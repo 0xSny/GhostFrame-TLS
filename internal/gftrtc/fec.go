@@ -8,11 +8,12 @@ import (
 )
 
 const (
-	fecMaxK         = 10
-	fecSlotDataCap  = MaxFrameArea // 1318 = [uint16(len) || frameBytes(<=1316)]
-	fecDefaultRings = 64
-	fecLowMemRings  = 16
-	fecFlushDelay   = 8 * time.Millisecond
+	fecMaxK           = 10
+	fecSlotDataCap    = MaxFrameArea // 1318 = [uint16(len) || frameBytes(<=1316)]
+	fecDefaultRings   = 64
+	fecLowMemRings    = 16
+	fecFlushDelay     = 8 * time.Millisecond
+	fecGameFlushDelay = 5 * time.Millisecond
 )
 
 func xorBytes64(dst, src []byte) {
@@ -34,6 +35,22 @@ func SelectFECCount(lossRate float64) uint8 {
 		return 6
 	case lossRate >= 0.015:
 		return 10
+	default:
+		return 0
+	}
+}
+
+// SelectFECCountForTraffic picks adaptive XOR group size K, lowering the activation threshold
+// to 0.2% (K=8) during interactive UDP gaming flows so mild loss triggers immediate XOR-FEC recovery.
+func SelectFECCountForTraffic(lossRate float64, interactiveUDP bool) uint8 {
+	if !interactiveUDP {
+		return SelectFECCount(lossRate)
+	}
+	switch {
+	case lossRate >= 0.06:
+		return 6
+	case lossRate >= 0.002:
+		return 8
 	default:
 		return 0
 	}
@@ -63,10 +80,16 @@ func NewFECEncoder() *FECEncoder {
 // If flushParity is returned non-nil prior to encoding this packet (e.g., adaptive K switched to 0),
 // both parities are returned cleanly.
 func (e *FECEncoder) WrapPlaintext(dst []byte, frameArea []byte, lossRate float64, now time.Time) (srcPlain []byte, preFlushParity []byte, completedParity []byte) {
+	return e.WrapPlaintextAdaptive(dst, frameArea, lossRate, false, now)
+}
+
+// WrapPlaintextAdaptive works like WrapPlaintext while allowing interactive UDP flows to use
+// tighter loss thresholds for zero-stall FEC activation.
+func (e *FECEncoder) WrapPlaintextAdaptive(dst []byte, frameArea []byte, lossRate float64, interactiveUDP bool, now time.Time) (srcPlain []byte, preFlushParity []byte, completedParity []byte) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	targetK := SelectFECCount(lossRate)
+	targetK := SelectFECCountForTraffic(lossRate, interactiveUDP)
 
 	// If currently mid-group with an old K and FEC just disabled (or K shrunk past current count),
 	// flush the pending group cleanly first so indices stay consistent.
@@ -123,9 +146,17 @@ func (e *FECEncoder) WrapPlaintext(dst []byte, frameArea []byte, lossRate float6
 // FlushIfDue seals and returns a shortened parity packet if the oldest un-flushed source packet
 // is at least 8ms old, avoiding tail-packet delay on interactive/sparse traffic.
 func (e *FECEncoder) FlushIfDue(now time.Time) ([]byte, bool) {
+	return e.FlushIfDueWithDelay(now, fecFlushDelay)
+}
+
+// FlushIfDueWithDelay seals and returns a shortened parity packet after the specified delay.
+func (e *FECEncoder) FlushIfDueWithDelay(now time.Time, delay time.Duration) ([]byte, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.count == 0 || now.Sub(e.firstAt) < fecFlushDelay {
+	if delay <= 0 {
+		delay = fecFlushDelay
+	}
+	if e.count == 0 || now.Sub(e.firstAt) < delay {
 		return nil, false
 	}
 	p := e.emitParityLocked()

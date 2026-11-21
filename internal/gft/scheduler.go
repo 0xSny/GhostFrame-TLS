@@ -977,6 +977,47 @@ func (a *ApexScheduler) activeRTCForSend() *gftrtc.RTCSession {
 	return sl.sess
 }
 
+func (a *ApexScheduler) isRTCHealthy(r *gftrtc.RTCSession) bool {
+	if r == nil {
+		return false
+	}
+	select {
+	case <-r.Done():
+		return false
+	default:
+	}
+	now := time.Now()
+	a.mu.Lock()
+	healthy := false
+	for _, sl := range a.rtcSlots {
+		if sl != nil && sl.sess == r {
+			if sl.degradedAt.IsZero() || now.Sub(sl.degradedAt) >= 15*time.Second {
+				healthy = true
+			}
+			break
+		}
+	}
+	a.mu.Unlock()
+	if !healthy {
+		return false
+	}
+	if a.link.EffectiveTransport() == "auto" {
+		rRTT := a.rtcRTTMs.Load()
+		tRTT := a.pool.rttMs.Load()
+		if rRTT > 180 && tRTT > 0 && rRTT > tRTT*2 && a.pool.Stats().ActiveConns > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *ApexScheduler) stickyRTCForSend(pinned *gftrtc.RTCSession) *gftrtc.RTCSession {
+	if pinned != nil && a.isRTCHealthy(pinned) {
+		return pinned
+	}
+	return a.activeRTCForSend()
+}
+
 func (a *ApexScheduler) markRTCDegraded(r *gftrtc.RTCSession, err error) {
 	now := time.Now()
 	a.mu.Lock()
@@ -1046,10 +1087,11 @@ type SchedulerUDPAssoc struct {
 	sched *ApexScheduler
 	id    uint16
 
-	mu     sync.Mutex
-	closed bool
-	bySess map[any]UDPAssociation
-	last   UDPAssociation
+	mu        sync.Mutex
+	closed    bool
+	pinnedRTC *gftrtc.RTCSession
+	bySess    map[any]UDPAssociation
+	last      UDPAssociation
 
 	recvCh    chan UDPPacket
 	done      chan struct{}
@@ -1166,6 +1208,29 @@ func (u *SchedulerUDPAssoc) pumpReplies(sessKey any, sub UDPAssociation) {
 	}
 }
 
+func (u *SchedulerUDPAssoc) getPinnedRTC() *gftrtc.RTCSession {
+	u.mu.Lock()
+	r := u.pinnedRTC
+	u.mu.Unlock()
+	return r
+}
+
+func (u *SchedulerUDPAssoc) setPinnedRTC(r *gftrtc.RTCSession) {
+	u.mu.Lock()
+	if !u.closed {
+		u.pinnedRTC = r
+	}
+	u.mu.Unlock()
+}
+
+func (u *SchedulerUDPAssoc) clearPinnedRTC(r *gftrtc.RTCSession) {
+	u.mu.Lock()
+	if u.pinnedRTC == r {
+		u.pinnedRTC = nil
+	}
+	u.mu.Unlock()
+}
+
 func (u *SchedulerUDPAssoc) SendTo(target string, data []byte) error {
 	select {
 	case <-u.done:
@@ -1173,7 +1238,11 @@ func (u *SchedulerUDPAssoc) SendTo(target string, data []byte) error {
 	default:
 	}
 
-	if r := u.sched.activeRTCForSend(); r != nil {
+	pinned := u.getPinnedRTC()
+	if r := u.sched.stickyRTCForSend(pinned); r != nil {
+		if r != pinned {
+			u.setPinnedRTC(r)
+		}
 		sub, err := u.bindUnderlying(r, func() (UDPAssociation, error) {
 			return r.OpenUDPWithID(u.id)
 		})
@@ -1182,9 +1251,28 @@ func (u *SchedulerUDPAssoc) SendTo(target string, data []byte) error {
 				return nil
 			} else {
 				u.sched.markRTCDegraded(r, serr)
+				u.clearPinnedRTC(r)
 			}
 		} else {
 			u.sched.markRTCDegraded(r, err)
+			u.clearPinnedRTC(r)
+		}
+		// Seamless failover once to another healthy RTC track before TCP fallback.
+		if r2 := u.sched.activeRTCForSend(); r2 != nil && r2 != r {
+			u.setPinnedRTC(r2)
+			if sub2, err2 := u.bindUnderlying(r2, func() (UDPAssociation, error) {
+				return r2.OpenUDPWithID(u.id)
+			}); err2 == nil {
+				if serr2 := sub2.SendTo(target, data); serr2 == nil {
+					return nil
+				} else {
+					u.sched.markRTCDegraded(r2, serr2)
+					u.clearPinnedRTC(r2)
+				}
+			} else {
+				u.sched.markRTCDegraded(r2, err2)
+				u.clearPinnedRTC(r2)
+			}
 		}
 	}
 
@@ -1209,6 +1297,7 @@ func (u *SchedulerUDPAssoc) Close() error {
 	u.closeOnce.Do(func() {
 		u.mu.Lock()
 		u.closed = true
+		u.pinnedRTC = nil
 		subs := make([]UDPAssociation, 0, len(u.bySess))
 		for k, sub := range u.bySess {
 			subs = append(subs, sub)

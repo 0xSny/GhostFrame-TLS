@@ -771,17 +771,17 @@ func (lt *LossTracker) PollTimeouts(now time.Time) (lostFrames []ReliableFrame, 
 			lostCount++
 			lostFrames = appendLostFrames(lostFrames, pn, p.frames)
 		} else if rtoExpired {
-			// Retire in-flight credit and move pn to retired map briefly for late SACK RTT
-			// calibration or until retransmitted packet SACKs resolve OriginPN / age exceeds 2*max(SRTT,500ms).
 			delete(lt.sent, pn)
-			p.retired = true
-			p.retiredAt = now
 			lt.inFlightBytes -= p.wireBytes
 			if lt.inFlightBytes < 0 {
 				lt.inFlightBytes = 0
 			}
-			hitPTO = true
 			if len(p.frames) > 0 {
+				// Retire in-flight credit and move pn to retired map briefly for late SACK RTT
+				// calibration or until retransmitted packet SACKs resolve OriginPN / age exceeds 2*max(SRTT,500ms).
+				p.retired = true
+				p.retiredAt = now
+				hitPTO = true
 				pending := 0
 				for _, f := range p.frames {
 					if f.OriginPN == 0 {
@@ -792,8 +792,11 @@ func (lt *LossTracker) PollTimeouts(now time.Time) (lostFrames []ReliableFrame, 
 				}
 				p.pendingOrig = pending
 				p.frames = nil
+				lt.retired[pn] = p
+			} else {
+				// Pure unreliable UDP packet expired: reclaim credit and record loss without inflating PTO backoff.
+				lostCount++
 			}
-			lt.retired[pn] = p
 		}
 	}
 	lt.advanceOldestPNLocked()

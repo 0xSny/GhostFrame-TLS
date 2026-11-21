@@ -229,6 +229,7 @@ type RTCSession struct {
 
 	inboundCh chan inboundPkt
 	sendKick  chan struct{}
+	udpKick   chan struct{}
 	ackKick   chan struct{}
 	pingCh    chan time.Duration
 
@@ -332,6 +333,7 @@ func newRTCSession(isClient bool, ssrc uint32, clientID [8]byte, host string, re
 		listener:         listener,
 		inboundCh:        make(chan inboundPkt, inboundQueueDepth),
 		sendKick:         make(chan struct{}, 1),
+		udpKick:          make(chan struct{}, 1),
 		ackKick:          make(chan struct{}, 1),
 		pingCh:           make(chan time.Duration, 4),
 		replay:           &ReplayWindow{},
@@ -656,6 +658,12 @@ func (s *RTCSession) enqueueUDPFrame(frame []byte) {
 		s.udpQ = append(s.udpQ, frame)
 	}
 	s.qMu.Unlock()
+	if len(frame) <= 450 {
+		select {
+		case s.udpKick <- struct{}{}:
+		default:
+		}
+	}
 	s.kickSend()
 }
 
@@ -832,7 +840,7 @@ func (s *RTCSession) sendSACKNow() {
 	_, _, _ = s.sealAndWrite(plain[:FECHeaderLen+len(frame)], PTAudioCtrl, true)
 }
 
-func (s *RTCSession) popRetransmitOrPending(budget int) (frames [][]byte, reliable []ReliableFrame, pt uint8, hasStreamData bool) {
+func (s *RTCSession) popRetransmitOrPending(budget int, udpFastOnly bool) (frames [][]byte, reliable []ReliableFrame, pt uint8, hasStreamData bool, hasUDPData bool) {
 	s.qMu.Lock()
 	defer s.qMu.Unlock()
 
@@ -840,27 +848,32 @@ func (s *RTCSession) popRetransmitOrPending(budget int) (frames [][]byte, reliab
 	pt = PTAudioCtrl
 
 	// 1. Retransmissions get top priority (zero head-of-line blocking recovery)
-	for len(s.retransmitQ) > 0 {
-		rf := s.retransmitQ[0]
-		if used+len(rf.Bytes) > budget {
-			if used == 0 && len(rf.Bytes) <= MaxFrameArea {
-				// Frame slightly exceeds jittered budget: let it use physical MaxFrameArea without dropping.
-			} else {
-				break
+	if !udpFastOnly {
+		for len(s.retransmitQ) > 0 {
+			rf := s.retransmitQ[0]
+			if used+len(rf.Bytes) > budget {
+				if used == 0 && len(rf.Bytes) <= MaxFrameArea {
+					// Frame slightly exceeds jittered budget: let it use physical MaxFrameArea without dropping.
+				} else {
+					break
+				}
 			}
+			s.retransmitQ[0] = ReliableFrame{}
+			s.retransmitQ = s.retransmitQ[1:]
+			frames = append(frames, rf.Bytes)
+			reliable = append(reliable, rf)
+			used += len(rf.Bytes)
+			hasStreamData = true
+			pt = PTVideoData
 		}
-		s.retransmitQ[0] = ReliableFrame{}
-		s.retransmitQ = s.retransmitQ[1:]
-		frames = append(frames, rf.Bytes)
-		reliable = append(reliable, rf)
-		used += len(rf.Bytes)
-		hasStreamData = true
-		pt = PTVideoData
 	}
 
 	// 2. Low-latency unreliable UDP datagrams
 	for len(s.udpQ) > 0 {
 		u := s.udpQ[0]
+		if udpFastOnly && len(u) > 450 {
+			break
+		}
 		if used+len(u) > budget {
 			if used == 0 && len(u) <= MaxFrameArea {
 			} else {
@@ -871,6 +884,7 @@ func (s *RTCSession) popRetransmitOrPending(budget int) (frames [][]byte, reliab
 		s.udpQ = s.udpQ[1:]
 		frames = append(frames, u)
 		used += len(u)
+		hasUDPData = true
 		if len(u) > 200 {
 			pt = PTVideoData
 		}
@@ -892,7 +906,7 @@ func (s *RTCSession) popRetransmitOrPending(budget int) (frames [][]byte, reliab
 	}
 
 	// 4. Round-robin pull from active streams for fair zero-starvation bandwidth sharing
-	if len(s.sendRR) > 0 {
+	if !udpFastOnly && len(s.sendRR) > 0 {
 		visited := 0
 		for visited < len(s.sendRR) && used < budget {
 			if s.sendRRIdx >= len(s.sendRR) {
@@ -955,12 +969,19 @@ func (s *RTCSession) popRetransmitOrPending(budget int) (frames [][]byte, reliab
 		}
 	}
 
-	return frames, reliable, pt, hasStreamData
+	return frames, reliable, pt, hasStreamData, hasUDPData
 }
 
 func (s *RTCSession) hasPendingData() bool {
 	s.qMu.Lock()
 	has := len(s.retransmitQ) > 0 || len(s.udpQ) > 0 || len(s.ctrlQ) > 0 || len(s.sendRR) > 0
+	s.qMu.Unlock()
+	return has
+}
+
+func (s *RTCSession) hasSmallPendingUDP(maxBytes int) bool {
+	s.qMu.Lock()
+	has := len(s.udpQ) > 0 && len(s.udpQ[0]) <= maxBytes
 	s.qMu.Unlock()
 	return has
 }
@@ -1007,7 +1028,8 @@ func (s *RTCSession) sendLoop() {
 		srtt, _, _ := s.loss.RTTMetrics(now)
 		inFlight := s.loss.InFlightBytes()
 		allowed, waitDur := s.cc.CanSend(inFlight, srtt, now)
-		if !allowed {
+		fastUDP := !allowed && s.hasSmallPendingUDP(450) && inFlight < s.cc.MaxInFlightBytes(srtt)
+		if !allowed && !fastUDP {
 			if paceTimer == nil {
 				paceTimer = time.NewTimer(waitDur)
 			} else {
@@ -1024,16 +1046,18 @@ func (s *RTCSession) sendLoop() {
 				return
 			case <-s.ackKick:
 				s.sendSACKNow()
+			case <-s.udpKick:
 			case <-paceTimer.C:
 			}
 			continue
 		}
 
 		lossRate := s.loss.LossRate()
-		fecEnabled := SelectFECCount(lossRate) > 0
+		udpActive := now.Sub(s.LastUDPTime()) < 5*time.Second
+		fecEnabled := SelectFECCountForTraffic(lossRate, udpActive) > 0
 		budget := s.cc.FrameBudget(fecEnabled)
 
-		frames, reliable, pt, hasStreamData := s.popRetransmitOrPending(budget)
+		frames, reliable, pt, hasStreamData, hasUDPData := s.popRetransmitOrPending(budget, !allowed)
 		if len(frames) == 0 {
 			// Session flow-control backpressure or empty queues: park until SACK/Window/Kick arrives.
 			select {
@@ -1041,6 +1065,7 @@ func (s *RTCSession) sendLoop() {
 				return
 			case <-s.ackKick:
 				s.sendSACKNow()
+			case <-s.udpKick:
 			case <-s.sendKick:
 			}
 			continue
@@ -1092,7 +1117,7 @@ func (s *RTCSession) sendLoop() {
 			}
 		}
 
-		srcPlain, preParity, postParity := s.fecEnc.WrapPlaintext((*plainPtr)[:], area[:used], lossRate, now)
+		srcPlain, preParity, postParity := s.fecEnc.WrapPlaintextAdaptive((*plainPtr)[:], area[:used], lossRate, udpActive, now)
 		if preParity != nil {
 			marker := s.cc.ConsumeBytes(len(preParity) + RTPOverhead)
 			_, _, _ = s.sealAndWrite(preParity, PTVideoData, marker)
@@ -1103,7 +1128,7 @@ func (s *RTCSession) sendLoop() {
 			marker = false // parity finishes the micro-burst
 		}
 		pn, wlen, err := s.sealAndWrite(srcPlain, pt, marker)
-		if err == nil && len(reliable) > 0 {
+		if err == nil && (len(reliable) > 0 || hasUDPData) {
 			s.loss.OnPacketSent(pn, wlen, reliable, now)
 		}
 		if postParity != nil {
@@ -1140,7 +1165,11 @@ func (s *RTCSession) timerLoop() {
 				s.kickACK()
 			}
 
-			if parity, ok := s.fecEnc.FlushIfDue(now); ok {
+			flushDelay := fecFlushDelay
+			if now.Sub(s.LastUDPTime()) < 5*time.Second {
+				flushDelay = fecGameFlushDelay
+			}
+			if parity, ok := s.fecEnc.FlushIfDueWithDelay(now, flushDelay); ok {
 				_, _, _ = s.sealAndWrite(parity, PTVideoData, true)
 			}
 
@@ -1708,6 +1737,7 @@ func (s *RTCSession) dispatchFrames(b []byte, now time.Time) (ackEliciting bool)
 			if off+8 > len(b) {
 				return ackEliciting
 			}
+			ackEliciting = true
 			assocID := binary.BigEndian.Uint16(b[off : off+2])
 			msgID := binary.BigEndian.Uint16(b[off+2 : off+4])
 			fragIdx := b[off+4]
@@ -1928,6 +1958,7 @@ func (s *RTCSession) deliverInboundUDP(assocID uint16, body []byte, now time.Tim
 	}
 	s.lastUDPNs.Store(now.UnixNano())
 	s.DownBytes.Add(uint64(len(data)))
+	s.recordTraffic(len(data), now)
 	s.emitBytes(0, len(data))
 	cp := make([]byte, len(data))
 	copy(cp, data)
@@ -2129,8 +2160,10 @@ func (s *RTCSession) sendUDPPacket(id uint16, target string, data []byte) error 
 		fr := encodeFrameUDPDatagram(id, msgID, uint8(i), uint8(totalFrags), body[start:end])
 		s.enqueueUDPFrame(fr)
 	}
-	s.lastUDPNs.Store(time.Now().UnixNano())
+	now := time.Now()
+	s.lastUDPNs.Store(now.UnixNano())
 	s.UpBytes.Add(uint64(len(data)))
+	s.recordTraffic(len(data), now)
 	s.emitBytes(len(data), 0)
 	return nil
 }
@@ -2155,8 +2188,10 @@ func (s *RTCSession) sendUDPOnStream(id uint16, body []byte, origDataLen int) er
 		s.udpFallback = nil
 		return err
 	}
-	s.lastUDPNs.Store(time.Now().UnixNano())
+	now := time.Now()
+	s.lastUDPNs.Store(now.UnixNano())
 	s.UpBytes.Add(uint64(origDataLen))
+	s.recordTraffic(origDataLen, now)
 	s.emitBytes(origDataLen, 0)
 	return nil
 }

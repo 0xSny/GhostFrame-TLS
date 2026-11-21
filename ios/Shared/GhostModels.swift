@@ -310,7 +310,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
     static let empty = GhostStatusSnapshot()
 
     init() {
-        version = "v4.0.32-LTS"
+        version = "v4.0.34-LTS"
         state = "disconnected"
         lastErr = ""
         activeTransport = ""

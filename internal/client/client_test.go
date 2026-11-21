@@ -869,3 +869,27 @@ func TestAutoConnectPreservedOnCloseAndClearedOnUserDisconnect(t *testing.T) {
 		t.Fatal("expected ShouldAutoConnect=false after explicit user disconnect")
 	}
 }
+
+func TestTencentACEAndLoLCNDirectWhitelist(t *testing.T) {
+	r := NewRouter()
+	domains := []string{
+		"anticheatexpert.com",
+		"down.anticheatexpert.com",
+		"gameley.com",
+		"wegame.com",
+		"wegame.com.cn",
+		"wegamedeveloper.com",
+		"iegcom.com",
+		"gcloudsdk.com",
+		"qcloudtiw.com",
+		"riotgames.com.cn",
+		"lpl.com.cn",
+	}
+	for _, d := range domains {
+		act, reason, unknown := r.evaluateStatic(RouteRule, d+":443")
+		if act != ActionDirect || unknown || reason != "direct:cn-game" {
+			t.Fatalf("expected %s to match curated direct:cn-game statically, got act=%v reason=%q unknown=%v",
+				d, act, reason, unknown)
+		}
+	}
+}

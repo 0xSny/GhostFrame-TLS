@@ -390,7 +390,7 @@ var builtinProxyRules = []ruleSeed{
 }
 
 var builtinDirectRules = []ruleSeed{
-	// Tencent / WeChat / QQ
+	// Tencent / WeChat / QQ / ACE Anti-Cheat / WeGame / LoL CN
 	{"qq.com", "direct:cn"},
 	{"gtimg.cn", "direct:cn"},
 	{"gtimg.com", "direct:cn"},
@@ -414,6 +414,16 @@ var builtinDirectRules = []ruleSeed{
 	{"smtcdns.net", "direct:cn-cloud"},
 	{"tencent.com", "direct:cn"},
 	{"tencent-cloud.com", "direct:cn-cloud"},
+	{"anticheatexpert.com", "direct:cn-game"},
+	{"gameley.com", "direct:cn-game"},
+	{"wegame.com", "direct:cn-game"},
+	{"wegame.com.cn", "direct:cn-game"},
+	{"wegamedeveloper.com", "direct:cn-game"},
+	{"iegcom.com", "direct:cn-game"},
+	{"gcloudsdk.com", "direct:cn-game"},
+	{"qcloudtiw.com", "direct:cn-game"},
+	{"riotgames.com.cn", "direct:cn-game"},
+	{"lpl.com.cn", "direct:cn-game"},
 
 	// Alibaba / Taobao / Alipay / Aliyun / Alipan / Amap / DingTalk
 	{"taobao.com", "direct:cn"},
