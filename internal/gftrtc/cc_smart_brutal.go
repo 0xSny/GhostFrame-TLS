@@ -7,9 +7,11 @@ import (
 )
 
 const (
-	ccInitialAutoBps = 12_000_000.0 / 8.0  // 12 Mbps initial Auto-Probe floor (ramps fast over 170ms links)
-	ccMinRateBps     = 256_000.0 / 8.0     // 256 Kbps absolute floor
-	ccMaxAutoBps     = 600_000_000.0 / 8.0 // 600 Mbps sanity cap
+	ccInitialAutoBps   = 12_000_000.0 / 8.0  // 12 Mbps initial Auto-Probe floor (ramps fast over 170ms links)
+	ccMinRateBps       = 256_000.0 / 8.0     // 256 Kbps absolute floor
+	ccClientMaxAutoBps = 60_000_000.0 / 8.0  // 60 Mbps client Auto-Probe uplink cap (prevents broadband policing amplification)
+	ccMaxAutoBps       = 600_000_000.0 / 8.0 // 600 Mbps server downlink Auto-Probe sanity cap
+	ccPolicingLossWall = 0.10                // >10% loss under Auto-Probe signals physical uplink/policing ceiling
 )
 
 type ccState uint8
@@ -26,6 +28,7 @@ const (
 type SmartBrutalCC struct {
 	mu sync.Mutex
 
+	isClient  bool
 	targetBps float64 // >0 if user/node configured explicit Mbps target; 0 = Auto-Probe
 	state     ccState
 	baseRate  float64 // current uncompensated base bytes/sec
@@ -51,8 +54,14 @@ type SmartBrutalCC struct {
 
 // NewSmartBrutalCC creates a Smart-Brutal controller. targetMbps == 0 enables Auto-Probe.
 func NewSmartBrutalCC(targetMbps int) *SmartBrutalCC {
+	return NewSmartBrutalCCForRole(targetMbps, false)
+}
+
+// NewSmartBrutalCCForRole creates a Smart-Brutal controller tailored for client uplink or server downlink.
+func NewSmartBrutalCCForRole(targetMbps int, isClient bool) *SmartBrutalCC {
 	now := time.Now()
 	c := &SmartBrutalCC{
+		isClient:    isClient,
 		state:       ccSlowStart,
 		baseRate:    ccInitialAutoBps,
 		bEst:        ccInitialAutoBps,
@@ -65,6 +74,29 @@ func NewSmartBrutalCC(targetMbps int) *SmartBrutalCC {
 	c.SetTargetMbps(targetMbps)
 	c.refillFrameSliceLocked(now)
 	return c
+}
+
+// SetClientMode configures whether Auto-Probe enforces client uplink safety limits.
+func (c *SmartBrutalCC) SetClientMode(isClient bool) {
+	c.mu.Lock()
+	c.isClient = isClient
+	if c.targetBps == 0 {
+		capBps := c.maxAutoBpsLocked()
+		if c.baseRate > capBps {
+			c.baseRate = capBps
+		}
+		if c.bEst > capBps {
+			c.bEst = capBps
+		}
+	}
+	c.mu.Unlock()
+}
+
+func (c *SmartBrutalCC) maxAutoBpsLocked() float64 {
+	if c.isClient {
+		return ccClientMaxAutoBps
+	}
+	return ccMaxAutoBps
 }
 
 func randomFrameSlice() time.Duration {
@@ -173,12 +205,13 @@ func (c *SmartBrutalCC) OnFeedback(ackedBytes int, lossRate float64, srtt, minRT
 	elapsedSec := now.Sub(c.roundStart).Seconds()
 	var deliveryBps float64
 	if elapsedSec > 0 && c.roundBytes > 0 {
-		// Reconstruct pre-loss send capacity smoothly up to 45% loss
-		lossCap := lossRate
-		if lossCap > 0.45 {
-			lossCap = 0.45
+		if lossRate > ccPolicingLossWall {
+			// Above 10% loss in Auto-Probe, measure actual goodput only without 1/(1-loss) amplification.
+			deliveryBps = float64(c.roundBytes) / elapsedSec
+		} else {
+			// Reconstruct pre-loss send capacity smoothly up to 10% loss.
+			deliveryBps = (float64(c.roundBytes) / elapsedSec) / (1.0 - lossRate)
 		}
-		deliveryBps = (float64(c.roundBytes) / elapsedSec) / (1.0 - lossCap)
 		if deliveryBps > c.peakDelivery {
 			c.peakDelivery = deliveryBps
 		}
@@ -187,12 +220,46 @@ func (c *SmartBrutalCC) OnFeedback(ackedBytes int, lossRate float64, srtt, minRT
 	c.roundStart = now
 	c.roundBytes = 0
 
+	maxAuto := c.maxAutoBpsLocked()
+
+	// Tail drops >10% during Auto-Probe indicate physical uplink/policing pressure -> exit SlowStart & back off 0.75x.
+	if lossRate > ccPolicingLossWall {
+		inSlowOrProbe := c.state == ccSlowStart || c.state == ccProbeUp
+		severePolicing := lossRate > 0.25
+		shouldBackoff := inSlowOrProbe || (severePolicing && now.Sub(c.lastBackoffAt) >= roundDur*4)
+		c.state = ccCruise
+		c.rttRounds = 0
+		if shouldBackoff {
+			c.bEst *= 0.75
+			if c.bEst < ccMinRateBps {
+				c.bEst = ccMinRateBps
+			}
+			c.baseRate = c.bEst
+			c.lastBackoffAt = now
+		} else {
+			if deliveryBps > c.bEst {
+				if deliveryBps > maxAuto {
+					deliveryBps = maxAuto
+				}
+				c.bEst = deliveryBps
+			}
+			c.baseRate = 0.95 * c.bEst
+			if c.baseRate < ccMinRateBps {
+				c.baseRate = ccMinRateBps
+			}
+		}
+		return
+	}
+
 	switch c.state {
 	case ccSlowStart:
 		if rho > 1.30 && queueDelta >= 12*time.Millisecond {
 			est := deliveryBps
 			if est < c.baseRate*0.85 {
 				est = c.baseRate * 0.85
+			}
+			if est > maxAuto {
+				est = maxAuto
 			}
 			c.bEst = est
 			c.baseRate = 0.95 * c.bEst
@@ -202,8 +269,8 @@ func (c *SmartBrutalCC) OnFeedback(ackedBytes int, lossRate float64, srtt, minRT
 			// Only ramp +35% when actual delivery approached at least 25% of baseRate (avoid idle runaway)
 			if deliveryBps >= c.baseRate*0.25 || (deliveryBps == 0 && c.baseRate <= ccInitialAutoBps*1.4) {
 				c.baseRate *= 1.35
-				if c.baseRate > ccMaxAutoBps {
-					c.baseRate = ccMaxAutoBps
+				if c.baseRate > maxAuto {
+					c.baseRate = maxAuto
 				}
 				if c.baseRate > c.bEst {
 					c.bEst = c.baseRate
@@ -218,6 +285,9 @@ func (c *SmartBrutalCC) OnFeedback(ackedBytes int, lossRate float64, srtt, minRT
 			return
 		}
 		if deliveryBps > c.bEst {
+			if deliveryBps > maxAuto {
+				deliveryBps = maxAuto
+			}
 			c.bEst = deliveryBps
 		}
 		c.baseRate = 0.95 * c.bEst
@@ -225,13 +295,16 @@ func (c *SmartBrutalCC) OnFeedback(ackedBytes int, lossRate float64, srtt, minRT
 			c.rttRounds = 0
 			c.state = ccProbeUp
 			c.baseRate = 1.15 * c.bEst
-			if c.baseRate > ccMaxAutoBps {
-				c.baseRate = ccMaxAutoBps
+			if c.baseRate > maxAuto {
+				c.baseRate = maxAuto
 			}
 		}
 
 	case ccProbeUp:
 		if (rho <= 1.35 || queueDelta < 15*time.Millisecond) && deliveryBps > c.bEst {
+			if deliveryBps > maxAuto {
+				deliveryBps = maxAuto
+			}
 			c.bEst = deliveryBps
 		}
 		c.baseRate = 0.95 * c.bEst
@@ -244,7 +317,8 @@ func (c *SmartBrutalCC) effectiveRateLocked() float64 {
 	if rate < ccMinRateBps {
 		rate = ccMinRateBps
 	}
-	if c.lastRho <= 1.35 {
+	// Never apply 1/(1-loss) upward acceleration when Auto-Probe exceeds the 10% physical policing threshold.
+	if c.lastRho <= 1.35 && !(c.targetBps == 0 && c.lastLossRate > ccPolicingLossWall) {
 		lossCap := c.lastLossRate
 		if lossCap > 0.45 {
 			lossCap = 0.45

@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -266,5 +267,187 @@ func TestRuleSetCategoriesAndCustomOverride(t *testing.T) {
 	st := r.Stats()
 	if st.Version != BuiltinRuleSetVersion || st.BuiltinDomains < 150 || st.CustomRules != 4 || st.DirectHits == 0 || st.ProxyHits == 0 || st.RejectHits != 2 {
 		t.Fatalf("unexpected RuleStats: %+v", st)
+	}
+}
+
+func TestNodeSelfLoopRejectedInHTTPProxyAndSOCKS5(t *testing.T) {
+	SetNoSysProxy(true)
+	eng, err := NewEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	nodeLink := &gft.Link{
+		Host:   "198.51.100.50",
+		Port:   443,
+		PSK:    "T8URkR/djwieb24xrR35JuOMrfA7mfLsu1lsaR79ZWw=",
+		Remark: "TestLoopNode",
+	}
+	if err := eng.SetLink(nodeLink); err != nil {
+		t.Fatal(err)
+	}
+
+	if !eng.IsNodeHost("198.51.100.50:443") || !eng.IsNodeHost("198.51.100.50:8443") {
+		t.Fatal("expected configured node IP to match IsNodeHost across ports")
+	}
+	if eng.ShouldSniffSNI("198.51.100.50:443") {
+		t.Fatal("expected ShouldSniffSNI=false for configured node IP")
+	}
+	for _, mode := range []RouteMode{RouteRule, RouteGlobal, RouteCore} {
+		act, reason := eng.router.DecideWithReason(mode, "198.51.100.50:443")
+		if act != ActionReject || reason != "anti-loop:node-host" {
+			t.Fatalf("mode %s: expected (ActionReject, anti-loop:node-host), got (%v, %q)", mode, act, reason)
+		}
+	}
+
+	ackCalled := false
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	_, act, _, ackSent, oerr := eng.OpenStreamWithOptionalSNISniff(c1, "198.51.100.50:443", func() error {
+		ackCalled = true
+		return nil
+	})
+	if act != ActionReject || ackSent || ackCalled || !errors.Is(oerr, errNodeLoopRejected) {
+		t.Fatalf("expected OpenStreamWithOptionalSNISniff to reject node self-loop before ack: act=%v ackSent=%v ackCalled=%v err=%v", act, ackSent, ackCalled, oerr)
+	}
+
+	// Simulate connected state and verify SOCKS5 CONNECT & UDP ASSOCIATE reject node self-loop without touching sched.
+	eng.mu.Lock()
+	eng.state = StateConnected
+	eng.sched = &gft.ApexScheduler{}
+	eng.mu.Unlock()
+	defer func() {
+		eng.mu.Lock()
+		eng.sched = nil
+		eng.state = StateDisconnected
+		eng.mu.Unlock()
+	}()
+
+	srv := NewSOCKS5Server("127.0.0.1:0", eng)
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	conn, err := net.DialTimeout("tcp", srv.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = conn.Write([]byte{0x05, 0x01, 0x00})
+	var greet [2]byte
+	if _, err := io.ReadFull(conn, greet[:]); err != nil {
+		t.Fatal(err)
+	}
+	req := []byte{0x05, 0x01, 0x00, 0x01, 198, 51, 100, 50, 0x01, 0xBB}
+	_, _ = conn.Write(req)
+	var rep [10]byte
+	if _, err := io.ReadFull(conn, rep[:]); err != nil {
+		t.Fatal(err)
+	}
+	if rep[1] == 0x00 {
+		t.Fatalf("expected SOCKS5 CONNECT targeting node IP to be rejected, got success reply")
+	}
+
+	// Verify SOCKS5 UDP ASSOCIATE also rejects packets targeting configured node IP.
+	udpCtrl, err := net.DialTimeout("tcp", srv.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpCtrl.Close()
+	_ = udpCtrl.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = udpCtrl.Write([]byte{0x05, 0x01, 0x00})
+	if _, err := io.ReadFull(udpCtrl, greet[:]); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = udpCtrl.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	var udpRep [10]byte
+	if _, err := io.ReadFull(udpCtrl, udpRep[:]); err != nil {
+		t.Fatal(err)
+	}
+	if udpRep[1] != 0x00 {
+		t.Fatalf("expected UDP ASSOCIATE handshake OK, got rep=%v", udpRep)
+	}
+	relayPort := binary.BigEndian.Uint16(udpRep[8:10])
+	relayConn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(relayPort)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relayConn.Close()
+	// RSV(2)=0, FRAG(1)=0, ATYP=1(IPv4), IP=198.51.100.50, PORT=443, PAYLOAD="LOOP"
+	udpPkt := []byte{0, 0, 0, 1, 198, 51, 100, 50, 0x01, 0xBB, 'L', 'O', 'O', 'P'}
+	if tgt, pl, derr := gft.DecodeAddr(udpPkt[3:]); derr != nil || tgt != "198.51.100.50:443" || string(pl) != "LOOP" {
+		t.Fatalf("DecodeAddr sanity check failed: tgt=%q pl=%q err=%v", tgt, pl, derr)
+	}
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	foundUDPBlock := false
+	for time.Now().Before(deadline) {
+		if wn, werr := relayConn.Write(udpPkt); werr != nil {
+			t.Fatalf("relayConn.Write failed (wn=%d): %v", wn, werr)
+		}
+		for _, entry := range eng.Logs() {
+			if strings.Contains(entry.Message, "[Anti-Loop] Rejected UDP") {
+				foundUDPBlock = true
+				break
+			}
+		}
+		if foundUDPBlock {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !foundUDPBlock {
+		_ = udpCtrl.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		var b1 [1]byte
+		_, ctrlErr := udpCtrl.Read(b1[:])
+		t.Fatalf("expected SOCKS5 UDP packet targeting node IP to be rejected with [Anti-Loop] log; laddr=%v raddr=%v blocked=%d logs=%+v udpRep=%v isNode=%v ctrlErr=%v", relayConn.LocalAddr(), relayConn.RemoteAddr(), eng.AntiLoopBlockedCount(), eng.Logs(), udpRep, eng.IsNodeHost("198.51.100.50:443"), ctrlErr)
+	}
+}
+
+func TestTargetTrafficTrackerTop10AndHighUploadAlert(t *testing.T) {
+	SetNoSysProxy(true)
+	eng, err := NewEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	for i := 1; i <= 12; i++ {
+		tgt := fmt.Sprintf("host%02d.example.com:443", i)
+		eng.RecordTargetTraffic(tgt, uint64(i)*1024*1024, uint64(i)*512*1024)
+	}
+	// Push >20 MB within 10s to trigger TrafficAlert
+	eng.RecordTargetTraffic("stealer.example.net:443", 21*1024*1024, 4096)
+	eng.RecordTargetTraffic("stealer.example.net:443", 1024, 0) // within 10s cooldown -> must not duplicate
+
+	top := eng.TopUploadTargets(10)
+	if len(top) != 10 {
+		t.Fatalf("expected 10 top upload entries, got %d", len(top))
+	}
+	if top[0].Target != "stealer.example.net:443" || top[1].Target != "host12.example.com:443" {
+		t.Fatalf("unexpected TopUpload ordering: #1=%s #2=%s", top[0].Target, top[1].Target)
+	}
+
+	alerts := 0
+	for _, entry := range eng.Logs() {
+		if strings.Contains(entry.Message, "[TrafficAlert] High upload: stealer.example.net:443") {
+			alerts++
+		}
+	}
+	if alerts != 1 {
+		t.Fatalf("expected exactly 1 [TrafficAlert] log within cooldown, got %d", alerts)
+	}
+
+	snap := eng.BuildDiagnosticSnapshot()
+	idxTop := strings.Index(snap, "--- Top-10 Upload Targets ---")
+	idxLogs := strings.Index(snap, "--- Recent Kernel Logs")
+	if idxTop < 0 || idxLogs < 0 || idxTop > idxLogs {
+		t.Fatalf("expected Top-10 Upload Targets at top before Recent Kernel Logs in diag snapshot:\n%s", snap)
+	}
+	if !strings.Contains(snap, "stealer.example.net:443") {
+		t.Fatalf("expected stealer.example.net:443 inside diag snapshot")
 	}
 }

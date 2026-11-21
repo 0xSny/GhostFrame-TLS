@@ -130,6 +130,8 @@ func (e *Engine) BuildDiagnosticSnapshot() string {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
+	topTargets := e.TopUploadTargets(10)
+
 	var sb strings.Builder
 	sb.WriteString("=== Kestrel Pro Diagnostic Snapshot (Sanitized) ===\n")
 	fmt.Fprintf(&sb, "Version: %s (%s/%s, %s)\n", Version, runtime.GOOS, runtime.GOARCH, runtime.Version())
@@ -149,11 +151,41 @@ func (e *Engine) BuildDiagnosticSnapshot() string {
 		st["socks_addr"], st["http_addr"], st["sys_proxy"], st["proxy_drifted"])
 	fmt.Fprintf(&sb, "Runtime: Goroutines=%d HeapAlloc=%.2fMB HeapInuse=%.2fMB Sys=%.2fMB\n",
 		runtime.NumGoroutine(), float64(ms.HeapAlloc)/(1<<20), float64(ms.HeapInuse)/(1<<20), float64(ms.Sys)/(1<<20))
-	sb.WriteString("\n--- Recent Kernel Logs (Masked, up to 1000 entries) ---\n")
-	for _, entry := range logs {
-		fmt.Fprintf(&sb, "%s %s\n", entry.Time, entry.Message)
+
+	topHeader := MaskSensitiveText(sb.String(), secrets...)
+
+	var topBuf strings.Builder
+	topBuf.WriteString("\n--- Top-10 Upload Targets ---\n")
+	if len(topTargets) == 0 {
+		topBuf.WriteString("(no traffic recorded yet)\n")
+	} else {
+		for i, item := range topTargets {
+			tgt := sanitizeExplicitSecrets(item.Target, secrets...)
+			if e.IsNodeHost(tgt) {
+				tgt = "***(node)"
+			}
+			fmt.Fprintf(&topBuf, "%2d. %-40s | Up: %8.2f MB (%d B) | Down: %8.2f MB (%d B)\n",
+				i+1, tgt, float64(item.UpBytes)/(1<<20), item.UpBytes, float64(item.DownBytes)/(1<<20), item.DownBytes)
+		}
 	}
-	return MaskSensitiveText(sb.String(), secrets...)
+
+	var logBuf strings.Builder
+	logBuf.WriteString("\n--- Recent Kernel Logs (Masked, up to 1000 entries) ---\n")
+	for _, entry := range logs {
+		fmt.Fprintf(&logBuf, "%s %s\n", entry.Time, entry.Message)
+	}
+	return topHeader + topBuf.String() + MaskSensitiveText(logBuf.String(), secrets...)
+}
+
+func sanitizeExplicitSecrets(in string, secrets ...string) string {
+	out := reKestrelLink.ReplaceAllString(in, "ksl4://***")
+	for _, sec := range secrets {
+		sec = strings.TrimSpace(sec)
+		if sec != "" && sec != "127.0.0.1" && strings.ToLower(sec) != "localhost" {
+			out = strings.ReplaceAll(out, sec, "***")
+		}
+	}
+	return out
 }
 
 // ExportDiagnosticSnapshot builds a sanitized snapshot, saves it to ~/.kestrel/diag_snapshot.txt,

@@ -35,6 +35,7 @@ const (
 	// Session-level aggregate flow-control window ceilings (Tier 2/3 backpressure).
 	DefaultSessionMaxWindow int64 = 32 * 1024 * 1024
 	LowMemSessionMaxWindow  int64 = 8 * 1024 * 1024
+	ClientMaxSendBacklog    int64 = 8 * 1024 * 1024 // Tight send-side unsent queue cap for client uplink
 	sessionWinStepBytes     int64 = 1024 * 1024
 
 	udpFragBodyCap     = 1050

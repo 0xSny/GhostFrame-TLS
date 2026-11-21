@@ -990,3 +990,83 @@ func TestNAT64DialSynthesizes64ff9b(t *testing.T) {
 		t.Fatalf("expected gftrtc.Dial to synthesize 64:ff9b::c633:642a, got err=%v", err)
 	}
 }
+
+func TestClientAutoProbeCapPolicingWallAndExplicitUnlimited(t *testing.T) {
+	now := time.Now()
+
+	// 1. Client Auto-Probe (targetMbps=0, isClient=true) must cap ramp at 60 Mbps.
+	cliCC := NewSmartBrutalCCForRole(0, true)
+	for round := 1; round <= 12; round++ {
+		ts := now.Add(time.Duration(round) * 60 * time.Millisecond)
+		// Deliver full current pacing rate with 0% loss and flat RTT
+		cliCC.OnFeedback(2_000_000, 0.0, 40*time.Millisecond, 40*time.Millisecond, 0, ts)
+	}
+	cliMbps := cliCC.PacingMbps()
+	if cliMbps > 60.1 || cliMbps < 50.0 {
+		t.Fatalf("expected client Auto-Probe pacing capped near 60 Mbps, got %.2f Mbps", cliMbps)
+	}
+
+	// 2. Server Auto-Probe (targetMbps=0, isClient=false) keeps 600 Mbps ceiling for high-BDP downlinks.
+	srvCC := NewSmartBrutalCCForRole(0, false)
+	for round := 1; round <= 12; round++ {
+		ts := now.Add(time.Duration(round) * 60 * time.Millisecond)
+		srvCC.OnFeedback(5_000_000, 0.0, 40*time.Millisecond, 40*time.Millisecond, 0, ts)
+	}
+	if srvMbps := srvCC.PacingMbps(); srvMbps <= 65.0 {
+		t.Fatalf("expected server Auto-Probe to ramp past 65 Mbps toward 600 Mbps, got %.2f Mbps", srvMbps)
+	}
+
+	// 3. Explicit client UpMbps > 0 (e.g. 150 Mbps) must NOT be capped at 60 Mbps.
+	explicitCC := NewSmartBrutalCCForRole(150, true)
+	if m := explicitCC.PacingMbps(); m < 145.0 || m > 155.0 {
+		t.Fatalf("expected explicit 150 Mbps client pacing ~150 Mbps, got %.2f Mbps", m)
+	}
+
+	// 4. Hitting physical policing wall (rho=1.05 <= 1.35, lossRate=0.25 > 0.10):
+	// MUST exit ccSlowStart, apply 0.75x backoff, and forbid 1/(1-loss) acceleration!
+	policingCC := NewSmartBrutalCCForRole(0, true)
+	policingCC.OnFeedback(200_000, 0.0, 40*time.Millisecond, 40*time.Millisecond, 0, now.Add(50*time.Millisecond))
+	beforeMbps := policingCC.PacingMbps()
+	policingCC.OnFeedback(150_000, 0.25, 42*time.Millisecond, 40*time.Millisecond, 0, now.Add(110*time.Millisecond))
+	afterMbps := policingCC.PacingMbps()
+	if policingCC.state != ccCruise {
+		t.Fatalf("expected policing loss >10%% to exit ccSlowStart into ccCruise, got state=%d", policingCC.state)
+	}
+	if afterMbps >= beforeMbps*0.80 {
+		t.Fatalf("expected 0.75x backoff with ZERO 1/(1-loss) boost: before=%.2f Mbps, after=%.2f Mbps", beforeMbps, afterMbps)
+	}
+}
+
+func TestClientSendBacklogCap8MBPreservesServer32MB(t *testing.T) {
+	SetLowMemMode(false)
+	if EffectiveSessionMaxWindow() != 32*1024*1024 {
+		t.Fatalf("expected receive-side DefaultSessionMaxWindow=32MB untouched, got %d", EffectiveSessionMaxWindow())
+	}
+	if ClientMaxSendBacklog != 8*1024*1024 {
+		t.Fatalf("expected ClientMaxSendBacklog=8MB, got %d", ClientMaxSendBacklog)
+	}
+
+	keys, _, err := deriveSessionKeys([]byte("shared-secret-32bytes-0123456789"), []byte("test-psk-0123456789abcdef012345"), [12]byte{7, 8, 9}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := newRTCSession(true, 0x11112222, [8]byte{}, "127.0.0.1", 443, keys, 0, nil, nil)
+	defer cli.Close()
+	srv := newRTCSession(false, 0x33334444, [8]byte{}, "127.0.0.1", 443, keys, 0, nil, nil)
+	defer srv.Close()
+
+	// Both start with peerSessMax=32MB, but client hits send backlog limit at 8MB while server does not.
+	cli.txQueuedBytes.Store(8 * 1024 * 1024)
+	srv.txQueuedBytes.Store(8 * 1024 * 1024)
+	if !cli.sendBacklogLimited() {
+		t.Fatal("expected client session sendBacklogLimited()=true at 8MB queued unsent backlog")
+	}
+	if srv.sendBacklogLimited() {
+		t.Fatal("expected server session NOT to be capped at 8MB (keeps 32MB downlink window)")
+	}
+	// Once sendLoop drains 2MB into txStreamBytes, client unsent backlog drops to 6MB (<8MB) and unblocks.
+	cli.txStreamBytes.Store(2 * 1024 * 1024)
+	if cli.sendBacklogLimited() {
+		t.Fatal("expected client sendBacklogLimited()=false once unsent backlog drains to 6MB")
+	}
+}

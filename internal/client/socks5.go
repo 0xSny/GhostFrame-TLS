@@ -273,7 +273,9 @@ func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
 		// RSV(2)=0, FRAG(1)=0, ATYP|ADDR|PORT, DATA
 		copy(pkt[3:], ab)
 		copy(pkt[3+len(ab):], payload)
-		_, _ = udpConn.WriteTo(pkt, ca)
+		if _, werr := udpConn.WriteTo(pkt, ca); werr == nil && len(payload) > 0 {
+			s.engine.RecordTargetTraffic(srcTarget, 0, uint64(len(payload)))
+		}
 	}
 
 	ensureProxyAssoc := func() (gft.UDPAssociation, error) {
@@ -384,8 +386,15 @@ func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
 		if err != nil {
 			continue
 		}
-		act, resolvedTarget, _ := s.engine.DecideSmartRoute(target, target)
+		if s.engine.IsNodeHost(target) {
+			s.engine.logAntiLoopThrottled("UDP", target)
+			continue
+		}
+		act, resolvedTarget, reason := s.engine.DecideSmartRoute(target, target)
 		if act == ActionReject {
+			if reason == "anti-loop:node-host" {
+				s.engine.logAntiLoopThrottled("UDP", target)
+			}
 			continue
 		}
 		if act == ActionDirect {
@@ -408,13 +417,17 @@ func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
 			if err != nil {
 				continue
 			}
-			_, _ = pc.WriteTo(payload, uaDst)
+			if wn, werr := pc.WriteTo(payload, uaDst); werr == nil && wn > 0 {
+				s.engine.RecordTargetTraffic(target, uint64(wn), 0)
+			}
 		} else {
 			a, err := ensureProxyAssoc()
 			if err != nil {
 				continue
 			}
-			_ = a.SendTo(target, payload)
+			if serr := a.SendTo(target, payload); serr == nil && len(payload) > 0 {
+				s.engine.RecordTargetTraffic(target, uint64(len(payload)), 0)
+			}
 		}
 	}
 }

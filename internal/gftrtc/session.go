@@ -340,7 +340,7 @@ func newRTCSession(isClient bool, ssrc uint32, clientID [8]byte, host string, re
 		loss:             NewLossTracker(),
 		fecEnc:           NewFECEncoder(),
 		fecDec:           NewFECDecoder(),
-		cc:               NewSmartBrutalCC(targetMbps),
+		cc:               NewSmartBrutalCCForRole(targetMbps, isClient),
 		inSendRR:         make(map[uint32]bool),
 		streams:          make(map[uint32]*RTCStream),
 		pendingStreams:   make(map[uint32]*RTCStream),
@@ -507,13 +507,24 @@ func (s *RTCSession) Recent30sBytesPerSec() uint64 {
 	return total / uint64(winSec)
 }
 
+func (s *RTCSession) sendBacklogLimited() bool {
+	queued := s.txQueuedBytes.Load()
+	if queued >= s.peerSessMax.Load() {
+		return true
+	}
+	if s.isClient && (queued-s.txStreamBytes.Load()) >= ClientMaxSendBacklog {
+		return true
+	}
+	return false
+}
+
 func (s *RTCSession) waitSessionSendBudget(streamDone *atomic.Bool) error {
-	if s.txQueuedBytes.Load() < s.peerSessMax.Load() {
+	if !s.sendBacklogLimited() {
 		return nil
 	}
 	s.winMu.Lock()
 	defer s.winMu.Unlock()
-	for s.txQueuedBytes.Load() >= s.peerSessMax.Load() {
+	for s.sendBacklogLimited() {
 		if streamDone != nil && streamDone.Load() {
 			return ErrStreamClosed
 		}
@@ -1058,6 +1069,9 @@ func (s *RTCSession) sendLoop() {
 		budget := s.cc.FrameBudget(fecEnabled)
 
 		frames, reliable, pt, hasStreamData, hasUDPData := s.popRetransmitOrPending(budget, !allowed)
+		if hasStreamData {
+			s.winCond.Broadcast()
+		}
 		if len(frames) == 0 {
 			// Session flow-control backpressure or empty queues: park until SACK/Window/Kick arrives.
 			select {

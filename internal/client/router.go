@@ -56,10 +56,11 @@ type Router struct {
 	customMu    sync.RWMutex
 	customRules []CustomRule
 
-	directHits atomic.Uint64
-	proxyHits  atomic.Uint64
-	rejectHits atomic.Uint64
-	enableIPv6 atomic.Bool
+	directHits      atomic.Uint64
+	proxyHits       atomic.Uint64
+	rejectHits      atomic.Uint64
+	enableIPv6      atomic.Bool
+	nodeBypassHosts atomic.Pointer[map[string]struct{}]
 }
 
 var privateIPv4CIDRs = []string{
@@ -138,6 +139,53 @@ func NewRouterWithDataDir(dataDir string) *Router {
 		r.compact.Store(b)
 	}
 	return r
+}
+
+// SetNodeBypassHosts atomically registers configured proxy node hosts/IPs for anti-loop rejection.
+func (r *Router) SetNodeBypassHosts(hosts []string) {
+	m := make(map[string]struct{}, len(hosts))
+	for _, h := range hosts {
+		clean := normalizeNodeHostKey(h)
+		if clean != "" {
+			m[clean] = struct{}{}
+		}
+	}
+	r.nodeBypassHosts.Store(&m)
+}
+
+// IsNodeHost reports whether hostOrTarget matches any registered proxy node IP or hostname.
+func (r *Router) IsNodeHost(hostOrTarget string) bool {
+	mp := r.nodeBypassHosts.Load()
+	if mp == nil || len(*mp) == 0 {
+		return false
+	}
+	clean := normalizeNodeHostKey(hostOrTarget)
+	if clean == "" {
+		return false
+	}
+	_, ok := (*mp)[clean]
+	return ok
+}
+
+func normalizeNodeHostKey(hostOrTarget string) string {
+	s := strings.TrimSpace(hostOrTarget)
+	if s == "" {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		s = h
+	}
+	s = strings.TrimSuffix(strings.TrimSpace(strings.Trim(s, "[]")), ".")
+	if s == "" {
+		return ""
+	}
+	if ip := net.ParseIP(s); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4.String()
+		}
+		return ip.String()
+	}
+	return strings.ToLower(s)
 }
 
 // SetEnableIPv6 toggles whether non-loopback IPv6 destinations are permitted or rejected.
@@ -337,6 +385,12 @@ func (r *Router) evaluateStatic(mode RouteMode, hostport string) (act RouteActio
 		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil && !ip.IsLoopback() {
 			return ActionReject, "ipv6:disabled", false
 		}
+	}
+
+	// Anti-loop shield: strictly reject proxied traffic targeting configured node hosts/IPs
+	// (prevents third-party WFP drivers like AdGuard from looping node packets back into sched.OpenStream).
+	if r.IsNodeHost(hostLower) {
+		return ActionReject, "anti-loop:node-host", false
 	}
 
 	switch mode {

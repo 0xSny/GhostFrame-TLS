@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.0.34-LTS"
+var Version = "v4.0.35-LTS"
 
 type ConnState string
 
@@ -85,14 +85,19 @@ type Engine struct {
 	tunnelDNS          *TunnelDNSResolver
 	smartCache         *smartRouteCache
 	recentRoutes       *recentRouteRing
+	trafficTracker     *targetTrafficTracker
 	directCNResolveFn  DirectCNDNSFunc
 	tunnelDNSResolveFn TunnelDNSFunc
-	socksSrv          *SOCKS5Server
-	httpSrv         *HTTPProxyServer
-	sysProxyApplied bool
-	proxyDrifted    atomic.Bool
-	directDNSBypass atomic.Bool
-	enableIPv6      atomic.Bool
+	socksSrv           *SOCKS5Server
+	httpSrv            *HTTPProxyServer
+	sysProxyApplied    bool
+	proxyDrifted       atomic.Bool
+	directDNSBypass     atomic.Bool
+	enableIPv6          atomic.Bool
+	lastAntiLoopTCPLogNs atomic.Int64
+	lastAntiLoopUDPLogNs atomic.Int64
+	antiLoopBlocked      atomic.Uint64
+	nodeHostsGen         atomic.Uint64
 
 	// Stats
 	prevUp     uint64
@@ -144,6 +149,7 @@ func NewEngine(cfgPath string) (*Engine, error) {
 		tunnelDNS:       NewTunnelDNSResolver(),
 		smartCache:      newSmartRouteCache(smartRouteCacheCap),
 		recentRoutes:    newRecentRouteRing(defaultRecentRouteCap),
+		trafficTracker:  newTargetTrafficTracker(),
 		history:         make([]TrafficPoint, 0, 60),
 		logRing:         NewLogRingBuffer(defaultLogRingCap),
 		stopStats:       make(chan struct{}),
@@ -180,6 +186,10 @@ func NewEngine(cfgPath string) (*Engine, error) {
 	e.config.SysProxy = e.config.RouteMode != RouteCore
 	e.enableIPv6.Store(e.config.EnableIPv6)
 	e.router.SetEnableIPv6(e.config.EnableIPv6)
+	e.mu.Lock()
+	gen := e.syncRouterNodeHostsLocked()
+	e.mu.Unlock()
+	go e.refreshRouterNodeIPsAsync(gen)
 
 	if active := e.activeLinkLocked(); active != nil && active.Params != nil {
 		e.paramStore.Set(*active.Params)
@@ -438,6 +448,10 @@ func (e *Engine) SetLink(l *gft.Link) error {
 		if l.Params != nil {
 			e.paramStore.Set(*l.Params)
 		}
+		gen := e.syncRouterNodeHostsLocked()
+		e.mu.Unlock()
+		go e.refreshRouterNodeIPsAsync(gen)
+		return e.SaveConfig()
 	}
 	e.mu.Unlock()
 	return e.SaveConfig()
@@ -472,7 +486,9 @@ func (e *Engine) ImportLink(uri string, switchTo bool) (int, error) {
 			e.paramStore.Set(*link.Params)
 		}
 	}
+	gen := e.syncRouterNodeHostsLocked()
 	e.mu.Unlock()
+	go e.refreshRouterNodeIPsAsync(gen)
 	if err := e.SaveConfig(); err != nil {
 		return idx, err
 	}
@@ -631,7 +647,9 @@ func (e *Engine) DeleteNode(idx int) error {
 	} else {
 		e.config.Link = e.config.Nodes[e.config.ActiveNode]
 	}
+	gen := e.syncRouterNodeHostsLocked()
 	e.mu.Unlock()
+	go e.refreshRouterNodeIPsAsync(gen)
 	if wasActive {
 		e.Disconnect()
 	}
@@ -775,6 +793,9 @@ func (e *Engine) RuleStats() RuleStats {
 // ShouldSniffSNI reports whether target is a raw non-private IP on a TLS port eligible
 // for 30ms ClientHello SNI sniffing under Rule mode.
 func (e *Engine) ShouldSniffSNI(target string) bool {
+	if e.IsNodeHost(target) {
+		return false
+	}
 	e.mu.RLock()
 	mode := e.config.RouteMode
 	e.mu.RUnlock()
@@ -793,6 +814,93 @@ func (e *Engine) ShouldSniffSNI(target string) bool {
 	return ip != nil && !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast()
 }
 
+// syncRouterNodeHostsLocked registers configured literal node hosts/IPs into e.router immediately.
+func (e *Engine) syncRouterNodeHostsLocked() uint64 {
+	gen := e.nodeHostsGen.Add(1)
+	if e.router == nil {
+		return gen
+	}
+	hosts := make([]string, 0, len(e.config.Nodes)+1)
+	if e.config.Link != nil && e.config.Link.Host != "" {
+		hosts = append(hosts, e.config.Link.Host)
+	}
+	for _, n := range e.config.Nodes {
+		if n != nil && n.Host != "" {
+			hosts = append(hosts, n.Host)
+		}
+	}
+	e.router.SetNodeBypassHosts(hosts)
+	return gen
+}
+
+func (e *Engine) refreshRouterNodeIPsAsync(gen uint64) {
+	if e.router == nil {
+		return
+	}
+	if e.nodeHostsGen.Load() != gen {
+		return
+	}
+	e.mu.RLock()
+	hosts := make([]string, 0, len(e.config.Nodes)+1)
+	if e.config.Link != nil && e.config.Link.Host != "" {
+		hosts = append(hosts, e.config.Link.Host)
+	}
+	for _, n := range e.config.Nodes {
+		if n != nil && n.Host != "" {
+			hosts = append(hosts, n.Host)
+		}
+	}
+	e.mu.RUnlock()
+
+	hosts = append(hosts, e.NodeHostIPs()...)
+	hosts = append(hosts, e.NodeHostIPv6s()...)
+	if e.nodeHostsGen.Load() == gen {
+		e.router.SetNodeBypassHosts(hosts)
+	}
+}
+
+// IsNodeHost reports whether target matches any configured proxy node IP or hostname.
+func (e *Engine) IsNodeHost(target string) bool {
+	return e.router != nil && e.router.IsNodeHost(target)
+}
+
+func (e *Engine) logAntiLoopThrottled(proto, target string) {
+	e.antiLoopBlocked.Add(1)
+	now := time.Now().UnixNano()
+	slot := &e.lastAntiLoopTCPLogNs
+	if proto == "UDP" {
+		slot = &e.lastAntiLoopUDPLogNs
+	}
+	prev := slot.Load()
+	if now-prev >= int64(5*time.Second) && slot.CompareAndSwap(prev, now) {
+		e.Logf("[Anti-Loop] Rejected %s loopback proxy request targeting configured node %s", proto, target)
+	}
+}
+
+// AntiLoopBlockedCount returns the number of rejected node-self-loop requests.
+func (e *Engine) AntiLoopBlockedCount() uint64 {
+	return e.antiLoopBlocked.Load()
+}
+
+// RecordTargetTraffic updates cumulative per-target upload/download statistics and emits
+// a [TrafficAlert] kernel log whenever a single destination uploads > 20 MB within 10 seconds.
+func (e *Engine) RecordTargetTraffic(target string, upBytes, downBytes uint64) {
+	if e.trafficTracker == nil {
+		return
+	}
+	if alert := e.trafficTracker.Record(target, upBytes, downBytes); alert != "" {
+		e.Logf("%s", alert)
+	}
+}
+
+// TopUploadTargets returns the top-N destinations sorted by cumulative uploaded bytes descending.
+func (e *Engine) TopUploadTargets(limit int) []TargetTrafficStat {
+	if e.trafficTracker == nil {
+		return nil
+	}
+	return e.trafficTracker.TopUpload(limit)
+}
+
 // OpenTargetStream opens either a direct TCP connection or a multiplexed GFT stream
 // per Router policy (never leaking overseas DNS queries locally).
 func (e *Engine) OpenTargetStream(target string, first []byte) (gft.DataStream, RouteAction, error) {
@@ -801,6 +909,7 @@ func (e *Engine) OpenTargetStream(target string, first []byte) (gft.DataStream, 
 
 var (
 	errRouteRejected      = errors.New("connection blocked by custom REJECT rule")
+	errNodeLoopRejected   = errors.New("connection rejected: target matches configured proxy node (anti-loop)")
 	errIPv6DisabledClient = errors.New("IPv6 is disabled by client switch")
 )
 
@@ -879,6 +988,11 @@ func (e *Engine) DirectDialer(timeout time.Duration) net.Dialer {
 // OpenTargetStreamWithRoute classifies routing using routeTarget (e.g. sniffed TLS SNI)
 // while opening the connection to dialTarget without local DNS leakage on known overseas hosts.
 func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first []byte) (gft.DataStream, RouteAction, error) {
+	if e.IsNodeHost(dialTarget) || (routeTarget != "" && e.IsNodeHost(routeTarget)) {
+		e.logAntiLoopThrottled("TCP", dialTarget)
+		return nil, ActionReject, errNodeLoopRejected
+	}
+
 	e.mu.RLock()
 	state := e.state
 	sched := e.sched
@@ -887,9 +1001,17 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 	if state != StateConnected || sched == nil {
 		return nil, ActionProxy, errNoActiveSession
 	}
-	act, resolvedDial, _ := e.DecideSmartRoute(dialTarget, routeTarget)
+	act, resolvedDial, reason := e.DecideSmartRoute(dialTarget, routeTarget)
 	if act == ActionReject {
+		if reason == "anti-loop:node-host" {
+			e.logAntiLoopThrottled("TCP", dialTarget)
+			return nil, ActionReject, errNodeLoopRejected
+		}
 		return nil, ActionReject, errRouteRejected
+	}
+	metricTarget := strings.TrimSpace(routeTarget)
+	if metricTarget == "" {
+		metricTarget = dialTarget
 	}
 	if act == ActionDirect {
 		dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -917,17 +1039,36 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 				_ = c.Close()
 				return nil, ActionDirect, werr
 			}
+			e.RecordTargetTraffic(metricTarget, uint64(len(first)), 0)
 		}
-		return &directStreamConn{Conn: c, target: resolvedDial}, ActionDirect, nil
+		return &trackedDataStream{
+			DataStream: &directStreamConn{Conn: c, target: resolvedDial},
+			eng:        e,
+			target:     metricTarget,
+		}, ActionDirect, nil
 	}
 	st, err := sched.OpenStream(dialTarget, first)
-	return st, ActionProxy, err
+	if err != nil {
+		return nil, ActionProxy, err
+	}
+	if len(first) > 0 {
+		e.RecordTargetTraffic(metricTarget, uint64(len(first)), 0)
+	}
+	return &trackedDataStream{
+		DataStream: st,
+		eng:        e,
+		target:     metricTarget,
+	}, ActionProxy, nil
 }
 
 // OpenStreamWithOptionalSNISniff performs 30ms TLS SNI sniffing when target is a raw public IP
 // under Rule mode, calling sendAck prior to reading the ClientHello when sniffing applies.
 func (e *Engine) OpenStreamWithOptionalSNISniff(c net.Conn, target string, sendAck func() error) (st gft.DataStream, act RouteAction, rc net.Conn, ackSent bool, err error) {
 	rc = c
+	if e.IsNodeHost(target) {
+		e.logAntiLoopThrottled("TCP", target)
+		return nil, ActionReject, rc, false, errNodeLoopRejected
+	}
 	if e.ShouldSniffSNI(target) {
 		if err = sendAck(); err != nil {
 			return nil, ActionProxy, rc, false, err
@@ -1232,6 +1373,10 @@ func (e *Engine) Connect() error {
 
 	e.Logf("Connecting to %s:%d (transport=%s, route=%s, Apex Dual-Track)...",
 		l.Host, l.Port, l.EffectiveTransport(), e.config.RouteMode)
+	e.mu.RLock()
+	nodeGen := e.nodeHostsGen.Load()
+	e.mu.RUnlock()
+	go e.refreshRouterNodeIPsAsync(nodeGen)
 
 	if err := sched.Start(8 * time.Second); err != nil {
 		sched.Close()
