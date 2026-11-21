@@ -662,6 +662,22 @@ struct ConsoleView: View {
                         labeledNumberField(title: "HTTP 端口", text: $viewModel.httpPortText)
                     }
 
+                    Toggle(isOn: $viewModel.enableIPv6) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("开启 IPv6 双栈分流与 AAAA 解析")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(GhostPalette.textPrimary)
+                            Text("关闭时自动过滤 AAAA 并拦截直连 IPv6 流量防止泄露")
+                                .font(.system(size: 11))
+                                .foregroundColor(GhostPalette.textMuted)
+                        }
+                    }
+                    .tint(GhostPalette.emerald)
+                    .padding(10)
+                    .background(GhostPalette.card)
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(GhostPalette.border, lineWidth: 1))
+                    .cornerRadius(10)
+
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {

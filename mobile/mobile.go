@@ -22,7 +22,7 @@ import (
 )
 
 // Version is the mobile runtime identifier (overridable via -ldflags -X).
-var Version = "v4.0.31-LTS"
+var Version = "v4.0.32-LTS"
 
 const (
 	defaultSocksPort = 10808
@@ -39,6 +39,7 @@ type mobileStartConfig struct {
 	UpMbps       *int     `json:"up_mbps,omitempty"`
 	DownMbps     *int     `json:"down_mbps,omitempty"`
 	AsyncConnect bool     `json:"async_connect,omitempty"`
+	EnableIPv6   bool     `json:"enable_ipv6,omitempty"`
 	CustomRules  []string `json:"custom_rules,omitempty"`
 }
 
@@ -235,6 +236,7 @@ func StartEngine(configJSON string) error {
 		eng.Close()
 		return fmt.Errorf("mobile: invalid route_mode: %w", err)
 	}
+	_ = eng.SetEnableIPv6(cfg.EnableIPv6)
 	if cfg.CustomRules != nil {
 		if err := eng.SetCustomRules(cfg.CustomRules); err != nil {
 			eng.Logf("[Mobile] apply custom rules warning: %v", err)
@@ -613,6 +615,23 @@ func handleLocalMgmt(method, path string, body []byte) (int, string, []byte) {
 			_ = json.Unmarshal(body, &req)
 		}
 		return 200, "application/json; charset=utf-8", []byte(UpdateRuleBundleJSON(req.URL))
+	case "/_ksl/ipv6":
+		if strings.ToUpper(strings.TrimSpace(method)) != "POST" {
+			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
+		}
+		var req struct {
+			EnableIPv6 bool `json:"enable_ipv6"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			return 400, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"invalid json"}`)
+		}
+		mu.Lock()
+		eng := engineInst
+		mu.Unlock()
+		if eng != nil {
+			_ = eng.SetEnableIPv6(req.EnableIPv6)
+		}
+		return 200, "application/json; charset=utf-8", []byte(GetStatusJSON())
 	case "/_ksl/reload", "/_gft/reload":
 		if strings.ToUpper(strings.TrimSpace(method)) != "POST" {
 			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)

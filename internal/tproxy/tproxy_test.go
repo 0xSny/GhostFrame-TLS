@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"io"
 	"net"
 	"os"
@@ -413,5 +414,71 @@ func TestSplitDNSTunnelFirstUnknownDomainZeroCNLeak(t *testing.T) {
 	if dir2 != 1 || tun2 != 1 || cnProbeCalls.Load() != 1 || localDirectUDPHits.Load() != 1 {
 		t.Fatalf("expected confirmed CN promotion, got dir=%d tun=%d cnProbe=%d localUDP=%d",
 			dir2, tun2, cnProbeCalls.Load(), localDirectUDPHits.Load())
+	}
+}
+
+func TestBuildNFTablesScriptIPv6EnabledAndConfigSync(t *testing.T) {
+	// 1. Legacy JSON {"filter_aaaa": false} migrates cleanly to EnableIPv6=true.
+	var cfg GatewayConfig
+	if err := json.Unmarshal([]byte(`{"gateway_mode":"rule","filter_aaaa":false}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Normalize()
+	if !cfg.EnableIPv6 || cfg.FilterAAAA {
+		t.Fatalf("expected legacy filter_aaaa=false -> EnableIPv6=true/FilterAAAA=false, got %+v", cfg)
+	}
+
+	// 2. Explicit {"enable_ipv6": false, "filter_aaaa": false} honors enable_ipv6=false.
+	var cfg2 GatewayConfig
+	if err := json.Unmarshal([]byte(`{"gateway_mode":"rule","enable_ipv6":false,"filter_aaaa":false}`), &cfg2); err != nil {
+		t.Fatal(err)
+	}
+	cfg2.Normalize()
+	if cfg2.EnableIPv6 || !cfg2.FilterAAAA {
+		t.Fatalf("expected enable_ipv6=false -> EnableIPv6=false/FilterAAAA=true, got %+v", cfg2)
+	}
+
+	// 3. BuildNFTablesScript with EnableIPv6=true emits @cn_ipv6, @vps_bypass_v6, IPv6 TPROXY rules, and omits forward_v6_guard.
+	spec := FirewallSpec{
+		Mode:         ModeRule,
+		DeviceMode:   DeviceAll,
+		VPSIPs:       []string{"203.0.113.10"},
+		VPSIPv6s:     []string{"2001:db8::10"},
+		TCPPort:      10880,
+		UDPPort:      10881,
+		DNSPort:      7853,
+		WebPort:      19080,
+		SocksPort:    10808,
+		HTTPPort:     10809,
+		FWMark:       0xff,
+		TProxyMark:   0x1,
+		RouteTable:   100,
+		PreferTProxy: true,
+		EnableIPv6:   true,
+		FilterAAAA:   false,
+	}
+	script := BuildNFTablesScript(spec)
+	mustHave := []string{
+		"set lan_bypass_v6",
+		"set vps_bypass_v6",
+		"2001:db8::10",
+		"set cn_ipv6",
+		"ip6 daddr @vps_bypass_v6 return",
+		"ip6 daddr @cn_ipv6 return",
+		"tproxy ip6 to [::1]:10880 meta mark set 0x1 accept",
+		"tproxy ip6 to [::1]:10881 meta mark set 0x1 accept",
+	}
+	for _, needle := range mustHave {
+		if !strings.Contains(script, needle) {
+			t.Fatalf("expected IPv6-enabled nftables script to contain %q", needle)
+		}
+	}
+	if strings.Contains(script, "chain forward_v6_guard") {
+		t.Fatalf("IPv6-enabled nftables script MUST NOT mount forward_v6_guard")
+	}
+
+	// 4.CNPublicIPv6CIDRs decodes non-empty China IPv6 ranges.
+	if v6cn := client.CNPublicIPv6CIDRs(); len(v6cn) < 500 {
+		t.Fatalf("expected >= 500 embedded CN IPv6 CIDRs, got %d", len(v6cn))
 	}
 }

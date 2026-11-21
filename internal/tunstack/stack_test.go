@@ -259,3 +259,100 @@ func (b *batchCaptureWriter) WritePacketBatch(concatPkts []byte, lengthsBE []byt
 		off += n
 	}
 }
+
+func buildIPv6UDPPacket(srcIP, dstIP [16]byte, srcPort, dstPort uint16, payload []byte) []byte {
+	udpLen := header.UDPMinimumSize + len(payload)
+	pkt := make([]byte, header.IPv6MinimumSize+udpLen)
+	srcAddr := tcpip.AddrFrom16(srcIP)
+	dstAddr := tcpip.AddrFrom16(dstIP)
+	ip := header.IPv6(pkt[:header.IPv6MinimumSize])
+	ip.Encode(&header.IPv6Fields{
+		PayloadLength:     uint16(udpLen),
+		TransportProtocol: header.UDPProtocolNumber,
+		HopLimit:          64,
+		SrcAddr:           srcAddr,
+		DstAddr:           dstAddr,
+	})
+
+	udpHdr := header.UDP(pkt[header.IPv6MinimumSize:])
+	udpHdr.Encode(&header.UDPFields{
+		SrcPort: srcPort,
+		DstPort: dstPort,
+		Length:  uint16(udpLen),
+	})
+	copy(pkt[header.IPv6MinimumSize+header.UDPMinimumSize:], payload)
+
+	xsum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, srcAddr, dstAddr, uint16(udpLen))
+	xsum = checksum.Checksum(payload, xsum)
+	udpHdr.SetChecksum(^udpHdr.CalculateChecksum(xsum))
+	return pkt
+}
+
+func TestFakeIPv6AndStackIPv6Toggle(t *testing.T) {
+	// 1. FakeIPPool AAAA behavior toggles cleanly with SetIPv6Enabled.
+	pool := NewFakeIPPool(8)
+	qAAAA := buildDNSQuery(0x7777, "dualstack.example.org", 28)
+
+	respOff, ok := pool.HandleDNSQuery(qAAAA)
+	if !ok || binary.BigEndian.Uint16(respOff[6:8]) != 0 {
+		t.Fatalf("expected AAAA NODATA when IPv6 disabled, ok=%v", ok)
+	}
+
+	pool.SetIPv6Enabled(true)
+	respOn, ok := pool.HandleDNSQuery(qAAAA)
+	if !ok || binary.BigEndian.Uint16(respOn[6:8]) != 1 {
+		t.Fatalf("expected AAAA Fake-IPv6 answer when IPv6 enabled, ok=%v", ok)
+	}
+	fake6 := net.IP(respOn[len(respOn)-16:])
+	if !IsFakeIP(fake6) {
+		t.Fatalf("expected Fake-IPv6 in fd18:c612::/64, got %s", fake6)
+	}
+	host, found := pool.Lookup(fake6)
+	if !found || host != "dualstack.example.org" {
+		t.Fatalf("expected reverse lookup for Fake-IPv6, found=%v host=%q", found, host)
+	}
+
+	// 2. Stack drops raw IPv6 packets when engine IPv6 is disabled, and routes DNSv6 when enabled.
+	client.SetNoSysProxy(true)
+	eng, err := client.NewEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	w := &captureWriter{ch: make(chan []byte, 4)}
+	st, err := NewWithOptions(eng, w, 1400, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	var src6, dst6 [16]byte
+	copy(src6[:], net.ParseIP("fd18:c612::2").To16())
+	copy(dst6[:], net.ParseIP("fd18:c612::1").To16())
+	pkt6 := buildIPv6UDPPacket(src6, dst6, 44444, 53, buildDNSQuery(0x8888, "ipv6test.example.org", 28))
+
+	// With IPv6 disabled by default, PushPacket drops IPv6 without incrementing PacketsIn.
+	st.PushPacket(pkt6)
+	if st.Stats().PacketsIn != 0 {
+		t.Fatalf("expected IPv6 packet dropped when engine IPv6 disabled, PacketsIn=%d", st.Stats().PacketsIn)
+	}
+
+	// Enable IPv6: PushPacket injects IPv6 packet and DNS responder returns Fake-IPv6 AAAA packet over IPv6!
+	if err := eng.SetEnableIPv6(true); err != nil {
+		t.Fatal(err)
+	}
+	st.PushPacket(pkt6)
+	select {
+	case out := <-w.ch:
+		if len(out) < header.IPv6MinimumSize+header.UDPMinimumSize+12 || (out[0]>>4) != 6 {
+			t.Fatalf("expected valid IPv6 DNS response packet, got len=%d ver=%d", len(out), out[0]>>4)
+		}
+		ans := out[header.IPv6MinimumSize+header.UDPMinimumSize:]
+		if binary.BigEndian.Uint16(ans[6:8]) != 1 {
+			t.Fatalf("expected 1 AAAA answer record in TUN IPv6 DNS response, got %d", binary.BigEndian.Uint16(ans[6:8]))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for TUN IPv6 AAAA DNS response")
+	}
+}

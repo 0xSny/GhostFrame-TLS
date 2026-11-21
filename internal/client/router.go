@@ -59,6 +59,7 @@ type Router struct {
 	directHits atomic.Uint64
 	proxyHits  atomic.Uint64
 	rejectHits atomic.Uint64
+	enableIPv6 atomic.Bool
 }
 
 var privateIPv4CIDRs = []string{
@@ -132,10 +133,21 @@ func NewRouterWithDataDir(dataDir string) *Router {
 		proxySuffixMap:  proxyMap,
 		directSuffixMap: directMap,
 	}
+	r.enableIPv6.Store(true)
 	if b := LoadCompactRuleBundleFromDir(dataDir); b != nil {
 		r.compact.Store(b)
 	}
 	return r
+}
+
+// SetEnableIPv6 toggles whether non-loopback IPv6 destinations are permitted or rejected.
+func (r *Router) SetEnableIPv6(on bool) {
+	r.enableIPv6.Store(on)
+}
+
+// IPv6Enabled reports whether IPv6 routing is currently enabled.
+func (r *Router) IPv6Enabled() bool {
+	return r.enableIPv6.Load()
 }
 
 // SetCompactBundle atomically swaps the zero-pointer 64-bit hash rule index at runtime.
@@ -318,6 +330,13 @@ func (r *Router) evaluateStatic(mode RouteMode, hostport string) (act RouteActio
 	// Internal management domain ALWAYS goes through the GhostFrame tunnel.
 	if hostLower == "gft.internal.panel" {
 		return ActionProxy, "internal:panel", false
+	}
+
+	// Strict IPv6 anti-leak gate: when IPv6 is disabled, reject any non-loopback literal IPv6.
+	if !r.IPv6Enabled() {
+		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil && !ip.IsLoopback() {
+			return ActionReject, "ipv6:disabled", false
+		}
 	}
 
 	switch mode {

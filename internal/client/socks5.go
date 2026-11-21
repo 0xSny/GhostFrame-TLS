@@ -225,7 +225,8 @@ func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
 	_ = ctrl.SetDeadline(time.Time{})
 
 	var assoc gft.UDPAssociation
-	var directPC net.PacketConn
+	var directPC4 net.PacketConn
+	var directPC6 net.PacketConn
 	var assocMu sync.Mutex
 	done := make(chan struct{})
 	defer func() {
@@ -234,8 +235,11 @@ func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
 		if assoc != nil {
 			_ = assoc.Close()
 		}
-		if directPC != nil {
-			_ = directPC.Close()
+		if directPC4 != nil {
+			_ = directPC4.Close()
+		}
+		if directPC6 != nil {
+			_ = directPC6.Close()
 		}
 		assocMu.Unlock()
 	}()
@@ -316,18 +320,40 @@ func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
 		return a, nil
 	}
 
-	ensureDirectUDP := func() (net.PacketConn, error) {
+	ensureDirectUDP := func(isIPv6 bool) (net.PacketConn, error) {
 		assocMu.Lock()
 		defer assocMu.Unlock()
-		if directPC != nil {
-			return directPC, nil
+		if isIPv6 {
+			if directPC6 != nil {
+				return directPC6, nil
+			}
+			lc := net.ListenConfig{Control: netbind.Control}
+			pc, err := lc.ListenPacket(context.Background(), "udp6", "[::]:0")
+			if err != nil {
+				return nil, err
+			}
+			directPC6 = pc
+			go func() {
+				dbuf := make([]byte, 64*1024)
+				for {
+					dn, da, derr := pc.ReadFrom(dbuf)
+					if derr != nil {
+						return
+					}
+					sendBackToClient(da.String(), dbuf[:dn])
+				}
+			}()
+			return pc, nil
+		}
+		if directPC4 != nil {
+			return directPC4, nil
 		}
 		lc := net.ListenConfig{Control: netbind.Control}
-		pc, err := lc.ListenPacket(context.Background(), "udp", ":0")
+		pc, err := lc.ListenPacket(context.Background(), "udp4", ":0")
 		if err != nil {
 			return nil, err
 		}
-		directPC = pc
+		directPC4 = pc
 		go func() {
 			dbuf := make([]byte, 64*1024)
 			for {
@@ -359,12 +385,26 @@ func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
 			continue
 		}
 		act, resolvedTarget, _ := s.engine.DecideSmartRoute(target, target)
+		if act == ActionReject {
+			continue
+		}
 		if act == ActionDirect {
-			pc, err := ensureDirectUDP()
-			if err != nil {
+			allowV6 := s.engine.IPv6Enabled() || netbind.IsPureIPv6Physical()
+			var uaDst *net.UDPAddr
+			var err error
+			if !allowV6 {
+				uaDst, err = net.ResolveUDPAddr("udp4", resolvedTarget)
+			} else {
+				uaDst, err = netbind.ResolveUDPTarget(context.Background(), resolvedTarget)
+			}
+			if err != nil || uaDst == nil {
 				continue
 			}
-			uaDst, err := netbind.ResolveUDPTarget(context.Background(), resolvedTarget)
+			isV6 := uaDst.IP != nil && uaDst.IP.To4() == nil
+			if isV6 && !allowV6 {
+				continue
+			}
+			pc, err := ensureDirectUDP(isV6)
 			if err != nil {
 				continue
 			}

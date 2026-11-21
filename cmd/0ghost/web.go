@@ -197,6 +197,7 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 			HasDeviceIPs       bool     `json:"has_device_ips"`
 			DirectDNS          []string `json:"direct_dns"`
 			HasDirectDNS       bool     `json:"has_direct_dns"`
+			EnableIPv6         *bool    `json:"enable_ipv6"`
 			FilterAAAA         *bool    `json:"filter_aaaa"`
 			LANMasquerade      *bool    `json:"lan_masquerade"`
 			AutoYieldConflicts *bool    `json:"auto_yield_conflicts"`
@@ -243,8 +244,13 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 			}
 			cfg.DirectDNS = cleanDNS
 		}
-		if req.FilterAAAA != nil {
+		ipv6Changed := req.EnableIPv6 != nil || req.FilterAAAA != nil
+		if req.EnableIPv6 != nil {
+			cfg.EnableIPv6 = *req.EnableIPv6
+			cfg.FilterAAAA = !cfg.EnableIPv6
+		} else if req.FilterAAAA != nil {
 			cfg.FilterAAAA = *req.FilterAAAA
+			cfg.EnableIPv6 = !cfg.FilterAAAA
 		}
 		if req.LANMasquerade != nil {
 			cfg.LANMasquerade = *req.LANMasquerade
@@ -263,9 +269,13 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		if b, err := json.Marshal(cfg); err == nil {
 			_ = s.engine.SetGatewayConfigRaw(b)
 		}
+		_ = s.engine.SetEnableIPv6(cfg.EnableIPv6)
 		_ = s.engine.SetRouteMode(mapGatewayToRouteMode(cfg.GatewayMode))
 		if dnsSrv != nil {
-			dnsSrv.UpdateConfig(s.effectiveDirectDNS(cfg), cfg.FilterAAAA)
+			dnsSrv.UpdateConfig(s.effectiveDirectDNS(cfg), !cfg.EnableIPv6)
+			if ipv6Changed {
+				dnsSrv.ClearCache()
+			}
 		}
 
 		if req.HasCustomRules {

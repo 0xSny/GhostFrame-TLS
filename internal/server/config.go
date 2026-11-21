@@ -49,6 +49,7 @@ type Config struct {
 	Remark           string      `json:"remark,omitempty"`            // custom exported link remark (e.g. "Tokyo-Main")
 	DisableRTC       bool        `json:"disable_rtc,omitempty"`
 	DisableQUIC      bool        `json:"disable_quic,omitempty"`  // legacy alias for DisableRTC
+	DisableIPv6      bool        `json:"disable_ipv6,omitempty"` // disable outbound IPv6 TCP/UDP resolution & dialing
 	TxMbps           int         `json:"tx_mbps,omitempty"`       // optional server Smart-Brutal max TX Mbps (0 = Auto)
 	UpMbps           int         `json:"up_mbps,omitempty"`       // default exported client Smart-Brutal uplink Mbps (0 = Auto)
 	DownMbps         int         `json:"down_mbps,omitempty"`     // default exported client Smart-Brutal downlink Mbps (0 = Auto)
@@ -71,6 +72,11 @@ func (c *Config) EffectiveMaxMemoryMB() int {
 // IsRTCDisabled reports whether Kestrel-RTC UDP transport is disabled in server config.
 func (c *Config) IsRTCDisabled() bool {
 	return c != nil && (c.DisableRTC || c.DisableQUIC)
+}
+
+// IsIPv6Enabled reports whether server outbound IPv6 TCP/UDP connections are permitted.
+func (c *Config) IsIPv6Enabled() bool {
+	return c == nil || !c.DisableIPv6
 }
 
 func LoadConfig(path string) (*Config, error) {

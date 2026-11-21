@@ -165,3 +165,35 @@ func appendBuiltinCNIPv6Ranges(dst []ipv6Range) []ipv6Range {
 	initCNIPv6CIDRs()
 	return append(dst, cnIPv6Ranges...)
 }
+
+// CNPublicIPv6CIDRs returns the embedded APNIC Mainland China IPv6 CIDR table on demand
+// for kernel-level nftables direct bypass when IPv6 dual-stack proxy is enabled.
+func CNPublicIPv6CIDRs() []string {
+	if len(cnIPv6Zlib) == 0 {
+		return nil
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(cnIPv6Zlib))
+	if err != nil {
+		return nil
+	}
+	defer zr.Close()
+	raw, err := io.ReadAll(io.LimitReader(zr, 4<<20))
+	if err != nil || len(raw) < 17 {
+		return nil
+	}
+	n := len(raw) / 17
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		off := i * 17
+		pref := int(raw[off+16])
+		if pref > 128 {
+			continue
+		}
+		ip := make(net.IP, net.IPv6len)
+		copy(ip, raw[off:off+16])
+		mask := net.CIDRMask(pref, 128)
+		ipNet := net.IPNet{IP: ip.Mask(mask), Mask: mask}
+		out = append(out, ipNet.String())
+	}
+	return out
+}

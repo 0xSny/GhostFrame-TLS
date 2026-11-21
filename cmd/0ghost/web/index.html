@@ -147,7 +147,7 @@ textarea{min-height:74px;resize:vertical;font-family:ui-monospace,SFMono-Regular
             <input id="webPassword" type="password" placeholder="可选：输入新口令，或留空保持不变" />
           </div>
           <div style="padding-top:16px">
-            <label class="chk"><input type="checkbox" id="filterAAAA" /> 过滤 IPv6 AAAA (防分流泄漏)</label>
+            <label class="chk"><input type="checkbox" id="enableIPv6" /> 开启 IPv6 双栈透明代理与 AAAA 解析</label>
             <label class="chk"><input type="checkbox" id="lanMasquerade" /> 旁路由 LAN 动态伪装 SNAT (防非对称断流)</label>
             <label class="chk"><input type="checkbox" id="autoYield" /> 启动前自动停用冲突代理</label>
           </div>
@@ -346,7 +346,8 @@ function saveGatewaySettings(){
       device_mode: curDevMode,
       device_ips: devIps, has_device_ips: true,
       direct_dns: directDns, has_direct_dns: true,
-      filter_aaaa: document.getElementById('filterAAAA').checked,
+      enable_ipv6: document.getElementById('enableIPv6').checked,
+      filter_aaaa: !document.getElementById('enableIPv6').checked,
       lan_masquerade: document.getElementById('lanMasquerade').checked,
       auto_yield_conflicts: document.getElementById('autoYield').checked,
       custom_rules: customRules, has_custom_rules: true
@@ -486,7 +487,7 @@ function refresh(){
       document.getElementById('devIpsBox').style.display = curDevMode === 'all' ? 'none' : 'block';
       document.getElementById('devIps').value = (s.device_ips || []).join('\n');
       document.getElementById('directDns').value = (s.direct_dns || []).join(', ');
-      document.getElementById('filterAAAA').checked = !!s.filter_aaaa;
+      document.getElementById('enableIPv6').checked = (s.enable_ipv6 !== undefined) ? !!s.enable_ipv6 : !s.filter_aaaa;
       document.getElementById('lanMasquerade').checked = !!s.lan_masquerade;
       document.getElementById('autoYield').checked = !!s.auto_yield_conflicts;
       document.getElementById('customRules').value = (s.custom_rules || []).join('\n');

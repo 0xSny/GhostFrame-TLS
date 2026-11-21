@@ -110,7 +110,7 @@ func CalibrateKernel(lanIface string) {
 
 // CheckFirewallHealthy verifies that `table inet kestrel0` and the TPROXY policy route
 // are still mounted (e.g. not wiped by an external fw4 reload or hotplug event).
-func CheckFirewallHealthy(mode GatewayMode, tproxyMark, routeTable int) bool {
+func CheckFirewallHealthy(mode GatewayMode, tproxyMark, routeTable int, enableIPv6 bool) bool {
 	if mode == ModePort {
 		return true
 	}
@@ -129,6 +129,12 @@ func CheckFirewallHealthy(mode GatewayMode, tproxyMark, routeTable int) bool {
 			needle := fmt.Sprintf("lookup %d", routeTable)
 			if !strings.Contains(string(out), needle) {
 				return false
+			}
+			if enableIPv6 {
+				out6, err6 := exec.Command("ip", "-6", "rule", "show").Output()
+				if err6 != nil || !strings.Contains(string(out6), needle) {
+					return false
+				}
 			}
 		}
 		return true
@@ -175,6 +181,25 @@ func ApplyFirewall(spec FirewallSpec) (string, error) {
 		return "", fmt.Errorf("ip route replace failed: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 
+	ipv6Active := false
+	ipv6FallbackNote := ""
+	if spec.EnableIPv6 && !spec.FilterAAAA {
+		writeSysctl("/proc/sys/net/ipv6/conf/all/forwarding", "1")
+		if out6, err6 := exec.Command("ip", "-6", "rule", "add", "fwmark", markStr, "lookup", tblStr, "pref", "100").CombinedOutput(); err6 != nil {
+			cleanPolicyRouteV6(markStr, tblStr)
+			spec.EnableIPv6 = false
+			spec.FilterAAAA = true
+			ipv6FallbackNote = "; IPv6 disabled (" + strings.TrimSpace(string(out6)) + ")"
+		} else if outR6, errR6 := exec.Command("ip", "-6", "route", "replace", "local", "::/0", "dev", "lo", "table", tblStr).CombinedOutput(); errR6 != nil {
+			cleanPolicyRouteV6(markStr, tblStr)
+			spec.EnableIPv6 = false
+			spec.FilterAAAA = true
+			ipv6FallbackNote = "; IPv6 disabled (" + strings.TrimSpace(string(outR6)) + ")"
+		} else {
+			ipv6Active = true
+		}
+	}
+
 	if _, err := exec.LookPath("nft"); err == nil {
 		spec.PreferTProxy = HasNFTTProxy()
 		script := BuildNFTablesScript(spec)
@@ -197,15 +222,18 @@ func ApplyFirewall(spec FirewallSpec) (string, error) {
 					CleanupFirewall(spec.TProxyMark, spec.RouteTable)
 					return "", fmt.Errorf("nft apply failed: %w (%s)", err2, strings.TrimSpace(out2.String()))
 				}
-				return "nftables (REDIRECT+DNS fallback)", nil
+				return "nftables (REDIRECT+DNS fallback" + ipv6FallbackNote + ")", nil
 			}
 			CleanupFirewall(spec.TProxyMark, spec.RouteTable)
 			return "", fmt.Errorf("nft apply failed: %w (%s)", err, strings.TrimSpace(out.String()))
 		}
 		if spec.PreferTProxy {
-			return "nftables (fw4 TPROXY+DNS)", nil
+			if ipv6Active {
+				return "nftables (fw4 TPROXY+DNS+IPv6)", nil
+			}
+			return "nftables (fw4 TPROXY+DNS" + ipv6FallbackNote + ")", nil
 		}
-		return "nftables (fw4 REDIRECT+DNS)", nil
+		return "nftables (fw4 REDIRECT+DNS" + ipv6FallbackNote + ")", nil
 	}
 
 	// Legacy fw3/iptables fallback.
@@ -237,6 +265,16 @@ func cleanPolicyRoute(markStr, tblStr string) {
 		}
 	}
 	_ = exec.Command("ip", "route", "flush", "table", tblStr).Run()
+	cleanPolicyRouteV6(markStr, tblStr)
+}
+
+func cleanPolicyRouteV6(markStr, tblStr string) {
+	for i := 0; i < 4; i++ {
+		if err := exec.Command("ip", "-6", "rule", "del", "fwmark", markStr, "table", tblStr).Run(); err != nil {
+			break
+		}
+	}
+	_ = exec.Command("ip", "-6", "route", "flush", "table", tblStr).Run()
 }
 
 func applyIPTablesFallback(spec FirewallSpec) error {

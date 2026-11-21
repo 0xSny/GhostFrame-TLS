@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.0.31-LTS"
+var Version = "v4.0.32-LTS"
 
 type ConnState string
 
@@ -40,6 +40,7 @@ type ClientConfig struct {
 	SocksAddr     string          `json:"socks_addr"`
 	HTTPAddr      string          `json:"http_addr"`
 	SysProxy      bool            `json:"sys_proxy"`
+	EnableIPv6    bool            `json:"enable_ipv6,omitempty"`
 	CustomRules   []string        `json:"custom_rules,omitempty"`
 	RuleBundleURL string          `json:"rule_bundle_url,omitempty"`
 	Gateway       json.RawMessage `json:"gateway,omitempty"`
@@ -90,6 +91,7 @@ type Engine struct {
 	sysProxyApplied bool
 	proxyDrifted    atomic.Bool
 	directDNSBypass atomic.Bool
+	enableIPv6      atomic.Bool
 
 	// Stats
 	prevUp     uint64
@@ -175,6 +177,8 @@ func NewEngine(cfgPath string) (*Engine, error) {
 		e.config.RouteMode = RouteCore
 	}
 	e.config.SysProxy = e.config.RouteMode != RouteCore
+	e.enableIPv6.Store(e.config.EnableIPv6)
+	e.router.SetEnableIPv6(e.config.EnableIPv6)
 
 	if active := e.activeLinkLocked(); active != nil && active.Params != nil {
 		e.paramStore.Set(*active.Params)
@@ -773,7 +777,38 @@ func (e *Engine) OpenTargetStream(target string, first []byte) (gft.DataStream, 
 	return e.OpenTargetStreamWithRoute(target, target, first)
 }
 
-var errRouteRejected = errors.New("connection blocked by custom REJECT rule")
+var (
+	errRouteRejected      = errors.New("connection blocked by custom REJECT rule")
+	errIPv6DisabledClient = errors.New("IPv6 is disabled by client switch")
+)
+
+// IPv6Enabled reports whether IPv6 dual-stack routing & resolution is enabled.
+func (e *Engine) IPv6Enabled() bool {
+	return e.enableIPv6.Load()
+}
+
+// SetEnableIPv6 toggles client IPv6 dual-stack routing/dialing, flushes DNS/smart-route caches, and persists config.
+func (e *Engine) SetEnableIPv6(enabled bool) error {
+	e.mu.Lock()
+	e.config.EnableIPv6 = enabled
+	e.enableIPv6.Store(enabled)
+	if e.router != nil {
+		e.router.SetEnableIPv6(enabled)
+	}
+	e.mu.Unlock()
+	if e.smartCache != nil {
+		e.smartCache.Clear()
+	}
+	if e.tunnelDNS != nil {
+		e.tunnelDNS.Clear()
+	}
+	stateWord := "关闭 (仅 IPv4 / 防泄露)"
+	if enabled {
+		stateWord = "开启 (IPv4 + IPv6 双栈)"
+	}
+	e.Logf("IPv6 双栈分流开关已%s", stateWord)
+	return e.SaveConfig()
+}
 
 // SetDirectDNSBypass enables direct public CN DNS resolution (223.5.5.5 / 119.29.29.29)
 // for ActionDirect connections so TUN Fake-IP system DNS (198.18.0.1) never causes self-resolution loops.
@@ -838,8 +873,17 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 		dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
 		dialTargetDirect := netbind.ResolveTCPTarget(dctx, resolvedDial)
 		dcancel()
+		dialNet := "tcp"
+		if !e.IPv6Enabled() && !netbind.IsPureIPv6Physical() {
+			if dh, _, herr := net.SplitHostPort(dialTargetDirect); herr == nil {
+				if ip := net.ParseIP(strings.Trim(strings.TrimSpace(dh), "[]")); ip != nil && ip.To4() == nil {
+					return nil, ActionReject, errIPv6DisabledClient
+				}
+			}
+			dialNet = "tcp4"
+		}
 		d := e.DirectDialer(8 * time.Second)
-		c, err := d.Dial("tcp", dialTargetDirect)
+		c, err := d.Dial(dialNet, dialTargetDirect)
 		if err != nil {
 			return nil, ActionDirect, err
 		}
@@ -1076,6 +1120,61 @@ func (e *Engine) NodeHostIPs() []string {
 			for _, a := range addrs {
 				if ip4 := a.IP.To4(); ip4 != nil {
 					s := ip4.String()
+					if _, ok := seen[s]; !ok {
+						seen[s] = struct{}{}
+						ips = append(ips, s)
+					}
+				}
+			}
+		}
+	}
+	return ips
+}
+
+// NodeHostIPv6s returns unique IPv6 literal addresses for all configured VPS nodes
+// (used for host/gateway firewall bypass when IPv6 dual-stack TPROXY is active).
+func (e *Engine) NodeHostIPv6s() []string {
+	e.mu.RLock()
+	hosts := make([]string, 0, len(e.config.Nodes)+1)
+	if e.config.Link != nil && e.config.Link.Host != "" {
+		hosts = append(hosts, e.config.Link.Host)
+	}
+	for _, n := range e.config.Nodes {
+		if n != nil && n.Host != "" {
+			hosts = append(hosts, n.Host)
+		}
+	}
+	e.mu.RUnlock()
+
+	seen := make(map[string]struct{})
+	var ips []string
+	for _, h := range hosts {
+		clean := strings.Trim(strings.TrimSpace(h), "[]")
+		if clean == "" {
+			continue
+		}
+		if ip := net.ParseIP(clean); ip != nil {
+			if ip.To4() == nil {
+				s := ip.String()
+				if _, ok := seen[s]; !ok {
+					seen[s] = struct{}{}
+					ips = append(ips, s)
+				}
+			}
+			continue
+		}
+		d := e.DirectDialer(3 * time.Second)
+		res := d.Resolver
+		if res == nil {
+			res = net.DefaultResolver
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		addrs, err := res.LookupIPAddr(ctx, clean)
+		cancel()
+		if err == nil {
+			for _, a := range addrs {
+				if a.IP.To4() == nil && a.IP.To16() != nil {
+					s := a.IP.String()
 					if _, ok := seen[s]; !ok {
 						seen[s] = struct{}{}
 						ips = append(ips, s)
@@ -1572,6 +1671,7 @@ func (e *Engine) Status() map[string]any {
 		"total_down":       totalDown,
 		"history":          histCopy,
 		"sys_proxy":        sysProxy,
+		"enable_ipv6":      e.IPv6Enabled(),
 		"proxy_drifted":    e.proxyDrifted.Load(),
 		"socks_addr":       socksAddr,
 		"http_addr":        httpAddr,

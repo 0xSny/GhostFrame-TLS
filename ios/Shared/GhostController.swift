@@ -35,6 +35,7 @@ final class GhostAppViewModel: ObservableObject {
     @Published var downMbpsText: String = "0"
     @Published var socksPortText: String = "10808"
     @Published var httpPortText: String = "10809"
+    @Published var enableIPv6: Bool = false
     @Published var customRulesText: String = ""
 
     @Published var status: GhostStatusSnapshot = .empty
@@ -61,6 +62,7 @@ final class GhostAppViewModel: ObservableObject {
     private let storageKeyDownMbps: String
     private let storageKeySocksPort: String
     private let storageKeyHttpPort: String
+    private let storageKeyEnableIPv6: String
     private let storageKeyCustomRules: String
 
     private var toastClearTask: DispatchWorkItem?
@@ -78,12 +80,13 @@ final class GhostAppViewModel: ObservableObject {
         storageKeyDownMbps = prefix + "downMbps"
         storageKeySocksPort = prefix + "socksPort"
         storageKeyHttpPort = prefix + "httpPort"
+        storageKeyEnableIPv6 = prefix + "enableIPv6"
         storageKeyCustomRules = prefix + "customRules"
 
         loadPreferences()
         bindBackend()
         syncFromBackendState()
-        appendLocalLog("Kestrel \(edition.title) v4.0.31-LTS initialized")
+        appendLocalLog("Kestrel \(edition.title) v4.0.32-LTS initialized")
     }
 
     var activeNode: GhostNode? {
@@ -242,7 +245,7 @@ final class GhostAppViewModel: ObservableObject {
         if let node = activeNode, (isConnected || isTransitioning) {
             let cfg = buildEngineConfig(for: node)
             backend.applyLiveConfig(config: cfg, node: node)
-            appendLocalLog("Applied config: transport=\(cfg.transport), route=\(cfg.routeMode), ports=\(cfg.socksPort)/\(cfg.httpPort)")
+            appendLocalLog("Applied config: transport=\(cfg.transport), route=\(cfg.routeMode), ipv6=\(cfg.enableIPv6), ports=\(cfg.socksPort)/\(cfg.httpPort)")
             showToast("参数已保存并通知内核生效")
         } else {
             showToast("参数已保存")
@@ -356,6 +359,7 @@ final class GhostAppViewModel: ObservableObject {
             upMbps: effectiveUpMbps,
             downMbps: effectiveDownMbps,
             asyncConnect: true,
+            enableIPv6: enableIPv6,
             customRules: parsedCustomRules
         )
     }
@@ -434,6 +438,7 @@ final class GhostAppViewModel: ObservableObject {
             let hp = defaults.integer(forKey: storageKeyHttpPort)
             if hp > 0 { httpPortText = "\(hp)" }
         }
+        enableIPv6 = defaults.bool(forKey: storageKeyEnableIPv6)
         customRulesText = defaults.string(forKey: storageKeyCustomRules) ?? ""
     }
 
@@ -448,6 +453,7 @@ final class GhostAppViewModel: ObservableObject {
         defaults.set(effectiveDownMbps, forKey: storageKeyDownMbps)
         defaults.set(effectiveSocksPort, forKey: storageKeySocksPort)
         defaults.set(effectiveHttpPort, forKey: storageKeyHttpPort)
+        defaults.set(enableIPv6, forKey: storageKeyEnableIPv6)
         defaults.set(customRulesText, forKey: storageKeyCustomRules)
     }
 }

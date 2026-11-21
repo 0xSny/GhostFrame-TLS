@@ -376,12 +376,13 @@ func (p *Panel) handleStats(w http.ResponseWriter, r *http.Request) {
 	rtcActive := p.srv.rtcActive.Load()
 
 	res := map[string]any{
-		"version":     Version,
-		"uptime_sec":  int64(time.Since(p.srv.started).Seconds()),
-		"active":      activeCount,
-		"rtc_active":  rtcActive,
-		"rtc_enabled": rtcEnabled,
-		"hop_range":   hopRange,
+		"version":      Version,
+		"uptime_sec":   int64(time.Since(p.srv.started).Seconds()),
+		"active":       activeCount,
+		"rtc_active":   rtcActive,
+		"rtc_enabled":  rtcEnabled,
+		"ipv6_enabled": p.srv.cfg.IsIPv6Enabled(),
+		"hop_range":    hopRange,
 		"up_mbps":     upMbps,
 		"down_mbps":   downMbps,
 		"public_host": pubHost,
@@ -484,13 +485,14 @@ func (p *Panel) handleRTC(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		p.srv.cfgMu.RLock()
 		res := map[string]any{
-			"rtc_enabled": !p.srv.cfg.DisableRTC && !p.srv.cfg.DisableQUIC && p.srv.UDPAddr() != nil,
-			"rtc_active":  p.srv.rtcActive.Load(),
-			"hop_range":   p.srv.cfg.HopRange,
-			"up_mbps":     p.srv.cfg.UpMbps,
-			"down_mbps":   p.srv.cfg.DownMbps,
-			"tx_mbps":     p.srv.cfg.TxMbps,
-			"remark":      strings.TrimSpace(p.srv.cfg.Remark),
+			"rtc_enabled":  !p.srv.cfg.DisableRTC && !p.srv.cfg.DisableQUIC && p.srv.UDPAddr() != nil,
+			"rtc_active":   p.srv.rtcActive.Load(),
+			"ipv6_enabled": p.srv.cfg.IsIPv6Enabled(),
+			"hop_range":    p.srv.cfg.HopRange,
+			"up_mbps":      p.srv.cfg.UpMbps,
+			"down_mbps":    p.srv.cfg.DownMbps,
+			"tx_mbps":      p.srv.cfg.TxMbps,
+			"remark":       strings.TrimSpace(p.srv.cfg.Remark),
 		}
 		p.srv.cfgMu.RUnlock()
 		_ = json.NewEncoder(w).Encode(res)
@@ -498,10 +500,11 @@ func (p *Panel) handleRTC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		HopRange string  `json:"hop_range"`
-		UpMbps   int     `json:"up_mbps"`
-		DownMbps int     `json:"down_mbps"`
-		Remark   *string `json:"remark,omitempty"`
+		HopRange    string  `json:"hop_range"`
+		UpMbps      int     `json:"up_mbps"`
+		DownMbps    int     `json:"down_mbps"`
+		Remark      *string `json:"remark,omitempty"`
+		IPv6Enabled *bool   `json:"ipv6_enabled,omitempty"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -526,9 +529,13 @@ func (p *Panel) handleRTC(w http.ResponseWriter, r *http.Request) {
 	oldUp := p.srv.cfg.UpMbps
 	oldDown := p.srv.cfg.DownMbps
 	oldRemark := p.srv.cfg.Remark
+	oldDisV6 := p.srv.cfg.DisableIPv6
 	p.srv.cfg.HopRange = normHop
 	p.srv.cfg.UpMbps = req.UpMbps
 	p.srv.cfg.DownMbps = req.DownMbps
+	if req.IPv6Enabled != nil {
+		p.srv.cfg.DisableIPv6 = !*req.IPv6Enabled
+	}
 	if req.Remark != nil {
 		rem := strings.TrimSpace(*req.Remark)
 		if runes := []rune(rem); len(runes) > 64 {
@@ -542,26 +549,31 @@ func (p *Panel) handleRTC(w http.ResponseWriter, r *http.Request) {
 			p.srv.cfg.UpMbps = oldUp
 			p.srv.cfg.DownMbps = oldDown
 			p.srv.cfg.Remark = oldRemark
+			p.srv.cfg.DisableIPv6 = oldDisV6
 			p.srv.cfgMu.Unlock()
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
 			return
 		}
 	}
+	newDisV6 := p.srv.cfg.DisableIPv6
 	newRemark := p.srv.cfg.Remark
 	linkObj := p.srv.cfg.Link(curParams)
 	p.srv.cfgMu.Unlock()
 
+	p.srv.outbound.SetDisableIPv6(newDisV6)
+
 	uri := linkObj.Encode()
 	qrSVG, _ := qr.RenderSVG(uri)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok":        true,
-		"hop_range": normHop,
-		"up_mbps":   req.UpMbps,
-		"down_mbps": req.DownMbps,
-		"remark":    newRemark,
-		"uri":       uri,
-		"qr_svg":    qrSVG,
+		"ok":           true,
+		"hop_range":    normHop,
+		"up_mbps":      req.UpMbps,
+		"down_mbps":    req.DownMbps,
+		"remark":       newRemark,
+		"ipv6_enabled": !newDisV6,
+		"uri":          uri,
+		"qr_svg":       qrSVG,
 	})
 }
 

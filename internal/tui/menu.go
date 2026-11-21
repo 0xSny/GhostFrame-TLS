@@ -108,7 +108,7 @@ func (c *Controller) RenderDashboard(cfg *server.Config, active bool, bbrState s
 		bwBadge = fmt.Sprintf("↑%d/↓%dM", cfg.UpMbps, cfg.DownMbps)
 	}
 	sb.WriteString(b.Line(fmt.Sprintf("服务状态: %s   |  内核拥塞: %s  |  监听端口: %d", svcBadge, bbrState, port)) + "\n")
-	sb.WriteString(b.Line(fmt.Sprintf("双栈传输: %s  |  UDP 跳跃: %s   |  校验模式: %s", rtcBadge, hopBadge, strings.ToUpper(cfg.CertMode))) + "\n")
+	sb.WriteString(b.Line(fmt.Sprintf("双栈传输: %s  |  UDP 跳跃: %s   |  校验模式: %s  |  出站IPv6: %v", rtcBadge, hopBadge, strings.ToUpper(cfg.CertMode), cfg.IsIPv6Enabled())) + "\n")
 	sb.WriteString(b.Line(fmt.Sprintf("伪装域名: %s (握手: %s) | 回落: %s | 带宽: %s", cfg.SNI, rttTxt, cfg.FallbackMode, bwBadge)) + "\n")
 	sb.WriteString(b.Line(fmt.Sprintf("实时流量: ↑%s ↓%s (速率 ↑%s/s ↓%s/s) | 拦截探测: %d 次",
 		fmtBytes(snap.TotalUp), fmtBytes(snap.TotalDown),
@@ -376,9 +376,10 @@ func (c *Controller) printProbeChecklist(r sni.ProbeResult) {
 
 func (c *Controller) handlePortAndQUICMenu(sc *bufio.Scanner, cfg *server.Config) {
 	curPort := ConfigListenPort(cfg.Listen)
-	c.printf("\n--- 监听端口 (%d) 与 Kestrel-RTC 双栈 (%v) ---\n", curPort, !cfg.IsRTCDisabled())
+	c.printf("\n--- 监听端口 (%d) | Kestrel-RTC (%v) | 出站 IPv6 (%v) ---\n", curPort, !cfg.IsRTCDisabled(), cfg.IsIPv6Enabled())
 	c.printf("  [1] 修改主监听端口 (将预检冲突并同步更新 Hop 目标端口)\n")
 	c.printf("  [2] 切换 Kestrel-RTC UDP 通道开关 (当前: %v)\n", !cfg.IsRTCDisabled())
+	c.printf("  [3] 切换服务端出站 IPv6 开关 (当前: %v)\n", cfg.IsIPv6Enabled())
 	sub := c.prompt(sc, "请选择:")
 	switch sub {
 	case "1":
@@ -413,6 +414,19 @@ func (c *Controller) handlePortAndQUICMenu(sc *bufio.Scanner, cfg *server.Config
 			c.errMsg(err.Error())
 		} else {
 			c.okMsg("Kestrel-RTC 双栈开关已更新")
+		}
+	case "3":
+		var nextEnabled bool
+		if err := c.Tx.Apply(func(nc *server.Config) error {
+			nc.DisableIPv6 = !nc.DisableIPv6
+			nextEnabled = !nc.DisableIPv6
+			return nil
+		}); err != nil {
+			c.errMsg(err.Error())
+		} else if nextEnabled {
+			c.okMsg("服务端出站 IPv6 已开启 (TCP/UDP 支持双栈直出)")
+		} else {
+			c.okMsg("服务端出站 IPv6 已禁用 (仅允许 IPv4 出站)")
 		}
 	}
 	c.pause(sc)

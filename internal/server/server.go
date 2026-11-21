@@ -28,7 +28,7 @@ import (
 )
 
 // Version is the canonical server build identifier (overridable via -ldflags -X).
-var Version = "v4.0.31-LTS"
+var Version = "v4.0.32-LTS"
 
 const (
 	MaxUDPAssocPerClient = 256
@@ -108,6 +108,7 @@ func New(cfg *Config, logger *log.Logger) (*Server, error) {
 		logger:   logger,
 	}
 	s.params = gft.NewParamStore(s.loadParams())
+	s.outbound.SetDisableIPv6(cfg.DisableIPv6)
 	s.audit = NewAudit(filepath.Join(cfg.StateDir, "audit.json"))
 	s.stats = NewStats()
 	s.fallback = newChanListener()

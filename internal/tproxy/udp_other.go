@@ -17,3 +17,4 @@ func NewUDPServer(addr string, eng *client.Engine, modeFn func() GatewayMode) (*
 func (s *UDPServer) Start() error  { return errors.New("tproxy udp requires linux") }
 func (s *UDPServer) Close()        {}
 func (s *UDPServer) Count() uint64 { return 0 }
+func (s *UDPServer) HasIPv6() bool { return false }

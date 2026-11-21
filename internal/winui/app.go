@@ -77,6 +77,7 @@ const (
 	hitDiagSnapshot
 	hitUpdateRules
 	hitRebindProxy
+	hitToggleIPv6
 	hitNodeOption
 )
 
@@ -935,6 +936,15 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 		} else {
 			a.setToastSuccess("已重新接管 Windows 系统代理")
 		}
+	case hitToggleIPv6:
+		next := !a.eng.IPv6Enabled()
+		if err := a.eng.SetEnableIPv6(next); err != nil {
+			a.setToast("切换 IPv6 开关失败: "+err.Error(), true)
+		} else if next {
+			a.setToastSuccess("IPv6 双栈分流已开启")
+		} else {
+			a.setToast("IPv6 已关闭 (仅 IPv4 / 防泄露)", false)
+		}
 	}
 	a.invalidate()
 }
@@ -1227,6 +1237,12 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 
 	y := r.Top + s(12)
 	f.drawText(f.fBold, f.fmtLeft, rect{r.Left + s(16), y, r.Left + s(140), y + s(18)}, colTextSub, "当前节点")
+	ipv6On, _ := st["enable_ipv6"].(bool)
+	ipv6Label, ipv6Fg, ipv6Border := "IPv6: 关", colTextSub, colBorderHi
+	if ipv6On {
+		ipv6Label, ipv6Fg, ipv6Border = "IPv6: 开", colEmerald, colEmerald
+	}
+	a.drawButton(rect{r.Right - s(106), y - s(2), r.Right - s(16), y + s(19)}, hitToggleIPv6, ipv6Label, colCardAlt, ipv6Border, ipv6Fg)
 	y += s(20)
 
 	delR := rect{r.Right - s(58), y, r.Right - s(16), y + s(32)}

@@ -32,10 +32,11 @@ type TCPServer struct {
 	addr     string
 	listenIP string
 	port     int
-	engine   *client.Engine
-	modeFn   func() GatewayMode
-	listener net.Listener
-	closed   chan struct{}
+	engine    *client.Engine
+	modeFn    func() GatewayMode
+	listener  net.Listener
+	listener6 net.Listener
+	closed    chan struct{}
 	closeMu  sync.Mutex
 	conns    atomic.Uint64
 }
@@ -82,7 +83,27 @@ func (s *TCPServer) Start() error {
 	}
 	s.listener = ln
 	go s.acceptLoop(ln)
+
+	lc6 := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			_ = c.Control(func(fd uintptr) {
+				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1)
+				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_TRANSPARENT, 1)
+			})
+			return nil
+		},
+	}
+	if ln6, err6 := lc6.Listen(context.Background(), "tcp6", net.JoinHostPort("::1", strconv.Itoa(s.port))); err6 == nil {
+		s.listener6 = ln6
+		go s.acceptLoop(ln6)
+	}
 	return nil
+}
+
+// HasIPv6 reports whether the IPv6 TCP TPROXY listener is active on [::1]:<port>.
+func (s *TCPServer) HasIPv6() bool {
+	return s.listener6 != nil
 }
 
 // Close stops accepting new connections.
@@ -97,6 +118,9 @@ func (s *TCPServer) Close() {
 	}
 	if s.listener != nil {
 		_ = s.listener.Close()
+	}
+	if s.listener6 != nil {
+		_ = s.listener6.Close()
 	}
 }
 
@@ -178,16 +202,21 @@ func (s *TCPServer) handleConn(c net.Conn) {
 }
 
 func extractTCPOriginalDst(c net.Conn, listenPort int) (string, bool) {
-	// Under Linux TPROXY, c.LocalAddr() holds the true remote destination IP:Port.
+	// Under Linux TPROXY, c.LocalAddr() holds the true remote destination IP:Port (IPv4 or IPv6).
 	if ta, ok := c.LocalAddr().(*net.TCPAddr); ok && ta != nil && ta.IP != nil {
 		if ip4 := ta.IP.To4(); ip4 != nil {
 			if !ip4.IsLoopback() || ta.Port != listenPort {
 				return net.JoinHostPort(ip4.String(), strconv.Itoa(ta.Port)), true
 			}
+		} else if ip16 := ta.IP.To16(); ip16 != nil {
+			if !ip16.IsLoopback() || ta.Port != listenPort {
+				return net.JoinHostPort(ip16.String(), strconv.Itoa(ta.Port)), true
+			}
 		}
 	}
 
-	// Fallback for iptables/nftables REDIRECT: query SO_ORIGINAL_DST (80).
+	// Fallback for iptables/ip6tables/nftables REDIRECT: query SO_ORIGINAL_DST / IP6T_SO_ORIGINAL_DST (80).
+	const ip6tSOOriginalDst = 80
 	sc, ok := c.(syscall.Conn)
 	if !ok {
 		return "", false
@@ -213,6 +242,27 @@ func extractTCPOriginalDst(c net.Conn, listenPort int) (string, bool) {
 		if errno == 0 && addrLen >= 8 {
 			port := binary.BigEndian.Uint16(addr[2:4])
 			ip := net.IPv4(addr[4], addr[5], addr[6], addr[7])
+			if !ip.IsLoopback() && port > 0 {
+				target = net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
+				got = true
+				return
+			}
+		}
+		var addr6 [28]byte
+		addr6Len := uint32(len(addr6))
+		_, _, errno6 := unix.Syscall6(
+			unix.SYS_GETSOCKOPT,
+			fd,
+			unix.SOL_IPV6,
+			ip6tSOOriginalDst,
+			uintptr(unsafe.Pointer(&addr6[0])),
+			uintptr(unsafe.Pointer(&addr6Len)),
+			0,
+		)
+		if errno6 == 0 && addr6Len >= 24 {
+			port := binary.BigEndian.Uint16(addr6[2:4])
+			ip := make(net.IP, net.IPv6len)
+			copy(ip, addr6[8:24])
 			if !ip.IsLoopback() && port > 0 {
 				target = net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
 				got = true

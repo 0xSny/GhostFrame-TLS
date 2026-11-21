@@ -33,10 +33,38 @@ var directReplyBufPool = sync.Pool{
 }
 
 type udpTuple struct {
-	srcIP   [4]byte
+	isV6    bool
+	srcIP   [16]byte
 	srcPort uint16
-	dstIP   [4]byte
+	dstIP   [16]byte
 	dstPort uint16
+}
+
+func (t udpTuple) srcNetIP() net.IP {
+	if t.isV6 {
+		ip := make(net.IP, 16)
+		copy(ip, t.srcIP[:])
+		return ip
+	}
+	return net.IPv4(t.srcIP[0], t.srcIP[1], t.srcIP[2], t.srcIP[3])
+}
+
+func (t udpTuple) dstNetIP() net.IP {
+	if t.isV6 {
+		ip := make(net.IP, 16)
+		copy(ip, t.dstIP[:])
+		return ip
+	}
+	return net.IPv4(t.dstIP[0], t.dstIP[1], t.dstIP[2], t.dstIP[3])
+}
+
+func (t udpTuple) replySockaddr() unix.Sockaddr {
+	if t.isV6 {
+		return &unix.SockaddrInet6{Port: int(t.srcPort), Addr: t.srcIP}
+	}
+	var a [4]byte
+	copy(a[:], t.srcIP[:4])
+	return &unix.SockaddrInet4{Port: int(t.srcPort), Addr: a}
 }
 
 type udpNatEntry struct {
@@ -52,6 +80,7 @@ type udpNatEntry struct {
 }
 
 // UDPServer accepts Linux TPROXY UDP packets via IP_TRANSPARENT + IP_RECVORIGDSTADDR
+// (and optional IPV6_TRANSPARENT + IPV6_RECVORIGDSTADDR on [::1])
 // and relays them via GFT UDPAssociation or direct 0xff-marked sockets.
 type UDPServer struct {
 	addr     string
@@ -59,6 +88,7 @@ type UDPServer struct {
 	engine   *client.Engine
 	modeFn   func() GatewayMode
 	fd       int
+	fd6      int
 	closed   chan struct{}
 	closeMu  sync.Mutex
 	mu       sync.Mutex
@@ -82,6 +112,7 @@ func NewUDPServer(addr string, eng *client.Engine, modeFn func() GatewayMode) (*
 		engine:   eng,
 		modeFn:   modeFn,
 		fd:       -1,
+		fd6:      -1,
 		closed:   make(chan struct{}),
 		sessions: make(map[udpTuple]*udpNatEntry),
 	}, nil
@@ -118,8 +149,32 @@ func (s *UDPServer) Start() error {
 	}
 	s.fd = fd
 	go s.readLoop(fd)
+
+	// Optional IPv6 TPROXY UDP listener on [::1]:<port>
+	if fd6, err6 := unix.Socket(unix.AF_INET6, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, unix.IPPROTO_UDP); err6 == nil {
+		_ = unix.SetsockoptInt(fd6, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+		_ = unix.SetsockoptInt(fd6, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1)
+		if unix.SetsockoptInt(fd6, unix.IPPROTO_IPV6, unix.IPV6_TRANSPARENT, 1) == nil &&
+			unix.SetsockoptInt(fd6, unix.IPPROTO_IPV6, unix.IPV6_RECVORIGDSTADDR, 1) == nil {
+			sa6 := &unix.SockaddrInet6{Port: s.port, Addr: [16]byte{15: 1}}
+			if unix.Bind(fd6, sa6) == nil {
+				s.fd6 = fd6
+				go s.readLoop6(fd6)
+			} else {
+				_ = unix.Close(fd6)
+			}
+		} else {
+			_ = unix.Close(fd6)
+		}
+	}
+
 	go s.reapLoop()
 	return nil
+}
+
+// HasIPv6 reports whether the IPv6 UDP TPROXY listener is active on [::1]:<port>.
+func (s *UDPServer) HasIPv6() bool {
+	return s.fd6 >= 0
 }
 
 // Close closes the TPROXY UDP listener and all active NAT sessions.
@@ -135,6 +190,10 @@ func (s *UDPServer) Close() {
 	if s.fd >= 0 {
 		_ = unix.Close(s.fd)
 		s.fd = -1
+	}
+	if s.fd6 >= 0 {
+		_ = unix.Close(s.fd6)
+		s.fd6 = -1
 	}
 	s.mu.Lock()
 	for k, ent := range s.sessions {
@@ -184,7 +243,63 @@ func (s *UDPServer) readLoop(fd int) {
 			continue
 		}
 
+		var tup udpTuple
+		copy(tup.srcIP[:4], srcSA.Addr[:])
+		tup.srcPort = uint16(srcSA.Port)
+		copy(tup.dstIP[:4], dstIP[:])
+		tup.dstPort = dstPort
+
+		ent := s.getOrCreateSession(tup)
+		if ent == nil {
+			continue
+		}
+		ent.lastUsed.Store(time.Now().UnixNano())
+		payload := buf[:n]
+		if ent.assoc != nil {
+			_ = ent.assoc.SendTo(ent.dstStr, payload)
+		} else if ent.direct != nil {
+			_, _ = ent.direct.WriteTo(payload, ent.dstAddr)
+		}
+	}
+}
+
+func (s *UDPServer) readLoop6(fd int) {
+	buf := make([]byte, 64*1024)
+	oob := make([]byte, 1024)
+	for {
+		n, oobn, _, fromSA, err := unix.Recvmsg(fd, buf, oob, 0)
+		if err != nil {
+			select {
+			case <-s.closed:
+				return
+			default:
+				if errors.Is(err, syscall.EINTR) {
+					continue
+				}
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+		}
+		if n <= 0 || oobn <= 0 {
+			continue
+		}
+		if s.engine != nil && !s.engine.IPv6Enabled() {
+			continue
+		}
+		srcSA, ok := fromSA.(*unix.SockaddrInet6)
+		if !ok || srcSA.Port <= 0 {
+			continue
+		}
+		dstIP, dstPort, ok := parseOrigDstAddr6(oob[:oobn])
+		if !ok || dstPort == 0 {
+			continue
+		}
+		if net.IP(dstIP[:]).IsLoopback() {
+			continue
+		}
+
 		tup := udpTuple{
+			isV6:    true,
 			srcIP:   srcSA.Addr,
 			srcPort: uint16(srcSA.Port),
 			dstIP:   dstIP,
@@ -212,7 +327,9 @@ func (s *UDPServer) getOrCreateSession(tup udpTuple) *udpNatEntry {
 	}
 	s.mu.Unlock()
 
-	dstStr := net.JoinHostPort(net.IP(tup.dstIP[:]).String(), strconv.Itoa(int(tup.dstPort)))
+	srcIP := tup.srcNetIP()
+	dstIP := tup.dstNetIP()
+	dstStr := net.JoinHostPort(dstIP.String(), strconv.Itoa(int(tup.dstPort)))
 	gwMode := ModeRule
 	if s.modeFn != nil {
 		gwMode = s.modeFn()
@@ -226,15 +343,15 @@ func (s *UDPServer) getOrCreateSession(tup udpTuple) *udpNatEntry {
 		return nil
 	}
 
-	replyFD, err := openTransparentReplySocket(tup.dstIP, tup.dstPort)
+	replyFD, err := openTransparentReplySocket(tup)
 	if err != nil {
 		return nil
 	}
 
 	ent := &udpNatEntry{
 		tuple:   tup,
-		srcAddr: &net.UDPAddr{IP: net.IP(tup.srcIP[:]), Port: int(tup.srcPort)},
-		dstAddr: &net.UDPAddr{IP: net.IP(tup.dstIP[:]), Port: int(tup.dstPort)},
+		srcAddr: &net.UDPAddr{IP: srcIP, Port: int(tup.srcPort)},
+		dstAddr: &net.UDPAddr{IP: dstIP, Port: int(tup.dstPort)},
 		dstStr:  dstStr,
 		replyFD: replyFD,
 	}
@@ -242,7 +359,11 @@ func (s *UDPServer) getOrCreateSession(tup udpTuple) *udpNatEntry {
 
 	if act == client.ActionDirect {
 		lc := net.ListenConfig{Control: netbind.Control}
-		pc, err := lc.ListenPacket(context.Background(), "udp4", ":0")
+		listenNet, listenAddr := "udp4", ":0"
+		if tup.isV6 {
+			listenNet, listenAddr = "udp6", "[::]:0"
+		}
+		pc, err := lc.ListenPacket(context.Background(), listenNet, listenAddr)
 		if err != nil {
 			_ = unix.Close(replyFD)
 			return nil
@@ -302,9 +423,7 @@ func (s *UDPServer) getOrCreateSession(tup udpTuple) *udpNatEntry {
 
 func (s *UDPServer) pumpTunnelReplies(ent *udpNatEntry) {
 	defer s.removeSession(ent.tuple)
-	var dstSA unix.SockaddrInet4
-	dstSA.Addr = ent.tuple.srcIP
-	dstSA.Port = int(ent.tuple.srcPort)
+	dstSA := ent.tuple.replySockaddr()
 	for {
 		select {
 		case <-s.closed:
@@ -316,16 +435,14 @@ func (s *UDPServer) pumpTunnelReplies(ent *udpNatEntry) {
 				return
 			}
 			ent.lastUsed.Store(time.Now().UnixNano())
-			_ = unix.Sendto(ent.replyFD, pkt.Data, 0, &dstSA)
+			_ = unix.Sendto(ent.replyFD, pkt.Data, 0, dstSA)
 		}
 	}
 }
 
 func (s *UDPServer) pumpDirectReplies(ent *udpNatEntry) {
 	defer s.removeSession(ent.tuple)
-	var dstSA unix.SockaddrInet4
-	dstSA.Addr = ent.tuple.srcIP
-	dstSA.Port = int(ent.tuple.srcPort)
+	dstSA := ent.tuple.replySockaddr()
 
 	sc, ok := ent.direct.(syscall.Conn)
 	if !ok {
@@ -337,7 +454,7 @@ func (s *UDPServer) pumpDirectReplies(ent *udpNatEntry) {
 				return
 			}
 			ent.lastUsed.Store(time.Now().UnixNano())
-			_ = unix.Sendto(ent.replyFD, (*bp)[:n], 0, &dstSA)
+			_ = unix.Sendto(ent.replyFD, (*bp)[:n], 0, dstSA)
 			directReplyBufPool.Put(bp)
 		}
 	}
@@ -360,7 +477,7 @@ func (s *UDPServer) pumpDirectReplies(ent *udpNatEntry) {
 				return true
 			}
 			ent.lastUsed.Store(time.Now().UnixNano())
-			_ = unix.Sendto(ent.replyFD, buf[:n], 0, &dstSA)
+			_ = unix.Sendto(ent.replyFD, buf[:n], 0, dstSA)
 			directReplyBufPool.Put(bp)
 			return true
 		})
@@ -409,7 +526,33 @@ func (s *UDPServer) reapLoop() {
 	}
 }
 
-func openTransparentReplySocket(srcIP [4]byte, srcPort uint16) (int, error) {
+func openTransparentReplySocket(tup udpTuple) (int, error) {
+	if tup.isV6 {
+		fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, unix.IPPROTO_UDP)
+		if err != nil {
+			return -1, err
+		}
+		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+		_ = unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1)
+		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_TRANSPARENT, 1); err != nil {
+			_ = unix.Close(fd)
+			return -1, err
+		}
+		if mark := netbind.OutboundMark(); mark > 0 {
+			_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_MARK, mark)
+		}
+		sa := &unix.SockaddrInet6{
+			Port: int(tup.dstPort),
+			Addr: tup.dstIP,
+		}
+		if err := unix.Bind(fd, sa); err != nil {
+			_ = unix.Close(fd)
+			return -1, err
+		}
+		return fd, nil
+	}
+
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, unix.IPPROTO_UDP)
 	if err != nil {
 		return -1, err
@@ -424,9 +567,11 @@ func openTransparentReplySocket(srcIP [4]byte, srcPort uint16) (int, error) {
 	if mark := netbind.OutboundMark(); mark > 0 {
 		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_MARK, mark)
 	}
+	var srcIP4 [4]byte
+	copy(srcIP4[:], tup.dstIP[:4])
 	sa := &unix.SockaddrInet4{
-		Port: int(srcPort),
-		Addr: srcIP,
+		Port: int(tup.dstPort),
+		Addr: srcIP4,
 	}
 	if err := unix.Bind(fd, sa); err != nil {
 		_ = unix.Close(fd)
@@ -448,6 +593,26 @@ func parseOrigDstAddr(oob []byte) ([4]byte, uint16, bool) {
 				port := binary.BigEndian.Uint16(m.Data[2:4])
 				var ip [4]byte
 				copy(ip[:], m.Data[4:8])
+				return ip, port, true
+			}
+		}
+	}
+	return zero, 0, false
+}
+
+func parseOrigDstAddr6(oob []byte) ([16]byte, uint16, bool) {
+	var zero [16]byte
+	msgs, err := unix.ParseSocketControlMessage(oob)
+	if err != nil {
+		return zero, 0, false
+	}
+	for _, m := range msgs {
+		if m.Header.Level == unix.IPPROTO_IPV6 && m.Header.Type == unix.IPV6_ORIGDSTADDR && len(m.Data) >= 24 {
+			family := binary.LittleEndian.Uint16(m.Data[0:2])
+			if family == unix.AF_INET6 {
+				port := binary.BigEndian.Uint16(m.Data[2:4])
+				var ip [16]byte
+				copy(ip[:], m.Data[8:24])
 				return ip, port, true
 			}
 		}

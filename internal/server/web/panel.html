@@ -214,6 +214,11 @@ tr:hover td { background: var(--bg-card-hover); }
         <input type="number" id="rtc-down" min="0" max="65535">
       </div>
     </div>
+    <div style="margin-top:8px">
+      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+        <input type="checkbox" id="rtc-ipv6" style="width:auto"> Enable Server Outbound IPv6 (TCP/UDP Egress)
+      </label>
+    </div>
   </div>
 
   <!-- Obfuscation Configuration Center -->
@@ -424,6 +429,7 @@ async function fetchRTC() {
     document.getElementById('rtc-hop').value = d.hop_range || '';
     document.getElementById('rtc-up').value = d.up_mbps || 0;
     document.getElementById('rtc-down').value = d.down_mbps || 0;
+    document.getElementById('rtc-ipv6').checked = d.ipv6_enabled !== false;
   } catch (e) {}
 }
 
@@ -434,6 +440,7 @@ async function saveRTC() {
     hop_range: (document.getElementById('rtc-hop').value || '').trim(),
     up_mbps: parseInt(document.getElementById('rtc-up').value, 10) || 0,
     down_mbps: parseInt(document.getElementById('rtc-down').value, 10) || 0,
+    ipv6_enabled: !!document.getElementById('rtc-ipv6').checked,
   };
   const res = await fetch('api/rtc', {
     method: 'PUT',

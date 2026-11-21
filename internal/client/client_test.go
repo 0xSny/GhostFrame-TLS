@@ -745,3 +745,66 @@ func TestSelectNodeMakeBeforeBreakLossless(t *testing.T) {
 		t.Fatalf("expected rollback preserving NodeTwo connected, got %+v", stAfterFail)
 	}
 }
+
+func TestEngineIPv6ToggleAndStrictReject(t *testing.T) {
+	SetNoSysProxy(true)
+	cfgPath := filepath.Join(t.TempDir(), "client.json")
+	eng, err := NewEngine(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	// Default EnableIPv6 is false for strict anti-leak safety.
+	if eng.IPv6Enabled() {
+		t.Fatal("expected EnableIPv6=false by default")
+	}
+	if en, _ := eng.Status()["enable_ipv6"].(bool); en {
+		t.Fatalf("expected Status()[enable_ipv6]=false by default")
+	}
+
+	// While IPv6 is disabled, literal non-loopback IPv6 targets MUST be rejected in Rule and Global modes,
+	// whereas loopback ::1 stays direct so local loopback tools aren't broken.
+	if act, _, reason := eng.DecideSmartRoute("[2606:4700:4700::1111]:443", "[2606:4700:4700::1111]:443"); act != ActionReject || reason != "ipv6:disabled" {
+		t.Fatalf("expected ActionReject(ipv6:disabled) for overseas IPv6 when disabled, got act=%v reason=%q", act, reason)
+	}
+	if act, _, reason := eng.DecideSmartRoute("[2408:8207:1::1]:443", "[2408:8207:1::1]:443"); act != ActionReject || reason != "ipv6:disabled" {
+		t.Fatalf("expected ActionReject(ipv6:disabled) for CN IPv6 when disabled, got act=%v reason=%q", act, reason)
+	}
+	if err := eng.SetRouteMode(RouteGlobal); err != nil {
+		t.Fatal(err)
+	}
+	if act, _, reason := eng.DecideSmartRoute("[2606:4700:4700::1111]:443", "[2606:4700:4700::1111]:443"); act != ActionReject || reason != "ipv6:disabled" {
+		t.Fatalf("expected Global mode ActionReject(ipv6:disabled) when IPv6 disabled, got act=%v reason=%q", act, reason)
+	}
+	if act, _, _ := eng.DecideSmartRoute("[::1]:8080", "[::1]:8080"); act != ActionDirect {
+		t.Fatalf("expected ::1 loopback ActionDirect, got %v", act)
+	}
+
+	// Enable IPv6: persists config and enables dual-stack Rule/Global routing.
+	if err := eng.SetEnableIPv6(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetRouteMode(RouteRule); err != nil {
+		t.Fatal(err)
+	}
+	if !eng.IPv6Enabled() {
+		t.Fatal("expected IPv6Enabled=true after SetEnableIPv6(true)")
+	}
+	if act, _, reason := eng.DecideSmartRoute("[2408:8207:1::1]:443", "[2408:8207:1::1]:443"); act != ActionDirect || reason != "geoip:cn" {
+		t.Fatalf("expected CN IPv6 ActionDirect(geoip:cn) when IPv6 enabled, got act=%v reason=%q", act, reason)
+	}
+	if act, _, reason := eng.DecideSmartRoute("[2606:4700:4700::1111]:443", "[2606:4700:4700::1111]:443"); act != ActionProxy || reason != "geoip:overseas" {
+		t.Fatalf("expected overseas IPv6 ActionProxy(geoip:overseas) when IPv6 enabled, got act=%v reason=%q", act, reason)
+	}
+
+	// Reload from disk verifies persistence of EnableIPv6=true.
+	eng2, err := NewEngine(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+	if !eng2.IPv6Enabled() {
+		t.Fatal("expected EnableIPv6=true to persist across NewEngine reload")
+	}
+}

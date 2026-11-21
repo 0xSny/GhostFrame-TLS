@@ -15,7 +15,9 @@ private final class PacketFlowTunWriter: NSObject, MobileTunPacketWriterProtocol
     func writePacket(_ pkt: Data?, family: Int) {
         autoreleasepool {
             guard let data = pkt, !data.isEmpty, let flow = self.flow else { return }
-            flow.writePackets([data], withProtocols: [NSNumber(value: family)])
+            let pktVersion = data[data.startIndex] >> 4
+            let proto: Int32 = (pktVersion == 6) ? AF_INET6 : AF_INET
+            flow.writePackets([data], withProtocols: [NSNumber(value: proto)])
         }
     }
 
@@ -29,15 +31,18 @@ private final class PacketFlowTunWriter: NSObject, MobileTunPacketWriterProtocol
             packets.reserveCapacity(count)
             protos.reserveCapacity(count)
 
-            let protoNum = NSNumber(value: family)
+            let v4Num = NSNumber(value: AF_INET)
+            let v6Num = NSNumber(value: AF_INET6)
             var offset = 0
             for i in 0..<count {
                 let hi = Int(lenBytes[i * 2])
                 let lo = Int(lenBytes[i * 2 + 1])
                 let pktLen = (hi << 8) | lo
                 guard pktLen > 0, offset + pktLen <= data.count else { break }
-                packets.append(data.subdata(in: offset..<(offset + pktLen)))
-                protos.append(protoNum)
+                let pkt = data.subdata(in: offset..<(offset + pktLen))
+                let pktVersion = pkt[pkt.startIndex] >> 4
+                packets.append(pkt)
+                protos.append(pktVersion == 6 ? v6Num : v4Num)
                 offset += pktLen
             }
             if !packets.isEmpty {
@@ -56,6 +61,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var currentHTTPPort: Int = 10809
     private var currentServerHost: String = ""
     private var currentRouteMode: String = "rule"
+    private var currentEnableIPv6: Bool = false
     private var tunWriter: PacketFlowTunWriter?
     private let tunLock = NSLock()
     private var tunReading: Bool = false
@@ -85,6 +91,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         let httpPort = (providerCfg?["httpPort"] as? Int) ?? decodedCfg?.httpPort ?? 10809
         let routeMode = (decodedCfg?.routeMode ?? "rule").lowercased()
+        let enableIPv6 = decodedCfg?.enableIPv6 ?? false
 
         let startConfigJSON: String
         if var cfg = decodedCfg {
@@ -113,8 +120,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         currentHTTPPort = httpPort
         currentServerHost = serverHost
         currentRouteMode = routeMode
+        currentEnableIPv6 = enableIPv6
 
-        let settings = buildNetworkSettings(httpPort: httpPort, serverHost: serverHost, routeMode: routeMode)
+        let settings = buildNetworkSettings(httpPort: httpPort, serverHost: serverHost, routeMode: routeMode, enableIPv6: enableIPv6)
         setTunnelNetworkSettings(settings) { [weak self] error in
             if let error = error {
                 _ = GhostMobileBridge.stopEngine()
@@ -186,7 +194,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 var totalBytes = 0
                 var validCount = 0
                 for (idx, pkt) in packets.enumerated() {
-                    if idx < protocols.count && protocols[idx].int32Value == AF_INET && pkt.count > 0 && pkt.count <= 0xFFFF {
+                    if idx < protocols.count && (protocols[idx].int32Value == AF_INET || protocols[idx].int32Value == AF_INET6) && pkt.count > 0 && pkt.count <= 0xFFFF {
                         totalBytes += pkt.count
                         validCount += 1
                     }
@@ -195,7 +203,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     var concat = Data(capacity: totalBytes)
                     var lens = Data(capacity: validCount * 2)
                     for (idx, pkt) in packets.enumerated() {
-                        if idx < protocols.count && protocols[idx].int32Value == AF_INET && pkt.count > 0 && pkt.count <= 0xFFFF {
+                        if idx < protocols.count && (protocols[idx].int32Value == AF_INET || protocols[idx].int32Value == AF_INET6) && pkt.count > 0 && pkt.count <= 0xFFFF {
                             let n = pkt.count
                             lens.append(UInt8((n >> 8) & 0xFF))
                             lens.append(UInt8(n & 0xFF))
@@ -277,6 +285,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
                 let newHTTPPort = decodedCfg?.httpPort ?? self.currentHTTPPort
                 let newRouteMode = (decodedCfg?.routeMode ?? self.currentRouteMode).lowercased()
+                let newEnableIPv6 = decodedCfg?.enableIPv6 ?? self.currentEnableIPv6
                 let startConfigJSON: String
                 if var cfg = decodedCfg {
                     cfg.asyncConnect = true
@@ -291,11 +300,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 case .failure(let err):
                     self.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
                 case .success:
-                    if newHTTPPort != self.currentHTTPPort || serverHost != self.currentServerHost || newRouteMode != self.currentRouteMode {
+                    if newHTTPPort != self.currentHTTPPort || serverHost != self.currentServerHost || newRouteMode != self.currentRouteMode || newEnableIPv6 != self.currentEnableIPv6 {
                         self.currentHTTPPort = newHTTPPort
                         self.currentServerHost = serverHost
                         self.currentRouteMode = newRouteMode
-                        let settings = self.buildNetworkSettings(httpPort: newHTTPPort, serverHost: serverHost, routeMode: newRouteMode)
+                        self.currentEnableIPv6 = newEnableIPv6
+                        let settings = self.buildNetworkSettings(httpPort: newHTTPPort, serverHost: serverHost, routeMode: newRouteMode, enableIPv6: newEnableIPv6)
                         self.setTunnelNetworkSettings(settings) { [weak self] err in
                             if let err = err {
                                 self?.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
@@ -325,7 +335,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         completionHandler?(data)
     }
 
-    private func buildNetworkSettings(httpPort: Int, serverHost: String, routeMode: String) -> NEPacketTunnelNetworkSettings {
+    private func buildNetworkSettings(httpPort: Int, serverHost: String, routeMode: String, enableIPv6: Bool) -> NEPacketTunnelNetworkSettings {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "198.18.0.1")
         settings.mtu = 1400
 
@@ -363,8 +373,34 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4
 
-        // Route all TUN DNS queries into the virtual Fake-IP DNS gateway (198.18.0.1:53).
-        let dns = NEDNSSettings(servers: ["198.18.0.1"])
+        // Capture IPv6 default route into TUN in both modes:
+        // - enableIPv6 == true : dual-stack Fake-IP (fd18:c612::/64) + AAAA proxy/direct routing
+        // - enableIPv6 == false: AAAA NODATA + gVisor PushPacket drop (anti-IPv6 leak on Wi-Fi/5G)
+        let ipv6 = NEIPv6Settings(addresses: ["fd18:c612::2"], networkPrefixLengths: [64])
+        ipv6.includedRoutes = [NEIPv6Route.default()]
+        var excluded6: [NEIPv6Route] = [
+            NEIPv6Route(destinationAddress: "::1", networkPrefixLength: 128),
+            NEIPv6Route(destinationAddress: "fe80::", networkPrefixLength: 10),
+            NEIPv6Route(destinationAddress: "fc00::", networkPrefixLength: 7),
+            NEIPv6Route(destinationAddress: "ff00::", networkPrefixLength: 8),
+            NEIPv6Route(destinationAddress: "64:ff9b::", networkPrefixLength: 96)
+        ]
+        if !serverHost.isEmpty {
+            let cleanServerHost = serverHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            if isValidIPv6(cleanServerHost) {
+                excluded6.append(NEIPv6Route(destinationAddress: cleanServerHost, networkPrefixLength: 128))
+            } else {
+                for resolvedIP6 in resolveIPv6Addresses(cleanServerHost) {
+                    excluded6.append(NEIPv6Route(destinationAddress: resolvedIP6, networkPrefixLength: 128))
+                }
+            }
+        }
+        ipv6.excludedRoutes = excluded6
+        settings.ipv6Settings = ipv6
+
+        // Route all TUN DNS queries into the virtual Fake-IP DNS gateway (198.18.0.1 / optional fd18:c612::1).
+        let dnsServers = enableIPv6 ? ["198.18.0.1", "fd18:c612::1"] : ["198.18.0.1"]
+        let dns = NEDNSSettings(servers: dnsServers)
         dns.matchDomains = [""]
         settings.dnsSettings = dns
 
@@ -381,10 +417,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var exceptions = [
             "localhost",
             "127.0.0.1",
+            "::1",
             "*.local",
             "10.0.0.0/8",
             "172.16.0.0/12",
-            "192.168.0.0/16"
+            "192.168.0.0/16",
+            "fc00::/7",
+            "fe80::/10"
         ]
         if !serverHost.isEmpty {
             exceptions.append(serverHost)
@@ -433,6 +472,41 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func isValidIPv4(_ host: String) -> Bool {
         var addr = in_addr()
         return host.withCString { inet_pton(AF_INET, $0, &addr) == 1 }
+    }
+
+    private func isValidIPv6(_ host: String) -> Bool {
+        var addr = in6_addr()
+        return host.withCString { inet_pton(AF_INET6, $0, &addr) == 1 }
+    }
+
+    private func resolveIPv6Addresses(_ host: String) -> [String] {
+        var hints = addrinfo()
+        hints.ai_family = AF_INET6
+        hints.ai_socktype = SOCK_STREAM
+        var res: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &res) == 0, let first = res else {
+            return []
+        }
+        defer { freeaddrinfo(res) }
+
+        var ips: [String] = []
+        var cursor: UnsafeMutablePointer<addrinfo>? = first
+        while let cur = cursor {
+            if let sa = cur.pointee.ai_addr, sa.pointee.sa_family == sa_family_t(AF_INET6) {
+                var sin6 = sockaddr_in6()
+                memcpy(&sin6, sa, MemoryLayout<sockaddr_in6>.size)
+                var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                var addrCopy = sin6.sin6_addr
+                if inet_ntop(AF_INET6, &addrCopy, &buf, socklen_t(INET6_ADDRSTRLEN)) != nil {
+                    let s = String(cString: buf)
+                    if !s.lowercased().hasPrefix("fd18:c612:") && !ips.contains(s) {
+                        ips.append(s)
+                    }
+                }
+            }
+            cursor = cur.pointee.ai_next
+        }
+        return ips
     }
 
     private func startNetworkMonitorAndDetectInitialInterface(timeout: TimeInterval) -> String {

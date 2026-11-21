@@ -135,6 +135,7 @@ struct GhostEngineConfig: Codable, Equatable {
     var upMbps: Int
     var downMbps: Int
     var asyncConnect: Bool = true
+    var enableIPv6: Bool = false
     var customRules: [String] = []
 
     enum CodingKeys: String, CodingKey {
@@ -146,6 +147,7 @@ struct GhostEngineConfig: Codable, Equatable {
         case upMbps = "up_mbps"
         case downMbps = "down_mbps"
         case asyncConnect = "async_connect"
+        case enableIPv6 = "enable_ipv6"
         case customRules = "custom_rules"
     }
 
@@ -158,6 +160,7 @@ struct GhostEngineConfig: Codable, Equatable {
         upMbps: Int,
         downMbps: Int,
         asyncConnect: Bool = true,
+        enableIPv6: Bool = false,
         customRules: [String] = []
     ) {
         self.linkURI = linkURI
@@ -168,6 +171,7 @@ struct GhostEngineConfig: Codable, Equatable {
         self.upMbps = upMbps
         self.downMbps = downMbps
         self.asyncConnect = asyncConnect
+        self.enableIPv6 = enableIPv6
         self.customRules = customRules
     }
 
@@ -181,6 +185,7 @@ struct GhostEngineConfig: Codable, Equatable {
         upMbps = (try? c.decode(Int.self, forKey: .upMbps)) ?? 0
         downMbps = (try? c.decode(Int.self, forKey: .downMbps)) ?? 0
         asyncConnect = (try? c.decode(Bool.self, forKey: .asyncConnect)) ?? true
+        enableIPv6 = (try? c.decode(Bool.self, forKey: .enableIPv6)) ?? false
         customRules = (try? c.decode([String].self, forKey: .customRules)) ?? []
     }
 
@@ -291,6 +296,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
     var nodeHost: String
     var nodePort: Int
     var isTunnelExt: Bool
+    var enableIPv6: Bool
     var lowMemMode: Bool
     var netbindEnabled: Bool
     var physicalIface: String
@@ -304,7 +310,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
     static let empty = GhostStatusSnapshot()
 
     init() {
-        version = "v4.0.31-LTS"
+        version = "v4.0.32-LTS"
         state = "disconnected"
         lastErr = ""
         activeTransport = ""
@@ -337,6 +343,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         nodeHost = ""
         nodePort = 0
         isTunnelExt = false
+        enableIPv6 = false
         lowMemMode = false
         netbindEnabled = false
         physicalIface = ""
@@ -382,6 +389,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         case nodeHost = "node_host"
         case nodePort = "node_port"
         case isTunnelExt = "is_tunnel_ext"
+        case enableIPv6 = "enable_ipv6"
         case lowMemMode = "low_mem_mode"
         case netbindEnabled = "netbind_enabled"
         case physicalIface = "physical_iface"
@@ -429,6 +437,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         nodeHost = (try? c.decode(String.self, forKey: .nodeHost)) ?? ""
         nodePort = (try? c.decode(Int.self, forKey: .nodePort)) ?? 0
         isTunnelExt = (try? c.decode(Bool.self, forKey: .isTunnelExt)) ?? false
+        enableIPv6 = (try? c.decode(Bool.self, forKey: .enableIPv6)) ?? false
         lowMemMode = (try? c.decode(Bool.self, forKey: .lowMemMode)) ?? false
         netbindEnabled = (try? c.decode(Bool.self, forKey: .netbindEnabled)) ?? false
         physicalIface = (try? c.decode(String.self, forKey: .physicalIface)) ?? ""

@@ -21,10 +21,11 @@ const (
 	cmdRouteRule = 1101
 	cmdRouteGlob = 1102
 	cmdRouteCore = 1103
-	cmdTransAuto = 1201
-	cmdTransRTC  = 1202
-	cmdTransTCP  = 1203
-	cmdNodeBase  = 2000
+	cmdTransAuto  = 1201
+	cmdTransRTC   = 1202
+	cmdTransTCP   = 1203
+	cmdToggleIPv6 = 1301
+	cmdNodeBase   = 2000
 )
 
 // CreateVectorIcon synthesizes a crisp 32x32 ARGB vector HICON in memory
@@ -334,6 +335,12 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 	}
 	appendItem(hMenu, mfPopup, hTrans, "传输模式")
 
+	ipv6Flags := uint32(mfString)
+	if ipv6On, _ := st["enable_ipv6"].(bool); ipv6On {
+		ipv6Flags |= mfChecked
+	}
+	appendItem(hMenu, ipv6Flags, cmdToggleIPv6, "开启 IPv6 (双栈分流)")
+
 	// Node Submenu
 	hNodes, _, _ := pCreatePopupMenu.Call()
 	if len(nodes) == 0 {
@@ -405,6 +412,16 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 			onToast("传输偏好已切换: TCP", false)
 			onRefresh()
 		}()
+	case cmd == cmdToggleIPv6:
+		next := !eng.IPv6Enabled()
+		if err := eng.SetEnableIPv6(next); err != nil {
+			onToast("切换 IPv6 失败: "+err.Error(), true)
+		} else if next {
+			onToast("IPv6 双栈分流已开启", false)
+		} else {
+			onToast("IPv6 已关闭 (仅 IPv4 / 防泄露)", false)
+		}
+		onRefresh()
 	case cmd == cmdImport:
 		onImport()
 	case cmd == cmdQuit:

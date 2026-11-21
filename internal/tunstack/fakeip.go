@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,10 +40,17 @@ type FakeIPPool struct {
 	ring     []uint32
 	ringPos  int
 
-	cachePath string
-	dirty     bool
-	stopCh    chan struct{}
-	closeOnce sync.Once
+	nextOff6  uint64
+	ip6ToHost map[uint64]string
+	hostToIP6 map[string]uint64
+	ring6     []uint64
+	ring6Pos  int
+
+	ipv6Enabled atomic.Bool
+	cachePath   string
+	dirty       bool
+	stopCh      chan struct{}
+	closeOnce   sync.Once
 }
 
 // NewFakeIPPool constructs an in-memory bounded Fake-IP pool (safe for iOS 50MB NetworkExtension cap).
@@ -64,6 +72,9 @@ func NewFakeIPPoolWithPersistence(capacity int, cachePath string) *FakeIPPool {
 		ipToHost:  make(map[uint32]string, capacity/4),
 		hostToIP:  make(map[string]uint32, capacity/4),
 		ring:      make([]uint32, capacity),
+		ip6ToHost: make(map[uint64]string, capacity/8),
+		hostToIP6: make(map[string]uint64, capacity/8),
+		ring6:     make([]uint64, capacity),
 		cachePath: strings.TrimSpace(cachePath),
 	}
 	if p.cachePath != "" {
@@ -72,6 +83,16 @@ func NewFakeIPPoolWithPersistence(capacity int, cachePath string) *FakeIPPool {
 		go p.flushLoop()
 	}
 	return p
+}
+
+// SetIPv6Enabled toggles whether DNS AAAA queries receive Fake-IPv6 (fd18:c612::/64) answers or NODATA.
+func (p *FakeIPPool) SetIPv6Enabled(on bool) {
+	p.ipv6Enabled.Store(on)
+}
+
+// IPv6Enabled reports whether Fake-IPv6 AAAA allocation is currently enabled.
+func (p *FakeIPPool) IPv6Enabled() bool {
+	return p.ipv6Enabled.Load()
 }
 
 // Close flushes any dirty Fake-IP mappings to disk and stops background persistence.
@@ -99,10 +120,61 @@ func (p *FakeIPPool) flushLoop() {
 	}
 }
 
-// IsFakeIP reports whether ip falls inside 198.18.0.0/16.
+// IsFakeIP reports whether ip falls inside 198.18.0.0/16 or fd18:c612::/64.
 func IsFakeIP(ip net.IP) bool {
-	ip4 := ip.To4()
-	return ip4 != nil && ip4[0] == 198 && ip4[1] == 18
+	if ip == nil {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 198 && ip4[1] == 18
+	}
+	return isFakeIPv6Slice(ip.To16())
+}
+
+func isFakeIPv6Slice(ip16 net.IP) bool {
+	return len(ip16) == 16 &&
+		ip16[0] == 0xfd && ip16[1] == 0x18 &&
+		ip16[2] == 0xc6 && ip16[3] == 0x12 &&
+		ip16[4] == 0 && ip16[5] == 0 &&
+		ip16[6] == 0 && ip16[7] == 0
+}
+
+func suffixToFakeIPv6(sfx uint64) [16]byte {
+	var b [16]byte
+	b[0], b[1], b[2], b[3] = 0xfd, 0x18, 0xc6, 0x12
+	binary.BigEndian.PutUint64(b[8:16], sfx)
+	return b
+}
+
+// Allocate6 returns an existing or newly assigned fd18:c612::/64 Fake-IPv6 address for domain.
+func (p *FakeIPPool) Allocate6(domain string) [16]byte {
+	host := normalizeDomain(domain)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if sfx, ok := p.hostToIP6[host]; ok {
+		return suffixToFakeIPv6(sfx)
+	}
+
+	if oldSfx := p.ring6[p.ring6Pos]; oldSfx != 0 {
+		if oldHost, exists := p.ip6ToHost[oldSfx]; exists {
+			delete(p.hostToIP6, oldHost)
+			delete(p.ip6ToHost, oldSfx)
+		}
+	}
+
+	// Reserve fd18:c612::1 (DNS gateway) and fd18:c612::2 (TUN local interface).
+	sfx := 3 + (p.nextOff6 % 65000)
+	p.nextOff6++
+	if prevHost, exists := p.ip6ToHost[sfx]; exists {
+		delete(p.hostToIP6, prevHost)
+	}
+
+	p.ip6ToHost[sfx] = host
+	p.hostToIP6[host] = sfx
+	p.ring6[p.ring6Pos] = sfx
+	p.ring6Pos = (p.ring6Pos + 1) % len(p.ring6)
+	return suffixToFakeIPv6(sfx)
 }
 
 // Allocate returns an existing or newly assigned 198.18.x.x IPv4 for domain.
@@ -140,15 +212,28 @@ func (p *FakeIPPool) Allocate(domain string) [4]byte {
 	return uint32ToIPv4(ipU32)
 }
 
-// Lookup resolves a Fake-IP back to its original queried domain name.
+// Lookup resolves a Fake-IP (IPv4 or IPv6) back to its original queried domain name.
 func (p *FakeIPPool) Lookup(ip net.IP) (string, bool) {
-	ip4 := ip.To4()
-	if ip4 == nil || ip4[0] != 198 || ip4[1] != 18 {
+	if ip == nil {
 		return "", false
 	}
-	u := binary.BigEndian.Uint32(ip4)
+	if ip4 := ip.To4(); ip4 != nil {
+		if ip4[0] != 198 || ip4[1] != 18 {
+			return "", false
+		}
+		u := binary.BigEndian.Uint32(ip4)
+		p.mu.RLock()
+		host, ok := p.ipToHost[u]
+		p.mu.RUnlock()
+		return host, ok
+	}
+	ip16 := ip.To16()
+	if !isFakeIPv6Slice(ip16) {
+		return "", false
+	}
+	sfx := binary.BigEndian.Uint64(ip16[8:16])
 	p.mu.RLock()
-	host, ok := p.ipToHost[u]
+	host, ok := p.ip6ToHost[sfx]
 	p.mu.RUnlock()
 	return host, ok
 }
@@ -156,7 +241,7 @@ func (p *FakeIPPool) Lookup(ip net.IP) (string, bool) {
 // Size returns the number of active Fake-IP entries.
 func (p *FakeIPPool) Size() int {
 	p.mu.RLock()
-	n := len(p.ipToHost)
+	n := len(p.ipToHost) + len(p.ip6ToHost)
 	p.mu.RUnlock()
 	return n
 }
@@ -411,19 +496,30 @@ func (p *FakeIPPool) HandleDNSQuery(query []byte) ([]byte, bool) {
 	reqFlags := binary.BigEndian.Uint16(query[2:4])
 	respFlags := uint16(0x8080) | (reqFlags & 0x7900) // QR=1, RA=1, preserve Opcode+RD
 
-	wantAnswer := qtype == 1 && qclass == 1 && name != ""
+	wantA := qtype == 1 && qclass == 1 && name != ""
+	wantAAAA := qtype == 28 && qclass == 1 && name != "" && p.IPv6Enabled()
+	wantAnswer := wantA || wantAAAA
 	var fakeIP [4]byte
-	if wantAnswer {
+	var fakeIP6 [16]byte
+	if wantA {
 		if ip := net.ParseIP(name); ip != nil && ip.To4() != nil {
 			copy(fakeIP[:], ip.To4())
 		} else {
 			fakeIP = p.Allocate(name)
 		}
+	} else if wantAAAA {
+		if ip := net.ParseIP(strings.Trim(name, "[]")); ip != nil && ip.To4() == nil && ip.To16() != nil {
+			copy(fakeIP6[:], ip.To16())
+		} else {
+			fakeIP6 = p.Allocate6(name)
+		}
 	}
 
 	respCap := qEnd
-	if wantAnswer {
+	if wantA {
 		respCap += 16
+	} else if wantAAAA {
+		respCap += 28
 	}
 	resp := make([]byte, qEnd, respCap)
 	copy(resp[:qEnd], query[:qEnd])
@@ -437,7 +533,7 @@ func (p *FakeIPPool) HandleDNSQuery(query []byte) ([]byte, bool) {
 	binary.BigEndian.PutUint16(resp[8:10], 0)  // NSCOUNT=0
 	binary.BigEndian.PutUint16(resp[10:12], 0) // ARCOUNT=0
 
-	if wantAnswer {
+	if wantA {
 		// Compressed pointer to QNAME at offset 12 (0xC00C), Type A, Class IN, TTL 2s, RDLENGTH 4.
 		var ans [16]byte
 		ans[0] = 0xC0
@@ -447,6 +543,17 @@ func (p *FakeIPPool) HandleDNSQuery(query []byte) ([]byte, bool) {
 		binary.BigEndian.PutUint32(ans[6:10], fakeIPDNSTTL) // TTL 2s
 		binary.BigEndian.PutUint16(ans[10:12], 4)
 		copy(ans[12:16], fakeIP[:])
+		resp = append(resp, ans[:]...)
+	} else if wantAAAA {
+		// Compressed pointer to QNAME at offset 12 (0xC00C), Type AAAA (28), Class IN, TTL 2s, RDLENGTH 16.
+		var ans [28]byte
+		ans[0] = 0xC0
+		ans[1] = 0x0C
+		binary.BigEndian.PutUint16(ans[2:4], 28)           // TYPE AAAA
+		binary.BigEndian.PutUint16(ans[4:6], 1)            // CLASS IN
+		binary.BigEndian.PutUint32(ans[6:10], fakeIPDNSTTL) // TTL 2s
+		binary.BigEndian.PutUint16(ans[10:12], 16)
+		copy(ans[12:28], fakeIP6[:])
 		resp = append(resp, ans[:]...)
 	}
 

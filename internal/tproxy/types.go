@@ -1,5 +1,7 @@
 package tproxy
 
+import "encoding/json"
+
 // GatewayMode controls how 0Ghost intercepts LAN and local router traffic.
 type GatewayMode string
 
@@ -24,6 +26,7 @@ type GatewayConfig struct {
 	DeviceMode         DeviceMode  `json:"device_mode"`
 	DeviceIPs          []string    `json:"device_ips,omitempty"`
 	DirectDNS          []string    `json:"direct_dns,omitempty"`
+	EnableIPv6         bool        `json:"enable_ipv6"`
 	FilterAAAA         bool        `json:"filter_aaaa"`
 	LANMasquerade      bool        `json:"lan_masquerade"`
 	AutoYieldConflicts bool        `json:"auto_yield_conflicts"`
@@ -78,6 +81,33 @@ func (c *GatewayConfig) Normalize() {
 	if c.FWMark <= 0 {
 		c.FWMark = def.FWMark
 	}
+	c.FilterAAAA = !c.EnableIPv6
+}
+
+// UnmarshalJSON keeps modern enable_ipv6 and legacy filter_aaaa bidirectional and unambiguous.
+func (c *GatewayConfig) UnmarshalJSON(data []byte) error {
+	type alias GatewayConfig
+	var raw struct {
+		alias
+		HasEnableIPv6 *bool `json:"enable_ipv6"`
+		HasFilterAAAA *bool `json:"filter_aaaa"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*c = GatewayConfig(raw.alias)
+	switch {
+	case raw.HasEnableIPv6 != nil:
+		c.EnableIPv6 = *raw.HasEnableIPv6
+		c.FilterAAAA = !c.EnableIPv6
+	case raw.HasFilterAAAA != nil:
+		c.FilterAAAA = *raw.HasFilterAAAA
+		c.EnableIPv6 = !c.FilterAAAA
+	default:
+		c.EnableIPv6 = false
+		c.FilterAAAA = true
+	}
+	return nil
 }
 
 // ConflictItem describes a detected third-party proxy daemon, routing hijack, or port collision.
@@ -102,6 +132,7 @@ type FirewallSpec struct {
 	DeviceMode  DeviceMode
 	DeviceIPs   []string
 	VPSIPs      []string
+	VPSIPv6s    []string
 	DirectDNS   []string
 	TCPPort     int
 	UDPPort     int
@@ -113,6 +144,7 @@ type FirewallSpec struct {
 	TProxyMark  int
 	RouteTable  int
 	PreferTProxy       bool
+	EnableIPv6         bool
 	FilterAAAA         bool
 	LANMasquerade      bool
 	CNIPv4OverridePath string

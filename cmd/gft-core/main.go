@@ -8,13 +8,14 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"syscall"
 
 	"ghostframe/internal/client"
 	"ghostframe/internal/gft"
 )
 
-var version = "v4.0.31-LTS"
+var version = "v4.0.32-LTS"
 
 func main() {
 	cfgFlag := flag.String("config", "", "optional path to client.json (e.g. /etc/kestrel/client.json)")
@@ -26,6 +27,7 @@ func main() {
 	upMbpsFlag := flag.Int("up-mbps", -1, "Smart-Brutal target upload Mbps override (>=0, 0=Auto-Probe)")
 	downMbpsFlag := flag.Int("down-mbps", -1, "Smart-Brutal target download Mbps override (>=0, 0=Auto-Probe)")
 	lowMem := flag.Bool("low-mem", false, "enable low-memory router mode (<35MB RSS, 4MB stream windows, ideal for Phicomm N1/S905D)")
+	ipv6Flag := flag.String("ipv6", "", "override IPv6 dual-stack proxy (true/false)")
 	noSysProxy := flag.Bool("no-sysproxy", false, "disable real system proxy modifications (sandbox mode)")
 	showVer := flag.Bool("version", false, "print kestrel-core version and hardware capabilities")
 	flag.Parse()
@@ -95,14 +97,26 @@ func main() {
 		}
 	}
 
+	if *ipv6Flag != "" {
+		switch strings.ToLower(strings.TrimSpace(*ipv6Flag)) {
+		case "1", "true", "on", "yes":
+			_ = eng.SetEnableIPv6(true)
+		case "0", "false", "off", "no":
+			_ = eng.SetEnableIPv6(false)
+		default:
+			fmt.Fprintf(os.Stderr, "invalid -ipv6 value: %q (expected true/false)\n", *ipv6Flag)
+			os.Exit(1)
+		}
+	}
+
 	if err := eng.StartServers(); err != nil {
 		fmt.Fprintf(os.Stderr, "kestrel-core start failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	st := eng.Status()
-	fmt.Printf("kestrel-core %s started (arch=%s/%s chacha20=%v low_mem=%v socks=%v http=%v hop=%v up_mbps=%v down_mbps=%v)\n",
-		version, runtime.GOOS, runtime.GOARCH, gft.PrioritizeChaCha20(), gft.IsLowMemMode(), st["socks_addr"], st["http_addr"], st["hop_range"], st["up_mbps"], st["down_mbps"])
+	fmt.Printf("kestrel-core %s started (arch=%s/%s chacha20=%v low_mem=%v ipv6=%v socks=%v http=%v hop=%v up_mbps=%v down_mbps=%v)\n",
+		version, runtime.GOOS, runtime.GOARCH, gft.PrioritizeChaCha20(), gft.IsLowMemMode(), st["enable_ipv6"], st["socks_addr"], st["http_addr"], st["hop_range"], st["up_mbps"], st["down_mbps"])
 
 	if err := eng.Connect(); err != nil {
 		fmt.Fprintf(os.Stderr, "kestrel-core initial connect error: %v (will continue running/retrying)\n", err)

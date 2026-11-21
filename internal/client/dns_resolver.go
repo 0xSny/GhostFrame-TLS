@@ -116,6 +116,14 @@ func (r *TunnelDNSResolver) Len() int {
 	return n
 }
 
+// Clear flushes all cached encrypted tunnel DNS responses.
+func (r *TunnelDNSResolver) Clear() {
+	r.mu.Lock()
+	r.lru.Init()
+	r.entries = make(map[string]*list.Element, 64)
+	r.mu.Unlock()
+}
+
 func clampDNSTTL(ttl time.Duration) time.Duration {
 	if ttl < tunnelDNSMinTTL {
 		return tunnelDNSMinTTL

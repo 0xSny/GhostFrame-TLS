@@ -629,6 +629,90 @@ func TestWebPanelRTCConfigUpdateAndSVGQR(t *testing.T) {
 	if decoded.HopRange != "20000-40000" || decoded.UpMbps != 30 || decoded.DownMbps != 100 || decoded.Remark != "Tokyo-VIP" || !strings.Contains(lData.QRSVG, "<svg") {
 		t.Fatalf("decoded link or QR mismatch: link=%+v hasSVG=%v", decoded, strings.Contains(lData.QRSVG, "<svg"))
 	}
+
+	// Toggle ipv6_enabled=false via PUT /api/rtc and verify persistence + live state
+	v6Req, _ := http.NewRequest(http.MethodPut, base+"/api/rtc", strings.NewReader(`{"hop_range":"20000-40000","up_mbps":30,"down_mbps":100,"remark":"Tokyo-VIP","ipv6_enabled":false}`))
+	v6Req.Header.Set("Content-Type", "application/json")
+	v6Req.Header.Set("X-CSRF-Token", sessData.CSRF)
+	v6Resp, err := pcli.Do(v6Req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v6Data struct {
+		OK          bool `json:"ok"`
+		IPv6Enabled bool `json:"ipv6_enabled"`
+	}
+	_ = json.NewDecoder(v6Resp.Body).Decode(&v6Data)
+	v6Resp.Body.Close()
+	if v6Resp.StatusCode != 200 || !v6Data.OK || v6Data.IPv6Enabled {
+		t.Fatalf("expected ipv6_enabled=false after PUT /api/rtc, got status=%d body=%+v", v6Resp.StatusCode, v6Data)
+	}
+	persistedV6, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig(%s) failed: %v", cfgPath, err)
+	}
+	if !persistedV6.DisableIPv6 || persistedV6.IsIPv6Enabled() {
+		t.Fatalf("expected persisted DisableIPv6=true, got %+v", persistedV6)
+	}
+}
+
+func TestFastOutboundIPv6Toggle(t *testing.T) {
+	ob := NewFastOutbound()
+	ctx := context.Background()
+
+	// Default: IPv6 outbound enabled.
+	v4, v6, err := ob.ResolveHost(ctx, "2606:4700:4700::1111")
+	if err != nil || len(v4) != 0 || len(v6) != 1 {
+		t.Fatalf("expected default IPv6 literal allowed, got v4=%v v6=%v err=%v", v4, v6, err)
+	}
+
+	// Seed mixed v4+v6 cache entry to verify stripping and cache purge on toggle.
+	ob.mu.Lock()
+	ob.cache["dual.example.test"] = &dnsEntry{
+		v4:      []net.IP{net.ParseIP("1.1.1.1").To4()},
+		v6:      []net.IP{net.ParseIP("2606:4700:4700::1111")},
+		expires: time.Now().Add(time.Minute),
+	}
+	ob.mu.Unlock()
+
+	ob.SetDisableIPv6(true)
+	if _, _, err := ob.ResolveHost(ctx, "2606:4700:4700::1111"); err != errIPv6Disabled {
+		t.Fatalf("expected errIPv6Disabled for literal IPv6 when disabled, got %v", err)
+	}
+
+	ob.mu.RLock()
+	cacheLen := len(ob.cache)
+	ob.mu.RUnlock()
+	if cacheLen != 0 {
+		t.Fatalf("expected SetDisableIPv6 to clear DNS cache, len=%d", cacheLen)
+	}
+
+	// Re-seed dual entry while disabled: ResolveHost must suppress v6.
+	ob.mu.Lock()
+	ob.cache["dual.example.test"] = &dnsEntry{
+		v4:      []net.IP{net.ParseIP("1.1.1.1").To4()},
+		v6:      []net.IP{net.ParseIP("2606:4700:4700::1111")},
+		expires: time.Now().Add(time.Minute),
+	}
+	ob.mu.Unlock()
+	v4, v6, err = ob.ResolveHost(ctx, "dual.example.test")
+	if err != nil || len(v4) != 1 || len(v6) != 0 {
+		t.Fatalf("expected only v4 when IPv6 disabled, got v4=%v v6=%v err=%v", v4, v6, err)
+	}
+
+	// Re-enable IPv6: dual entry returns both again.
+	ob.SetDisableIPv6(false)
+	ob.mu.Lock()
+	ob.cache["dual.example.test"] = &dnsEntry{
+		v4:      []net.IP{net.ParseIP("1.1.1.1").To4()},
+		v6:      []net.IP{net.ParseIP("2606:4700:4700::1111")},
+		expires: time.Now().Add(time.Minute),
+	}
+	ob.mu.Unlock()
+	v4, v6, err = ob.ResolveHost(ctx, "dual.example.test")
+	if err != nil || len(v4) != 1 || len(v6) != 1 {
+		t.Fatalf("expected dual-stack when IPv6 re-enabled, got v4=%v v6=%v err=%v", v4, v6, err)
+	}
 }
 
 type simpleJar struct {

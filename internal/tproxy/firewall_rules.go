@@ -86,6 +86,8 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 	b.WriteString("delete table inet kestrel0\n")
 	b.WriteString("table inet kestrel0 {\n")
 
+	ipv6Enabled := spec.EnableIPv6 && !spec.FilterAAAA
+
 	// 1. Reserved & LAN bypass ranges (RFC1918 + loopback + multicast + broadcast + CGNAT).
 	b.WriteString("  set lan_bypass_v4 {\n")
 	b.WriteString("    type ipv4_addr\n")
@@ -93,6 +95,14 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 	b.WriteString("    auto-merge\n")
 	b.WriteString("    elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 }\n")
 	b.WriteString("  }\n")
+	if ipv6Enabled {
+		b.WriteString("  set lan_bypass_v6 {\n")
+		b.WriteString("    type ipv6_addr\n")
+		b.WriteString("    flags interval\n")
+		b.WriteString("    auto-merge\n")
+		b.WriteString("    elements = { ::1/128, fe80::/10, fc00::/7, ff00::/8 }\n")
+		b.WriteString("  }\n")
+	}
 
 	// 2. Active VPS / node server IPs bypass set.
 	vpsIPs := filterValidIPv4s(spec.VPSIPs)
@@ -105,8 +115,21 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 		b.WriteString(" }\n")
 	}
 	b.WriteString("  }\n")
+	var vpsIP6s []string
+	if ipv6Enabled {
+		vpsIP6s = filterValidIPv6s(spec.VPSIPv6s)
+		b.WriteString("  set vps_bypass_v6 {\n")
+		b.WriteString("    type ipv6_addr\n")
+		b.WriteString("    flags interval\n")
+		if len(vpsIP6s) > 0 {
+			b.WriteString("    elements = { ")
+			b.WriteString(strings.Join(vpsIP6s, ", "))
+			b.WriteString(" }\n")
+		}
+		b.WriteString("  }\n")
+	}
 
-	// 3. Mainland China IPv4 kernel-level direct bypass set (@cn_ipv4).
+	// 3. Mainland China IPv4 kernel-level direct bypass set (@cn_ipv4) and optional @cn_ipv6.
 	cnCIDRs := EffectiveCNIPv4CIDRs(spec.CNIPv4OverridePath)
 	b.WriteString("  set cn_ipv4 {\n")
 	b.WriteString("    type ipv4_addr\n")
@@ -128,10 +151,35 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 	}
 	b.WriteString("  }\n")
 
+	var cnCIDRsV6 []string
+	if ipv6Enabled && spec.Mode == ModeRule {
+		cnCIDRsV6 = client.CNPublicIPv6CIDRs()
+		if len(cnCIDRsV6) > 0 {
+			b.WriteString("  set cn_ipv6 {\n")
+			b.WriteString("    type ipv6_addr\n")
+			b.WriteString("    flags interval\n")
+			b.WriteString("    auto-merge\n")
+			b.WriteString("    elements = {\n      ")
+			for i, c := range cnCIDRsV6 {
+				if i > 0 {
+					if i%8 == 0 {
+						b.WriteString(",\n      ")
+					} else {
+						b.WriteString(", ")
+					}
+				}
+				b.WriteString(c)
+			}
+			b.WriteString("\n    }\n")
+			b.WriteString("  }\n")
+		}
+	}
+
 	// 4. Optional LAN client device filter set.
 	devIPs := filterValidIPv4s(spec.DeviceIPs)
-	hasDevFilter := (spec.DeviceMode == DeviceOnly || spec.DeviceMode == DeviceBypass) && len(devIPs) > 0
-	if hasDevFilter {
+	devIP6s := filterValidIPv6s(spec.DeviceIPs)
+	hasDevFilter := (spec.DeviceMode == DeviceOnly || spec.DeviceMode == DeviceBypass) && (len(devIPs) > 0 || (ipv6Enabled && len(devIP6s) > 0))
+	if hasDevFilter && len(devIPs) > 0 {
 		b.WriteString("  set device_filter_v4 {\n")
 		b.WriteString("    type ipv4_addr\n")
 		b.WriteString("    flags interval\n")
@@ -140,13 +188,46 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 		b.WriteString(" }\n")
 		b.WriteString("  }\n")
 	}
+	if ipv6Enabled && hasDevFilter && len(devIP6s) > 0 {
+		b.WriteString("  set device_filter_v6 {\n")
+		b.WriteString("    type ipv6_addr\n")
+		b.WriteString("    flags interval\n")
+		b.WriteString("    elements = { ")
+		b.WriteString(strings.Join(devIP6s, ", "))
+		b.WriteString(" }\n")
+		b.WriteString("  }\n")
+	}
 
 	devMatchRule := ""
 	if hasDevFilter {
-		if spec.DeviceMode == DeviceOnly {
-			devMatchRule = "    ip saddr != @device_filter_v4 return\n"
-		} else if spec.DeviceMode == DeviceBypass {
-			devMatchRule = "    ip saddr @device_filter_v4 return\n"
+		if !ipv6Enabled {
+			if spec.DeviceMode == DeviceOnly {
+				devMatchRule = "    ip saddr != @device_filter_v4 return\n"
+			} else if spec.DeviceMode == DeviceBypass {
+				devMatchRule = "    ip saddr @device_filter_v4 return\n"
+			}
+		} else {
+			var dm strings.Builder
+			if spec.DeviceMode == DeviceOnly {
+				if len(devIPs) > 0 {
+					dm.WriteString("    meta nfproto ipv4 ip saddr != @device_filter_v4 return\n")
+				} else {
+					dm.WriteString("    meta nfproto ipv4 return\n")
+				}
+				if len(devIP6s) > 0 {
+					dm.WriteString("    meta nfproto ipv6 ip6 saddr != @device_filter_v6 return\n")
+				} else {
+					dm.WriteString("    meta nfproto ipv6 return\n")
+				}
+			} else if spec.DeviceMode == DeviceBypass {
+				if len(devIPs) > 0 {
+					dm.WriteString("    ip saddr @device_filter_v4 return\n")
+				}
+				if len(devIP6s) > 0 {
+					dm.WriteString("    ip6 saddr @device_filter_v6 return\n")
+				}
+			}
+			devMatchRule = dm.String()
 		}
 	}
 
@@ -156,6 +237,9 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 	b.WriteString(fmt.Sprintf("    meta mark %s return\n", markHex))
 	if len(vpsIPs) > 0 {
 		b.WriteString("    ip daddr @vps_bypass_v4 return\n")
+	}
+	if ipv6Enabled && len(vpsIP6s) > 0 {
+		b.WriteString("    ip6 daddr @vps_bypass_v6 return\n")
 	}
 	if devMatchRule != "" {
 		b.WriteString(devMatchRule)
@@ -168,8 +252,14 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 	b.WriteString(fmt.Sprintf("    meta mark %s return\n", markHex))
 	b.WriteString("    ip daddr @lan_bypass_v4 return\n")
 	b.WriteString("    ip6 daddr { ::1/128, fe80::/10, fc00::/7 } return\n")
+	if ipv6Enabled {
+		b.WriteString("    ip6 daddr @lan_bypass_v6 return\n")
+	}
 	if len(vpsIPs) > 0 {
 		b.WriteString("    ip daddr @vps_bypass_v4 return\n")
+	}
+	if ipv6Enabled && len(vpsIP6s) > 0 {
+		b.WriteString("    ip6 daddr @vps_bypass_v6 return\n")
 	}
 	b.WriteString(fmt.Sprintf("    meta l4proto { tcp, udp } th dport 53 redirect to :%d\n", spec.DNSPort))
 	b.WriteString("  }\n")
@@ -183,9 +273,16 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 			spec.WebPort, spec.SocksPort, spec.HTTPPort))
 		b.WriteString("    fib daddr type local return\n")
 		b.WriteString("    ip daddr @lan_bypass_v4 return\n")
-		b.WriteString("    ip6 daddr { ::1/128, fe80::/10, fc00::/7 } return\n")
+		if ipv6Enabled {
+			b.WriteString("    ip6 daddr @lan_bypass_v6 return\n")
+		} else {
+			b.WriteString("    ip6 daddr { ::1/128, fe80::/10, fc00::/7 } return\n")
+		}
 		if len(vpsIPs) > 0 {
 			b.WriteString("    ip daddr @vps_bypass_v4 return\n")
+		}
+		if ipv6Enabled && len(vpsIP6s) > 0 {
+			b.WriteString("    ip6 daddr @vps_bypass_v6 return\n")
 		}
 		if devMatchRule != "" {
 			b.WriteString(devMatchRule)
@@ -193,10 +290,17 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 		b.WriteString("    meta l4proto { tcp, udp } th dport 53 return\n")
 		if spec.Mode == ModeRule {
 			b.WriteString("    ip daddr @cn_ipv4 return\n")
+			if ipv6Enabled && len(cnCIDRsV6) > 0 {
+				b.WriteString("    ip6 daddr @cn_ipv6 return\n")
+			}
 		}
 		b.WriteString(fmt.Sprintf("    meta l4proto tcp socket transparent 1 meta mark set %s accept\n", tproxyMarkHex))
 		b.WriteString(fmt.Sprintf("    meta l4proto tcp tproxy ip to 127.0.0.1:%d meta mark set %s accept\n", spec.TCPPort, tproxyMarkHex))
 		b.WriteString(fmt.Sprintf("    meta l4proto udp tproxy ip to 127.0.0.1:%d meta mark set %s accept\n", spec.UDPPort, tproxyMarkHex))
+		if ipv6Enabled {
+			b.WriteString(fmt.Sprintf("    meta l4proto tcp tproxy ip6 to [::1]:%d meta mark set %s accept\n", spec.TCPPort, tproxyMarkHex))
+			b.WriteString(fmt.Sprintf("    meta l4proto udp tproxy ip6 to [::1]:%d meta mark set %s accept\n", spec.UDPPort, tproxyMarkHex))
+		}
 		b.WriteString("  }\n")
 	} else {
 		b.WriteString("  chain tcp_redir_nat {\n")
@@ -206,8 +310,16 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 			spec.WebPort, spec.SocksPort, spec.HTTPPort))
 		b.WriteString("    fib daddr type local return\n")
 		b.WriteString("    ip daddr @lan_bypass_v4 return\n")
+		if ipv6Enabled {
+			b.WriteString("    ip6 daddr @lan_bypass_v6 return\n")
+		} else {
+			b.WriteString("    meta nfproto ipv6 return\n")
+		}
 		if len(vpsIPs) > 0 {
 			b.WriteString("    ip daddr @vps_bypass_v4 return\n")
+		}
+		if ipv6Enabled && len(vpsIP6s) > 0 {
+			b.WriteString("    ip6 daddr @vps_bypass_v6 return\n")
 		}
 		if devMatchRule != "" {
 			b.WriteString(devMatchRule)
@@ -215,6 +327,9 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 		b.WriteString("    tcp dport 53 return\n")
 		if spec.Mode == ModeRule {
 			b.WriteString("    ip daddr @cn_ipv4 return\n")
+			if ipv6Enabled && len(cnCIDRsV6) > 0 {
+				b.WriteString("    ip6 daddr @cn_ipv6 return\n")
+			}
 		}
 		b.WriteString(fmt.Sprintf("    meta l4proto tcp redirect to :%d\n", spec.TCPPort))
 		b.WriteString("  }\n")
@@ -228,20 +343,31 @@ func BuildNFTablesScript(spec FirewallSpec) string {
 		b.WriteString("    ct direction reply return\n")
 		b.WriteString("    fib daddr type local return\n")
 		b.WriteString("    ip daddr @lan_bypass_v4 return\n")
-		b.WriteString("    ip6 daddr { ::1/128, fe80::/10, fc00::/7 } return\n")
+		if ipv6Enabled {
+			b.WriteString("    ip6 daddr @lan_bypass_v6 return\n")
+		} else {
+			b.WriteString("    ip6 daddr { ::1/128, fe80::/10, fc00::/7 } return\n")
+			b.WriteString("    meta nfproto ipv6 return\n")
+		}
 		if len(vpsIPs) > 0 {
 			b.WriteString("    ip daddr @vps_bypass_v4 return\n")
+		}
+		if ipv6Enabled && len(vpsIP6s) > 0 {
+			b.WriteString("    ip6 daddr @vps_bypass_v6 return\n")
 		}
 		b.WriteString("    meta l4proto { tcp, udp } th dport 53 return\n")
 		if spec.Mode == ModeRule {
 			b.WriteString("    ip daddr @cn_ipv4 return\n")
+			if ipv6Enabled && len(cnCIDRsV6) > 0 {
+				b.WriteString("    ip6 daddr @cn_ipv6 return\n")
+			}
 		}
 		b.WriteString(fmt.Sprintf("    meta l4proto { tcp, udp } meta mark set %s accept\n", tproxyMarkHex))
 		b.WriteString("  }\n")
 	}
 
-	// 8. Optional IPv6 leak guard in forward hook when FilterAAAA is enabled.
-	if spec.FilterAAAA {
+	// 8. IPv6 leak guard in forward hook when IPv6 transparent proxy is disabled.
+	if !ipv6Enabled {
 		b.WriteString("  chain forward_v6_guard {\n")
 		b.WriteString("    type filter hook forward priority filter - 5; policy accept;\n")
 		b.WriteString(fmt.Sprintf("    meta mark %s return\n", markHex))
@@ -290,6 +416,37 @@ func filterValidIPv4s(in []string) []string {
 		}
 		if _, ipNet, err := net.ParseCIDR(s); err == nil {
 			if ipNet.IP.To4() != nil {
+				norm := ipNet.String()
+				if _, ok := seen[norm]; !ok {
+					seen[norm] = struct{}{}
+					out = append(out, norm)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func filterValidIPv6s(in []string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, raw := range in {
+		s := strings.Trim(strings.TrimSpace(raw), "[]")
+		if s == "" {
+			continue
+		}
+		if ip := net.ParseIP(s); ip != nil {
+			if ip.To4() == nil {
+				norm := ip.String()
+				if _, ok := seen[norm]; !ok {
+					seen[norm] = struct{}{}
+					out = append(out, norm)
+				}
+			}
+			continue
+		}
+		if _, ipNet, err := net.ParseCIDR(s); err == nil {
+			if ipNet.IP.To4() == nil {
 				norm := ipNet.String()
 				if _, ok := seen[norm]; !ok {
 					seen[norm] = struct{}{}

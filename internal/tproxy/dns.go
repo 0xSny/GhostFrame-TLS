@@ -329,7 +329,7 @@ func (s *SplitDNSServer) queryDirectConcurrent(ctx context.Context, req []byte, 
 	for _, srv := range servers {
 		go func(target string) {
 			d := net.Dialer{Timeout: 2500 * time.Millisecond, Control: netbind.Control}
-			c, err := d.DialContext(ctx, "udp4", target)
+			c, err := d.DialContext(ctx, "udp", target)
 			if err != nil {
 				errCh <- err
 				return

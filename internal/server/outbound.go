@@ -29,6 +29,8 @@ type dnsEntry struct {
 	refreshing atomic.Bool
 }
 
+var errIPv6Disabled = errors.New("outbound ipv6 disabled")
+
 // FastOutbound provides an in-memory async DNS cache (4096 entries, 300s TTL),
 // Happy Eyeballs (RFC 8305) IPv4/IPv6 racing dialer, and strict SSRF filtering.
 type FastOutbound struct {
@@ -36,6 +38,22 @@ type FastOutbound struct {
 	cache        map[string]*dnsEntry
 	resolver     *net.Resolver
 	listenPacket func(network, addr string) (net.PacketConn, error)
+	disableIPv6  atomic.Bool
+}
+
+// SetDisableIPv6 toggles outbound IPv6 resolution/dialing and clears cached DNS answers.
+func (f *FastOutbound) SetDisableIPv6(disabled bool) {
+	prev := f.disableIPv6.Swap(disabled)
+	if prev != disabled {
+		f.mu.Lock()
+		f.cache = make(map[string]*dnsEntry, 64)
+		f.mu.Unlock()
+	}
+}
+
+// IsIPv6Disabled reports whether server outbound IPv6 is disabled.
+func (f *FastOutbound) IsIPv6Disabled() bool {
+	return f.disableIPv6.Load()
 }
 
 // NewFastOutbound creates a FastOutbound engine.
@@ -53,6 +71,8 @@ func (f *FastOutbound) lookupAndFilter(ctx context.Context, host string) (*dnsEn
 		return nil, err
 	}
 	ent := &dnsEntry{expires: time.Now().Add(dnsCacheTTL)}
+	disableV6 := f.IsIPv6Disabled()
+	sawV6 := false
 	for _, a := range addrs {
 		ip := a.IP
 		if ip == nil {
@@ -64,10 +84,16 @@ func (f *FastOutbound) lookupAndFilter(ctx context.Context, host string) (*dnsEn
 		if v4 := ip.To4(); v4 != nil {
 			ent.v4 = append(ent.v4, v4)
 		} else {
-			ent.v6 = append(ent.v6, ip)
+			sawV6 = true
+			if !disableV6 {
+				ent.v6 = append(ent.v6, ip)
+			}
 		}
 	}
 	if len(ent.v4) == 0 && len(ent.v6) == 0 {
+		if disableV6 && sawV6 {
+			return nil, errIPv6Disabled
+		}
 		return nil, errBlockedTarget
 	}
 	return ent, nil
@@ -75,12 +101,16 @@ func (f *FastOutbound) lookupAndFilter(ctx context.Context, host string) (*dnsEn
 
 // ResolveHost returns allowed IPv4 and IPv6 addresses from memory cache or DNS.
 func (f *FastOutbound) ResolveHost(ctx context.Context, host string) (v4 []net.IP, v6 []net.IP, err error) {
+	disableV6 := f.IsIPv6Disabled()
 	if ip := net.ParseIP(host); ip != nil {
 		if blockedIP(ip) && !AllowPrivateTargets {
 			return nil, nil, errBlockedTarget
 		}
 		if ip4 := ip.To4(); ip4 != nil {
 			return []net.IP{ip4}, nil, nil
+		}
+		if disableV6 {
+			return nil, nil, errIPv6Disabled
 		}
 		return nil, []net.IP{ip}, nil
 	}
@@ -94,14 +124,26 @@ func (f *FastOutbound) ResolveHost(ctx context.Context, host string) (v4 []net.I
 		if time.Until(ent.expires) < dnsRefreshAhead && ent.refreshing.CompareAndSwap(false, true) {
 			go f.asyncRefresh(host)
 		}
+		if disableV6 {
+			if len(ent.v4) == 0 {
+				return nil, nil, errIPv6Disabled
+			}
+			return ent.v4, nil, nil
+		}
 		return ent.v4, ent.v6, nil
 	}
 
 	fresh, err := f.lookupAndFilter(ctx, host)
 	if err != nil {
 		// Serve slightly stale entry if DNS temporarily blipped
-		if ent != nil && (len(ent.v4) > 0 || len(ent.v6) > 0) {
-			return ent.v4, ent.v6, nil
+		if ent != nil {
+			if disableV6 {
+				if len(ent.v4) > 0 {
+					return ent.v4, nil, nil
+				}
+			} else if len(ent.v4) > 0 || len(ent.v6) > 0 {
+				return ent.v4, ent.v6, nil
+			}
 		}
 		return nil, nil, err
 	}
@@ -366,11 +408,15 @@ func (m *udpManager) handleDatagramSink(sink gft.UDPReplySink, id uint16, target
 			delete(m.assocs, oldestID)
 			evicted = append(evicted, oldest)
 		}
-		lp := net.ListenPacket
-		if m.outbound != nil && m.outbound.listenPacket != nil {
-			lp = m.outbound.listenPacket
+		listenNet := "udp"
+		if m.outbound != nil && m.outbound.IsIPv6Disabled() {
+			listenNet = "udp4"
 		}
-		pc, err := lp("udp", ":0")
+		listenFn := net.ListenPacket
+		if m.outbound != nil && m.outbound.listenPacket != nil {
+			listenFn = m.outbound.listenPacket
+		}
+		pc, err := listenFn(listenNet, ":0")
 		if err != nil {
 			m.mu.Unlock()
 			for _, ev := range evicted {

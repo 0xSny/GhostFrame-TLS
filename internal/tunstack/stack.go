@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -33,6 +35,24 @@ const (
 	afINET                     = 2 // POSIX AF_INET (matches iOS NEPacketTunnelFlow protocol family)
 	maxOutBatch                = 32
 )
+
+func afINET6() int {
+	switch runtime.GOOS {
+	case "darwin", "ios":
+		return 30
+	case "windows":
+		return 23
+	default:
+		return 10
+	}
+}
+
+func packetFamily(firstByte byte) int {
+	if firstByte>>4 == 6 {
+		return afINET6()
+	}
+	return afINET
+}
 
 // PacketWriter receives outbound raw IP packets from the userspace TCP/IP stack
 // and injects them back into the OS TUN interface (e.g. iOS NEPacketTunnelFlow).
@@ -140,11 +160,13 @@ func NewWithOptions(eng *client.Engine, writer PacketWriter, mtu int, lowMem boo
 	ns := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
+			ipv6.NewProtocol,
 		},
 		TransportProtocols: []stack.TransportProtocolFactory{
 			tcp.NewProtocol,
 			udp.NewProtocol,
 			icmp.NewProtocol4,
+			icmp.NewProtocol6,
 		},
 	})
 
@@ -182,10 +204,16 @@ func NewWithOptions(eng *client.Engine, writer PacketWriter, mtu int, lowMem boo
 			Destination: header.IPv4EmptySubnet,
 			NIC:         tunNICID,
 		},
+		{
+			Destination: header.IPv6EmptySubnet,
+			NIC:         tunNICID,
+		},
 	})
 
 	bw, _ := writer.(BatchPacketWriter)
 	ctx, cancel := context.WithCancel(context.Background())
+	fp := NewFakeIPPoolWithPersistence(fakeCap, fakeCachePath)
+	fp.SetIPv6Enabled(eng.IPv6Enabled())
 	s := &Stack{
 		engine:       eng,
 		writer:       writer,
@@ -195,7 +223,7 @@ func NewWithOptions(eng *client.Engine, writer PacketWriter, mtu int, lowMem boo
 		maxActiveTCP: maxTCP,
 		maxActiveUDP: maxUDP,
 		udpIdle:      udpIdle,
-		fakeIP:       NewFakeIPPoolWithPersistence(fakeCap, fakeCachePath),
+		fakeIP:       fp,
 		ns:           ns,
 		ep:           ep,
 		ctx:          ctx,
@@ -212,13 +240,22 @@ func NewWithOptions(eng *client.Engine, writer PacketWriter, mtu int, lowMem boo
 	return s, nil
 }
 
-// PushPacket injects a raw IPv4 packet read from the OS TUN interface into gVisor netstack.
+// PushPacket injects a raw IPv4 or IPv6 packet read from the OS TUN interface into gVisor netstack.
 func (s *Stack) PushPacket(pkt []byte) {
 	if s.closed.Load() || len(pkt) < header.IPv4MinimumSize {
 		return
 	}
-	// Only IPv4 packets are handled in IPv4 TUN mode.
-	if pkt[0]>>4 != 4 {
+	ver := pkt[0] >> 4
+	var proto tcpip.NetworkProtocolNumber
+	switch ver {
+	case 4:
+		proto = header.IPv4ProtocolNumber
+	case 6:
+		if !s.engine.IPv6Enabled() || len(pkt) < header.IPv6MinimumSize {
+			return
+		}
+		proto = header.IPv6ProtocolNumber
+	default:
 		return
 	}
 	s.packetsIn.Add(1)
@@ -227,7 +264,7 @@ func (s *Stack) PushPacket(pkt []byte) {
 	pb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData(cp),
 	})
-	s.ep.InjectInbound(header.IPv4ProtocolNumber, pb)
+	s.ep.InjectInbound(proto, pb)
 	pb.DecRef()
 }
 
@@ -294,7 +331,7 @@ func (s *Stack) outboundPump() {
 				continue
 			}
 			s.packetsOut.Add(1)
-			s.writer.WritePacket(outBuf, afINET)
+			s.writer.WritePacket(outBuf, packetFamily(outBuf[0]))
 		}
 	}
 
@@ -335,7 +372,7 @@ func (s *Stack) outboundPump() {
 			continue
 		}
 		s.packetsOut.Add(uint64(count))
-		s.batchWriter.WritePacketBatch(batchBuf, lenBuf[:count*2], count, afINET)
+		s.batchWriter.WritePacketBatch(batchBuf, lenBuf[:count*2], count, packetFamily(batchBuf[0]))
 	}
 }
 
@@ -459,6 +496,7 @@ func (s *Stack) handleDNSConn(conn *gonet.UDPConn) {
 	if err != nil || n < 12 {
 		return
 	}
+	s.fakeIP.SetIPv6Enabled(s.engine.IPv6Enabled())
 	if resp, ok := s.fakeIP.HandleDNSQuery(buf[:n]); ok {
 		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		_, _ = conn.Write(resp)
@@ -528,13 +566,24 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 }
 
 func (s *Stack) relayUDPDirect(conn *gonet.UDPConn, dialTarget string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	if ua, rerr := netbind.ResolveUDPTarget(ctx, dialTarget); rerr == nil && ua != nil {
+	allowV6 := s.engine.IPv6Enabled() || netbind.IsPureIPv6Physical()
+	dialNet := "udp"
+	if !allowV6 {
+		ua, rerr := net.ResolveUDPAddr("udp4", dialTarget)
+		if rerr != nil || ua == nil {
+			return
+		}
 		dialTarget = ua.String()
+		dialNet = "udp4"
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if ua, rerr := netbind.ResolveUDPTarget(ctx, dialTarget); rerr == nil && ua != nil {
+			dialTarget = ua.String()
+		}
+		cancel()
 	}
-	cancel()
 	d := s.engine.DirectDialer(5 * time.Second)
-	remote, err := d.Dial("udp", dialTarget)
+	remote, err := d.Dial(dialNet, dialTarget)
 	if err != nil {
 		return
 	}

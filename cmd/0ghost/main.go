@@ -26,7 +26,7 @@ import (
 	"ghostframe/internal/tproxy"
 )
 
-var gatewayVersion = "v4.0.31-LTS"
+var gatewayVersion = "v4.0.32-LTS"
 
 type GatewayService struct {
 	cfgPath string
@@ -68,6 +68,7 @@ func NewGatewayService(cfgPath, webOverride string) (*GatewayService, error) {
 	// Explicitly expose SOCKS5 & HTTP on all LAN interfaces (0.0.0.0:10808 / 0.0.0.0:10809).
 	eng.OverrideListenAddrs("0.0.0.0:10808", "0.0.0.0:10809")
 	_ = eng.SetRouteMode(mapGatewayToRouteMode(gwCfg.GatewayMode))
+	_ = eng.SetEnableIPv6(gwCfg.EnableIPv6)
 
 	// Apply Linux kernel SO_MARK anti-loop tag globally across all GFT/client outbound dials.
 	netbind.SetOutboundMark(gwCfg.FWMark)
@@ -172,7 +173,7 @@ func (s *GatewayService) Start() {
 		if serr := tcpSrv.Start(); serr != nil {
 			s.engine.Logf("[KestrelBox] TCP TPROXY 启动告警: %v", serr)
 		} else {
-			s.engine.Logf("[KestrelBox] TCP 透明接管已监听 127.0.0.1:%d", cfg.TCPPort)
+			s.engine.Logf("[KestrelBox] TCP 透明接管已监听 127.0.0.1:%d (ipv6=%v)", cfg.TCPPort, tcpSrv.HasIPv6())
 		}
 	}
 
@@ -185,7 +186,7 @@ func (s *GatewayService) Start() {
 		if serr := udpSrv.Start(); serr != nil {
 			s.engine.Logf("[KestrelBox] UDP TPROXY 启动告警: %v", serr)
 		} else {
-			s.engine.Logf("[KestrelBox] UDP TPROXY 已监听 127.0.0.1:%d", cfg.UDPPort)
+			s.engine.Logf("[KestrelBox] UDP TPROXY 已监听 127.0.0.1:%d (ipv6=%v)", cfg.UDPPort, udpSrv.HasIPv6())
 		}
 	}
 
@@ -241,7 +242,7 @@ func (s *GatewayService) watchLoop() {
 				active := s.fwActive
 				s.mu.RUnlock()
 				if active && connected && cfg.GatewayMode != tproxy.ModePort {
-					if !tproxy.CheckFirewallHealthy(cfg.GatewayMode, 1, 100) {
+					if !tproxy.CheckFirewallHealthy(cfg.GatewayMode, 1, 100, cfg.EnableIPv6) {
 						s.engine.Logf("[KestrelBox] 巡检发现防火墙规则或策略路由异常脱落，立即自动修复...")
 						s.SyncFirewall()
 					}
@@ -298,6 +299,7 @@ func (s *GatewayService) SyncFirewall() {
 		DeviceMode:   cfg.DeviceMode,
 		DeviceIPs:    cfg.DeviceIPs,
 		VPSIPs:       s.engine.NodeHostIPs(),
+		VPSIPv6s:     s.engine.NodeHostIPv6s(),
 		DirectDNS:    s.effectiveDirectDNS(cfg),
 		TCPPort:      cfg.TCPPort,
 		UDPPort:      cfg.UDPPort,
@@ -309,7 +311,8 @@ func (s *GatewayService) SyncFirewall() {
 		TProxyMark:   1,
 		RouteTable:   100,
 		PreferTProxy:  true,
-		FilterAAAA:    cfg.FilterAAAA,
+		EnableIPv6:    cfg.EnableIPv6,
+		FilterAAAA:    !cfg.EnableIPv6,
 		LANMasquerade: cfg.LANMasquerade,
 	}
 
@@ -519,7 +522,8 @@ func (s *GatewayService) Snapshot() map[string]any {
 	st["device_mode"] = string(cfg.DeviceMode)
 	st["device_ips"] = cfg.DeviceIPs
 	st["direct_dns"] = cfg.DirectDNS
-	st["filter_aaaa"] = cfg.FilterAAAA
+	st["enable_ipv6"] = cfg.EnableIPv6
+	st["filter_aaaa"] = !cfg.EnableIPv6
 	st["lan_masquerade"] = cfg.LANMasquerade
 	st["auto_yield_conflicts"] = cfg.AutoYieldConflicts
 	st["web_password_enabled"] = strings.TrimSpace(cfg.WebPassword) != ""
