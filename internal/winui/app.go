@@ -817,8 +817,14 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 	case hitNodeOption:
 		a.nodeDropOpen = false
 		go func(i int) {
+			if a.eng.IsConnected() {
+				a.setToast("正在无损切换节点...", false)
+				a.postRefresh()
+			}
 			if err := a.eng.SelectNode(i); err != nil {
 				a.setToast("切换节点失败: "+err.Error(), true)
+			} else if a.eng.IsConnected() {
+				a.setToastSuccess("已无损切换节点（连接不断开）")
 			} else {
 				a.setToast("已切换并持久化节点", false)
 			}

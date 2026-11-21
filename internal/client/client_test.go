@@ -6,17 +6,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"ghostframe/internal/gft"
 	"ghostframe/internal/netbind"
+	"ghostframe/internal/server"
 )
 
 // mockServer creates an in-memory GFT server loop over a pipe.
@@ -595,3 +598,150 @@ func TestNAT64DirectCNProbeAndWireRespTTL(t *testing.T) {
 var _ = time.Now
 var _ = fmt.Sprintf
 var _ = context.Background
+
+func startLocalTestServerForClient(t *testing.T, remark string) (string, func()) {
+	t.Helper()
+	dir := t.TempDir()
+	sec, err := server.InitWithOptions(server.InitOptions{
+		ConfDir:      filepath.Join(dir, "conf"),
+		StateDir:     filepath.Join(dir, "state"),
+		Host:         "127.0.0.1",
+		Listen:       "127.0.0.1:0",
+		SNI:          "ftp.jaist.ac.jp",
+		CertMode:     "self_signed_90d",
+		FallbackMode: "builtin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := server.LoadConfig(filepath.Join(dir, "conf", "server.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DisableQUIC = true
+	srv, err := server.New(cfg, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Run(ctx)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if a := srv.TCPAddr(); a != nil {
+			l, err := gft.ParseLink(sec.Link)
+			if err != nil {
+				cancel()
+				<-done
+				t.Fatal(err)
+			}
+			_, pStr, _ := net.SplitHostPort(a.String())
+			fmt.Sscanf(pStr, "%d", &l.Port)
+			l.Transport = "tcp"
+			l.Remark = remark
+			return l.Encode(), func() {
+				cancel()
+				<-done
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	t.Fatal("local test server did not start")
+	return "", nil
+}
+
+func TestSelectNodeMakeBeforeBreakLossless(t *testing.T) {
+	SetNoSysProxy(true)
+	uri1, stop1 := startLocalTestServerForClient(t, "NodeOne")
+	defer stop1()
+	uri2, stop2 := startLocalTestServerForClient(t, "NodeTwo")
+	defer stop2()
+
+	// Create a closed port URI for testing rollback on failed node switch.
+	deadLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadPort := deadLn.Addr().(*net.TCPAddr).Port
+	_ = deadLn.Close()
+	deadLink, err := gft.ParseLink(uri2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadLink.Port = deadPort
+	deadLink.Remark = "DeadNode"
+	uriDead := deadLink.Encode()
+
+	eng, err := NewEngine(filepath.Join(t.TempDir(), "client.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	if _, err := eng.ImportLink(uri1, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.ImportLink(uri2, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.ImportLink(uriDead, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetRouteMode(RouteCore); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Connect(); err != nil {
+		t.Fatalf("initial Connect failed: %v", err)
+	}
+	if !eng.IsConnected() {
+		t.Fatal("expected connected state after initial Connect")
+	}
+
+	// Poll connection state continuously while performing lossless switch from Node 1 -> Node 2.
+	var dropped atomic.Bool
+	stopPoll := make(chan struct{})
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		for {
+			select {
+			case <-stopPoll:
+				return
+			default:
+				if !eng.IsConnected() {
+					dropped.Store(true)
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	if err := eng.SelectNode(1); err != nil {
+		close(stopPoll)
+		<-pollDone
+		t.Fatalf("lossless SelectNode(1) failed: %v", err)
+	}
+	close(stopPoll)
+	<-pollDone
+	if dropped.Load() {
+		t.Fatal("engine reported disconnected during make-before-break node switch")
+	}
+	st := eng.Status()
+	if st["state"] != string(StateConnected) || st["node_name"] != "NodeTwo" || st["active_node"] != 1 {
+		t.Fatalf("unexpected status after lossless switch: %+v", st)
+	}
+
+	// Switching to a dead node MUST return error while keeping NodeTwo connected and active.
+	if err := eng.SelectNode(2); err == nil {
+		t.Fatal("expected error switching to dead node")
+	}
+	stAfterFail := eng.Status()
+	if !eng.IsConnected() || stAfterFail["state"] != string(StateConnected) || stAfterFail["node_name"] != "NodeTwo" || stAfterFail["active_node"] != 1 {
+		t.Fatalf("expected rollback preserving NodeTwo connected, got %+v", stAfterFail)
+	}
+}

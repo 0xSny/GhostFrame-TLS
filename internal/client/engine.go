@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.0.30-LTS"
+var Version = "v4.0.31-LTS"
 
 type ConnState string
 
@@ -475,26 +475,136 @@ func (e *Engine) ImportLink(uri string, switchTo bool) (int, error) {
 	return idx, nil
 }
 
-// SelectNode switches active node (disconnecting any running session first).
+// SelectNode switches active node losslessly (make-before-break when already connected):
+// the existing tunnel stays up until the new node's handshake succeeds, keeping system proxy
+// untouched and rolling back cleanly to the working node if the new node fails to connect.
 func (e *Engine) SelectNode(idx int) error {
-	e.Disconnect()
 	e.mu.Lock()
-	if idx < 0 || idx >= len(e.config.Nodes) {
+	if idx < 0 || idx >= len(e.config.Nodes) || e.config.Nodes[idx] == nil {
 		e.mu.Unlock()
 		return errors.New("node index out of range")
 	}
-	e.config.ActiveNode = idx
-	e.config.Link = e.config.Nodes[idx]
-	if e.config.Link != nil && e.config.Link.Params != nil {
-		e.paramStore.Set(*e.config.Link.Params)
+	targetLink := e.config.Nodes[idx]
+	targetName := targetLink.Remark
+	if targetName == "" {
+		targetName = fmt.Sprintf("%s:%d", targetLink.Host, targetLink.Port)
 	}
-	name := ""
-	if e.config.Link != nil {
-		name = e.config.Link.Remark
+	wasConnected := e.state == StateConnected || e.state == StateConnecting
+	activeSched := e.sched
+	oldConnSched := e.connectingSched
+
+	if !wasConnected {
+		e.config.ActiveNode = idx
+		e.config.Link = targetLink
+		if targetLink.Params != nil {
+			e.paramStore.Set(*targetLink.Params)
+		}
+		e.mu.Unlock()
+		e.Logf("Switched active node to #%d (%s)", idx+1, targetName)
+		return e.SaveConfig()
 	}
+
+	if idx == e.config.ActiveNode && e.state == StateConnected && activeSched != nil {
+		e.mu.Unlock()
+		return e.SaveConfig()
+	}
+
+	targetParams := gft.DefaultParams()
+	if targetLink.Params != nil && targetLink.Params.Validate() == nil {
+		targetParams = *targetLink.Params
+	} else {
+		targetParams = e.paramStore.Get()
+	}
+	nextStore := gft.NewParamStore(targetParams)
+	newSched := gft.NewApexScheduler(targetLink, nextStore, gft.DefaultPoolSize, e.Logf)
+
+	e.connectGen++
+	gen := e.connectGen
+	e.connectingSched = newSched
 	e.mu.Unlock()
-	e.Logf("Switched active node to #%d (%s)", idx+1, name)
-	return e.SaveConfig()
+
+	if oldConnSched != nil && oldConnSched != activeSched {
+		go oldConnSched.Close()
+	}
+
+	if activeSched != nil {
+		e.Logf("Hot-switching to #%d (%s:%d) without dropping current tunnel...", idx+1, targetLink.Host, targetLink.Port)
+	} else {
+		e.Logf("Connecting to #%d (%s:%d)...", idx+1, targetLink.Host, targetLink.Port)
+	}
+
+	if err := newSched.Start(8 * time.Second); err != nil {
+		newSched.Close()
+		e.mu.Lock()
+		if e.connectingSched == newSched {
+			e.connectingSched = nil
+		}
+		keptActive := e.sched != nil && e.connectGen == gen
+		if !keptActive && e.connectGen == gen && activeSched == nil {
+			e.config.ActiveNode = idx
+			e.config.Link = targetLink
+			e.state = StateError
+			e.lastErr = err.Error()
+		}
+		e.mu.Unlock()
+		if keptActive {
+			e.Logf("Node #%d (%s) handshake failed (%v); kept existing tunnel active", idx+1, targetName, err)
+			return fmt.Errorf("目标节点 %s 连接失败，已保留原节点连接: %w", targetName, err)
+		}
+		return err
+	}
+
+	st := newSched.Stats()
+	e.mu.Lock()
+	if e.connectingSched == newSched {
+		e.connectingSched = nil
+	}
+	if e.connectGen != gen || e.state == StateDisconnected {
+		e.mu.Unlock()
+		newSched.Close()
+		return errors.New("node switch cancelled")
+	}
+	prevSched := e.sched
+	e.sched = newSched
+	e.state = StateConnected
+	e.lastErr = ""
+	e.pingMs = st.RTTMs
+	e.config.ActiveNode = idx
+	e.config.Link = targetLink
+	if targetLink.Params != nil {
+		e.paramStore.Set(*targetLink.Params)
+	}
+	mode := e.config.RouteMode
+	httpAddr := e.config.HTTPAddr
+	e.config.SysProxy = mode != RouteCore
+	needSysProxy := mode != RouteCore && !e.sysProxyApplied
+	e.mu.Unlock()
+
+	if err := e.SaveConfig(); err != nil {
+		e.Logf("SaveConfig warning after lossless node switch: %v", err)
+	}
+	if needSysProxy {
+		if serr := EnableSystemProxyWithBackup(httpAddr, e.proxyBackupPath); serr != nil {
+			e.Logf("Failed to enable system proxy: %v", serr)
+		} else {
+			e.mu.Lock()
+			e.sysProxyApplied = true
+			e.mu.Unlock()
+		}
+	}
+
+	if prevSched != nil && prevSched != newSched {
+		go func(old *gft.ApexScheduler) {
+			select {
+			case <-e.stopStats:
+			case <-time.After(400 * time.Millisecond):
+			}
+			old.Close()
+		}(prevSched)
+	}
+
+	e.Logf("Losslessly switched to #%d (%s) via [%s] (RTT=%dms)", idx+1, targetName, st.Mode, st.RTTMs)
+	return nil
 }
 
 // DeleteNode deletes a saved node by index.

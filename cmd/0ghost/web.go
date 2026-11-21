@@ -144,14 +144,16 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		if err := s.engine.SelectNode(req.Index); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
-			return
-		}
-		go func() {
-			_ = s.engine.Connect()
+		go func(idx int) {
+			if err := s.engine.SelectNode(idx); err != nil {
+				s.engine.Logf("[KestrelBox] 切换节点失败: %v", err)
+				return
+			}
+			if !s.engine.IsConnected() {
+				_ = s.engine.Connect()
+			}
 			s.SyncFirewall()
-		}()
+		}(req.Index)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}))
 

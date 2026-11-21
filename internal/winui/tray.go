@@ -412,7 +412,17 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 	case cmd >= cmdNodeBase && int(cmd-cmdNodeBase) < len(nodes):
 		idx := nodes[int(cmd-cmdNodeBase)].Index
 		go func(i int) {
-			_ = eng.SelectNode(i)
+			wasUp := eng.IsConnected()
+			if wasUp {
+				onToast("正在无损切换节点...", false)
+			}
+			if err := eng.SelectNode(i); err != nil {
+				onToast("切换节点失败: "+err.Error(), true)
+			} else if wasUp {
+				onToast("已无损切换节点", false)
+			} else {
+				onToast("已切换节点", false)
+			}
 			onRefresh()
 		}(idx)
 	}
