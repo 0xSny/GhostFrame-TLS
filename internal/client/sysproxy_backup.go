@@ -168,7 +168,11 @@ func EnableSystemProxyWithBackup(addr, backupPath string) error {
 			}
 		}
 	}
-	return SetSystemProxy(addr, true)
+	if err := SetSystemProxy(addr, true); err != nil {
+		return err
+	}
+	registerSysProxyBootRecovery(backupPath, addr)
+	return nil
 }
 
 // DisableAndRestoreSystemProxy restores system proxy from backupPath (if present)
@@ -191,12 +195,17 @@ func DisableAndRestoreSystemProxy(backupPath string) error {
 					return aerr
 				}
 				_ = os.Remove(backupPath)
+				clearSysProxyBootRecovery()
 				return nil
 			}
 			_ = os.Remove(backupPath)
 		}
 	}
-	return SetSystemProxy("", false)
+	if err := SetSystemProxy("", false); err != nil {
+		return err
+	}
+	clearSysProxyBootRecovery()
+	return nil
 }
 
 // RecoverSystemProxyIfDirty runs on startup to restore pre-crash proxy state if
@@ -219,6 +228,7 @@ func RecoverSystemProxyIfDirtyFor(backupPath, expectedHTTPAddr string) (bool, er
 		sameOwn := expectedHTTPAddr != "" && strings.EqualFold(strings.TrimSpace(cur.Server), strings.TrimSpace(expectedHTTPAddr))
 		if sameOwn || isLoopbackProxyDead(cur.Server) {
 			serr := SetSystemProxy("", false)
+			clearSysProxyBootRecovery()
 			return true, serr
 		}
 	}

@@ -40,6 +40,7 @@ type ClientConfig struct {
 	SocksAddr     string          `json:"socks_addr"`
 	HTTPAddr      string          `json:"http_addr"`
 	SysProxy      bool            `json:"sys_proxy"`
+	AutoConnect   bool            `json:"auto_connect,omitempty"`
 	EnableIPv6    bool            `json:"enable_ipv6,omitempty"`
 	CustomRules   []string        `json:"custom_rules,omitempty"`
 	RuleBundleURL string          `json:"rule_bundle_url,omitempty"`
@@ -623,6 +624,7 @@ func (e *Engine) DeleteNode(idx int) error {
 	if len(e.config.Nodes) == 0 {
 		e.config.ActiveNode = 0
 		e.config.Link = nil
+		e.config.AutoConnect = false
 	} else if e.config.ActiveNode >= len(e.config.Nodes) {
 		e.config.ActiveNode = len(e.config.Nodes) - 1
 		e.config.Link = e.config.Nodes[e.config.ActiveNode]
@@ -709,6 +711,26 @@ func (e *Engine) IsConnected() bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.state == StateConnected && e.sched != nil
+}
+
+// ShouldAutoConnect reports whether the previous desktop session ended with an active tunnel
+// and an active node is configured to automatically resume on startup.
+func (e *Engine) ShouldAutoConnect() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.config.AutoConnect && e.activeLinkLocked() != nil
+}
+
+// SetAutoConnect updates whether future startups should automatically reconnect the tunnel/proxy.
+func (e *Engine) SetAutoConnect(on bool) error {
+	e.mu.Lock()
+	changed := e.config.AutoConnect != on
+	e.config.AutoConnect = on
+	e.mu.Unlock()
+	if changed {
+		return e.SaveConfig()
+	}
+	return nil
 }
 
 // RouteDecision decides whether hostport should bypass or traverse GhostFrame,
@@ -1246,7 +1268,13 @@ func (e *Engine) Connect() error {
 	httpAddr := e.config.HTTPAddr
 	socksAddr := e.config.SocksAddr
 	e.config.SysProxy = mode != RouteCore
+	needSaveAuto := !e.config.AutoConnect
+	e.config.AutoConnect = true
 	e.mu.Unlock()
+
+	if needSaveAuto {
+		_ = e.SaveConfig()
+	}
 
 	e.Logf("Connected via [%s] (RTT=%dms, conns=%d)", st.Mode, st.RTTMs, st.ActiveConns)
 

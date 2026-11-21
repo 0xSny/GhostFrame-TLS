@@ -30,7 +30,12 @@ func initCrashLog() *os.File {
 	return f
 }
 
+var desktopVersion = "v4.0.33-LTS"
+
 func main() {
+	if client.Version == "v4.0.32-LTS" {
+		client.Version = desktopVersion
+	}
 	if crashFile := initCrashLog(); crashFile != nil {
 		defer crashFile.Close()
 	}
@@ -39,7 +44,21 @@ func main() {
 	autoConnect := flag.Bool("connect", false, "automatically connect tunnel on startup")
 	noSysProxy := flag.Bool("no-sysproxy", false, "disable real Windows Registry system proxy writes (sandbox mode)")
 	lowMem := flag.Bool("low-mem", false, "enable low-memory mode (4MB stream windows)")
+	restoreSysProxy := flag.Bool("restore-sysproxy", false, "internal boot-time recovery for orphaned system proxy")
+	restoreBackup := flag.String("backup", "", "path to sysproxy_backup.json for -restore-sysproxy")
+	restoreExpected := flag.String("expected", "", "expected loopback proxy addr for -restore-sysproxy")
 	flag.Parse()
+
+	if *restoreSysProxy {
+		if !winui.IsAnotherInstanceRunning() {
+			bp := *restoreBackup
+			if bp == "" {
+				bp = filepath.Join(filepath.Dir(resolveConfigPath(*cfgFlag)), "sysproxy_backup.json")
+			}
+			_, _ = client.RecoverSystemProxyIfDirtyFor(bp, *restoreExpected)
+		}
+		return
+	}
 
 	if *noSysProxy {
 		client.SetNoSysProxy(true)
@@ -75,7 +94,7 @@ func main() {
 	}
 	eng.Logf("Kestrel Pro %s (Kestrel-RTC) native desktop initialized", client.Version)
 
-	if *autoConnect {
+	if *autoConnect || eng.ShouldAutoConnect() {
 		go func() { _ = eng.Connect() }()
 	}
 

@@ -33,3 +33,7 @@ func ApplySystemProxySnapshot(snap ProxySnapshot) error {
 	}
 	return nil
 }
+
+func registerSysProxyBootRecovery(backupPath, httpAddr string) {}
+
+func clearSysProxyBootRecovery() {}

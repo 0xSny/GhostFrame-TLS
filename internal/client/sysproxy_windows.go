@@ -3,6 +3,8 @@
 package client
 
 import (
+	"fmt"
+	"os"
 	"syscall"
 	"unsafe"
 )
@@ -11,11 +13,13 @@ var (
 	modWininet            = syscall.NewLazyDLL("wininet.dll")
 	procInternetSetOption = modWininet.NewProc("InternetSetOptionW")
 
-	modAdvapi32       = syscall.NewLazyDLL("advapi32.dll")
-	procRegOpenKeyEx  = modAdvapi32.NewProc("RegOpenKeyExW")
-	procRegCloseKey   = modAdvapi32.NewProc("RegCloseKey")
-	procRegSetValueEx = modAdvapi32.NewProc("RegSetValueExW")
-	procRegQueryValue = modAdvapi32.NewProc("RegQueryValueExW")
+	modAdvapi32        = syscall.NewLazyDLL("advapi32.dll")
+	procRegOpenKeyEx   = modAdvapi32.NewProc("RegOpenKeyExW")
+	procRegCreateKeyEx = modAdvapi32.NewProc("RegCreateKeyExW")
+	procRegCloseKey    = modAdvapi32.NewProc("RegCloseKey")
+	procRegSetValueEx  = modAdvapi32.NewProc("RegSetValueExW")
+	procRegQueryValue  = modAdvapi32.NewProc("RegQueryValueExW")
+	procRegDeleteValue = modAdvapi32.NewProc("RegDeleteValueW")
 )
 
 const (
@@ -29,6 +33,9 @@ const (
 
 	internetOptionSettingsChanged = 39
 	internetOptionRefresh         = 37
+
+	runOnceSubKey    = `Software\Microsoft\Windows\CurrentVersion\RunOnce`
+	runOnceValueName = "KestrelProSysProxyRecovery"
 )
 
 func refreshSysProxy() {
@@ -257,4 +264,75 @@ func ApplySystemProxySnapshot(snap ProxySnapshot) error {
 	writeSZ("ProxyOverride", snap.Override)
 	refreshSysProxy()
 	return nil
+}
+
+// registerSysProxyBootRecovery installs a one-shot HKCU RunOnce entry so that
+// even if Windows powers off or the process crashes before cleaning up,
+// the next Windows login immediately restores a clean system proxy before any browser runs.
+func registerSysProxyBootRecovery(backupPath, httpAddr string) {
+	if IsMockSysProxy() {
+		return
+	}
+	exePath, err := os.Executable()
+	if err != nil || exePath == "" {
+		return
+	}
+	cmd := fmt.Sprintf("\"%s\" -restore-sysproxy -backup \"%s\" -expected \"%s\"", exePath, backupPath, httpAddr)
+
+	subKey, err := syscall.UTF16PtrFromString(runOnceSubKey)
+	if err != nil {
+		return
+	}
+	var hKey uintptr
+	r1, _, _ := procRegCreateKeyEx.Call(
+		uintptr(hkeyCurrentUser),
+		uintptr(unsafe.Pointer(subKey)),
+		0,
+		0,
+		0,
+		uintptr(keySetValue),
+		0,
+		uintptr(unsafe.Pointer(&hKey)),
+		0,
+	)
+	if r1 != 0 {
+		return
+	}
+	defer procRegCloseKey.Call(hKey)
+
+	valName, _ := syscall.UTF16PtrFromString(runOnceValueName)
+	cmdUTF16, _ := syscall.UTF16FromString(cmd)
+	_, _, _ = procRegSetValueEx.Call(
+		hKey,
+		uintptr(unsafe.Pointer(valName)),
+		0,
+		uintptr(regSz),
+		uintptr(unsafe.Pointer(&cmdUTF16[0])),
+		uintptr(len(cmdUTF16)*2),
+	)
+}
+
+func clearSysProxyBootRecovery() {
+	if IsMockSysProxy() {
+		return
+	}
+	subKey, err := syscall.UTF16PtrFromString(runOnceSubKey)
+	if err != nil {
+		return
+	}
+	var hKey uintptr
+	r1, _, _ := procRegOpenKeyEx.Call(
+		uintptr(hkeyCurrentUser),
+		uintptr(unsafe.Pointer(subKey)),
+		0,
+		uintptr(keySetValue),
+		uintptr(unsafe.Pointer(&hKey)),
+	)
+	if r1 != 0 {
+		return
+	}
+	defer procRegCloseKey.Call(hKey)
+
+	valName, _ := syscall.UTF16PtrFromString(runOnceValueName)
+	_, _, _ = procRegDeleteValue.Call(hKey, uintptr(unsafe.Pointer(valName)))
 }

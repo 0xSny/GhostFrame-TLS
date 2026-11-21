@@ -372,6 +372,7 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 		onOpen()
 	case cmd == cmdToggle:
 		if state == client.StateConnected || state == client.StateConnecting {
+			_ = eng.SetAutoConnect(false)
 			eng.Disconnect()
 			onToast("已断开安全隧道", false)
 			onRefresh()

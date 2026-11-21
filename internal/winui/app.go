@@ -138,6 +138,7 @@ func Run(eng *client.Engine) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	SetHighestAppShutdownPriority()
 	enablePerMonitorDPI()
 
 	var gdipToken uintptr
@@ -776,6 +777,7 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 	switch k {
 	case hitConnect:
 		if state == client.StateConnected || state == client.StateConnecting {
+			_ = a.eng.SetAutoConnect(false)
 			a.eng.Disconnect()
 			a.setToast("已断开安全隧道", false)
 		} else {

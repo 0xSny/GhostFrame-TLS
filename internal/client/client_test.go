@@ -808,3 +808,64 @@ func TestEngineIPv6ToggleAndStrictReject(t *testing.T) {
 		t.Fatal("expected EnableIPv6=true to persist across NewEngine reload")
 	}
 }
+
+func TestAutoConnectPreservedOnCloseAndClearedOnUserDisconnect(t *testing.T) {
+	SetNoSysProxy(true)
+	defer applyMockSystemProxySnapshot(ProxySnapshot{})
+
+	uri1, stop1 := startLocalTestServerForClient(t, "AutoResumeNode")
+	defer stop1()
+
+	cfgPath := filepath.Join(t.TempDir(), "client.json")
+	eng, err := NewEngine(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.ImportLink(uri1, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetRouteMode(RouteRule); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Connect(); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	if !eng.ShouldAutoConnect() {
+		t.Fatal("expected ShouldAutoConnect=true after successful Connect")
+	}
+	if enabled, _, _ := GetSystemProxy(); !enabled {
+		t.Fatal("expected mock system proxy enabled while connected in Rule mode")
+	}
+
+	// Software close cleans system proxy without clearing user's active AutoConnect intent.
+	eng.Close()
+	if enabled, _, _ := GetSystemProxy(); enabled {
+		t.Fatal("expected dirty system proxy cleared after Close()")
+	}
+
+	reopened, err := NewEngine(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.ShouldAutoConnect() {
+		reopened.Close()
+		t.Fatal("expected ShouldAutoConnect=true preserved across software restart")
+	}
+
+	// Explicit user Disconnect clears AutoConnect so subsequent launch stays disconnected.
+	if err := reopened.SetAutoConnect(false); err != nil {
+		reopened.Close()
+		t.Fatal(err)
+	}
+	reopened.Disconnect()
+	reopened.Close()
+
+	reopened2, err := NewEngine(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened2.Close()
+	if reopened2.ShouldAutoConnect() {
+		t.Fatal("expected ShouldAutoConnect=false after explicit user disconnect")
+	}
+}

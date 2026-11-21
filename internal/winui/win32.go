@@ -111,6 +111,8 @@ var (
 	gdiplus  = windows.NewLazySystemDLL("gdiplus.dll")
 
 	pGetModuleHandleW              = kernel32.NewProc("GetModuleHandleW")
+	pOpenMutexW                    = kernel32.NewProc("OpenMutexW")
+	pSetProcessShutdownParameters  = kernel32.NewProc("SetProcessShutdownParameters")
 	pGlobalAlloc                   = kernel32.NewProc("GlobalAlloc")
 	pGlobalLock                    = kernel32.NewProc("GlobalLock")
 	pGlobalSize                    = kernel32.NewProc("GlobalSize")
@@ -378,6 +380,25 @@ func AcquireSingleInstance() (windows.Handle, bool) {
 		return 0, true // proceed if mutex API unexpectedly restricted
 	}
 	return h, true
+}
+
+// SetHighestAppShutdownPriority requests Windows notify Kestrel-Pro first among user applications
+// during shutdown/reboot so WM_QUERYENDSESSION can cleanly restore system proxy before session teardown.
+func SetHighestAppShutdownPriority() {
+	_, _, _ = pSetProcessShutdownParameters.Call(0x3FF, 0)
+}
+
+// IsAnotherInstanceRunning reports whether a live Kestrel-Pro instance currently holds the single-instance mutex.
+func IsAnotherInstanceRunning() bool {
+	const mutexSynchronize = 0x00100000
+	mutPtr := utf16Ptr(singleMutexName)
+	h, _, _ := pOpenMutexW.Call(mutexSynchronize, 0, uintptr(unsafe.Pointer(mutPtr)))
+	runtime.KeepAlive(mutPtr)
+	if h != 0 {
+		_ = windows.CloseHandle(windows.Handle(h))
+		return true
+	}
+	return false
 }
 
 func osPtr(addr uintptr) unsafe.Pointer {
