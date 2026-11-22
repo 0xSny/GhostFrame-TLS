@@ -1074,11 +1074,34 @@ func (a *ApexScheduler) OpenStream(target string, first []byte) (DataStream, err
 	if a.link.EffectiveTransport() == "rtc" {
 		return nil, errors.New("gft: rtc track unavailable")
 	}
-	st, err := a.pool.OpenStream(target, first)
+	st, err := a.pool.OpenDataStream(target, first)
 	if err != nil {
 		return nil, err
 	}
 	return st, nil
+}
+
+// ProbeNow executes an immediate live RTT measurement on the active transport track
+// (RTC ProbeRTT or least-congested TCP in-band CmdPing) rather than returning stale cached values.
+func (a *ApexScheduler) ProbeNow(ctx context.Context) (int64, string, error) {
+	if sl := a.activeSlotForSend(nil); sl != nil {
+		rtt, err := sl.sess.ProbeRTT(2500 * time.Millisecond)
+		if err != nil {
+			return 0, "RTC-Smart", err
+		}
+		ms := rtt.Milliseconds()
+		if ms <= 0 {
+			ms = 1
+		}
+		a.rtcRTTMs.Store(ms)
+		return ms, "RTC-Smart", nil
+	}
+	mode := "TCP-uTLS"
+	if a.link.EffectiveTransport() != "tcp" {
+		mode = "TCP-Fallback"
+	}
+	ms, err := a.pool.PingNow(ctx)
+	return ms, mode, err
 }
 
 // SchedulerUDPAssoc is a persistent virtual UDP association across RTC port hops

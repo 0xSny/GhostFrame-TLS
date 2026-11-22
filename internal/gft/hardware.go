@@ -42,6 +42,15 @@ func EffectiveMaxStreamWindow() int {
 	return maxStreamWindow
 }
 
+// EffectivePoolSize returns 4 TCP-uTLS sessions in low-memory mode or 6 by default
+// for multi-flow TCP-uTLS striping without single-socket loss bottlenecks.
+func EffectivePoolSize() int {
+	if lowMemMode.Load() {
+		return DefaultPoolSize
+	}
+	return 6
+}
+
 // EffectiveUDPSocketBuffer returns the OS UDP socket receive/send buffer target
 // (512KB in low-memory mode or 8MB by default).
 func EffectiveUDPSocketBuffer() int {

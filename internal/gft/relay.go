@@ -11,7 +11,7 @@ import (
 func CopyBuf(dst io.Writer, src io.Reader, onN func(int)) error {
 	bp := GetBuf()
 	defer PutBuf(bp)
-	chunk := 32 * 1024
+	chunk := maxChunk
 	if IsLowMemMode() {
 		chunk = 16 * 1024
 	}

@@ -580,7 +580,7 @@ func (e *Engine) SelectNode(idx int) error {
 		targetParams = e.paramStore.Get()
 	}
 	nextStore := gft.NewParamStore(targetParams)
-	newSched := gft.NewApexScheduler(targetLink, nextStore, gft.DefaultPoolSize, e.Logf)
+	newSched := gft.NewApexScheduler(targetLink, nextStore, gft.EffectivePoolSize(), e.Logf)
 
 	e.connectGen++
 	gen := e.connectGen
@@ -1453,7 +1453,7 @@ func (e *Engine) Connect() error {
 	e.lastErr = ""
 	e.connectGen++
 	gen := e.connectGen
-	sched := gft.NewApexScheduler(l, e.paramStore, gft.DefaultPoolSize, e.Logf)
+	sched := gft.NewApexScheduler(l, e.paramStore, gft.EffectivePoolSize(), e.Logf)
 	e.connectingSched = sched
 	e.mu.Unlock()
 
@@ -1716,6 +1716,16 @@ func (e *Engine) PingNow() (PingSummary, error) {
 	e.mu.RUnlock()
 
 	if sched != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		ms, mode, perr := sched.ProbeNow(ctx)
+		cancel()
+		if perr == nil && ms > 0 {
+			e.mu.Lock()
+			e.pingMs = ms
+			e.mu.Unlock()
+			e.Logf("Live RTT [%s]: %dms", mode, ms)
+			return PingSummary{RTTMs: ms, Transport: mode}, nil
+		}
 		st := sched.Stats()
 		if st.RTTMs > 0 {
 			e.mu.Lock()

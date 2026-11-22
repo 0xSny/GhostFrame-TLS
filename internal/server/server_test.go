@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -738,4 +739,100 @@ func mustAtoi(s string) int {
 		v = v*10 + int(c-'0')
 	}
 	return v
+}
+
+func TestServerMultiTCPBondedStreamEndToEnd(t *testing.T) {
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(cc net.Conn) {
+				defer cc.Close()
+				_, _ = io.Copy(cc, cc)
+			}(c)
+		}
+	}()
+
+	AllowPrivateTargets = true
+	defer func() { AllowPrivateTargets = false }()
+
+	_, sec, addr, stop := startTestServer(t, InitOptions{
+		SNI:          "ftp.jaist.ac.jp",
+		CertMode:     "self_signed_90d",
+		FallbackMode: "mirror",
+	}, false, nil)
+	defer stop()
+
+	link, err := gft.ParseLink(sec.Link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, portStr, _ := net.SplitHostPort(addr)
+	link.Port = mustAtoi(portStr)
+	link.Host = "127.0.0.1"
+	link.Transport = "tcp"
+
+	ps := gft.NewParamStore(gft.DefaultParams())
+	sched := gft.NewApexScheduler(link, ps, 4, func(f string, a ...any) { t.Logf("[SCHED] "+f, a...) })
+	if err := sched.Start(5 * time.Second); err != nil {
+		t.Fatalf("sched.Start failed: %v", err)
+	}
+	defer sched.Close()
+
+	// Wait briefly until at least 2 TCP-uTLS slots come online and CmdBondCap arrives.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if sched.Stats().ActiveConns >= 3 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	tStart := time.Now()
+	st, err := sched.OpenStream(echoLn.Addr().String(), []byte("BOND:"))
+	if err != nil {
+		t.Fatalf("OpenStream bonded failed: %v", err)
+	}
+	defer st.Close()
+	t.Logf("OpenStream type=%T elapsed=%v", st, time.Since(tStart))
+
+	payload := make([]byte, 4*1024*1024)
+	_, _ = rand.Read(payload)
+	wantHash := sha256.Sum256(append([]byte("BOND:"), payload...))
+
+	go func() {
+		wn, werr := st.Write(payload)
+		t.Logf("writer done wn=%d werr=%v elapsed=%v", wn, werr, time.Since(tStart))
+	}()
+
+	got := make([]byte, len("BOND:")+len(payload))
+	rn, rerr := io.ReadFull(st, got)
+	t.Logf("ReadFull done rn=%d err=%v elapsed=%v", rn, rerr, time.Since(tStart))
+	if rerr != nil {
+		t.Fatalf("ReadFull bonded echo failed (rn=%d/%d): %v", rn, len(got), rerr)
+	}
+	_ = st.CloseWrite()
+	var tail [1]byte
+	if tn, terr := st.Read(tail[:]); tn != 0 || terr != io.EOF {
+		t.Fatalf("expected clean EOF after CloseWrite, got n=%d err=%v", tn, terr)
+	}
+	t.Logf("EOF verified elapsed=%v", time.Since(tStart))
+	if sha256.Sum256(got) != wantHash {
+		t.Fatalf("SHA-256 mismatch on end-to-end TLS Multi-TCP bonded echo")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ms, mode, perr := sched.ProbeNow(ctx)
+	t.Logf("ProbeNow done ms=%d mode=%s err=%v elapsed=%v", ms, mode, perr, time.Since(tStart))
+	if perr != nil || ms <= 0 || mode != "TCP-uTLS" {
+		t.Fatalf("expected live ProbeNow over TCP-uTLS, got ms=%d mode=%q err=%v", ms, mode, perr)
+	}
 }

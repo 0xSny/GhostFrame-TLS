@@ -2,6 +2,8 @@ package gft
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"math"
 	"sync"
@@ -66,6 +68,11 @@ type SessionPool struct {
 	rttMs atomic.Int64
 	hsMs  atomic.Int64
 
+	bond        *BondGroup
+	poolEpoch   uint32
+	nextBondSeq atomic.Uint32
+	bondReady   atomic.Bool
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -74,21 +81,26 @@ type SessionPool struct {
 // NewSessionPool creates and starts a background-maintained SessionPool.
 func NewSessionPool(l *Link, ps *ParamStore, size int, logf func(string, ...any)) *SessionPool {
 	if size < MinPoolSize {
-		size = DefaultPoolSize
+		size = EffectivePoolSize()
 	}
 	if size > MaxPoolSize {
 		size = MaxPoolSize
 	}
+	var ep [4]byte
+	_, _ = rand.Read(ep[:])
+	epoch := binary.BigEndian.Uint32(ep[:]) | 1
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &SessionPool{
-		link:   l,
-		ps:     ps,
-		size:   size,
-		dialFn: DialSession,
-		onLog:  logf,
-		wakeCh: make(chan struct{}, 1),
-		ctx:    ctx,
-		cancel: cancel,
+		link:      l,
+		ps:        ps,
+		size:      size,
+		dialFn:    DialSession,
+		onLog:     logf,
+		wakeCh:    make(chan struct{}, 1),
+		bond:      NewBondGroup(nil),
+		poolEpoch: epoch,
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 	return p
 }
@@ -151,6 +163,12 @@ func (p *SessionPool) dialOne(timeout time.Duration) (*poolEntry, time.Duration,
 		}
 		p.rttMs.Store(ms)
 	})
+	if p.bond != nil {
+		p.bond.AddSession(sess)
+		sess.SetOnBondCap(func() {
+			p.bondReady.Store(true)
+		})
+	}
 	maxAge := time.Duration(randRange(int(rotateMinAge.Seconds()), int(rotateMaxAge.Seconds()))) * time.Second
 	entry := &poolEntry{
 		id:        id,
@@ -261,21 +279,28 @@ func (p *SessionPool) reapAndCheck() (activeCount int, needed int) {
 			// Dead session: retire counters and discard.
 			p.retiredUp += e.sess.UpBytes.Load()
 			p.retiredDown += e.sess.DownBytes.Load()
+			p.bond.RemoveSession(e.sess, false)
 			continue
 		default:
 		}
 
 		if !e.draining && (now.Sub(e.createdAt) >= e.maxAge || e.sess.TotalBytes() >= rotateMaxBytes) {
 			e.draining = true
+			e.sess.draining.Store(true)
 			if p.onLog != nil {
 				p.onLog("[TCP] Pool slot #%d entering graceful drain (age=%v, bytes=%dMB)", e.id, now.Sub(e.createdAt).Round(time.Second), e.sess.TotalBytes()>>20)
 			}
 		}
 
 		if e.draining {
-			if e.sess.NumStreams() == 0 {
+			bondStreams := 0
+			if p.bond != nil {
+				bondStreams = p.bond.NumStreams()
+			}
+			if e.sess.NumStreams() == 0 && (bondStreams == 0 || now.Sub(e.createdAt) >= e.maxAge+45*time.Second) {
 				p.retiredUp += e.sess.UpBytes.Load()
 				p.retiredDown += e.sess.DownBytes.Load()
+				p.bond.RemoveSession(e.sess, false)
 				e.sess.Close()
 				continue
 			}
@@ -296,18 +321,18 @@ func (p *SessionPool) reapAndCheck() (activeCount int, needed int) {
 
 func (p *SessionPool) inBandPingLoop() {
 	defer p.wg.Done()
-	// Fire an initial in-band ping shortly after startup, then every 20..35s.
+	// Fire an initial in-band ping shortly after startup, then every 6..10s on least-loaded socket.
 	select {
 	case <-p.ctx.Done():
 		return
-	case <-time.After(1500 * time.Millisecond):
-		_, _ = p.PingInBand()
+	case <-time.After(1200 * time.Millisecond):
+		_, _ = p.PingNow(p.ctx)
 	}
 
 	t := time.NewTimer(time.Hour)
 	defer t.Stop()
 	for {
-		wait := time.Duration(randRange(20000, 35000)) * time.Millisecond
+		wait := time.Duration(randRange(6000, 10000)) * time.Millisecond
 		if !t.Stop() {
 			select {
 			case <-t.C:
@@ -319,21 +344,131 @@ func (p *SessionPool) inBandPingLoop() {
 		case <-p.ctx.Done():
 			return
 		case <-t.C:
-			_, _ = p.PingInBand()
+			_, _ = p.PingNow(p.ctx)
 		}
 	}
 }
 
-// PingInBand measures RTT strictly inside an existing active pooled session (no new TCP+TLS dials).
-func (p *SessionPool) PingInBand() (int64, error) {
-	s, err := p.Acquire()
+// acquireForPingTop picks up to 2 healthy sessions with lowest pending write backlog
+// and fewest streams so interactive RTT probing isn't skewed by a single slow TCP socket.
+func (p *SessionPool) acquireForPingTop() ([]*Session, error) {
+	if p.ctx.Err() != nil {
+		return nil, ErrSessionClosed
+	}
+	p.mu.Lock()
+	type cand struct {
+		s    *Session
+		pend int64
+		load int
+		rtt  int64
+	}
+	var cands []cand
+	for _, e := range p.entries {
+		if e.draining {
+			continue
+		}
+		select {
+		case <-e.sess.Done():
+			continue
+		default:
+		}
+		cands = append(cands, cand{
+			s:    e.sess,
+			pend: e.sess.PendingWriteBytes(),
+			load: e.sess.NumStreams(),
+			rtt:  e.sess.LastRTTMs(),
+		})
+	}
+	p.mu.Unlock()
+	if len(cands) == 0 {
+		s, err := p.Acquire()
+		if err != nil {
+			return nil, err
+		}
+		return []*Session{s}, nil
+	}
+	// Simple partial selection for best 2 candidates without sorting allocation overhead.
+	for i := 0; i < len(cands) && i < 2; i++ {
+		best := i
+		for j := i + 1; j < len(cands); j++ {
+			better := false
+			if (cands[j].pend == 0) != (cands[best].pend == 0) {
+				better = cands[j].pend == 0
+			} else if cands[j].pend != cands[best].pend {
+				better = cands[j].pend < cands[best].pend
+			} else if cands[j].load != cands[best].load {
+				better = cands[j].load < cands[best].load
+			} else if cands[j].rtt > 0 && (cands[best].rtt == 0 || cands[j].rtt < cands[best].rtt) {
+				better = true
+			}
+			if better {
+				best = j
+			}
+		}
+		cands[i], cands[best] = cands[best], cands[i]
+	}
+	if len(cands) > 2 {
+		cands = cands[:2]
+	}
+	out := make([]*Session, len(cands))
+	for i := range cands {
+		out[i] = cands[i].s
+	}
+	return out, nil
+}
+
+// PingNow actively measures live in-band RTT by racing up to 2 least-congested sessions.
+func (p *SessionPool) PingNow(ctx context.Context) (int64, error) {
+	sessions, err := p.acquireForPingTop()
 	if err != nil {
 		return 0, err
 	}
-	if err := s.SendPingReq(); err != nil {
-		return 0, err
+	pCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	if len(sessions) == 1 {
+		rtt, err := sessions[0].SendPingReqAndWait(pCtx)
+		if err != nil {
+			return 0, err
+		}
+		ms := rtt.Milliseconds()
+		if ms <= 0 {
+			ms = 1
+		}
+		p.rttMs.Store(ms)
+		return ms, nil
 	}
-	return p.rttMs.Load(), nil
+
+	type res struct {
+		rtt time.Duration
+		err error
+	}
+	ch := make(chan res, len(sessions))
+	for _, s := range sessions {
+		go func(sess *Session) {
+			r, e := sess.SendPingReqAndWait(pCtx)
+			ch <- res{r, e}
+		}(s)
+	}
+	var lastErr error
+	for i := 0; i < len(sessions); i++ {
+		r := <-ch
+		if r.err == nil {
+			ms := r.rtt.Milliseconds()
+			if ms <= 0 {
+				ms = 1
+			}
+			p.rttMs.Store(ms)
+			return ms, nil
+		}
+		lastErr = r.err
+	}
+	return 0, lastErr
+}
+
+// PingInBand measures RTT strictly inside an existing active pooled session (no new TCP+TLS dials).
+func (p *SessionPool) PingInBand() (int64, error) {
+	return p.PingNow(p.ctx)
 }
 
 // Acquire returns the healthy non-draining session with the fewest active streams.
@@ -451,6 +586,18 @@ func (p *SessionPool) OpenStream(target string, first []byte) (*Stream, error) {
 	return s.OpenStream(target, first)
 }
 
+// OpenDataStream opens a Multi-TCP BondedStream when the server advertises CmdBondCap
+// (and low-memory mode is off), falling back transparently to a single-session Stream.
+func (p *SessionPool) OpenDataStream(target string, first []byte) (DataStream, error) {
+	if !IsLowMemMode() && p.bondReady.Load() && p.bond != nil {
+		bondID := (uint64(p.poolEpoch) << 32) | uint64(p.nextBondSeq.Add(1))
+		if bs, err := p.bond.OpenStream(bondID, target, first); err == nil {
+			return bs, nil
+		}
+	}
+	return p.OpenStream(target, first)
+}
+
 // OpenUDP opens a multiplexed UDP association on the least-loaded healthy session.
 func (p *SessionPool) OpenUDP() (*UDPStream, error) {
 	s, err := p.Acquire()
@@ -488,12 +635,18 @@ func (p *SessionPool) Stats() PoolStats {
 		st.TotalUp += e.sess.UpBytes.Load()
 		st.TotalDown += e.sess.DownBytes.Load()
 	}
+	if p.bond != nil {
+		st.ActiveStreams += p.bond.NumStreams()
+	}
 	return st
 }
 
 // Close closes the entire pool and all active/draining sessions.
 func (p *SessionPool) Close() {
 	p.cancel()
+	if p.bond != nil {
+		p.bond.CloseAll(ErrSessionClosed)
+	}
 	p.mu.Lock()
 	entries := p.entries
 	p.entries = nil

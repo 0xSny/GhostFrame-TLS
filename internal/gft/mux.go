@@ -2,6 +2,7 @@ package gft
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -24,6 +25,11 @@ const (
 	CmdParam       byte = 0x06
 	CmdUDPDatagram byte = 0x07
 	CmdUDPClose    byte = 0x08
+	CmdBondCap     byte = 0x09
+	CmdBondOpen    byte = 0x0A
+	CmdBondData    byte = 0x0B
+	CmdBondClose   byte = 0x0C
+	CmdBondWindow  byte = 0x0D
 
 	HeaderLen       = 8
 	MaxPayload      = 65535
@@ -63,6 +69,9 @@ type UDPHandler func(s *Session, id uint16, target string, data []byte)
 // UDPCloseHandler is invoked when a client closes a UDP association (CmdUDPClose).
 type UDPCloseHandler func(s *Session, id uint16)
 
+// BondHandler dispatches multi-TCP bonded stream frames (CmdBondOpen..CmdBondWindow).
+type BondHandler func(s *Session, cmd, flags byte, pl []byte) error
+
 // UDPPacket represents a decoded UDP payload received over CmdUDPDatagram or Kestrel-RTC.
 type UDPPacket = gftrtc.UDPPacket
 
@@ -84,6 +93,10 @@ type Session struct {
 	handler  ConnectHandler
 	udpH     UDPHandler
 	udpClose UDPCloseHandler
+	bondH    BondHandler
+	onBondCap func()
+	bondSupported atomic.Bool
+	draining      atomic.Bool
 
 	// Optional ServerAck expected before v2/v3 frames on client side.
 	hasAck   bool
@@ -96,8 +109,14 @@ type Session struct {
 	udpStreams map[uint16]*UDPStream
 	nextID     uint16
 
-	wmu  sync.Mutex
-	sent int
+	wmu               sync.Mutex
+	sent              int
+	pendingWriteBytes atomic.Int64
+	lastRTTMs         atomic.Int64
+
+	pingWaitMu  sync.Mutex
+	pingWaiters map[int64]chan time.Duration
+	lastPingNs  atomic.Int64
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -141,8 +160,34 @@ func (s *Session) SetExpectedV3Ack(psk []byte, salt []byte) {
 	copy(s.ackSalt[:], salt)
 }
 
-func (s *Session) SetOnParam(f func(Params))       { s.onParam = f }
-func (s *Session) SetOnPing(f func(time.Duration)) { s.onPing = f }
+func (s *Session) SetOnParam(f func(Params)) {
+	s.mu.Lock()
+	s.onParam = f
+	s.mu.Unlock()
+}
+func (s *Session) SetOnPing(f func(time.Duration)) {
+	s.mu.Lock()
+	s.onPing = f
+	s.mu.Unlock()
+}
+func (s *Session) SetOnBondCap(f func()) {
+	s.mu.Lock()
+	s.onBondCap = f
+	already := s.bondSupported.Load()
+	s.mu.Unlock()
+	if already && f != nil {
+		f()
+	}
+}
+func (s *Session) SetBondHandler(h BondHandler) {
+	s.mu.Lock()
+	s.bondH = h
+	s.mu.Unlock()
+}
+func (s *Session) SupportsBond() bool              { return s.bondSupported.Load() }
+func (s *Session) PendingWriteBytes() int64        { return s.pendingWriteBytes.Load() }
+func (s *Session) LastRTTMs() int64                { return s.lastRTTMs.Load() }
+func (s *Session) SendBondCap() error              { return s.writeFrame(CmdBondCap, 0, 0, nil, 0) }
 func (s *Session) SetUDPHandler(h UDPHandler, c UDPCloseHandler) {
 	s.udpH = h
 	s.udpClose = c
@@ -267,10 +312,12 @@ func (s *Session) writeFrame(cmd, flags byte, id uint16, payload []byte, streamF
 		n += pad
 	}
 
+	s.pendingWriteBytes.Add(int64(n))
 	s.wmu.Lock()
 	s.sent++
 	_, err := s.conn.Write(buf[:n])
 	s.wmu.Unlock()
+	s.pendingWriteBytes.Add(-int64(n))
 	PutBuf(bp)
 
 	if err != nil {
@@ -423,16 +470,54 @@ func (s *Session) dispatch(cmd, flags byte, id uint16, pl []byte) error {
 			// Echo exact nanosecond timestamp back to requester
 			return s.writeFrame(CmdPing, PingResp, 0, pl, 0)
 		case PingResp:
-			if len(pl) >= 8 && s.onPing != nil {
+			if len(pl) >= 8 {
 				sentNs := int64(binary.BigEndian.Uint64(pl[:8]))
 				rtt := time.Duration(time.Now().UnixNano() - sentNs)
-				if rtt < 0 {
+				if rtt <= 0 {
 					rtt = time.Millisecond
 				}
-				s.onPing(rtt)
+				ms := rtt.Milliseconds()
+				if ms <= 0 {
+					ms = 1
+				}
+				s.lastRTTMs.Store(ms)
+				s.pingWaitMu.Lock()
+				ch := s.pingWaiters[sentNs]
+				delete(s.pingWaiters, sentNs)
+				s.pingWaitMu.Unlock()
+				if ch != nil {
+					select {
+					case ch <- rtt:
+					default:
+					}
+				}
+				s.mu.Lock()
+				onPing := s.onPing
+				s.mu.Unlock()
+				if onPing != nil {
+					onPing(rtt)
+				}
 			}
 		default:
 			// PingNoise (0x00) silently dropped
+		}
+
+	case CmdBondCap:
+		s.bondSupported.Store(true)
+		s.mu.Lock()
+		onCap := s.onBondCap
+		s.mu.Unlock()
+		if onCap != nil {
+			onCap()
+		}
+
+	case CmdBondOpen, CmdBondData, CmdBondClose, CmdBondWindow:
+		s.touchReal()
+		s.mu.Lock()
+		bh := s.bondH
+		s.mu.Unlock()
+		if bh != nil {
+			return bh(s, cmd, flags, pl)
 		}
 
 	case CmdParam:
@@ -492,8 +577,55 @@ func (s *Session) SendParams(p Params) error {
 // SendPingReq sends an in-band CmdPing request carrying an 8-byte nanosecond timestamp.
 func (s *Session) SendPingReq() error {
 	var ts [8]byte
-	binary.BigEndian.PutUint64(ts[:], uint64(time.Now().UnixNano()))
+	binary.BigEndian.PutUint64(ts[:], uint64(s.nextPingTimestamp()))
 	return s.writeFrame(CmdPing, PingReq, 0, ts[:], 0)
+}
+
+func (s *Session) nextPingTimestamp() int64 {
+	now := time.Now().UnixNano()
+	for {
+		prev := s.lastPingNs.Load()
+		next := now
+		if next <= prev {
+			next = prev + 1
+		}
+		if s.lastPingNs.CompareAndSwap(prev, next) {
+			return next
+		}
+	}
+}
+
+// SendPingReqAndWait dispatches a live in-band CmdPing and waits for its matching PingResp echo.
+func (s *Session) SendPingReqAndWait(ctx context.Context) (time.Duration, error) {
+	sentNs := s.nextPingTimestamp()
+	ch := make(chan time.Duration, 1)
+	s.pingWaitMu.Lock()
+	if s.pingWaiters == nil {
+		s.pingWaiters = make(map[int64]chan time.Duration)
+	}
+	s.pingWaiters[sentNs] = ch
+	s.pingWaitMu.Unlock()
+
+	defer func() {
+		s.pingWaitMu.Lock()
+		delete(s.pingWaiters, sentNs)
+		s.pingWaitMu.Unlock()
+	}()
+
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], uint64(sentNs))
+	if err := s.writeFrame(CmdPing, PingReq, 0, ts[:], 0); err != nil {
+		return 0, err
+	}
+
+	select {
+	case rtt := <-ch:
+		return rtt, nil
+	case <-s.done:
+		return 0, ErrSessionClosed
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
 }
 
 // SendUDPDatagram sends a UDP datagram frame over the session for streamID.

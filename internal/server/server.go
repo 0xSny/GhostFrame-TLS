@@ -65,12 +65,14 @@ type Server struct {
 	tcpAddr   net.Addr
 	udpAddr   net.Addr
 
-	smu      sync.Mutex
-	sessions map[uint64]*sessEntry
-	nextSess atomic.Uint64
-	udpMgrMu sync.Mutex
-	udpMgrs  map[[8]byte]*udpManager
-	logger   *log.Logger
+	smu       sync.Mutex
+	sessions  map[uint64]*sessEntry
+	nextSess  atomic.Uint64
+	udpMgrMu  sync.Mutex
+	udpMgrs   map[[8]byte]*udpManager
+	bondMgrMu sync.Mutex
+	bondMgrs  map[[8]byte]*gft.BondGroup
+	logger    *log.Logger
 }
 
 // SetConfigPath records the path of the active server.json so web panel
@@ -104,6 +106,7 @@ func New(cfg *Config, logger *log.Logger) (*Server, error) {
 		outbound: NewFastOutbound(),
 		sessions: map[uint64]*sessEntry{},
 		udpMgrs:  map[[8]byte]*udpManager{},
+		bondMgrs: map[[8]byte]*gft.BondGroup{},
 		started:  time.Now(),
 		logger:   logger,
 	}
@@ -527,6 +530,45 @@ func (s *Server) closeAllSessions() {
 		m.closeAll()
 	}
 	s.udpMgrMu.Unlock()
+	s.bondMgrMu.Lock()
+	for k, bg := range s.bondMgrs {
+		delete(s.bondMgrs, k)
+		bg.CloseAll(gft.ErrSessionClosed)
+	}
+	s.bondMgrMu.Unlock()
+}
+
+func (s *Server) attachBondSession(clientID [8]byte, sess *gft.Session) *gft.BondGroup {
+	if clientID == ([8]byte{}) || sess == nil {
+		return nil
+	}
+	s.bondMgrMu.Lock()
+	bg, ok := s.bondMgrs[clientID]
+	if !ok {
+		bg = gft.NewBondGroup(func(st gft.DataStream, target string, first []byte) {
+			s.handleDataStream(st, target, first)
+		})
+		s.bondMgrs[clientID] = bg
+	}
+	bg.AddSession(sess)
+	s.bondMgrMu.Unlock()
+	return bg
+}
+
+func (s *Server) releaseBondSession(clientID [8]byte, bg *gft.BondGroup, sess *gft.Session) {
+	if bg == nil || sess == nil {
+		return
+	}
+	rem := bg.RemoveSession(sess, true)
+	if rem == 0 {
+		s.bondMgrMu.Lock()
+		if cur := s.bondMgrs[clientID]; cur == bg {
+			if bg.NumStreams() == 0 {
+				delete(s.bondMgrs, clientID)
+			}
+		}
+		s.bondMgrMu.Unlock()
+	}
 }
 
 func addrIP(a net.Addr) string {
@@ -671,6 +713,10 @@ func (s *Server) serveTCPSession(_ context.Context, conn net.Conn, ip string, cl
 	}, func(_ *gft.Session, id uint16) {
 		udpMgr.handleClose(id)
 	})
+	if bondGrp := s.attachBondSession(clientID, sess); bondGrp != nil {
+		defer s.releaseBondSession(clientID, bondGrp, sess)
+		_ = sess.SendBondCap()
+	}
 
 	id := s.nextSess.Add(1)
 	s.smu.Lock()
