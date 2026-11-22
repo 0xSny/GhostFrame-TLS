@@ -4,6 +4,7 @@ package winui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -54,10 +55,10 @@ const (
 	hitPing
 	hitImport
 	hitNodeDrop
-	hitNodeRename
+	hitNodeRowRename
 	hitNodeRenameBox
 	hitNodeRenameSave
-	hitNodeDelete
+	hitNodeRowDelete
 	hitRouteRule
 	hitRouteGlobal
 	hitRouteCore
@@ -100,17 +101,20 @@ type appUI struct {
 	hHand  uintptr
 	hIcon  uintptr
 
-	hoverID  hitKind
-	hoverIdx int
-	pressed  hitKind
-	hits     []hitBox
+	hoverID    hitKind
+	hoverIdx   int
+	pressed    hitKind
+	pressedIdx int
+	hits       []hitBox
 
-	nodeDropOpen bool
-	logScroll    int
-	autoScroll   bool
-	lastLogCount int
+	nodeDropOpen   bool
+	nodeDropScroll int
+	logScroll      int
+	autoScroll     bool
+	lastLogCount   int
 
 	editFocus     int // 0=none, 1=socks5 port, 2=http port, 3=bw up mbps, 4=bw down mbps, 5=node remark
+	editNodeIdx   int
 	portSocksBuf  string
 	portHTTPBuf   string
 	bwUpBuf       string
@@ -123,6 +127,7 @@ type appUI struct {
 	toastSuccess bool
 	toastUntil   time.Time
 
+	switchSeq     atomic.Uint64
 	rulesUpdating atomic.Bool
 	shutOnce      sync.Once
 }
@@ -338,8 +343,9 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	case wmLButtonDown:
 		x := int32(int16(lParam & 0xFFFF))
 		y := int32(int16((lParam >> 16) & 0xFFFF))
-		hid, _ := a.hitTest(x, y)
+		hid, hidx := a.hitTest(x, y)
 		a.pressed = hid
+		a.pressedIdx = hidx
 		a.invalidate()
 		return 0
 
@@ -347,19 +353,20 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		x := int32(int16(lParam & 0xFFFF))
 		y := int32(int16((lParam >> 16) & 0xFFFF))
 		hid, hidx := a.hitTest(x, y)
-		wasPressed := a.pressed
+		wasPressed, wasPressedIdx := a.pressed, a.pressedIdx
 		a.pressed = hitNone
-		if hid != hitNone && hid == wasPressed {
+		a.pressedIdx = 0
+		if hid != hitNone && hid == wasPressed && hidx == wasPressedIdx {
 			a.handleClick(hid, hidx)
 		} else {
 			changed := false
-			if a.nodeDropOpen && hid != hitNodeDrop && hid != hitNodeOption {
+			if a.nodeDropOpen && !isNodeDropHit(hid) {
 				a.nodeDropOpen = false
 				changed = true
 			}
 			if a.editFocus != 0 && hid != hitPortSocks && hid != hitPortHTTP && hid != hitPortSave && hid != hitPortCapsule &&
 				hid != hitBWUp && hid != hitBWDown && hid != hitBWSave &&
-				hid != hitNodeRename && hid != hitNodeRenameBox && hid != hitNodeRenameSave {
+				hid != hitNodeRowRename && hid != hitNodeRenameBox && hid != hitNodeRenameSave {
 				a.cancelPortEdit()
 				changed = true
 			}
@@ -379,7 +386,11 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 				lines = -1
 			}
 		}
-		a.scrollLogs(-lines)
+		if a.nodeDropOpen {
+			a.scrollNodeDrop(-lines / 3)
+		} else {
+			a.scrollLogs(-lines)
+		}
 		return 0
 
 	case wmKeyDown:
@@ -684,15 +695,66 @@ func (a *appUI) commitNodeRename() {
 	if a.eng == nil {
 		return
 	}
-	st := a.eng.Status()
-	activeIdx := intVal(st["active_node"])
 	rem := strings.TrimSpace(a.nodeRemarkBuf)
-	if err := a.eng.RenameNode(activeIdx, rem); err != nil {
+	if err := a.eng.RenameNode(a.editNodeIdx, rem); err != nil {
 		a.setToast("修改备注失败: "+err.Error(), true)
 		return
 	}
 	a.editFocus = 0
 	a.setToastSuccess("节点备注已保存")
+}
+
+func isNodeDropHit(k hitKind) bool {
+	switch k {
+	case hitNodeDrop, hitNodeOption, hitNodeRowRename, hitNodeRowDelete, hitNodeRenameBox, hitNodeRenameSave:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *appUI) scrollNodeDrop(deltaRows int) {
+	if deltaRows == 0 {
+		if a.nodeDropScroll < 0 {
+			a.nodeDropScroll = 0
+		}
+		return
+	}
+	a.nodeDropScroll += deltaRows
+	if a.nodeDropScroll < 0 {
+		a.nodeDropScroll = 0
+	}
+	a.invalidate()
+}
+
+func (a *appUI) switchNodeAsync(idx int, importedCount int) {
+	seq := a.switchSeq.Add(1)
+	go func() {
+		st := a.eng.Status()
+		curState := client.ConnState(strVal(st["state"]))
+		isSwitchingLive := curState == client.StateConnected || curState == client.StateConnecting
+		if isSwitchingLive && importedCount == 0 {
+			a.setToast("正在无损切换节点...", false)
+		}
+		if err := a.eng.SelectNode(idx); err != nil {
+			if errors.Is(err, client.ErrSwitchCancelled) || a.switchSeq.Load() != seq {
+				return
+			}
+			a.setToast("切换节点失败: "+err.Error(), true)
+		} else {
+			if a.switchSeq.Load() != seq {
+				return
+			}
+			if importedCount > 0 {
+				a.setToastSuccess(fmt.Sprintf("已导入 %d 个节点并热切换生效", importedCount))
+			} else if isSwitchingLive && a.eng.IsConnected() {
+				a.setToastSuccess("已无损切换节点（连接不断开）")
+			} else {
+				a.setToast("已切换并持久化节点", false)
+			}
+		}
+		a.postRefresh()
+	}()
 }
 
 func (a *appUI) commitBWEdit() {
@@ -767,24 +829,31 @@ func (a *appUI) hitTest(x, y int32) (hitKind, int) {
 func (a *appUI) handleClick(k hitKind, idx int) {
 	st := a.eng.Status()
 	state := client.ConnState(strVal(st["state"]))
-	activeIdx := intVal(st["active_node"])
 	if a.editFocus != 0 && k != hitPortSocks && k != hitPortHTTP && k != hitPortSave && k != hitPortCapsule &&
 		k != hitBWUp && k != hitBWDown && k != hitBWSave &&
-		k != hitNodeRename && k != hitNodeRenameBox && k != hitNodeRenameSave {
+		k != hitNodeRowRename && k != hitNodeRenameBox && k != hitNodeRenameSave {
 		a.cancelPortEdit()
 	}
 
 	switch k {
 	case hitConnect:
 		if state == client.StateConnected || state == client.StateConnecting {
+			a.switchSeq.Add(1)
 			_ = a.eng.SetAutoConnect(false)
 			a.eng.Disconnect()
 			a.setToast("已断开安全隧道", false)
 		} else {
+			seq := a.switchSeq.Add(1)
 			go func() {
 				if err := a.eng.Connect(); err != nil {
+					if a.switchSeq.Load() != seq {
+						return
+					}
 					a.setToast("连接失败: "+err.Error(), true)
 				} else {
+					if a.switchSeq.Load() != seq {
+						return
+					}
 					a.setToast("安全隧道已建立", false)
 				}
 				a.postRefresh()
@@ -804,41 +873,47 @@ func (a *appUI) handleClick(k hitKind, idx int) {
 		a.importFromClipboard()
 	case hitNodeDrop:
 		a.nodeDropOpen = !a.nodeDropOpen
-	case hitNodeRename:
-		a.nodeDropOpen = false
-		nodes, _ := st["nodes"].([]client.NodeSummary)
-		if len(nodes) == 0 {
-			a.setToast("请先导入节点", true)
-			break
+		if !a.nodeDropOpen && a.editFocus == 5 {
+			a.editFocus = 0
 		}
-		a.nodeRemarkBuf = strVal(st["node_name"])
+	case hitNodeRowRename:
+		a.nodeDropOpen = true
+		nodes, _ := st["nodes"].([]client.NodeSummary)
+		curName := ""
+		for _, n := range nodes {
+			if n.Index == idx {
+				curName = n.Name
+				break
+			}
+		}
+		a.editNodeIdx = idx
+		a.nodeRemarkBuf = curName
 		a.editFocus = 5
 	case hitNodeRenameBox:
+		a.nodeDropOpen = true
 		a.editFocus = 5
 	case hitNodeRenameSave:
+		a.nodeDropOpen = true
 		a.commitNodeRename()
 	case hitNodeOption:
 		a.nodeDropOpen = false
-		go func(i int) {
-			if a.eng.IsConnected() {
-				a.setToast("正在无损切换节点...", false)
-				a.postRefresh()
-			}
-			if err := a.eng.SelectNode(i); err != nil {
-				a.setToast("切换节点失败: "+err.Error(), true)
-			} else if a.eng.IsConnected() {
-				a.setToastSuccess("已无损切换节点（连接不断开）")
-			} else {
-				a.setToast("已切换并持久化节点", false)
-			}
-			a.postRefresh()
-		}(idx)
-	case hitNodeDelete:
-		a.nodeDropOpen = false
-		if err := a.eng.DeleteNode(activeIdx); err != nil {
+		if a.editFocus == 5 {
+			a.editFocus = 0
+		}
+		a.switchNodeAsync(idx, 0)
+	case hitNodeRowDelete:
+		if a.editFocus == 5 && a.editNodeIdx == idx {
+			a.editFocus = 0
+		} else if a.editFocus == 5 && idx < a.editNodeIdx {
+			a.editNodeIdx--
+		}
+		if err := a.eng.DeleteNode(idx); err != nil {
 			a.setToast("删除节点失败: "+err.Error(), true)
 		} else {
-			a.setToast("已删除当前节点", false)
+			if nodes, _ := a.eng.Status()["nodes"].([]client.NodeSummary); len(nodes) == 0 {
+				a.nodeDropOpen = false
+			}
+			a.setToast("已删除节点", false)
 		}
 	case hitRouteRule:
 		_ = a.eng.SetRouteMode(client.RouteRule)
@@ -959,29 +1034,42 @@ func (a *appUI) importFromClipboard() {
 	}
 	lines := strings.Split(raw, "\n")
 	imported := 0
+	firstIdx := -1
 	var lastErr error
 	for _, ln := range lines {
 		ln = strings.TrimSpace(ln)
 		if ln == "" || (!strings.HasPrefix(ln, "ksl4://") && !strings.HasPrefix(ln, "gft3://") && !strings.HasPrefix(ln, "gft2://") && !strings.HasPrefix(ln, "gft://")) {
 			continue
 		}
-		if _, err := a.eng.ImportLink(ln, imported == 0); err != nil {
+		if idx, err := a.eng.ImportLink(ln, imported == 0); err != nil {
 			lastErr = err
 		} else {
+			if imported == 0 {
+				firstIdx = idx
+			}
 			imported++
 		}
 	}
 	if imported == 0 {
-		if _, err := a.eng.ImportLink(raw, true); err != nil {
+		idx, err := a.eng.ImportLink(raw, true)
+		if err != nil {
 			if lastErr != nil {
 				err = lastErr
 			}
 			a.setToast("节点导入失败: "+err.Error(), true)
 			return
 		}
+		firstIdx = idx
 		imported = 1
 	}
-	a.setToast(fmt.Sprintf("已导入 %d 个节点并激活", imported), false)
+	st := a.eng.Status()
+	curState := client.ConnState(strVal(st["state"]))
+	if firstIdx >= 0 && (curState == client.StateConnected || curState == client.StateConnecting) {
+		a.setToast(fmt.Sprintf("已导入 %d 个节点，正在热切换...", imported), false)
+		a.switchNodeAsync(firstIdx, imported)
+	} else {
+		a.setToast(fmt.Sprintf("已导入 %d 个节点并激活", imported), false)
+	}
 	a.invalidate()
 }
 
@@ -1247,34 +1335,34 @@ func (a *appUI) drawNodeCard(r rect, st map[string]any) {
 	a.drawButton(rect{r.Right - s(106), y - s(2), r.Right - s(16), y + s(19)}, hitToggleIPv6, ipv6Label, colCardAlt, ipv6Border, ipv6Fg)
 	y += s(20)
 
-	delR := rect{r.Right - s(58), y, r.Right - s(16), y + s(32)}
-	renR := rect{delR.Left - s(64), y, delR.Left - s(6), y + s(32)}
-	dropR := rect{r.Left + s(16), y, renR.Left - s(6), y + s(32)}
-	if a.editFocus == 5 {
-		a.buf.fillRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), colCardAlt)
-		a.buf.strokeRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), 1.4, colCyan)
-		disp := a.nodeRemarkBuf + "|"
-		f.drawText(f.fBody, f.fmtLeft, rect{dropR.Left + s(10), dropR.Top, dropR.Right - s(8), dropR.Bottom}, colTextMain, disp)
-		a.hits = append(a.hits, hitBox{id: hitNodeRenameBox, rect: dropR})
-		a.drawButton(renR, hitNodeRenameSave, "保存", colCardAlt, colBorderHi, colEmerald)
-	} else {
-		dropBg := colBg
-		if a.hoverID == hitNodeDrop || a.nodeDropOpen {
-			dropBg = colCardAlt
-		}
-		a.buf.fillRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), dropBg)
-		a.buf.strokeRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), 1, colBorderHi)
-		f.drawText(f.fBody, f.fmtLeft, rect{dropR.Left + s(10), dropR.Top, dropR.Right - s(24), dropR.Bottom}, colTextMain, nodeName)
-		arrow := "▾"
-		if a.nodeDropOpen {
-			arrow = "▴"
-		}
-		f.drawText(f.fBody, f.fmtCent, rect{dropR.Right - s(24), dropR.Top, dropR.Right - s(4), dropR.Bottom}, colTextSub, arrow)
-		a.hits = append(a.hits, hitBox{id: hitNodeDrop, rect: dropR})
-		a.drawButton(renR, hitNodeRename, "改备注", colCardAlt, colBorderHi, colCyan)
+	dropR := rect{r.Left + s(16), y, r.Right - s(16), y + s(32)}
+	switchingIdx := -1
+	if v, ok := st["switching_node"].(int); ok {
+		switchingIdx = v
 	}
-
-	a.drawButton(delR, hitNodeDelete, "删除", colBg, colBorderHi, colRed)
+	switchingName := strVal(st["switching_name"])
+	dropBg := colBg
+	dropBorder := colBorderHi
+	dispName := nodeName
+	dispCol := colTextMain
+	if switchingIdx >= 0 && switchingName != "" {
+		dispName = fmt.Sprintf("正在切换 → %s...", switchingName)
+		dispCol = colCyan
+		dropBorder = colCyan
+		dropBg = colCardAlt
+	} else if a.hoverID == hitNodeDrop || a.nodeDropOpen {
+		dropBg = colCardAlt
+		dropBorder = colCyan
+	}
+	a.buf.fillRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), dropBg)
+	a.buf.strokeRoundRect(dropR.Left, dropR.Top, dropR.width(), dropR.height(), s(8), 1, dropBorder)
+	f.drawText(f.fBody, f.fmtLeft, rect{dropR.Left + s(10), dropR.Top, dropR.Right - s(26), dropR.Bottom}, dispCol, dispName)
+	arrow := "▾"
+	if a.nodeDropOpen {
+		arrow = "▴"
+	}
+	f.drawText(f.fBody, f.fmtCent, rect{dropR.Right - s(26), dropR.Top, dropR.Right - s(6), dropR.Bottom}, colTextSub, arrow)
+	a.hits = append(a.hits, hitBox{id: hitNodeDrop, rect: dropR})
 
 	// Segmented: Unified Route + System Proxy Mode
 	y += s(42)
@@ -1397,44 +1485,96 @@ func (a *appUI) drawNodeDropdownOverlay(card rect, st map[string]any) {
 	nodes, _ := st["nodes"].([]client.NodeSummary)
 	activeIdx := intVal(st["active_node"])
 
-	rowH := s(32)
-	count := len(nodes)
+	rowH := s(36)
+	const maxVis = 7
+	total := len(nodes)
+	count := total
 	if count == 0 {
 		count = 1
 	}
-	if count > 7 {
-		count = 7
+	if count > maxVis {
+		count = maxVis
+	}
+	maxScroll := 0
+	if total > maxVis {
+		maxScroll = total - maxVis
+	}
+	if a.nodeDropScroll > maxScroll {
+		a.nodeDropScroll = maxScroll
+	}
+	if a.nodeDropScroll < 0 {
+		a.nodeDropScroll = 0
+	}
+	extraH := int32(0)
+	if total > maxVis {
+		extraH = s(20)
 	}
 	pop := rect{
 		Left:   card.Left + s(16),
-		Top:    card.Top + s(76),
+		Top:    card.Top + s(70),
 		Right:  card.Right - s(16),
-		Bottom: card.Top + s(76) + int32(count)*rowH + s(8),
+		Bottom: card.Top + s(70) + int32(count)*rowH + s(8) + extraH,
 	}
 	a.buf.fillRoundRect(pop.Left, pop.Top, pop.width(), pop.height(), s(10), 0xFF162036)
 	a.buf.strokeRoundRect(pop.Left, pop.Top, pop.width(), pop.height(), s(10), 1.5, colCyan)
 
-	if len(nodes) == 0 {
+	if total == 0 {
 		f.drawText(f.fSmall, f.fmtCent, pop, colTextMuted, "暂无节点，请使用 Ctrl+V 粘贴导入")
 		return
 	}
-	for i := 0; i < len(nodes) && i < 7; i++ {
+	switchingIdx := -1
+	if v, ok := st["switching_node"].(int); ok {
+		switchingIdx = v
+	}
+	end := a.nodeDropScroll + maxVis
+	if end > total {
+		end = total
+	}
+	for row, i := 0, a.nodeDropScroll; i < end; row, i = row+1, i+1 {
 		n := nodes[i]
-		ir := rect{pop.Left + s(4), pop.Top + s(4) + int32(i)*rowH, pop.Right - s(4), pop.Top + s(4) + int32(i+1)*rowH}
+		ir := rect{pop.Left + s(4), pop.Top + s(4) + int32(row)*rowH, pop.Right - s(4), pop.Top + s(4) + int32(row+1)*rowH - s(2)}
+		if a.editFocus == 5 && a.editNodeIdx == n.Index {
+			saveR := rect{ir.Right - s(56), ir.Top + s(4), ir.Right - s(4), ir.Bottom - s(4)}
+			boxR := rect{ir.Left + s(4), ir.Top + s(4), saveR.Left - s(6), ir.Bottom - s(4)}
+			a.buf.fillRoundRect(ir.Left, ir.Top, ir.width(), ir.height(), s(6), colCardAlt)
+			a.buf.fillRoundRect(boxR.Left, boxR.Top, boxR.width(), boxR.height(), s(6), colBg)
+			a.buf.strokeRoundRect(boxR.Left, boxR.Top, boxR.width(), boxR.height(), s(6), 1.3, colCyan)
+			f.drawText(f.fBody, f.fmtLeft, rect{boxR.Left + s(8), boxR.Top, boxR.Right - s(6), boxR.Bottom}, colTextMain, a.nodeRemarkBuf+"|")
+			a.hits = append(a.hits, hitBox{id: hitNodeRenameBox, idx: n.Index, rect: boxR})
+			a.drawRowButton(saveR, hitNodeRenameSave, n.Index, "保存", colCardAlt, colEmerald, colEmerald)
+			continue
+		}
+
+		delR := rect{ir.Right - s(44), ir.Top + s(5), ir.Right - s(4), ir.Bottom - s(5)}
+		renR := rect{delR.Left - s(56), ir.Top + s(5), delR.Left - s(5), ir.Bottom - s(5)}
+		optR := rect{ir.Left, ir.Top, renR.Left - s(4), ir.Bottom}
+
 		if a.hoverID == hitNodeOption && a.hoverIdx == n.Index {
 			a.buf.fillRoundRect(ir.Left, ir.Top, ir.width(), ir.height(), s(6), colCyanDim)
+		} else if n.Index == switchingIdx {
+			a.buf.fillRoundRect(ir.Left, ir.Top, ir.width(), ir.height(), s(6), 0x33F59E0B)
 		} else if n.Index == activeIdx {
 			a.buf.fillRoundRect(ir.Left, ir.Top, ir.width(), ir.height(), s(6), colEmeraldDim)
 		}
 		mark := "  "
 		txtCol := colTextMain
-		if n.Index == activeIdx {
+		if n.Index == switchingIdx {
+			mark = "⟳ "
+			txtCol = colAmber
+		} else if n.Index == activeIdx {
 			mark = "✓ "
 			txtCol = colEmerald
 		}
-		f.drawText(f.fBody, f.fmtLeft, rect{ir.Left + s(8), ir.Top, ir.Right - s(8), ir.Bottom}, txtCol,
+		f.drawText(f.fBody, f.fmtLeft, rect{optR.Left + s(8), optR.Top, optR.Right - s(4), optR.Bottom}, txtCol,
 			fmt.Sprintf("%s%s  (%s:%d)", mark, n.Name, n.Host, n.Port))
-		a.hits = append(a.hits, hitBox{id: hitNodeOption, idx: n.Index, rect: ir})
+		a.hits = append(a.hits, hitBox{id: hitNodeOption, idx: n.Index, rect: optR})
+		a.drawRowButton(renR, hitNodeRowRename, n.Index, "改备注", colCardAlt, colBorderHi, colCyan)
+		a.drawRowButton(delR, hitNodeRowDelete, n.Index, "删除", colBg, colBorderHi, colRed)
+	}
+	if total > maxVis {
+		footR := rect{pop.Left + s(8), pop.Bottom - extraH, pop.Right - s(8), pop.Bottom - s(2)}
+		f.drawText(f.fSmall, f.fmtCent, footR, colTextMuted,
+			fmt.Sprintf("↕ 滚轮切换查看更多 (%d-%d / 共%d个)", a.nodeDropScroll+1, end, total))
 	}
 }
 
@@ -1630,6 +1770,21 @@ func (a *appUI) drawCard(r rect) {
 	rad := a.s(12)
 	a.buf.fillRoundRect(r.Left, r.Top, r.width(), r.height(), rad, colCard)
 	a.buf.strokeRoundRect(r.Left, r.Top, r.width(), r.height(), rad, 1, colBorder)
+}
+
+func (a *appUI) drawRowButton(r rect, id hitKind, idx int, label string, bg, border, textCol uint32) {
+	if a.hoverID == id && a.hoverIdx == idx {
+		bg = lerpColor(bg, 0xFFFFFFFF, 0.10)
+		border = textCol
+	}
+	if a.pressed == id && a.pressedIdx == idx {
+		bg = lerpColor(bg, 0xFF000000, 0.15)
+	}
+	rad := a.s(6)
+	a.buf.fillRoundRect(r.Left, r.Top, r.width(), r.height(), rad, bg)
+	a.buf.strokeRoundRect(r.Left, r.Top, r.width(), r.height(), rad, 1, border)
+	a.fonts.drawText(a.fonts.fSmall, a.fonts.fmtCent, r, textCol, label)
+	a.hits = append(a.hits, hitBox{id: id, idx: idx, rect: r})
 }
 
 func (a *appUI) drawButton(r rect, id hitKind, label string, bg, border, textCol uint32) {

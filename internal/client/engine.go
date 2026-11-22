@@ -66,6 +66,9 @@ type PingSummary struct {
 	Transport string
 }
 
+// ErrSwitchCancelled is returned by SelectNode when superseded by a newer switch, Connect, or Disconnect.
+var ErrSwitchCancelled = errors.New("node switch cancelled")
+
 // Engine coordinates GFT v3 ApexScheduler, CN/Domain Router, SOCKS5 (TCP+UDP),
 // HTTP proxy, and crash-safe Windows system proxy.
 type Engine struct {
@@ -78,8 +81,11 @@ type Engine struct {
 	state           ConnState
 	lastErr         string
 	sched           *gft.ApexScheduler
+	activeSchedLink *gft.Link
 	connectingSched *gft.ApexScheduler
 	connectGen      uint64
+	switchingNode   int
+	switchingName   string
 	paramStore      *gft.ParamStore
 	router          *Router
 	tunnelDNS          *TunnelDNSResolver
@@ -144,6 +150,7 @@ func NewEngine(cfgPath string) (*Engine, error) {
 		ruleDataDir:     ruleDir,
 		proxyBackupPath: backupPath,
 		state:           StateDisconnected,
+		switchingNode:   -1,
 		paramStore:      gft.NewParamStore(gft.DefaultParams()),
 		router:          NewRouterWithDataDir(ruleDir),
 		tunnelDNS:       NewTunnelDNSResolver(),
@@ -496,6 +503,15 @@ func (e *Engine) ImportLink(uri string, switchTo bool) (int, error) {
 	return idx, nil
 }
 
+func sliceIndexLink(nodes []*gft.Link, target *gft.Link) int {
+	for i, n := range nodes {
+		if n == target {
+			return i
+		}
+	}
+	return -1
+}
+
 // SelectNode switches active node losslessly (make-before-break when already connected):
 // the existing tunnel stays up until the new node's handshake succeeds, keeping system proxy
 // untouched and rolling back cleanly to the working node if the new node fails to connect.
@@ -515,19 +531,46 @@ func (e *Engine) SelectNode(idx int) error {
 	oldConnSched := e.connectingSched
 
 	if !wasConnected {
+		e.connectGen++
+		e.connectingSched = nil
+		e.switchingNode = -1
+		e.switchingName = ""
+		if e.state == StateError {
+			e.state = StateDisconnected
+		}
+		e.lastErr = ""
 		e.config.ActiveNode = idx
 		e.config.Link = targetLink
 		if targetLink.Params != nil {
 			e.paramStore.Set(*targetLink.Params)
 		}
 		e.mu.Unlock()
+		if oldConnSched != nil && oldConnSched != activeSched {
+			go oldConnSched.Close()
+		}
 		e.Logf("Switched active node to #%d (%s)", idx+1, targetName)
 		return e.SaveConfig()
 	}
 
-	if idx == e.config.ActiveNode && e.state == StateConnected && activeSched != nil {
+	// Only skip if already connected to the exact same link object AND no pending switch needs cancellation.
+	if idx == e.config.ActiveNode && e.state == StateConnected && activeSched != nil && e.activeSchedLink == targetLink && oldConnSched == nil {
 		e.mu.Unlock()
 		return e.SaveConfig()
+	}
+
+	// Clicking the currently active node while another switch handshake is in flight cancels the pending switch.
+	if idx == e.config.ActiveNode && e.state == StateConnected && activeSched != nil && e.activeSchedLink == targetLink && oldConnSched != nil {
+		e.connectGen++
+		e.connectingSched = nil
+		e.switchingNode = -1
+		e.switchingName = ""
+		e.lastErr = ""
+		e.mu.Unlock()
+		if oldConnSched != activeSched {
+			go oldConnSched.Close()
+		}
+		e.Logf("Cancelled pending node switch; kept #%d (%s) active", idx+1, targetName)
+		return nil
 	}
 
 	targetParams := gft.DefaultParams()
@@ -542,6 +585,9 @@ func (e *Engine) SelectNode(idx int) error {
 	e.connectGen++
 	gen := e.connectGen
 	e.connectingSched = newSched
+	e.switchingNode = idx
+	e.switchingName = targetName
+	e.lastErr = ""
 	e.mu.Unlock()
 
 	if oldConnSched != nil && oldConnSched != activeSched {
@@ -560,14 +606,24 @@ func (e *Engine) SelectNode(idx int) error {
 		if e.connectingSched == newSched {
 			e.connectingSched = nil
 		}
-		keptActive := e.sched != nil && e.connectGen == gen
-		if !keptActive && e.connectGen == gen && activeSched == nil {
-			e.config.ActiveNode = idx
-			e.config.Link = targetLink
+		superseded := e.connectGen != gen || e.state == StateDisconnected
+		if e.connectGen == gen {
+			e.switchingNode = -1
+			e.switchingName = ""
+		}
+		keptActive := !superseded && e.sched != nil
+		if !superseded && !keptActive {
+			if curIdx := sliceIndexLink(e.config.Nodes, targetLink); curIdx >= 0 {
+				e.config.ActiveNode = curIdx
+				e.config.Link = targetLink
+			}
 			e.state = StateError
 			e.lastErr = err.Error()
 		}
 		e.mu.Unlock()
+		if superseded {
+			return ErrSwitchCancelled
+		}
 		if keptActive {
 			e.Logf("Node #%d (%s) handshake failed (%v); kept existing tunnel active", idx+1, targetName, err)
 			return fmt.Errorf("目标节点 %s 连接失败，已保留原节点连接: %w", targetName, err)
@@ -580,18 +636,27 @@ func (e *Engine) SelectNode(idx int) error {
 	if e.connectingSched == newSched {
 		e.connectingSched = nil
 	}
-	if e.connectGen != gen || e.state == StateDisconnected {
+	newIdx := sliceIndexLink(e.config.Nodes, targetLink)
+	if e.connectGen != gen || e.state == StateDisconnected || newIdx < 0 {
+		if e.connectGen == gen {
+			e.switchingNode = -1
+			e.switchingName = ""
+		}
 		e.mu.Unlock()
 		newSched.Close()
-		return errors.New("node switch cancelled")
+		return ErrSwitchCancelled
 	}
 	prevSched := e.sched
 	e.sched = newSched
+	e.activeSchedLink = targetLink
 	e.state = StateConnected
 	e.lastErr = ""
 	e.pingMs = st.RTTMs
-	e.config.ActiveNode = idx
+	e.switchingNode = -1
+	e.switchingName = ""
+	e.config.ActiveNode = newIdx
 	e.config.Link = targetLink
+	e.config.AutoConnect = true
 	if targetLink.Params != nil {
 		e.paramStore.Set(*targetLink.Params)
 	}
@@ -624,11 +689,11 @@ func (e *Engine) SelectNode(idx int) error {
 		}(prevSched)
 	}
 
-	e.Logf("Losslessly switched to #%d (%s) via [%s] (RTT=%dms)", idx+1, targetName, st.Mode, st.RTTMs)
+	e.Logf("Losslessly switched to #%d (%s) via [%s] (RTT=%dms)", newIdx+1, targetName, st.Mode, st.RTTMs)
 	return nil
 }
 
-// DeleteNode deletes a saved node by index.
+// DeleteNode deletes a saved node by index without corrupting ActiveNode ordering.
 func (e *Engine) DeleteNode(idx int) error {
 	e.mu.Lock()
 	if idx < 0 || idx >= len(e.config.Nodes) {
@@ -636,20 +701,38 @@ func (e *Engine) DeleteNode(idx int) error {
 		return errors.New("node index out of range")
 	}
 	wasActive := idx == e.config.ActiveNode
+	var cancelConnSched *gft.ApexScheduler
 	e.config.Nodes = append(e.config.Nodes[:idx], e.config.Nodes[idx+1:]...)
 	if len(e.config.Nodes) == 0 {
 		e.config.ActiveNode = 0
 		e.config.Link = nil
 		e.config.AutoConnect = false
-	} else if e.config.ActiveNode >= len(e.config.Nodes) {
-		e.config.ActiveNode = len(e.config.Nodes) - 1
-		e.config.Link = e.config.Nodes[e.config.ActiveNode]
+		e.switchingNode = -1
+		e.switchingName = ""
 	} else {
+		if idx < e.config.ActiveNode {
+			e.config.ActiveNode--
+		}
+		if e.config.ActiveNode >= len(e.config.Nodes) {
+			e.config.ActiveNode = len(e.config.Nodes) - 1
+		}
 		e.config.Link = e.config.Nodes[e.config.ActiveNode]
+		if e.switchingNode == idx {
+			e.connectGen++
+			e.switchingNode = -1
+			e.switchingName = ""
+			cancelConnSched = e.connectingSched
+			e.connectingSched = nil
+		} else if idx < e.switchingNode {
+			e.switchingNode--
+		}
 	}
 	gen := e.syncRouterNodeHostsLocked()
 	e.mu.Unlock()
 	go e.refreshRouterNodeIPsAsync(gen)
+	if cancelConnSched != nil {
+		go cancelConnSched.Close()
+	}
 	if wasActive {
 		e.Disconnect()
 	}
@@ -676,6 +759,9 @@ func (e *Engine) RenameNode(idx int, remark string) error {
 	}
 	if idx == e.config.ActiveNode && e.config.Link != nil {
 		e.config.Link.Remark = clean
+	}
+	if idx == e.switchingNode {
+		e.switchingName = clean
 	}
 	e.mu.Unlock()
 	e.Logf("Renamed node #%d -> %s", idx+1, clean)
@@ -1406,6 +1492,7 @@ func (e *Engine) Connect() error {
 		return nil
 	}
 	e.sched = sched
+	e.activeSchedLink = l
 	e.state = StateConnected
 	e.lastErr = ""
 	e.pingMs = st.RTTMs
@@ -1447,10 +1534,13 @@ func (e *Engine) Disconnect() {
 	}
 	e.state = StateDisconnected
 	e.connectGen++
+	e.switchingNode = -1
+	e.switchingName = ""
 	connSched := e.connectingSched
 	e.connectingSched = nil
 	sched := e.sched
 	e.sched = nil
+	e.activeSchedLink = nil
 	wasApplied := e.sysProxyApplied
 	e.sysProxyApplied = false
 	e.mu.Unlock()
@@ -1735,6 +1825,8 @@ func (e *Engine) Status() map[string]any {
 	socksAddr := e.config.SocksAddr
 	httpAddr := e.config.HTTPAddr
 	activeIdx := e.config.ActiveNode
+	switchingNode := e.switchingNode
+	switchingName := e.switchingName
 	histCopy := make([]TrafficPoint, len(e.history))
 	copy(histCopy, e.history)
 
@@ -1815,6 +1907,8 @@ func (e *Engine) Status() map[string]any {
 		"version":          Version,
 		"state":            string(state),
 		"last_err":         lastErr,
+		"switching_node":   switchingNode,
+		"switching_name":   switchingName,
 		"active_transport": activeMode,
 		"transport_pref":   tPref,
 		"route_mode":       string(routeMode),

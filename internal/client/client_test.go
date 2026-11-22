@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -891,5 +892,116 @@ func TestTencentACEAndLoLCNDirectWhitelist(t *testing.T) {
 			t.Fatalf("expected %s to match curated direct:cn-game statically, got act=%v reason=%q unknown=%v",
 				d, act, reason, unknown)
 		}
+	}
+}
+
+func TestDeleteNodePreservesActiveIndexAndSwitchCancellation(t *testing.T) {
+	SetNoSysProxy(true)
+	uri0, stop0 := startLocalTestServerForClient(t, "NodeZero")
+	defer stop0()
+	uri1, stop1 := startLocalTestServerForClient(t, "NodeOne")
+	defer stop1()
+	uri2, stop2 := startLocalTestServerForClient(t, "NodeTwo")
+	defer stop2()
+	uri3, stop3 := startLocalTestServerForClient(t, "NodeThree")
+	defer stop3()
+
+	// Unreachable port for slow/cancelled handshake simulation.
+	deadLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadPort := deadLn.Addr().(*net.TCPAddr).Port
+	_ = deadLn.Close()
+	deadLink, err := gft.ParseLink(uri0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadLink.Port = deadPort
+	deadLink.Remark = "SlowDead"
+	uriDead := deadLink.Encode()
+
+	eng, err := NewEngine(filepath.Join(t.TempDir(), "client.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	if _, err := eng.ImportLink(uri0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.ImportLink(uri1, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.ImportLink(uri2, true); err != nil { // ActiveNode = 2 (NodeTwo)
+		t.Fatal(err)
+	}
+	if _, err := eng.ImportLink(uri3, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.ImportLink(uriDead, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetRouteMode(RouteCore); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Connect(); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+
+	// 1. Deleting node #0 BEFORE active #2 must shift ActiveNode -> 1 (still NodeTwo) without dropping tunnel.
+	if err := eng.DeleteNode(0); err != nil {
+		t.Fatalf("DeleteNode(0) failed: %v", err)
+	}
+	st := eng.Status()
+	if !eng.IsConnected() || st["active_node"] != 1 || st["node_name"] != "NodeTwo" {
+		t.Fatalf("expected active_node=1 (NodeTwo) stayed connected after DeleteNode(0), got %+v", st)
+	}
+
+	// 2. Re-importing same active node with updated HopRange while connected and calling SelectNode(1)
+	// must trigger a live hot-swap onto the updated link rather than returning early as a no-op.
+	updLink, _ := gft.ParseLink(uri2)
+	updLink.HopRange = "40000-40100"
+	updLink.Remark = "NodeTwo-Hop"
+	idxUpd, err := eng.ImportLink(updLink.Encode(), true)
+	if err != nil || idxUpd != 1 {
+		t.Fatalf("ImportLink update failed: idx=%d err=%v", idxUpd, err)
+	}
+	if err := eng.SelectNode(1); err != nil {
+		t.Fatalf("SelectNode on updated active link failed: %v", err)
+	}
+	stUpd := eng.Status()
+	if stUpd["node_name"] != "NodeTwo-Hop" || stUpd["hop_range"] != "40000-40100" {
+		t.Fatalf("expected updated link applied, got name=%v hop=%v", stUpd["node_name"], stUpd["hop_range"])
+	}
+
+	// 3. Rapid concurrent switch to dead node #3, superseded immediately by valid node #0 (NodeOne) ->
+	// slow attempt #3 must return ErrSwitchCancelled while #0 succeeds.
+	deadErrCh := make(chan error, 1)
+	go func() {
+		deadErrCh <- eng.SelectNode(3)
+	}()
+	// Wait briefly until switching_node=3 is visible.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if eng.Status()["switching_node"] == 3 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := eng.SelectNode(0); err != nil {
+		t.Fatalf("SelectNode(0) superseding dead switch failed: %v", err)
+	}
+	select {
+	case derr := <-deadErrCh:
+		if !errors.Is(derr, ErrSwitchCancelled) {
+			t.Fatalf("expected ErrSwitchCancelled for superseded switch, got %v", derr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("superseded SelectNode did not return promptly")
+	}
+	stAfter := eng.Status()
+	if !eng.IsConnected() || stAfter["active_node"] != 0 || stAfter["node_name"] != "NodeOne" || stAfter["switching_node"] != -1 {
+		t.Fatalf("unexpected state after superseding switch: %+v", stAfter)
 	}
 }

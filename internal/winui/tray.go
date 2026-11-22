@@ -3,6 +3,7 @@
 package winui
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"runtime"
@@ -435,6 +436,9 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 				onToast("正在无损切换节点...", false)
 			}
 			if err := eng.SelectNode(i); err != nil {
+				if errors.Is(err, client.ErrSwitchCancelled) {
+					return
+				}
 				onToast("切换节点失败: "+err.Error(), true)
 			} else if wasUp {
 				onToast("已无损切换节点", false)
