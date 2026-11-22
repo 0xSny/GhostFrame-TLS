@@ -7,11 +7,12 @@ import (
 )
 
 const (
-	ccInitialAutoBps   = 12_000_000.0 / 8.0  // 12 Mbps initial Auto-Probe floor (ramps fast over 170ms links)
-	ccMinRateBps       = 256_000.0 / 8.0     // 256 Kbps absolute floor
-	ccClientMaxAutoBps = 60_000_000.0 / 8.0  // 60 Mbps client Auto-Probe uplink cap (prevents broadband policing amplification)
-	ccMaxAutoBps       = 600_000_000.0 / 8.0 // 600 Mbps server downlink Auto-Probe sanity cap
-	ccPolicingLossWall = 0.10                // >10% loss under Auto-Probe signals physical uplink/policing ceiling
+	ccInitialAutoBps       = 12_000_000.0 / 8.0  // 12 Mbps initial client Auto-Probe floor
+	ccServerInitialAutoBps = 24_000_000.0 / 8.0  // 24 Mbps initial server downlink Auto-Probe floor (faster high-BDP warmup)
+	ccMinRateBps           = 256_000.0 / 8.0     // 256 Kbps absolute floor
+	ccClientMaxAutoBps     = 60_000_000.0 / 8.0  // 60 Mbps client Auto-Probe uplink cap (prevents broadband policing amplification)
+	ccMaxAutoBps           = 600_000_000.0 / 8.0 // 600 Mbps server downlink Auto-Probe sanity cap
+	ccPolicingLossWall     = 0.10                // >10% loss under client Auto-Probe signals physical uplink policing ceiling
 )
 
 type ccState uint8
@@ -39,6 +40,7 @@ type SmartBrutalCC struct {
 	lastRoundAt   time.Time
 	lastBackoffAt time.Time
 	rttRounds     int
+	highRhoRounds int
 
 	roundBytes   int64
 	roundStart   time.Time
@@ -60,11 +62,15 @@ func NewSmartBrutalCC(targetMbps int) *SmartBrutalCC {
 // NewSmartBrutalCCForRole creates a Smart-Brutal controller tailored for client uplink or server downlink.
 func NewSmartBrutalCCForRole(targetMbps int, isClient bool) *SmartBrutalCC {
 	now := time.Now()
+	initBps := ccInitialAutoBps
+	if !isClient {
+		initBps = ccServerInitialAutoBps
+	}
 	c := &SmartBrutalCC{
 		isClient:    isClient,
 		state:       ccSlowStart,
-		baseRate:    ccInitialAutoBps,
-		bEst:        ccInitialAutoBps,
+		baseRate:    initBps,
+		bEst:        initBps,
 		lastRho:     1.0,
 		lastRoundAt: now,
 		roundStart:  now,
@@ -205,12 +211,16 @@ func (c *SmartBrutalCC) OnFeedback(ackedBytes int, lossRate float64, srtt, minRT
 	elapsedSec := now.Sub(c.roundStart).Seconds()
 	var deliveryBps float64
 	if elapsedSec > 0 && c.roundBytes > 0 {
-		if lossRate > ccPolicingLossWall {
-			// Above 10% loss in Auto-Probe, measure actual goodput only without 1/(1-loss) amplification.
+		if c.isClient && lossRate > ccPolicingLossWall {
+			// Above 10% loss in client Auto-Probe, measure actual goodput only without 1/(1-loss) amplification.
 			deliveryBps = float64(c.roundBytes) / elapsedSec
 		} else {
-			// Reconstruct pre-loss send capacity smoothly up to 10% loss.
-			deliveryBps = (float64(c.roundBytes) / elapsedSec) / (1.0 - lossRate)
+			// Reconstruct pre-loss send capacity smoothly up to 45% loss (server tolerates cross-border random QoS drops).
+			lossCap := lossRate
+			if lossCap > 0.45 {
+				lossCap = 0.45
+			}
+			deliveryBps = (float64(c.roundBytes) / elapsedSec) / (1.0 - lossCap)
 		}
 		if deliveryBps > c.peakDelivery {
 			c.peakDelivery = deliveryBps
@@ -222,13 +232,14 @@ func (c *SmartBrutalCC) OnFeedback(ackedBytes int, lossRate float64, srtt, minRT
 
 	maxAuto := c.maxAutoBpsLocked()
 
-	// Tail drops >10% during Auto-Probe indicate physical uplink/policing pressure -> exit SlowStart & back off 0.75x.
-	if lossRate > ccPolicingLossWall {
+	// Tail drops >10% during client Auto-Probe indicate physical home-broadband uplink policing -> exit SlowStart & back off 0.75x.
+	if c.isClient && lossRate > ccPolicingLossWall {
 		inSlowOrProbe := c.state == ccSlowStart || c.state == ccProbeUp
 		severePolicing := lossRate > 0.25
 		shouldBackoff := inSlowOrProbe || (severePolicing && now.Sub(c.lastBackoffAt) >= roundDur*4)
 		c.state = ccCruise
 		c.rttRounds = 0
+		c.highRhoRounds = 0
 		if shouldBackoff {
 			c.bEst *= 0.75
 			if c.bEst < ccMinRateBps {
@@ -253,7 +264,18 @@ func (c *SmartBrutalCC) OnFeedback(ackedBytes int, lossRate float64, srtt, minRT
 
 	switch c.state {
 	case ccSlowStart:
-		if rho > 1.30 && queueDelta >= 12*time.Millisecond {
+		needSlowExit := rho > 1.30 && queueDelta >= 12*time.Millisecond
+		if !c.isClient {
+			// Server downlink requires 2 consecutive elevated-RTT rounds (or strong >1.45 rho) so transient jitter doesn't stall SlowStart.
+			if rho > 1.35 && queueDelta >= 15*time.Millisecond {
+				c.highRhoRounds++
+			} else {
+				c.highRhoRounds = 0
+			}
+			needSlowExit = (rho > 1.45 && queueDelta >= 22*time.Millisecond) || c.highRhoRounds >= 2
+		}
+		if needSlowExit {
+			c.highRhoRounds = 0
 			est := deliveryBps
 			if est < c.baseRate*0.85 {
 				est = c.baseRate * 0.85
@@ -266,9 +288,15 @@ func (c *SmartBrutalCC) OnFeedback(ackedBytes int, lossRate float64, srtt, minRT
 			c.state = ccCruise
 			c.rttRounds = 0
 		} else {
-			// Only ramp +35% when actual delivery approached at least 25% of baseRate (avoid idle runaway)
-			if deliveryBps >= c.baseRate*0.25 || (deliveryBps == 0 && c.baseRate <= ccInitialAutoBps*1.4) {
-				c.baseRate *= 1.35
+			// Only ramp when actual delivery approached at least 25% of baseRate (avoid idle runaway)
+			initFloor := ccInitialAutoBps
+			rampMul := 1.35
+			if !c.isClient {
+				initFloor = ccServerInitialAutoBps
+				rampMul = 1.45
+			}
+			if deliveryBps >= c.baseRate*0.25 || (deliveryBps == 0 && c.baseRate <= initFloor*1.4) {
+				c.baseRate *= rampMul
 				if c.baseRate > maxAuto {
 					c.baseRate = maxAuto
 				}
@@ -291,10 +319,16 @@ func (c *SmartBrutalCC) OnFeedback(ackedBytes int, lossRate float64, srtt, minRT
 			c.bEst = deliveryBps
 		}
 		c.baseRate = 0.95 * c.bEst
-		if c.rttRounds >= 8 {
+		probeInterval := 8
+		probeGain := 1.15
+		if !c.isClient {
+			probeInterval = 4
+			probeGain = 1.20
+		}
+		if c.rttRounds >= probeInterval {
 			c.rttRounds = 0
 			c.state = ccProbeUp
-			c.baseRate = 1.15 * c.bEst
+			c.baseRate = probeGain * c.bEst
 			if c.baseRate > maxAuto {
 				c.baseRate = maxAuto
 			}
@@ -317,8 +351,8 @@ func (c *SmartBrutalCC) effectiveRateLocked() float64 {
 	if rate < ccMinRateBps {
 		rate = ccMinRateBps
 	}
-	// Never apply 1/(1-loss) upward acceleration when Auto-Probe exceeds the 10% physical policing threshold.
-	if c.lastRho <= 1.35 && !(c.targetBps == 0 && c.lastLossRate > ccPolicingLossWall) {
+	// Never apply 1/(1-loss) upward acceleration when client Auto-Probe exceeds the 10% physical uplink policing threshold.
+	if c.lastRho <= 1.35 && !(c.isClient && c.targetBps == 0 && c.lastLossRate > ccPolicingLossWall) {
 		lossCap := c.lastLossRate
 		if lossCap > 0.45 {
 			lossCap = 0.45
@@ -337,10 +371,17 @@ func (c *SmartBrutalCC) effectiveRateLocked() float64 {
 func (c *SmartBrutalCC) refillFrameSliceLocked(now time.Time) {
 	rate := c.effectiveRateLocked()
 	slice := randomFrameSlice()
+	// Recover tiny OS timer wakeup jitter (1-4ms) during continuous saturation without granting idle burst debt.
+	effSlice := slice
+	if !c.sliceNextAt.IsZero() {
+		if late := now.Sub(c.sliceNextAt); late > 0 && late <= slice {
+			effSlice += late
+		}
+	}
 	c.sliceDur = slice
 	c.sliceNextAt = now.Add(slice)
 	c.frameOuterCap = MinUDPPayloadJitter + mrand.IntN(MaxUDPPayload-MinUDPPayloadJitter+1)
-	grant := rate * slice.Seconds()
+	grant := rate * effSlice.Seconds()
 	if grant < float64(MaxUDPPayload*2) {
 		grant = float64(MaxUDPPayload * 2)
 	}
@@ -377,6 +418,7 @@ func (c *SmartBrutalCC) ResetOnWake(now time.Time) {
 	c.lastRho = 1.0
 	c.lastLossRate = 0
 	c.rttRounds = 0
+	c.highRhoRounds = 0
 	c.roundBytes = 0
 	c.roundStart = now
 	c.lastRoundAt = now

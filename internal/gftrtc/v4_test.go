@@ -1035,6 +1035,17 @@ func TestClientAutoProbeCapPolicingWallAndExplicitUnlimited(t *testing.T) {
 	if afterMbps >= beforeMbps*0.80 {
 		t.Fatalf("expected 0.75x backoff with ZERO 1/(1-loss) boost: before=%.2f Mbps, after=%.2f Mbps", beforeMbps, afterMbps)
 	}
+
+	// 5. Server Auto-Probe (isClient=false) MUST NOT slash downlink under cross-border random loss with flat RTT (rho<=1.35):
+	// it must preserve Zone A 1/(1-loss) compensation so server->client throughput isn't starved!
+	srvLossyCC := NewSmartBrutalCCForRole(0, false)
+	srvLossyCC.OnFeedback(250_000, 0.0, 100*time.Millisecond, 100*time.Millisecond, 0, now.Add(110*time.Millisecond))
+	srvBefore := srvLossyCC.PacingMbps()
+	srvLossyCC.OnFeedback(250_000, 0.15, 101*time.Millisecond, 100*time.Millisecond, 0, now.Add(220*time.Millisecond))
+	srvAfter := srvLossyCC.PacingMbps()
+	if srvAfter <= srvBefore {
+		t.Fatalf("expected server Auto-Probe under 15%% flat-RTT loss to compensate/ramp upward, got before=%.2f after=%.2f", srvBefore, srvAfter)
+	}
 }
 
 func TestClientSendBacklogCap8MBPreservesServer32MB(t *testing.T) {

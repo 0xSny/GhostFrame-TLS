@@ -262,9 +262,10 @@ apply_hop_firewall() {
   elif command -v iptables >/dev/null 2>&1; then
     iptables -t nat -D PREROUTING -j GFT_HOP >/dev/null 2>&1 || true
     iptables -t nat -D PREROUTING -p udp -j GFT_HOP >/dev/null 2>&1 || true
+    iptables -t nat -D PREROUTING -j KSL_HOP >/dev/null 2>&1 || true
     iptables -t nat -N KSL_HOP >/dev/null 2>&1 || true
     iptables -t nat -F KSL_HOP
-    iptables -t nat -C PREROUTING -j KSL_HOP >/dev/null 2>&1 || iptables -t nat -A PREROUTING -j KSL_HOP
+    iptables -t nat -C PREROUTING -p udp -j KSL_HOP >/dev/null 2>&1 || iptables -t nat -A PREROUTING -p udp -j KSL_HOP
     if (( ${#exempt_ports[@]} > 0 )); then
       local i=0 chunk=""
       for p in "${exempt_ports[@]}"; do
@@ -371,6 +372,66 @@ install_server() {
   pkill -x gft-server >/dev/null 2>&1 || true
   sleep 0.5
 
+  cat > /usr/local/bin/ksl-hop-sync <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+CFG="/etc/kestrel/server.json"
+[[ -f "$CFG" ]] || exit 0
+RANGE="$(sed -n 's/.*"hop_range"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CFG" | head -n1 || true)"
+DST="$(sed -n 's/.*"listen"[[:space:]]*:[[:space:]]*":\([0-9][0-9]*\)".*/\1/p' "$CFG" | head -n1 || true)"
+DST="${DST:-443}"
+if [[ -z "$RANGE" ]]; then
+  command -v nft >/dev/null 2>&1 && nft delete table inet ksl_hop >/dev/null 2>&1 || true
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -t nat -D PREROUTING -j KSL_HOP >/dev/null 2>&1 || true
+    iptables -t nat -D PREROUTING -p udp -j KSL_HOP >/dev/null 2>&1 || true
+    iptables -t nat -F KSL_HOP >/dev/null 2>&1 || true
+    iptables -t nat -X KSL_HOP >/dev/null 2>&1 || true
+  fi
+  exit 0
+fi
+LO="${RANGE%-*}"; HI="${RANGE#*-}"
+EXEMPT=()
+if command -v ss >/dev/null 2>&1; then
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    if (( p >= LO && p <= HI && p != DST )); then EXEMPT+=("$p"); fi
+  done < <(ss -ulnp 2>/dev/null | grep -vE 'kestrel-server|gft-server' | awk 'NR>1 {print $4}' | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | sort -nu)
+fi
+if command -v nft >/dev/null 2>&1; then
+  nft delete table inet gft_hop >/dev/null 2>&1 || true
+  nft delete table inet ksl_hop >/dev/null 2>&1 || true
+  {
+    echo "add table inet ksl_hop"
+    echo "add chain inet ksl_hop prerouting { type nat hook prerouting priority dstnat; policy accept; }"
+    if (( ${#EXEMPT[@]} > 0 )); then
+      PSET=$(IFS=,; echo "${EXEMPT[*]}")
+      echo "add rule inet ksl_hop prerouting udp dport { ${PSET} } return"
+    fi
+    echo "add rule inet ksl_hop prerouting udp dport ${LO}-${HI} redirect to :${DST}"
+  } | nft -f -
+elif command -v iptables >/dev/null 2>&1; then
+  iptables -t nat -D PREROUTING -j GFT_HOP >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -p udp -j GFT_HOP >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -j KSL_HOP >/dev/null 2>&1 || true
+  iptables -t nat -N KSL_HOP >/dev/null 2>&1 || true
+  iptables -t nat -F KSL_HOP
+  iptables -t nat -C PREROUTING -p udp -j KSL_HOP >/dev/null 2>&1 || iptables -t nat -A PREROUTING -p udp -j KSL_HOP
+  if (( ${#EXEMPT[@]} > 0 )); then
+    i=0; chunk=""
+    for p in "${EXEMPT[@]}"; do
+      chunk="${chunk:+${chunk},}${p}"; i=$((i+1))
+      if (( i % 15 == 0 )); then
+        iptables -t nat -A KSL_HOP -p udp -m multiport --dports "${chunk}" -j RETURN; chunk=""
+      fi
+    done
+    [[ -n "$chunk" ]] && iptables -t nat -A KSL_HOP -p udp -m multiport --dports "${chunk}" -j RETURN
+  fi
+  iptables -t nat -A KSL_HOP -p udp --dport "${LO}:${HI}" -j REDIRECT --to-ports "${DST}"
+fi
+EOF
+  chmod 0755 /usr/local/bin/ksl-hop-sync
+
   cat > /etc/systemd/system/kestrel.service <<'EOF'
 [Unit]
 Description=Kestrel (Kestrel-RTC) v4.0 LTS Dual-Stack Server
@@ -381,6 +442,7 @@ Wants=network-online.target
 Type=simple
 User=gft
 Group=gft
+ExecStartPre=+/usr/local/bin/ksl-hop-sync
 ExecStart=/opt/kestrel/kestrel-server run -config /etc/kestrel/server.json
 Restart=always
 RestartSec=2s
