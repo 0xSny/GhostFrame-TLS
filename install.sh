@@ -6,7 +6,9 @@ REPO="Spittingjiu/Ghost"
 ROLE="server"
 UNATTENDED=0
 LISTEN_PORT=443
+DEFAULT_HOP_RANGE="40000-65000"
 HOP_RANGE=""
+HOP_EXPLICIT=0
 SNI_OVERRIDE=""
 CLIENT_LINK=""
 SOCKS_ADDR="127.0.0.1:10808"
@@ -30,7 +32,7 @@ Options:
   --role <server|client>   Install server + `ksl` TUI or `kestrel-core` client daemon (default: server)
   --unattended             Non-interactive server deployment
   --port <1-65535>         Server main TCP/RTC listen port (default: 443)
-  --hop <min-max>          Server UDP port hopping range (e.g. 20000-30000)
+  --hop <min-max|none>     Server UDP port hopping range (default: 40000-65000; pass 'none' to disable)
   --sni <domain>           Override auto-selected non-CDN camouflage SNI
   --link <ksl4://...>      Client ksl4:// URI (or legacy gft3://) for --role client
   --socks <addr:port>      Client SOCKS5 listen address (default: 127.0.0.1:10808)
@@ -46,7 +48,7 @@ while [[ $# -gt 0 ]]; do
     --role)       ROLE="$2"; shift 2 ;;
     --unattended) UNATTENDED=1; shift ;;
     --port)       LISTEN_PORT="$2"; shift 2 ;;
-    --hop)        HOP_RANGE="$2"; shift 2 ;;
+    --hop)        if [[ "${2:-}" == "none" || "${2:-}" == "off" ]]; then HOP_RANGE=""; else HOP_RANGE="$2"; fi; HOP_EXPLICIT=1; shift 2 ;;
     --sni)        SNI_OVERRIDE="$2"; shift 2 ;;
     --link)       CLIENT_LINK="$2"; shift 2 ;;
     --socks)      SOCKS_ADDR="$2"; shift 2 ;;
@@ -320,7 +322,7 @@ install_server() {
 
   if [[ -f /etc/kestrel/server.json ]]; then
     log "Preserving existing /etc/kestrel/server.json (lossless binary upgrade)."
-    if [[ -z "$HOP_RANGE" ]]; then
+    if [[ "$HOP_EXPLICIT" -eq 0 ]]; then
       local existing_hop
       existing_hop="$(sed -n 's/.*"hop_range"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/kestrel/server.json | head -n1 || true)"
       if [[ -n "$existing_hop" ]]; then
@@ -335,6 +337,10 @@ install_server() {
     fi
   else
     check_port_and_guide
+    if [[ "$HOP_EXPLICIT" -eq 0 ]]; then
+      HOP_RANGE="$DEFAULT_HOP_RANGE"
+      log "Enabling default UDP port hopping range: ${HOP_RANGE}"
+    fi
     local init_args=(init --conf-dir /etc/kestrel --state-dir /var/lib/kestrel --listen ":${LISTEN_PORT}")
     if [[ -n "$SNI_OVERRIDE" ]]; then
       init_args+=(--sni "$SNI_OVERRIDE")
