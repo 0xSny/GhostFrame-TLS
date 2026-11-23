@@ -29,7 +29,7 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Build Server, Core CLI, Windows GUI & 0Ghost Side-Router
+      - name: Build Server, Windows GUI & 0Ghost Side-Router
         env:
           INPUT_TAG: ${{ inputs.tag }}
           REF_NAME: ${{ github.ref_name }}
@@ -53,8 +53,6 @@ jobs:
 
           GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kestrel-server-linux-amd64 ./cmd/gft-server
           GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kestrel-server-linux-arm64 ./cmd/gft-server
-          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kestrel-core-linux-amd64   ./cmd/gft-core
-          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kestrel-core-linux-arm64   ./cmd/gft-core
           GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H=windowsgui ${VER_X}" -o dist/Kestrel-Pro-windows-amd64.exe ./cmd/gft-client-gui
           GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kbox-linux-amd64     ./cmd/0ghost
           GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kbox-linux-arm64     ./cmd/0ghost
@@ -338,7 +336,7 @@ jobs:
             gh release create "$RELEASE_TAG" release-out/* \
               --repo Spittingjiu/Ghost \
               --title "Kestrel ${RELEASE_TAG} (All Platforms)" \
-              --notes "Automated pure-binary multi-platform release (${RELEASE_TAG}). Includes Kestrel Server/Core, Kestrel Pro (Windows), KestrelBox (iStoreOS arm64/amd64), Kestrel Duo & Kestrel Air (iOS), OmniSign source.json, and sha256 checksums."
+              --notes "Automated pure-binary multi-platform release (${RELEASE_TAG}). Includes Kestrel Server, Kestrel Pro (Windows), KestrelBox (iStoreOS arm64/amd64), Kestrel Duo & Kestrel Air (iOS), OmniSign source.json, and sha256 checksums."
           fi
 
       - name: Fallback Release on Current Repository (when DIST_PUSH_TOKEN not set)
