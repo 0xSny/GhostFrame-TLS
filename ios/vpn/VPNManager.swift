@@ -254,7 +254,7 @@ final class VPNManager: GhostBackend {
         let neStatus = Self.statusName(manager?.connection.status ?? .invalid)
         let lastErr = lastDisconnectErrorText.isEmpty ? "none" : lastDisconnectErrorText
         return """
-        Kestrel Duo App Diagnostic (v4.0-LTS)
+        Kestrel Duo App Diagnostic (\(GhostStatusSnapshot.bundleVersionLabel))
         MainBundleID: \(mainID)
         ResolvedExtensionBundleID: \(detectedExtensionBundleID)
         TunnelState: \(backendStateLabel) (NEStatus=\(neStatus))

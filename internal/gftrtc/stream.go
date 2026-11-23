@@ -23,8 +23,10 @@ const (
 	FrameUDPClose    byte = 0x08
 	FramePing        byte = 0x09
 	FramePong        byte = 0x0A
-	FrameRekey       byte = 0x0B
-	FrameSessionWin  byte = 0x0C
+	FrameRekey          byte = 0x0B
+	FrameSessionWin     byte = 0x0C
+	FrameStreamRSTFinal byte = 0x0D
+	FrameDataBlocked    byte = 0x0E
 )
 
 const (
@@ -188,6 +190,21 @@ func encodeFrameSessionWin(maxBytes uint64) []byte {
 	return b
 }
 
+func encodeFrameStreamRSTFinal(streamID uint32, finalWireBytes uint64) []byte {
+	b := make([]byte, 13)
+	b[0] = FrameStreamRSTFinal
+	binary.BigEndian.PutUint32(b[1:5], streamID)
+	binary.BigEndian.PutUint64(b[5:13], finalWireBytes)
+	return b
+}
+
+func encodeFrameDataBlocked(blockedAtBytes uint64) []byte {
+	b := make([]byte, 9)
+	b[0] = FrameDataBlocked
+	binary.BigEndian.PutUint64(b[1:9], blockedAtBytes)
+	return b
+}
+
 type queuedSendChunk struct {
 	seq     uint32
 	frame   []byte
@@ -210,26 +227,31 @@ type RTCStream struct {
 	wcond *sync.Cond
 
 	// Receive / reassembly state (completely independent from other streams)
-	nextReadSeq    uint32
-	reorderBuf     map[uint32][]byte
-	reorderBytes   int
-	readyBuf       []byte
-	readyOff       int
-	hasFIN         bool
-	finSeq         uint32
-	rEOF           bool
-	curWinBytes    int
-	consumedBytes  int
-	winConsumed    int
-	lastWinCheck   int64
-	lastSentMaxSeq uint32
+	createdAt        time.Time
+	nextReadSeq      uint32
+	reorderBuf       map[uint32][]byte
+	reorderBytes     int
+	readyBuf         []byte
+	readyOff         int
+	hasFIN           bool
+	finSeq           uint32
+	rEOF             bool
+	finalReconciled  bool
+	curWinBytes      int
+	consumedBytes    int
+	winConsumed      int
+	rxAccountedBytes int64
+	lastWinCheck     int64
+	lastSentMaxSeq   uint32
 
 	// Transmit / flow control state
 	nextSendSeq uint32
+	txWireBytes uint64
 	peerMaxSeq  uint32
 	sendQ       []queuedSendChunk
 	finQueued   bool
 	wClosed     bool
+	resetSent   bool
 	aborted     error
 	writeDone   atomic.Bool
 	closeOnce   sync.Once
@@ -246,6 +268,7 @@ func newRTCStream(sess *RTCSession, id uint32, target string) *RTCStream {
 		sess:           sess,
 		id:             id,
 		target:         target,
+		createdAt:      time.Now(),
 		reorderBuf:     make(map[uint32][]byte, 16),
 		curWinBytes:    initWin,
 		lastWinCheck:   time.Now().UnixNano(),
@@ -282,10 +305,14 @@ func (s *RTCStream) deliverChunk(seq uint32, data []byte) {
 	}
 	if s.aborted != nil || s.rEOF || (s.hasFIN && seq >= s.finSeq) {
 		_, dup := s.reorderBuf[seq]
-		s.mu.Unlock()
-		if !dup && len(data) > 0 && s.sess.closedIDs.markChunkAccounted(s.id, seq) {
+		reconciled := s.finalReconciled
+		if !reconciled && !dup && len(data) > 0 && !s.sess.closedIDs.isFinalReconciled(s.id) && s.sess.closedIDs.markChunkAccounted(s.id, seq) {
+			s.rxAccountedBytes += int64(len(data))
+			s.mu.Unlock()
 			s.sess.onStreamBytesConsumed(len(data))
+			return
 		}
+		s.mu.Unlock()
 		return
 	}
 	if len(data) > 0 {
@@ -363,6 +390,7 @@ func (s *RTCStream) collectAccountedSeqsLocked() (uint32, []uint32) {
 func (s *RTCStream) deliverFIN(finalSeq uint32) {
 	var baseSeq uint32
 	var extraSeqs []uint32
+	var rxAcc int64
 	s.mu.Lock()
 	if !s.hasFIN {
 		s.hasFIN = true
@@ -374,16 +402,73 @@ func (s *RTCStream) deliverFIN(finalSeq uint32) {
 	bothDone := s.rEOF && s.wClosed && len(s.sendQ) == 0 && !s.finQueued
 	if bothDone {
 		baseSeq, extraSeqs = s.collectAccountedSeqsLocked()
+		rxAcc = s.rxAccountedBytes
 	}
 	s.rcond.Broadcast()
 	s.mu.Unlock()
 	if bothDone {
-		s.sess.removeStreamWithSeqs(s.id, baseSeq, extraSeqs)
+		s.sess.removeStreamWithAcct(s.id, baseSeq, extraSeqs, rxAcc, false)
 	}
 }
 
 func (s *RTCStream) deliverRST() {
 	s.abort(ErrStreamReset, false)
+}
+
+func (s *RTCStream) deliverRSTFinal(finalWireBytes uint64) {
+	s.writeDone.Store(true)
+	s.mu.Lock()
+	if s.finalReconciled {
+		s.mu.Unlock()
+		return
+	}
+	s.finalReconciled = true
+	if s.aborted == nil {
+		s.aborted = ErrStreamReset
+	}
+	s.rEOF = true
+	s.wClosed = true
+	discardQueued := 0
+	for i := range s.sendQ {
+		discardQueued += s.sendQ[i].dataLen
+	}
+	s.sendQ = nil
+	s.finQueued = false
+	needPrune := !s.resetSent && s.txWireBytes > 0
+	if needPrune {
+		s.resetSent = true
+	}
+	baseSeq, extraSeqs := s.collectAccountedSeqsLocked()
+	unread := (len(s.readyBuf) - s.readyOff) + s.reorderBytes
+	s.readyBuf = nil
+	s.readyOff = 0
+	s.reorderBuf = nil
+	s.reorderBytes = 0
+
+	delta := int64(finalWireBytes) - s.rxAccountedBytes
+	if delta < 0 {
+		delta = 0
+	}
+	s.rxAccountedBytes += delta
+	rxAcc := s.rxAccountedBytes
+	s.rcond.Broadcast()
+	s.wcond.Broadcast()
+	s.mu.Unlock()
+
+	if discardQueued > 0 {
+		s.sess.releaseQueuedTxBytes(discardQueued)
+	}
+	if needPrune {
+		s.sess.pruneStreamRetransmits(s.id)
+	}
+	if unread > 0 || delta > 0 {
+		s.sess.accountStreamWindow(unread, int(delta))
+	}
+	s.sess.winCond.Broadcast()
+	if s.closed.CompareAndSwap(false, true) {
+		s.sess.decStreams()
+	}
+	s.sess.removeStreamWithAcct(s.id, baseSeq, extraSeqs, rxAcc, true)
 }
 
 func (s *RTCStream) updatePeerMaxSeq(maxAllowed uint32) {
@@ -411,12 +496,22 @@ func (s *RTCStream) abort(err error, sendRST bool) {
 	}
 	s.sendQ = nil
 	s.finQueued = false
+	emitRST := sendRST && !s.resetSent
+	if emitRST {
+		s.resetSent = true
+	}
+	finalWire := s.txWireBytes
 	baseSeq, extraSeqs := s.collectAccountedSeqsLocked()
 	unread := (len(s.readyBuf) - s.readyOff) + s.reorderBytes
 	s.readyBuf = nil
 	s.readyOff = 0
 	s.reorderBuf = nil
 	s.reorderBytes = 0
+	if unread > 0 {
+		s.rxAccountedBytes += int64(unread)
+	}
+	rxAcc := s.rxAccountedBytes
+	reconciled := s.finalReconciled
 	s.rcond.Broadcast()
 	s.wcond.Broadcast()
 	s.mu.Unlock()
@@ -428,13 +523,18 @@ func (s *RTCStream) abort(err error, sendRST bool) {
 		s.sess.onStreamBytesConsumed(unread)
 	}
 	s.sess.winCond.Broadcast()
-	if sendRST {
-		s.sess.enqueueReliableFrame(encodeFrameStreamRST(s.id))
+	if emitRST {
+		s.sess.pruneStreamRetransmits(s.id)
+		if s.sess.flowAcctV2.Load() {
+			s.sess.enqueueReliableFrame(encodeFrameStreamRSTFinal(s.id, finalWire))
+		} else {
+			s.sess.enqueueReliableFrame(encodeFrameStreamRST(s.id))
+		}
 	}
 	if s.closed.CompareAndSwap(false, true) {
 		s.sess.decStreams()
 	}
-	s.sess.removeStreamWithSeqs(s.id, baseSeq, extraSeqs)
+	s.sess.removeStreamWithAcct(s.id, baseSeq, extraSeqs, rxAcc, reconciled)
 }
 
 // Read reads contiguous in-order stream bytes.
@@ -469,6 +569,9 @@ func (s *RTCStream) Read(p []byte) (int, error) {
 
 	s.consumedBytes += n
 	s.winConsumed += n
+	if n > 0 {
+		s.rxAccountedBytes += int64(n)
+	}
 
 	var winFrame []byte
 	step := s.curWinBytes / 4
@@ -601,6 +704,7 @@ func (s *RTCStream) popSendFrame(maxLen int, allowData bool) (frame []byte, data
 		}
 		s.sendQ[0] = queuedSendChunk{}
 		s.sendQ = s.sendQ[1:]
+		s.txWireBytes += uint64(head.dataLen)
 		if len(s.sendQ) == 0 && cap(s.sendQ) > 128 {
 			s.sendQ = nil
 		}
@@ -642,6 +746,9 @@ func (s *RTCStream) Close() error {
 		var unread int
 		var baseSeq uint32
 		var extraSeqs []uint32
+		var finalWire uint64
+		var rxAcc int64
+		var reconciled bool
 		s.mu.Lock()
 		hadEOF := s.rEOF
 		wasWClosed := s.wClosed
@@ -658,20 +765,29 @@ func (s *RTCStream) Close() error {
 			s.readyOff = 0
 			s.reorderBuf = nil
 			s.reorderBytes = 0
+			if unread > 0 {
+				s.rxAccountedBytes += int64(unread)
+			}
 			if !hadEOF {
 				s.rEOF = true
-				if !wasWClosed {
+				if !wasWClosed && !s.resetSent {
 					sendRST = true
+					s.resetSent = true
 					for i := range s.sendQ {
 						discardQueued += s.sendQ[i].dataLen
 					}
 					s.sendQ = nil
 					s.finQueued = false
 				}
+			} else if s.hasFIN && s.nextReadSeq >= s.finSeq {
+				s.finalReconciled = true
 			}
 		} else {
 			baseSeq = s.nextReadSeq
 		}
+		finalWire = s.txWireBytes
+		rxAcc = s.rxAccountedBytes
+		reconciled = s.finalReconciled
 		s.rcond.Broadcast()
 		s.wcond.Broadcast()
 		s.mu.Unlock()
@@ -684,14 +800,19 @@ func (s *RTCStream) Close() error {
 		}
 		s.sess.winCond.Broadcast()
 		if sendRST {
-			s.sess.enqueueReliableFrame(encodeFrameStreamRST(s.id))
+			s.sess.pruneStreamRetransmits(s.id)
+			if s.sess.flowAcctV2.Load() {
+				s.sess.enqueueReliableFrame(encodeFrameStreamRSTFinal(s.id, finalWire))
+			} else {
+				s.sess.enqueueReliableFrame(encodeFrameStreamRST(s.id))
+			}
 		} else {
 			s.sess.markStreamSendable(s)
 		}
 		if s.closed.CompareAndSwap(false, true) {
 			s.sess.decStreams()
 		}
-		s.sess.removeStreamWithSeqs(s.id, baseSeq, extraSeqs)
+		s.sess.removeStreamWithAcct(s.id, baseSeq, extraSeqs, rxAcc, reconciled)
 	})
 	return nil
 }

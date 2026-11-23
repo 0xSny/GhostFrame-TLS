@@ -309,8 +309,17 @@ struct GhostStatusSnapshot: Codable, Equatable {
 
     static let empty = GhostStatusSnapshot()
 
+    static var bundleVersionLabel: String {
+        let short = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !short.isEmpty {
+            return short.hasPrefix("v") ? short : "v\(short)-LTS"
+        }
+        return "v4.0.40-LTS"
+    }
+
     init() {
-        version = "v4.0.34-LTS"
+        version = Self.bundleVersionLabel
         state = "disconnected"
         lastErr = ""
         activeTransport = ""

@@ -21,7 +21,7 @@ import (
 )
 
 // CurrentVersion is the canonical release identifier compiled into server & TUI binaries (overridable via -ldflags -X).
-var CurrentVersion = "v4.0.35-LTS"
+var CurrentVersion = "v4.0.40-LTS"
 
 const (
 	defaultGitHubAPIBase   = "https://api.github.com"

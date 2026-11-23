@@ -76,6 +76,8 @@ const (
 	LowMemSocketBufSize  = 512 * 1024
 
 	FlagPreferChaCha20 uint16 = 0x0001
+	FlagLowMemSession  uint16 = 0x0002
+	FlagFlowAcctV2     uint16 = 0x0004
 
 	pktBufCap = 1600
 )
@@ -651,6 +653,10 @@ func buildClientBindingReqInternal(psk []byte, clientID [8]byte, maxRxMbps, flag
 		return nil, nil, txID, err
 	}
 
+	flags |= FlagFlowAcctV2
+	if IsLowMemMode() {
+		flags |= FlagLowMemSession
+	}
 	if PrioritizeChaCha20() {
 		flags |= FlagPreferChaCha20
 	}
@@ -827,6 +833,12 @@ func BuildServerBindingResp(psk []byte, req *ParsedClientReq, clientAddr net.Add
 	outFlags := uint16(0)
 	if useChaCha {
 		outFlags |= FlagPreferChaCha20
+	}
+	if req.ClientFlags&FlagFlowAcctV2 != 0 {
+		outFlags |= FlagFlowAcctV2
+	}
+	if IsLowMemMode() || (serverFlags&FlagLowMemSession != 0) {
+		outFlags |= FlagLowMemSession
 	}
 
 	keys, ackAEAD, err := deriveSessionKeys(shared, psk, req.TxID, useChaCha)

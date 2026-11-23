@@ -1081,3 +1081,340 @@ func TestClientSendBacklogCap8MBPreservesServer32MB(t *testing.T) {
 		t.Fatal("expected client sendBacklogLimited()=false once unsent backlog drains to 6MB")
 	}
 }
+
+func TestHandshakeFlowAcctV2AndLowMemFlags(t *testing.T) {
+	origLowMem := IsLowMemMode()
+	t.Cleanup(func() { SetLowMemMode(origLowMem) })
+
+	psk := make([]byte, 32)
+	_, _ = rand.Read(psk)
+	guard := NewReplayGuard()
+
+	// 1. LowMem client announces FlagLowMemSession | FlagFlowAcctV2; server echoes FlagFlowAcctV2 + FlagLowMemSession.
+	SetLowMemMode(true)
+	reqPkt, cliPriv, txID, err := BuildClientBindingReq(psk, [8]byte{1, 2, 3, 4}, 100, 0, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedReq, ok := ParseClientBindingReq(reqPkt, psk, guard, time.Now())
+	if !ok {
+		t.Fatal("ParseClientBindingReq failed")
+	}
+	if parsedReq.ClientFlags&(FlagLowMemSession|FlagFlowAcctV2) != (FlagLowMemSession | FlagFlowAcctV2) {
+		t.Fatalf("expected client flags to include LowMemSession|FlowAcctV2, got 0x%x", parsedReq.ClientFlags)
+	}
+
+	SetLowMemMode(false)
+	respPkt, keys, err := BuildServerBindingResp(psk, parsedReq, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50000}, 0xCAFEBABE, 100, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedResp, _, ok := ParseServerBindingResp(respPkt, psk, cliPriv, txID)
+	if !ok {
+		t.Fatal("ParseServerBindingResp failed")
+	}
+	if parsedResp.Flags&FlagFlowAcctV2 == 0 {
+		t.Fatalf("expected server to echo FlagFlowAcctV2, got 0x%x", parsedResp.Flags)
+	}
+
+	// Server applying LowMem client flags starts directly with peerSessMax == LowMemSessionMaxWindow (8MB),
+	// and FrameSessionWin updates remain strictly monotonically increasing.
+	srv := newRTCSession(false, 0xCAFEBABE, [8]byte{}, "127.0.0.1", 50000, keys, 100, nil, nil)
+	defer srv.Close()
+	srv.applyPeerHandshakeFlags(parsedReq.ClientFlags)
+	if !srv.flowAcctV2.Load() || srv.peerSessMax.Load() != LowMemSessionMaxWindow {
+		t.Fatalf("expected server peerSessMax=8MB & flowAcctV2=true, got max=%d v2=%v", srv.peerSessMax.Load(), srv.flowAcctV2.Load())
+	}
+
+	var bigger [9]byte
+	bigger[0] = FrameSessionWin
+	binary.BigEndian.PutUint64(bigger[1:9], uint64(12*1024*1024))
+	srv.dispatchFrames(bigger[:], time.Now())
+	if srv.peerSessMax.Load() != 12*1024*1024 {
+		t.Fatalf("expected monotonic FrameSessionWin increase to 12MB, got %d", srv.peerSessMax.Load())
+	}
+	var staleSmaller [9]byte
+	staleSmaller[0] = FrameSessionWin
+	binary.BigEndian.PutUint64(staleSmaller[1:9], uint64(8*1024*1024))
+	srv.dispatchFrames(staleSmaller[:], time.Now())
+	if srv.peerSessMax.Load() != 12*1024*1024 {
+		t.Fatalf("expected stale smaller FrameSessionWin(8MB) to be ignored, got %d", srv.peerSessMax.Load())
+	}
+}
+
+func TestStreamRSTFinalExactWindowConservationAndDataBlocked(t *testing.T) {
+	origLowMem := IsLowMemMode()
+	SetLowMemMode(true)
+	t.Cleanup(func() { SetLowMemMode(origLowMem) })
+
+	keys, _, err := deriveSessionKeys([]byte("shared-secret-32bytes-0123456789"), []byte("test-psk-0123456789abcdef012345"), [12]byte{1, 2, 3}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cli := newRTCSession(true, 0x10102020, [8]byte{}, "127.0.0.1", 443, keys, 0, nil, nil)
+	defer cli.Close()
+	cli.applyPeerHandshakeFlags(FlagFlowAcctV2 | FlagLowMemSession)
+
+	srv := newRTCSession(false, 0x10102020, [8]byte{}, "127.0.0.1", 443, keys, 0, nil, nil)
+	defer srv.Close()
+	srv.applyPeerHandshakeFlags(FlagFlowAcctV2 | FlagLowMemSession)
+
+	// TX side: queue 5 chunks, pop 2 onto wire (2200B), enqueue 1 into retransmitQ, then abort/Close().
+	stTX := newRTCStream(cli, 1, "example.com:443")
+	cli.mu.Lock()
+	cli.streams[1] = stTX
+	cli.mu.Unlock()
+	cli.streamCount.Add(1)
+
+	payload := bytes.Repeat([]byte{'A'}, 5*1100)
+	if _, err := stTX.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		fr, dlen, _, _, ok := stTX.popSendFrame(MaxFrameArea, true)
+		if !ok || dlen != 1100 {
+			t.Fatalf("popSendFrame #%d failed: ok=%v dlen=%d", i, ok, dlen)
+		}
+		cli.txStreamBytes.Add(int64(dlen))
+		cli.enqueueReliableFrame(fr) // simulate unacked chunk sitting in retransmitQ
+	}
+	_ = stTX.Close()
+
+	// Dead FrameStreamData for stream 1 must be pruned, while FrameStreamRSTFinal(1, 2200) is queued.
+	var foundRSTFinal bool
+	var finalWire uint64
+	cli.qMu.Lock()
+	for _, rf := range cli.retransmitQ {
+		if len(rf.Bytes) >= 5 && rf.Bytes[0] == FrameStreamData && binary.BigEndian.Uint32(rf.Bytes[1:5]) == 1 {
+			t.Fatalf("expected dead stream 1 FrameStreamData pruned from retransmitQ")
+		}
+		if len(rf.Bytes) == 13 && rf.Bytes[0] == FrameStreamRSTFinal && binary.BigEndian.Uint32(rf.Bytes[1:5]) == 1 {
+			foundRSTFinal = true
+			finalWire = binary.BigEndian.Uint64(rf.Bytes[5:13])
+		}
+	}
+	cli.qMu.Unlock()
+	if !foundRSTFinal || finalWire != 2200 {
+		t.Fatalf("expected FrameStreamRSTFinal(1, 2200), got found=%v finalWire=%d", foundRSTFinal, finalWire)
+	}
+	if cli.txQueuedBytes.Load() != cli.txStreamBytes.Load() {
+		t.Fatalf("expected txQueuedBytes (%d) aligned with txStreamBytes (%d) after Close()", cli.txQueuedBytes.Load(), cli.txStreamBytes.Load())
+	}
+
+	// RX side: another stream 3 has 500B buffered; stream 1 only received chunk 0 (1100B) and lost chunk 1.
+	stOther := newRTCStream(srv, 3, "other.com:443")
+	stOther.deliverChunk(0, bytes.Repeat([]byte{'B'}, 500))
+	stRX := newRTCStream(srv, 1, "example.com:443")
+	srv.mu.Lock()
+	srv.streams[3] = stOther
+	srv.streams[1] = stRX
+	srv.mu.Unlock()
+	srv.streamCount.Add(2)
+	stRX.deliverChunk(0, bytes.Repeat([]byte{'A'}, 1100))
+
+	rstFrame := encodeFrameStreamRSTFinal(1, finalWire)
+	srv.dispatchFrames(rstFrame, time.Now())
+	// Duplicate RSTFinal + late duplicate chunk 1 must be completely ignored without double accounting!
+	srv.dispatchFrames(rstFrame, time.Now())
+	srv.dispatchFrames(encodeFrameStreamData(1, 1, bytes.Repeat([]byte{'A'}, 1100)), time.Now())
+
+	if srv.rxConsumedBytes.Load() != int64(finalWire) {
+		t.Fatalf("expected rxConsumedBytes=%d after RSTFinal + duplicates, got %d", finalWire, srv.rxConsumedBytes.Load())
+	}
+	if srv.rxBufferedBytes.Load() != 500 {
+		t.Fatalf("expected concurrent stream 3 rxBufferedBytes preserved at 500, got %d", srv.rxBufferedBytes.Load())
+	}
+
+	// Verify FrameDataBlocked triggers immediate FrameSessionWin in ctrlQ even < 1MB step.
+	srv.dispatchFrames(encodeFrameDataBlocked(1234), time.Now())
+	var sawWin bool
+	srv.qMu.Lock()
+	for _, cf := range srv.ctrlQ {
+		if len(cf) == 9 && cf[0] == FrameSessionWin {
+			sawWin = true
+		}
+	}
+	srv.qMu.Unlock()
+	if !sawWin {
+		t.Fatal("expected FrameDataBlocked to immediately enqueue FrameSessionWin into ctrlQ")
+	}
+
+	// Verify 15s orphan pendingStream sweep frees buffered bytes.
+	orphan := srv.getOrCreatePendingStream(999)
+	orphan.deliverChunk(0, bytes.Repeat([]byte{'C'}, 400))
+	orphan.createdAt = time.Now().Add(-16 * time.Second)
+	srv.sweepOrphanPendingStreams(time.Now())
+	srv.mu.Lock()
+	_, stillPending := srv.pendingStreams[999]
+	srv.mu.Unlock()
+	if stillPending || srv.rxBufferedBytes.Load() != 500 {
+		t.Fatalf("expected 15s orphan pending stream swept & 400B released, stillPending=%v rxBuffered=%d", stillPending, srv.rxBufferedBytes.Load())
+	}
+}
+
+func TestLowMemLossyConcurrentOpenRST64MBZeroDeadlock(t *testing.T) {
+	origLowMem := IsLowMemMode()
+	SetLowMemMode(true)
+	t.Cleanup(func() { SetLowMemMode(origLowMem) })
+
+	psk := make([]byte, 32)
+	_, _ = rand.Read(psk)
+
+	// 22% random packet loss (within 20%~30% weak-net spec) + 3% reordering + 1% duplicate + 1ms path delay.
+	sw := NewLossyUDPSwitch("127.0.0.1:21443", 22, 3, 1, time.Millisecond)
+	defer sw.CloseAll()
+
+	ln, err := NewListener(sw.srvConn, false, psk, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	var srvResetAccepted atomic.Int64
+	go func() {
+		for {
+			srvSess, aerr := ln.Accept(ctx)
+			if aerr != nil {
+				return
+			}
+			srvSess.SetHandlers(func(st *RTCStream, target string, first []byte) {
+				defer st.Close()
+				// Server drains all client bytes cleanly and echoes back tiny completion ack
+				// so client can open/transfer >64MB through the 8MB LowMem window rapidly.
+				var buf [32 * 1024]byte
+				for {
+					n, rerr := st.Read(buf[:])
+					if n > 0 {
+						srvResetAccepted.Add(int64(n))
+					}
+					if rerr != nil {
+						return
+					}
+				}
+			}, nil, nil)
+		}
+	}()
+
+	var cli *RTCSession
+	for attempt := 0; attempt < 3; attempt++ {
+		ce := sw.NewClientEnd()
+		cli, _, err = DialWithPacketConn(ctx, ce, true, sw.srvAddr, DialOptions{
+			Host:     "127.0.0.1",
+			Port:     21443,
+			PSK:      psk,
+			ClientID: [8]byte{7, 6, 5, 4, 3, 2, 1, 0},
+			Timeout:  5 * time.Second,
+		})
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		t.Fatalf("DialWithPacketConn under 25%% loss failed: %v", err)
+	}
+	defer cli.Close()
+
+	if !cli.flowAcctV2.Load() || cli.peerSessMax.Load() < LowMemSessionMaxWindow {
+		t.Fatalf("expected FlowAcctV2=true & LowMemSession window >=8MB, got v2=%v max=%d", cli.flowAcctV2.Load(), cli.peerSessMax.Load())
+	}
+
+	const totalStreams = 88
+	const chunkPayload = 1024 * 1024 // ~60 full 1MB + ~28 RST partial streams => >64MB wire bytes under 8MB LowMem window
+	const workers = 12
+	jobs := make(chan int, totalStreams)
+	for i := 0; i < totalStreams; i++ {
+		jobs <- i
+	}
+	close(jobs)
+
+	var totalSentBytes atomic.Int64
+	var completedBytes atomic.Int64
+	var rstCount atomic.Int64
+	var wg sync.WaitGroup
+	errCh := make(chan error, totalStreams)
+
+	pattern := bytes.Repeat([]byte{0x5A, 0xA5, 0x3C, 0xC3}, 8*1024) // 32KB write block
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				st, serr := cli.OpenStream(fmt.Sprintf("stress-%d.example:443", idx), nil)
+				if serr != nil {
+					errCh <- fmt.Errorf("stream %d OpenStream: %w", idx, serr)
+					return
+				}
+				abortEarly := (idx % 3) == 1 // ~33% streams randomly RST mid-transfer
+				targetBytes := chunkPayload
+				if abortEarly {
+					targetBytes = 128*1024 + (idx%7)*48*1024
+				}
+				written := 0
+				for written < targetBytes {
+					step := len(pattern)
+					if targetBytes-written < step {
+						step = targetBytes - written
+					}
+					n, werr := st.Write(pattern[:step])
+					written += n
+					totalSentBytes.Add(int64(n))
+					if werr != nil {
+						errCh <- fmt.Errorf("stream %d Write: %w", idx, werr)
+						_ = st.Close()
+						return
+					}
+				}
+				if abortEarly {
+					rstCount.Add(1)
+					_ = st.Close() // Triggers FrameStreamRSTFinal mid-flight!
+				} else {
+					_ = st.CloseWrite()
+					// Wait for clean peer close after server drains FIN
+					var tmp [16]byte
+					_, _ = st.Read(tmp[:])
+					_ = st.Close()
+					completedBytes.Add(int64(written))
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+
+	for e := range errCh {
+		t.Fatal(e)
+	}
+	select {
+	case <-cli.Done():
+		t.Fatalf("client session died unexpectedly during 64MB+ lossy RST stress test")
+	default:
+	}
+
+	sentTotal := totalSentBytes.Load()
+	if sentTotal <= 64*1024*1024 {
+		t.Fatalf("expected >64MB transferred across 8MB LowMem window, got %.2f MB", float64(sentTotal)/(1024*1024))
+	}
+
+	// Wait briefly for in-flight sendQ / RSTFinal accounting to settle and confirm queued == stream bytes.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cli.txQueuedBytes.Load() == cli.txStreamBytes.Load() {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if cli.txQueuedBytes.Load() != cli.txStreamBytes.Load() {
+		t.Fatalf("client txQueuedBytes (%d) != txStreamBytes (%d) after drain", cli.txQueuedBytes.Load(), cli.txStreamBytes.Load())
+	}
+	t.Logf("LowMem 22%% lossy >64MB RST stress PASSED: sent=%.2fMB completed=%.2fMB rstStreams=%d serverRead=%.2fMB peerMax=%d",
+		float64(sentTotal)/(1024*1024),
+		float64(completedBytes.Load())/(1024*1024),
+		rstCount.Load(),
+		float64(srvResetAccepted.Load())/(1024*1024),
+		cli.peerSessMax.Load(),
+	)
+}

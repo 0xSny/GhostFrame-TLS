@@ -108,44 +108,100 @@ type inboundPkt struct {
 const closedChunkRingSize = 4096
 
 type closedIDSet struct {
-	mu       sync.Mutex
-	ring     []uint32
-	pos      int
-	m        map[uint32]struct{}
-	baseSeq  map[uint32]uint32
-	cRing    []uint64
-	cPos     int
-	cSet     map[uint64]struct{}
+	mu         sync.Mutex
+	ring       []uint32
+	pos        int
+	m          map[uint32]struct{}
+	baseSeq    map[uint32]uint32
+	acctBytes  map[uint32]int64
+	reconciled map[uint32]struct{}
+	localReset map[uint32]struct{}
+	cRing      []uint64
+	cPos       int
+	cSet       map[uint64]struct{}
 }
 
 func newClosedIDSet() *closedIDSet {
 	return &closedIDSet{
-		ring:    make([]uint32, closedIDRingSize),
-		m:       make(map[uint32]struct{}, 256),
-		baseSeq: make(map[uint32]uint32, 256),
-		cRing:   make([]uint64, closedChunkRingSize),
-		cSet:    make(map[uint64]struct{}, 512),
+		ring:       make([]uint32, closedIDRingSize),
+		m:          make(map[uint32]struct{}, 256),
+		baseSeq:    make(map[uint32]uint32, 256),
+		acctBytes:  make(map[uint32]int64, 256),
+		reconciled: make(map[uint32]struct{}, 256),
+		localReset: make(map[uint32]struct{}, 256),
+		cRing:      make([]uint64, closedChunkRingSize),
+		cSet:       make(map[uint64]struct{}, 512),
 	}
 }
 
-func (c *closedIDSet) addWithSeqs(id uint32, base uint32, extraSeqs []uint32) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *closedIDSet) ensureRingLocked(id uint32) {
 	if _, exists := c.m[id]; !exists {
 		if old := c.ring[c.pos]; old != 0 {
 			delete(c.m, old)
 			delete(c.baseSeq, old)
+			delete(c.acctBytes, old)
+			delete(c.reconciled, old)
+			delete(c.localReset, old)
 		}
 		c.ring[c.pos] = id
 		c.m[id] = struct{}{}
 		c.pos = (c.pos + 1) % len(c.ring)
 	}
+}
+
+func (c *closedIDSet) addWithSeqs(id uint32, base uint32, extraSeqs []uint32) {
+	c.addWithAcct(id, base, extraSeqs, 0, false)
+}
+
+func (c *closedIDSet) addWithAcct(id uint32, base uint32, extraSeqs []uint32, rxAcct int64, finalReconciled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensureRingLocked(id)
 	if prev, hasBase := c.baseSeq[id]; !hasBase || base > prev {
 		c.baseSeq[id] = base
+	}
+	if prevAcct, hasAcct := c.acctBytes[id]; !hasAcct || rxAcct > prevAcct {
+		c.acctBytes[id] = rxAcct
+	}
+	if finalReconciled {
+		c.reconciled[id] = struct{}{}
 	}
 	for _, seq := range extraSeqs {
 		c.insertChunkLocked((uint64(id) << 32) | uint64(seq))
 	}
+}
+
+func (c *closedIDSet) markLocalReset(id uint32) {
+	c.mu.Lock()
+	c.ensureRingLocked(id)
+	c.localReset[id] = struct{}{}
+	c.mu.Unlock()
+}
+
+func (c *closedIDSet) isLocalReset(id uint32) bool {
+	c.mu.Lock()
+	_, ok := c.localReset[id]
+	c.mu.Unlock()
+	return ok
+}
+
+func (c *closedIDSet) isFinalReconciled(id uint32) bool {
+	c.mu.Lock()
+	_, ok := c.reconciled[id]
+	c.mu.Unlock()
+	return ok
+}
+
+func (c *closedIDSet) claimRSTFinal(id uint32) (prevAcct int64, seen bool, alreadyReconciled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.reconciled[id]; ok {
+		return 0, true, true
+	}
+	c.ensureRingLocked(id)
+	prevAcct, seen = c.acctBytes[id]
+	c.reconciled[id] = struct{}{}
+	return prevAcct, seen, false
 }
 
 func (c *closedIDSet) insertChunkLocked(key uint64) bool {
@@ -164,6 +220,9 @@ func (c *closedIDSet) insertChunkLocked(key uint64) bool {
 func (c *closedIDSet) markChunkAccounted(id, seq uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if _, ok := c.reconciled[id]; ok {
+		return false
+	}
 	if base, ok := c.baseSeq[id]; ok && seq < base {
 		return false
 	}
@@ -252,6 +311,7 @@ type RTCSession struct {
 
 	winMu           sync.Mutex
 	winCond         *sync.Cond
+	flowAcctV2      atomic.Bool
 	peerSessMax     atomic.Int64
 	hasPeerSessWin  atomic.Bool
 	txQueuedBytes   atomic.Int64
@@ -361,6 +421,16 @@ func newRTCSession(isClient bool, ssrc uint32, clientID [8]byte, host string, re
 	s.lastRecvNs.Store(now.UnixNano())
 	s.lastSendNs.Store(now.UnixNano())
 	return s
+}
+
+func (s *RTCSession) applyPeerHandshakeFlags(peerFlags uint16) {
+	if peerFlags&FlagFlowAcctV2 != 0 {
+		s.flowAcctV2.Store(true)
+	}
+	if peerFlags&FlagLowMemSession != 0 {
+		s.peerSessMax.Store(LowMemSessionMaxWindow)
+		s.hasPeerSessWin.Store(true)
+	}
 }
 
 func (s *RTCSession) startLoops() {
@@ -556,20 +626,26 @@ func (s *RTCSession) releaseQueuedTxBytes(n int) {
 }
 
 func (s *RTCSession) onStreamBytesConsumed(n int) {
-	if n <= 0 {
+	s.accountStreamWindow(n, n)
+}
+
+func (s *RTCSession) accountStreamWindow(bufferedRelease, creditBytes int) {
+	if bufferedRelease > 0 {
+		for {
+			cur := s.rxBufferedBytes.Load()
+			nxt := cur - int64(bufferedRelease)
+			if nxt < 0 {
+				nxt = 0
+			}
+			if s.rxBufferedBytes.CompareAndSwap(cur, nxt) {
+				break
+			}
+		}
+	}
+	if creditBytes <= 0 {
 		return
 	}
-	for {
-		cur := s.rxBufferedBytes.Load()
-		nxt := cur - int64(n)
-		if nxt < 0 {
-			nxt = 0
-		}
-		if s.rxBufferedBytes.CompareAndSwap(cur, nxt) {
-			break
-		}
-	}
-	consumed := s.rxConsumedBytes.Add(int64(n))
+	consumed := s.rxConsumedBytes.Add(int64(creditBytes))
 	newMax := consumed + EffectiveSessionMaxWindow()
 	for {
 		prev := s.lastSentSessWin.Load()
@@ -683,11 +759,51 @@ func (s *RTCSession) removeStream(id uint32) {
 }
 
 func (s *RTCSession) removeStreamWithSeqs(id uint32, baseSeq uint32, extraSeqs []uint32) {
-	s.closedIDs.addWithSeqs(id, baseSeq, extraSeqs)
+	s.removeStreamWithAcct(id, baseSeq, extraSeqs, 0, false)
+}
+
+func (s *RTCSession) removeStreamWithAcct(id uint32, baseSeq uint32, extraSeqs []uint32, rxAcct int64, finalReconciled bool) {
+	s.closedIDs.addWithAcct(id, baseSeq, extraSeqs, rxAcct, finalReconciled)
 	s.mu.Lock()
 	delete(s.streams, id)
 	delete(s.pendingStreams, id)
 	s.mu.Unlock()
+}
+
+func (s *RTCSession) pruneStreamRetransmits(streamID uint32) {
+	s.closedIDs.markLocalReset(streamID)
+	s.qMu.Lock()
+	if len(s.retransmitQ) > 0 {
+		kept := s.retransmitQ[:0]
+		for _, rf := range s.retransmitQ {
+			if len(rf.Bytes) >= 5 && rf.Bytes[0] == FrameStreamData && binary.BigEndian.Uint32(rf.Bytes[1:5]) == streamID {
+				continue
+			}
+			kept = append(kept, rf)
+		}
+		for i := len(kept); i < len(s.retransmitQ); i++ {
+			s.retransmitQ[i] = ReliableFrame{}
+		}
+		s.retransmitQ = kept
+	}
+	s.qMu.Unlock()
+}
+
+func (s *RTCSession) appendLostFrames(lostFrames []ReliableFrame) {
+	if len(lostFrames) == 0 {
+		return
+	}
+	s.qMu.Lock()
+	for _, rf := range lostFrames {
+		if len(rf.Bytes) >= 5 && rf.Bytes[0] == FrameStreamData {
+			sid := binary.BigEndian.Uint32(rf.Bytes[1:5])
+			if s.closedIDs.isLocalReset(sid) {
+				continue
+			}
+		}
+		s.retransmitQ = append(s.retransmitQ, rf)
+	}
+	s.qMu.Unlock()
 }
 
 func (s *RTCSession) getOrCreatePendingStream(id uint32) *RTCStream {
@@ -1189,9 +1305,7 @@ func (s *RTCSession) timerLoop() {
 
 			lostFrames, ptoCount, lossRate, srtt, minRTT := s.loss.PollTimeouts(now)
 			if len(lostFrames) > 0 {
-				s.qMu.Lock()
-				s.retransmitQ = append(s.retransmitQ, lostFrames...)
-				s.qMu.Unlock()
+				s.appendLostFrames(lostFrames)
 				s.cc.OnFeedback(0, lossRate, srtt, minRTT, ptoCount, now)
 				s.kickSend()
 			}
@@ -1215,23 +1329,42 @@ func (s *RTCSession) timerLoop() {
 				}
 			}
 
-			// Session flow-control anti-deadlock patrol: recover if txQueuedBytes >= peerSessMax
-			// persists >= 3s while no packets remain in-flight.
-			if (s.txQueuedBytes.Load() >= s.peerSessMax.Load() || s.txStreamBytes.Load() >= s.peerSessMax.Load()) &&
+			// Session flow-control anti-deadlock patrol: send idempotent DATA_BLOCKED (or Ping fallback)
+			// after max(2*SRTT, 250ms) and keep alive while valid RX packets are still arriving.
+			if (s.sendBacklogLimited() || s.txStreamBytes.Load() >= s.peerSessMax.Load()) &&
 				s.loss.InFlightBytes() == 0 && s.hasPendingData() {
 				nowNs := now.UnixNano()
 				s.winBlockedSinceNs.CompareAndSwap(0, nowNs)
 				blockedSince := s.winBlockedSinceNs.Load()
 				if blockedSince > 0 {
 					blockedDur := now.Sub(time.Unix(0, blockedSince))
-					if blockedDur >= 3*time.Second {
+					curSRTT := srtt
+					if curSRTT <= 0 {
+						curSRTT = time.Duration(s.rttNs.Load())
+					}
+					if curSRTT <= 0 {
+						curSRTT = 100 * time.Millisecond
+					}
+					probeThreshold := 2 * curSRTT
+					if probeThreshold < 250*time.Millisecond {
+						probeThreshold = 250 * time.Millisecond
+					}
+					probeGap := curSRTT
+					if probeGap < 250*time.Millisecond {
+						probeGap = 250 * time.Millisecond
+					}
+					if blockedDur >= probeThreshold {
 						lastProbe := s.winProbeSentAtNs.Load()
-						if lastProbe == 0 || now.Sub(time.Unix(0, lastProbe)) >= 1500*time.Millisecond {
+						if lastProbe == 0 || now.Sub(time.Unix(0, lastProbe)) >= probeGap {
 							s.winProbeSentAtNs.Store(nowNs)
-							s.enqueueCtrlFrame(encodeFramePingPong(FramePing, nowNs))
+							if s.flowAcctV2.Load() {
+								s.enqueueCtrlFrame(encodeFrameDataBlocked(uint64(s.txStreamBytes.Load())))
+							} else {
+								s.enqueueCtrlFrame(encodeFramePingPong(FramePing, nowNs))
+							}
 						}
 					}
-					if s.isClient && blockedDur >= 5*time.Second {
+					if s.isClient && blockedDur >= 5*time.Second && now.Sub(time.Unix(0, s.lastRecvNs.Load())) >= 10*time.Second {
 						s.fail(errors.New("gftrtc: session flow-control window stalled"))
 						return
 					}
@@ -1240,10 +1373,11 @@ func (s *RTCSession) timerLoop() {
 				s.winBlockedSinceNs.Store(0)
 			}
 
-			// Rekey maintenance, 30s grace key shredding, and RTCP-Mux mimic scheduling.
+			// Rekey maintenance, orphan pending stream cleanup (15s TTL), 30s grace key shredding, and RTCP-Mux mimic scheduling.
 			if now.After(nextMaint) {
 				nextMaint = now.Add(250 * time.Millisecond)
 				s.maintainKeys(now)
+				s.sweepOrphanPendingStreams(now)
 			}
 			if now.After(nextRTCP) {
 				nextRTCP = now.Add(randomRTCPGap())
@@ -1741,9 +1875,7 @@ func (s *RTCSession) dispatchFrames(b []byte, now time.Time) (ackEliciting bool)
 			}
 			s.cc.OnFeedback(sr.AckedBytes, sr.LossRate, sr.SRTT, sr.MinRTT, 0, now)
 			if len(sr.LostFrames) > 0 {
-				s.qMu.Lock()
-				s.retransmitQ = append(s.retransmitQ, sr.LostFrames...)
-				s.qMu.Unlock()
+				s.appendLostFrames(sr.LostFrames)
 				s.kickSend()
 			}
 
@@ -1816,28 +1948,96 @@ func (s *RTCSession) dispatchFrames(b []byte, now time.Time) (ackEliciting bool)
 			maxWin := int64(binary.BigEndian.Uint64(b[off : off+8]))
 			off += 8
 			if maxWin > 0 {
-				if s.hasPeerSessWin.CompareAndSwap(false, true) {
-					s.peerSessMax.Store(maxWin)
-				} else {
-					for {
-						cur := s.peerSessMax.Load()
-						if maxWin <= cur {
-							break
-						}
-						if s.peerSessMax.CompareAndSwap(cur, maxWin) {
-							break
-						}
+				for {
+					cur := s.peerSessMax.Load()
+					if maxWin <= cur {
+						break
+					}
+					if s.peerSessMax.CompareAndSwap(cur, maxWin) {
+						break
 					}
 				}
+				s.hasPeerSessWin.Store(true)
 				s.winCond.Broadcast()
 				s.kickSend()
 			}
+
+		case FrameStreamRSTFinal:
+			if off+12 > len(b) {
+				return ackEliciting
+			}
+			ackEliciting = true
+			streamID := binary.BigEndian.Uint32(b[off : off+4])
+			finalWireBytes := binary.BigEndian.Uint64(b[off+4 : off+12])
+			off += 12
+			s.handleInboundRSTFinal(streamID, finalWireBytes)
+
+		case FrameDataBlocked:
+			if off+8 > len(b) {
+				return ackEliciting
+			}
+			ackEliciting = true
+			_ = binary.BigEndian.Uint64(b[off : off+8])
+			off += 8
+			newMax := s.rxConsumedBytes.Load() + EffectiveSessionMaxWindow()
+			for {
+				prev := s.lastSentSessWin.Load()
+				if newMax <= prev {
+					break
+				}
+				if s.lastSentSessWin.CompareAndSwap(prev, newMax) {
+					break
+				}
+			}
+			s.enqueueCtrlFrame(encodeFrameSessionWin(uint64(newMax)))
 
 		default:
 			return ackEliciting
 		}
 	}
 	return ackEliciting
+}
+
+func (s *RTCSession) sweepOrphanPendingStreams(now time.Time) {
+	var expired []*RTCStream
+	s.mu.Lock()
+	for id, st := range s.pendingStreams {
+		if now.Sub(st.createdAt) > 15*time.Second {
+			delete(s.pendingStreams, id)
+			expired = append(expired, st)
+		}
+	}
+	s.mu.Unlock()
+	for _, st := range expired {
+		st.abort(ErrStreamReset, false)
+	}
+}
+
+func (s *RTCSession) handleInboundRSTFinal(streamID uint32, finalWireBytes uint64) {
+	s.mu.Lock()
+	st := s.streams[streamID]
+	if st == nil {
+		st = s.pendingStreams[streamID]
+		delete(s.pendingStreams, streamID)
+	}
+	s.mu.Unlock()
+	if st != nil {
+		st.deliverRSTFinal(finalWireBytes)
+		return
+	}
+	prevAcct, seen, alreadyReconciled := s.closedIDs.claimRSTFinal(streamID)
+	if alreadyReconciled {
+		return
+	}
+	var delta int64
+	if seen {
+		delta = int64(finalWireBytes) - prevAcct
+	} else {
+		delta = int64(finalWireBytes)
+	}
+	if delta > 0 {
+		s.accountStreamWindow(0, int(delta))
+	}
 }
 
 func (s *RTCSession) handleInboundStreamOpen(streamID uint32, target string, first []byte) {
@@ -2680,6 +2880,7 @@ func DialWithPacketConn(ctx context.Context, pc net.PacketConn, ownPC bool, radd
 			}
 			sess := newRTCSession(true, resp.SessionSSRC, opts.ClientID, opts.Host, opts.Port, keys, opts.UpMbps, pj, nil)
 			sess.legacyV3 = useLegacyV3
+			sess.applyPeerHandshakeFlags(resp.Flags)
 			sess.connMu.Lock()
 			sess.curConn = pc
 			sess.curOwn = ownPC
@@ -2955,6 +3156,7 @@ func (l *RTCListener) handleSTUNHandshake(pkt []byte, addr net.Addr) {
 	}
 
 	sess := newRTCSession(false, ssrc, req.ClientID, "", 0, keys, targetMbps, l.paramsJSON, l)
+	sess.applyPeerHandshakeFlags(req.ClientFlags)
 	sess.connMu.Lock()
 	sess.curConn = l.pc
 	sess.curOwn = false

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 
 	"ghostframe/internal/netbind"
@@ -81,7 +82,11 @@ func DialV3StealthWithID(ctx context.Context, l *Link, timeout time.Duration, cl
 		return nil, nil, 0, err
 	}
 	d := net.Dialer{Timeout: timeout, Control: netbind.Control}
-	raw, err := d.DialContext(ctx, "tcp", netbind.ResolveTCPHostPort(ctx, l.Host, l.Port))
+	dialNet, resolvedAddr, rerr := netbind.ResolveDirectTCPAddr(ctx, net.JoinHostPort(l.Host, strconv.Itoa(l.Port)), true)
+	if rerr != nil {
+		return nil, nil, 0, rerr
+	}
+	raw, err := d.DialContext(ctx, dialNet, resolvedAddr)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -130,7 +135,11 @@ func DialKnock(ctx context.Context, l *Link, poolFlags uint16, timeout time.Dura
 	}
 
 	d := net.Dialer{Timeout: timeout, Control: netbind.Control}
-	raw, err := d.DialContext(ctx, "tcp", netbind.ResolveTCPHostPort(ctx, l.Host, l.Port))
+	dialNet, resolvedAddr, rerr := netbind.ResolveDirectTCPAddr(ctx, net.JoinHostPort(l.Host, strconv.Itoa(l.Port)), true)
+	if rerr != nil {
+		return nil, salt, 0, rerr
+	}
+	raw, err := d.DialContext(ctx, dialNet, resolvedAddr)
 	if err != nil {
 		return nil, salt, 0, err
 	}

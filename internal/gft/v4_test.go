@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"ghostframe/internal/gftrtc"
+	"ghostframe/internal/netbind"
 )
 
 func buildTestTLSClientHello(sni string) []byte {
@@ -240,6 +242,45 @@ func TestSessionPoolAcquireCoalescesEmergencyDial(t *testing.T) {
 		if results[i] != sharedSess {
 			t.Fatalf("worker %d got unexpected session instance", i)
 		}
+	}
+}
+
+func TestDialStealthAndKnockRejectFakeIPDNS(t *testing.T) {
+	restore := netbind.SetNAT64TestHooks(
+		func() bool { return false },
+		nil,
+		func(ctx context.Context, host string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("198.18.0.5")}, nil
+		},
+	)
+	defer restore()
+
+	link := &Link{
+		V:         3,
+		Host:      "poisoned-node.example",
+		Port:      443,
+		SNI:       "cdn.example.net",
+		PSK:       "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Verify:    "ca",
+		FP:        "ios",
+		Transport: "tcp",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if c, _, _, err := DialV3StealthWithID(ctx, link, time.Second, DefaultClientID); !errors.Is(err, netbind.ErrFakeIPBlocked) {
+		if c != nil {
+			c.Close()
+		}
+		t.Fatalf("DialV3StealthWithID expected ErrFakeIPBlocked for Fake-IP DNS answer, got %v", err)
+	}
+
+	if c, _, _, err := DialKnock(ctx, link, 0, time.Second); !errors.Is(err, netbind.ErrFakeIPBlocked) {
+		if c != nil {
+			c.Close()
+		}
+		t.Fatalf("DialKnock expected ErrFakeIPBlocked for Fake-IP DNS answer, got %v", err)
 	}
 }
 

@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.0.35-LTS"
+var Version = "v4.0.40-LTS"
 
 type ConnState string
 
