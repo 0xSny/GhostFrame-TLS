@@ -160,6 +160,21 @@ func TestUIServerAuthAndEndpoints(t *testing.T) {
 	if dResp.StatusCode != http.StatusOK || !strings.Contains(strVal(diagBody["text"]), "Kestrel Pro Diagnostic Snapshot") {
 		t.Fatalf("diagnostic export failed: status=%d body=%v", dResp.StatusCode, diagBody)
 	}
+
+	// 7. Close behavior toggle persists in Engine and /api/status.
+	if !eng.CloseToTray() {
+		t.Fatal("expected CloseToTray default true")
+	}
+	cbReq, _ := http.NewRequest(http.MethodPost, base+"/api/settings/close-behavior", strings.NewReader(`{"close_to_tray":false}`))
+	cbReq.Header.Set("X-Kestrel-Token", srv.Token())
+	cbResp, err := http.DefaultClient.Do(cbReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cbResp.Body.Close()
+	if cbResp.StatusCode != http.StatusOK || eng.CloseToTray() {
+		t.Fatalf("expected CloseToTray false after toggle, status=%d CloseToTray=%v", cbResp.StatusCode, eng.CloseToTray())
+	}
 }
 
 func TestWebView2HostInitializationSmoke(t *testing.T) {

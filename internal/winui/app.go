@@ -49,12 +49,20 @@ func Run(eng *client.Engine) error {
 
 	hInst, _, _ := pGetModuleHandleW.Call(0)
 	hArrow, _, _ := pLoadCursorW.Call(0, idcArrow)
-	appIcon := CreateVectorIcon(client.StateDisconnected)
+	appIcon, _, _ := pLoadIconW.Call(hInst, 1) // MAKEINTRESOURCE(1) from embedded PE .rsrc
+	appIconOwned := false
+	if appIcon == 0 {
+		appIcon = CreateVectorIcon(client.StateConnected)
+		appIconOwned = true
+	}
 
 	app := &appUI{
 		eng:   eng,
 		dpi:   96,
 		hIcon: appIcon,
+	}
+	if !appIconOwned {
+		app.hIcon = 0 // shared module resource icon does not require DestroyIcon
 	}
 
 	uiSrv, err := startUIServer(eng, 0, func() { app.postRefresh() })
@@ -268,11 +276,18 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		return 0
 
 	case wmClose:
-		// Hide to system tray instead of killing the background proxy tunnel.
-		if a.wv != nil {
-			a.wv.SetVisible(false)
+		if a.eng == nil || a.eng.CloseToTray() {
+			// Hide to system tray instead of killing the background proxy tunnel.
+			if a.wv != nil {
+				a.wv.SetVisible(false)
+			}
+			_, _, _ = pShowWindow.Call(hwnd, swHide)
+			return 0
 		}
 		_, _, _ = pShowWindow.Call(hwnd, swHide)
+		a.cleanup()
+		_, _, _ = pDestroyWindow.Call(hwnd)
+		_, _, _ = pPostQuitMessage.Call(0)
 		return 0
 
 	case wmQueryEndSession:

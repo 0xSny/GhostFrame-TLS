@@ -148,6 +148,7 @@ var (
 	pSetTimer                      = user32.NewProc("SetTimer")
 	pKillTimer                     = user32.NewProc("KillTimer")
 	pLoadCursorW                   = user32.NewProc("LoadCursorW")
+	pLoadIconW                     = user32.NewProc("LoadIconW")
 	pSetCursor                     = user32.NewProc("SetCursor")
 	pGetKeyState                   = user32.NewProc("GetKeyState")
 	pCreatePopupMenu               = user32.NewProc("CreatePopupMenu")

@@ -234,6 +234,8 @@ func (s *uiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.requirePost(w, r, s.handleSetPorts)
 	case "/api/settings/params":
 		s.requirePost(w, r, s.handleSetParams)
+	case "/api/settings/close-behavior":
+		s.requirePost(w, r, s.handleSetCloseBehavior)
 	case "/api/rules/append":
 		s.requirePost(w, r, s.handleAppendRule)
 	case "/api/rules/set":
@@ -714,6 +716,29 @@ func (s *uiServer) handleSetParams(w http.ResponseWriter, r *http.Request) {
 	}
 	s.setToastSuccess("传输限速参数已保存并应用")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *uiServer) handleSetCloseBehavior(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CloseToTray bool `json:"close_to_tray"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := s.eng.SetCloseToTray(req.CloseToTray); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if req.CloseToTray {
+		s.setToastSuccess("关闭行为已设为：缩小到右下角托盘")
+	} else {
+		s.setToastSuccess("关闭行为已设为：直接全部退出关闭")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"close_to_tray": req.CloseToTray,
+	})
 }
 
 func (s *uiServer) handleAppendRule(w http.ResponseWriter, r *http.Request) {

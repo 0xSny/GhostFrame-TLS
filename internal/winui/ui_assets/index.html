@@ -1057,6 +1057,13 @@ tr.alert-row { background: #FFFBEB; }
             </div>
             <button id="btnSavePorts" class="btn btn-primary">应用端口热切换</button>
           </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);gap:8px;flex-wrap:wrap;">
+            <span style="font-size:12px;color:var(--text-sub);">点右上角关闭按钮时</span>
+            <div id="segCloseBehavior" class="seg">
+              <button class="seg-btn active" data-val="tray" type="button">缩小到右下角托盘</button>
+              <button class="seg-btn" data-val="exit" type="button">直接全部关闭</button>
+            </div>
+          </div>
         </div>
 
         <div class="card">
@@ -1590,6 +1597,10 @@ function renderSettingsTab(st) {
     $("inDownMbps").value = String(st.down_mbps || 0);
     $("inHopRange").value = st.hop_range || "";
   }
+  const toTray = st.close_to_tray !== false;
+  document.querySelectorAll("#segCloseBehavior .seg-btn").forEach(b => {
+    b.classList.toggle("active", b.dataset.val === (toTray ? "tray" : "exit"));
+  });
   const rs = st.rule_stats || {};
   $("kslrDomains").textContent = String(rs.builtin_domains || 0);
   $("kslrCidr").textContent = String(rs.builtin_cidrs || 0);
@@ -1677,6 +1688,16 @@ $("wrapSysProxyToggle").addEventListener("click", async () => {
     await apiFetch("/api/proxy/toggle", { method: "POST", body: JSON.stringify({ enabled: next }) });
     setTimeout(pollStatus, 80);
   } catch (e) { showToast(e.message, "err"); }
+});
+
+document.querySelectorAll("#segCloseBehavior .seg-btn").forEach(b => {
+  b.addEventListener("click", async () => {
+    const toTray = b.dataset.val !== "exit";
+    try {
+      await apiFetch("/api/settings/close-behavior", { method: "POST", body: JSON.stringify({ close_to_tray: toTray }) });
+      pollStatus();
+    } catch (e) { showToast(e.message, "err"); }
+  });
 });
 
 $("btnCopyClash").addEventListener("click", () => {

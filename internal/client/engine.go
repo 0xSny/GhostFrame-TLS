@@ -42,6 +42,7 @@ type ClientConfig struct {
 	SysProxy      bool            `json:"sys_proxy"`
 	AutoConnect   bool            `json:"auto_connect,omitempty"`
 	EnableIPv6    bool            `json:"enable_ipv6,omitempty"`
+	CloseToTray   *bool           `json:"close_to_tray,omitempty"`
 	CustomRules   []string        `json:"custom_rules,omitempty"`
 	RuleBundleURL string          `json:"rule_bundle_url,omitempty"`
 	Gateway       json.RawMessage `json:"gateway,omitempty"`
@@ -840,6 +841,29 @@ func (e *Engine) SetAutoConnect(on bool) error {
 		return e.SaveConfig()
 	}
 	return nil
+}
+
+// CloseToTray reports whether clicking the window close button minimizes to the tray (default true)
+// rather than exiting Kestrel Pro completely.
+func (e *Engine) CloseToTray() bool {
+	e.mu.RLock()
+	v := e.config.CloseToTray
+	e.mu.RUnlock()
+	return v == nil || *v
+}
+
+// SetCloseToTray configures whether closing the main window minimizes to tray or exits the app.
+func (e *Engine) SetCloseToTray(toTray bool) error {
+	e.mu.Lock()
+	val := toTray
+	e.config.CloseToTray = &val
+	e.mu.Unlock()
+	if toTray {
+		e.Logf("主窗口关闭行为已设为: 缩小到右下角托盘")
+	} else {
+		e.Logf("主窗口关闭行为已设为: 直接退出全部关闭")
+	}
+	return e.SaveConfig()
 }
 
 // RouteDecision decides whether hostport should bypass or traverse GhostFrame,
@@ -2358,6 +2382,7 @@ func (e *Engine) Status() map[string]any {
 		"history":          histCopy,
 		"sys_proxy":        sysProxy,
 		"enable_ipv6":      e.IPv6Enabled(),
+		"close_to_tray":    e.CloseToTray(),
 		"proxy_drifted":    e.proxyDrifted.Load(),
 		"socks_addr":       socksAddr,
 		"http_addr":        httpAddr,
