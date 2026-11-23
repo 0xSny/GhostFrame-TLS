@@ -21,6 +21,9 @@ var (
 	directDNSCacheMu sync.Mutex
 	directDNSCache   = make(map[string]directDNSCacheEntry)
 
+	directDNSInflightMu sync.Mutex
+	directDNSInflight   = make(map[string]*directDNSInFlightCall)
+
 	// Overridable in unit tests to point physical direct DNS lookups at a local mock DNS server.
 	directDNSServersOverride []string
 )
@@ -28,6 +31,12 @@ var (
 type directDNSCacheEntry struct {
 	ips       []net.IP
 	expiresAt time.Time
+}
+
+type directDNSInFlightCall struct {
+	done chan struct{}
+	ips  []net.IP
+	err  error
 }
 
 // ClearDirectDNSCache purges all cached direct DNS answers. Called automatically when
@@ -191,12 +200,25 @@ func putCachedDirectDNS(key string, ips []net.IP) {
 // public direct DNS servers (223.5.5.5 / 119.29.29.29 on IPv4; 2400:3200::1 / 2402:4e00:: on IPv6),
 // filtering any Fake-IP answers and caching up to 512 entries for 60s.
 func DirectLookupHostIPs(ctx context.Context, host string) ([]net.IP, error) {
+	return DirectLookupHostIPsFamily(ctx, host, "ip")
+}
+
+// DirectLookupHostIPsFamily resolves host using the requested address family ("ip4" or "ip")
+// with in-flight singleflight coalescing and 60s positive caching.
+func DirectLookupHostIPsFamily(ctx context.Context, host, network string) ([]net.IP, error) {
 	h := strings.TrimSpace(host)
 	h = strings.Trim(h, "[]")
 	if h == "" {
 		return nil, &net.DNSError{Err: "empty host", Name: host}
 	}
+	fam := strings.TrimSpace(strings.ToLower(network))
+	if fam != "ip4" && fam != "ip6" {
+		fam = "ip"
+	}
 	if strings.EqualFold(h, "localhost") {
+		if fam == "ip4" {
+			return []net.IP{net.IPv4(127, 0, 0, 1)}, nil
+		}
 		if IsPureIPv6Physical() {
 			return []net.IP{net.IPv6loopback, net.IPv4(127, 0, 0, 1)}, nil
 		}
@@ -209,10 +231,29 @@ func DirectLookupHostIPs(ctx context.Context, host string) ([]net.IP, error) {
 		return []net.IP{append(net.IP(nil), ip...)}, nil
 	}
 
-	cacheKey := strings.ToLower(strings.TrimSuffix(h, "."))
+	cacheKey := fam + "|" + strings.ToLower(strings.TrimSuffix(h, "."))
 	if cached, ok := getCachedDirectDNS(cacheKey); ok {
 		return cached, nil
 	}
+
+	// Singleflight dedup: coalesce concurrent lookups for the same domain+family.
+	directDNSInflightMu.Lock()
+	if call, ok := directDNSInflight[cacheKey]; ok {
+		directDNSInflightMu.Unlock()
+		if ctx == nil {
+			<-call.done
+		} else {
+			select {
+			case <-call.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return cloneIPSlice(call.ips), call.err
+	}
+	call := &directDNSInFlightCall{done: make(chan struct{})}
+	directDNSInflight[cacheKey] = call
+	directDNSInflightMu.Unlock()
 
 	if ctx == nil {
 		var cancel context.CancelFunc
@@ -230,7 +271,7 @@ func DirectLookupHostIPs(ctx context.Context, host string) ([]net.IP, error) {
 		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 			perTryCtx, cancelTry = context.WithTimeout(ctx, directDNSDialTimeout)
 		}
-		ips, err := newDirectResolver(srv).LookupIP(perTryCtx, "ip", h)
+		ips, err := newDirectResolver(srv).LookupIP(perTryCtx, fam, h)
 		if cancelTry != nil {
 			cancelTry()
 		}
@@ -247,15 +288,27 @@ func DirectLookupHostIPs(ctx context.Context, host string) ([]net.IP, error) {
 		}
 		if len(clean) > 0 {
 			putCachedDirectDNS(cacheKey, clean)
-			return clean, nil
+			call.ips = clean
+			directDNSInflightMu.Lock()
+			delete(directDNSInflight, cacheKey)
+			directDNSInflightMu.Unlock()
+			close(call.done)
+			return cloneIPSlice(clean), nil
 		}
 	}
 
+	var resErr error
 	if sawFake {
-		return nil, ErrFakeIPBlocked
+		resErr = ErrFakeIPBlocked
+	} else if lastErr != nil {
+		resErr = lastErr
+	} else {
+		resErr = &net.DNSError{Err: "no non-fake direct DNS addresses found", Name: h, IsNotFound: true}
 	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, &net.DNSError{Err: "no non-fake direct DNS addresses found", Name: h, IsNotFound: true}
+	call.err = resErr
+	directDNSInflightMu.Lock()
+	delete(directDNSInflight, cacheKey)
+	directDNSInflightMu.Unlock()
+	close(call.done)
+	return nil, resErr
 }

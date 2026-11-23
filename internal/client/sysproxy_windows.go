@@ -95,7 +95,7 @@ func SetSystemProxy(addr string, enable bool) error {
 			uintptr(len(serverBytes)*2),
 		)
 
-		overrideBytes, _ := syscall.UTF16FromString("localhost;127.*;10.*;172.16.*;192.168.*;<local>")
+		overrideBytes, _ := syscall.UTF16FromString(WindowsProxyOverride)
 		procRegSetValueEx.Call(
 			hKey,
 			uintptr(unsafe.Pointer(valNameOverride)),

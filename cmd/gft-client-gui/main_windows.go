@@ -30,12 +30,7 @@ func initCrashLog() *os.File {
 	return f
 }
 
-var desktopVersion = "v4.0.40-LTS"
-
 func main() {
-	if client.Version == "v4.0.32-LTS" || client.Version == "v4.0.34-LTS" || client.Version == "v4.0.35-LTS" || client.Version == "v4.0.40-LTS" {
-		client.Version = desktopVersion
-	}
 	if crashFile := initCrashLog(); crashFile != nil {
 		defer crashFile.Close()
 	}

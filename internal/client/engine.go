@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.0.40-LTS"
+var Version = "v4.0.41-LTS"
 
 type ConnState string
 
@@ -96,6 +96,7 @@ type Engine struct {
 	tunnelDNSResolveFn TunnelDNSFunc
 	fakeIPLookupMu     sync.RWMutex
 	fakeIPLookupFn     func(net.IP) (string, bool)
+	systemLookupIPFn   func(context.Context, string, string) ([]net.IP, error)
 	socksSrv           *SOCKS5Server
 	httpSrv            *HTTPProxyServer
 	sysProxyApplied    bool
@@ -1099,9 +1100,93 @@ func (e *Engine) DirectDialer(timeout time.Duration) net.Dialer {
 	return d
 }
 
+func (e *Engine) lookupSystemIPs(ctx context.Context, network, host string) ([]net.IP, error) {
+	e.fakeIPLookupMu.RLock()
+	fn := e.systemLookupIPFn
+	e.fakeIPLookupMu.RUnlock()
+	if fn != nil {
+		return fn(ctx, network, host)
+	}
+	return net.DefaultResolver.LookupIP(ctx, network, host)
+}
+
+func (e *Engine) resolveDirectTCPCandidates(ctx context.Context, addr string) ([]netbind.DirectEndpoint, error) {
+	allowIPv6 := e.IPv6Enabled()
+	if e.directDNSBypass.Load() {
+		return netbind.ResolveDirectTCPAddrs(ctx, addr, allowIPv6)
+	}
+
+	h, pStr, splitErr := net.SplitHostPort(strings.TrimSpace(addr))
+	if splitErr != nil {
+		return netbind.ResolveDirectTCPAddrs(ctx, addr, allowIPv6)
+	}
+	portNum, perr := strconv.Atoi(pStr)
+	if perr != nil || portNum <= 0 || portNum > 65535 {
+		return netbind.ResolveDirectTCPAddrs(ctx, addr, allowIPv6)
+	}
+	rawHost := strings.TrimSpace(strings.Trim(h, "[]"))
+	if idx := strings.IndexByte(rawHost, '%'); idx >= 0 {
+		rawHost = rawHost[:idx]
+	}
+	if rawHost == "" || strings.EqualFold(rawHost, "localhost") || net.ParseIP(rawHost) != nil {
+		return netbind.ResolveDirectTCPAddrs(ctx, addr, allowIPv6)
+	}
+
+	fam := "ip4"
+	if allowIPv6 {
+		fam = "ip"
+	}
+	sysIPs, sysErr := e.lookupSystemIPs(ctx, fam, rawHost)
+	if sysErr == nil && len(sysIPs) > 0 {
+		var v4List, v6List []net.IP
+		seen := make(map[string]struct{}, len(sysIPs))
+		sawFake := false
+		for _, ip := range sysIPs {
+			if ip == nil || ip.IsUnspecified() || ip.IsMulticast() {
+				continue
+			}
+			if netbind.IsFakeIP(ip) {
+				sawFake = true
+				continue
+			}
+			k := ip.String()
+			if _, ok := seen[k]; ok {
+				continue
+			}
+			seen[k] = struct{}{}
+			if ip4 := ip.To4(); ip4 != nil {
+				v4List = append(v4List, ip4)
+			} else if allowIPv6 {
+				v6List = append(v6List, ip)
+			}
+		}
+		if !sawFake && (len(v4List) > 0 || len(v6List) > 0) {
+			eps := make([]netbind.DirectEndpoint, 0, len(v4List)+len(v6List))
+			for _, ip4 := range v4List {
+				eps = append(eps, netbind.DirectEndpoint{
+					DialNet: "tcp4",
+					Addr:    net.JoinHostPort(ip4.String(), pStr),
+				})
+			}
+			for _, ip6 := range v6List {
+				eps = append(eps, netbind.DirectEndpoint{
+					DialNet: "tcp6",
+					Addr:    net.JoinHostPort(ip6.String(), pStr),
+				})
+			}
+			return eps, nil
+		}
+	}
+
+	// Fallback to physical-interface direct DNS (223.5.5.5 / 119.29.29.29) when system DNS
+	// fails, returns empty/polluted answers, or returns Fake-IPs.
+	return netbind.ResolveDirectTCPAddrs(ctx, addr, allowIPv6)
+}
+
 // DirectDialContext dials addr directly over the physical interface, recovering Fake-IP targets
-// via reverse lookup (or rejecting unmapped Fake-IPs with netbind.ErrFakeIPBlocked) and resolving
-// domain names via physical-interface-bound DNS + pure-IPv6 NAT64 synthesis before dialing.
+// via reverse lookup (or rejecting unmapped Fake-IPs with netbind.ErrFakeIPBlocked). On desktop
+// platforms (!DirectDNSBypassEnabled), system DNS is preferred first with automatic fallback to
+// DirectLookupHostIPs and multi-IP sequential dialing tolerance across returned CDN endpoints.
 func (e *Engine) DirectDialContext(ctx context.Context, _ string, addr string) (net.Conn, error) {
 	recovered, err := e.RecoverFakeIPTarget(addr)
 	if err != nil {
@@ -1114,7 +1199,7 @@ func (e *Engine) DirectDialContext(ctx context.Context, _ string, addr string) (
 	} else if _, hasDeadline := resolveCtx.Deadline(); !hasDeadline {
 		resolveCtx, cancel = context.WithTimeout(resolveCtx, 3*time.Second)
 	}
-	dialNet, resolvedAddr, rerr := netbind.ResolveDirectTCPAddr(resolveCtx, recovered, e.IPv6Enabled())
+	eps, rerr := e.resolveDirectTCPCandidates(resolveCtx, recovered)
 	if cancel != nil {
 		cancel()
 	}
@@ -1130,7 +1215,100 @@ func (e *Engine) DirectDialContext(ctx context.Context, _ string, addr string) (
 		defer dcancel()
 	}
 	d := e.DirectDialer(8 * time.Second)
-	return d.DialContext(ctx, dialNet, resolvedAddr)
+	var lastErr error
+	for i, ep := range eps {
+		if ctx.Err() != nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, ctx.Err()
+		}
+		attemptCtx := ctx
+		var acancel context.CancelFunc
+		if i < len(eps)-1 {
+			perTry := 2500 * time.Millisecond
+			if dl, ok := ctx.Deadline(); ok {
+				rem := time.Until(dl)
+				if rem <= 0 {
+					if lastErr != nil {
+						return nil, lastErr
+					}
+					return nil, context.DeadlineExceeded
+				}
+				share := rem / time.Duration(len(eps)-i)
+				if share < 1200*time.Millisecond {
+					share = minDuration(rem, 1200*time.Millisecond)
+				}
+				if share < perTry {
+					perTry = share
+				}
+			}
+			attemptCtx, acancel = context.WithTimeout(ctx, perTry)
+		}
+		conn, derr := d.DialContext(attemptCtx, ep.DialNet, ep.Addr)
+		if acancel != nil {
+			acancel()
+		}
+		if derr == nil {
+			return conn, nil
+		}
+		lastErr = derr
+	}
+	return nil, lastErr
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// CanStaticDirect reports whether target is explicitly permitted for direct dialing under static
+// RouteRule entries (LAN IPs, CN CIDRs, builtin CN domains, or custom DIRECT rules) without
+// requiring an active remote tunnel session.
+func (e *Engine) CanStaticDirect(target string) bool {
+	e.mu.RLock()
+	mode := e.config.RouteMode
+	e.mu.RUnlock()
+	if mode != RouteRule {
+		return false
+	}
+	if recovered, err := e.RecoverFakeIPTarget(target); err == nil && recovered != "" {
+		target = recovered
+	}
+	if e.IsNodeHost(target) {
+		return false
+	}
+	act, _, unknown := e.router.evaluateStatic(mode, target)
+	return !unknown && act == ActionDirect
+}
+
+func (e *Engine) dialDirectTrackedStream(resolvedDial, metricTarget string, first []byte) (gft.DataStream, RouteAction, error) {
+	dctx, dcancel := context.WithTimeout(context.Background(), 8*time.Second)
+	c, err := e.DirectDialContext(dctx, "tcp", resolvedDial)
+	dcancel()
+	if err != nil {
+		if errors.Is(err, errIPv6DisabledClient) || errors.Is(err, netbind.ErrFakeIPBlocked) {
+			return nil, ActionReject, err
+		}
+		return nil, ActionDirect, err
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+	if len(first) > 0 {
+		if _, werr := c.Write(first); werr != nil {
+			_ = c.Close()
+			return nil, ActionDirect, werr
+		}
+		e.RecordTargetTraffic(metricTarget, uint64(len(first)), 0)
+	}
+	return &trackedDataStream{
+		DataStream: &directStreamConn{Conn: c, target: resolvedDial},
+		eng:        e,
+		target:     metricTarget,
+	}, ActionDirect, nil
 }
 
 // OpenTargetStreamWithRoute classifies routing using routeTarget (e.g. sniffed TLS SNI)
@@ -1155,12 +1333,37 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 		return nil, ActionReject, errNodeLoopRejected
 	}
 
+	metricTarget := strings.TrimSpace(routeTarget)
+	if metricTarget == "" {
+		metricTarget = dialTarget
+	}
+
 	e.mu.RLock()
 	state := e.state
 	sched := e.sched
+	mode := e.config.RouteMode
 	e.mu.RUnlock()
 
 	if state != StateConnected || sched == nil {
+		if mode == RouteRule {
+			effTarget := routeTarget
+			if effTarget == "" {
+				effTarget = dialTarget
+			}
+			act, reason, unknown := e.router.evaluateStatic(mode, effTarget)
+			if !unknown {
+				act, reason = e.router.RecordDecision(act, reason)
+				if e.recentRoutes != nil {
+					e.recentRoutes.Push(dialTarget, effTarget, act, reason)
+				}
+				if act == ActionReject {
+					return nil, ActionReject, errRouteRejected
+				}
+				if act == ActionDirect {
+					return e.dialDirectTrackedStream(dialTarget, metricTarget, first)
+				}
+			}
+		}
 		return nil, ActionProxy, errNoActiveSession
 	}
 	act, resolvedDial, reason := e.DecideSmartRoute(dialTarget, routeTarget)
@@ -1171,35 +1374,8 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 		}
 		return nil, ActionReject, errRouteRejected
 	}
-	metricTarget := strings.TrimSpace(routeTarget)
-	if metricTarget == "" {
-		metricTarget = dialTarget
-	}
 	if act == ActionDirect {
-		dctx, dcancel := context.WithTimeout(context.Background(), 8*time.Second)
-		c, err := e.DirectDialContext(dctx, "tcp", resolvedDial)
-		dcancel()
-		if err != nil {
-			if errors.Is(err, errIPv6DisabledClient) || errors.Is(err, netbind.ErrFakeIPBlocked) {
-				return nil, ActionReject, err
-			}
-			return nil, ActionDirect, err
-		}
-		if tc, ok := c.(*net.TCPConn); ok {
-			_ = tc.SetNoDelay(true)
-		}
-		if len(first) > 0 {
-			if _, werr := c.Write(first); werr != nil {
-				_ = c.Close()
-				return nil, ActionDirect, werr
-			}
-			e.RecordTargetTraffic(metricTarget, uint64(len(first)), 0)
-		}
-		return &trackedDataStream{
-			DataStream: &directStreamConn{Conn: c, target: resolvedDial},
-			eng:        e,
-			target:     metricTarget,
-		}, ActionDirect, nil
+		return e.dialDirectTrackedStream(resolvedDial, metricTarget, first)
 	}
 	st, err := sched.OpenStream(dialTarget, first)
 	if err != nil {
@@ -1840,6 +2016,86 @@ func (e *Engine) PingNow() (PingSummary, error) {
 	return PingSummary{RTTMs: ms, Transport: "uTLS-" + l.EffectiveFP()}, nil
 }
 
+// NodePingResult reports the latency probe result for a specific saved node index.
+type NodePingResult struct {
+	Index     int    `json:"index"`
+	RTTMs     int64  `json:"rtt_ms"`
+	Transport string `json:"transport,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// PingNode probes the saved node at idx without switching the active node or dropping the current session.
+func (e *Engine) PingNode(ctx context.Context, idx int) NodePingResult {
+	res := NodePingResult{Index: idx, RTTMs: -1}
+	e.mu.RLock()
+	var l *gft.Link
+	if idx >= 0 && idx < len(e.config.Nodes) && e.config.Nodes[idx] != nil {
+		cp := *e.config.Nodes[idx]
+		l = &cp
+	}
+	activeIdx := e.config.ActiveNode
+	sched := e.sched
+	e.mu.RUnlock()
+
+	if l == nil {
+		res.Error = "node index out of range"
+		return res
+	}
+	if idx == activeIdx && sched != nil {
+		pctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		ms, mode, perr := sched.ProbeNow(pctx)
+		cancel()
+		if perr == nil && ms > 0 {
+			res.RTTMs = ms
+			res.Transport = mode
+			return res
+		}
+	}
+	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	pr, err := gft.Ping(pctx, l, 5*time.Second)
+	cancel()
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	ms := pr.KnockRTT.Milliseconds()
+	if ms <= 0 {
+		ms = 1
+	}
+	res.RTTMs = ms
+	res.Transport = "uTLS-" + l.EffectiveFP()
+	return res
+}
+
+// PingAllNodes probes all configured nodes concurrently (up to 6 parallel workers).
+func (e *Engine) PingAllNodes(ctx context.Context) []NodePingResult {
+	e.mu.RLock()
+	n := len(e.config.Nodes)
+	e.mu.RUnlock()
+	if n == 0 {
+		return nil
+	}
+	results := make([]NodePingResult, n)
+	sem := make(chan struct{}, 6)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				results[idx] = NodePingResult{Index: idx, RTTMs: -1, Error: ctx.Err().Error()}
+				return
+			}
+			results[idx] = e.PingNode(ctx, idx)
+		}(i)
+	}
+	wg.Wait()
+	return results
+}
+
 // SetTransport updates the active node's preferred transport ("auto", "rtc", "tcp").
 // Legacy "quic" values are normalized seamlessly to "rtc".
 func (e *Engine) SetTransport(mode string) error {
@@ -2056,10 +2312,28 @@ func (e *Engine) Logs() []LogEntry {
 	return e.logRing.Entries()
 }
 
-// LinkURI returns the active node's gft3:// link.
+// LinkURI returns the active node's ksl4:// / gft3:// link.
 func (e *Engine) LinkURI() string {
 	e.mu.RLock()
 	l := e.activeLinkLocked()
+	e.mu.RUnlock()
+	if l == nil {
+		return ""
+	}
+	return l.Encode()
+}
+
+// LinkURIForNode returns the shareable URI for node idx (falling back to LinkURI if idx < 0).
+func (e *Engine) LinkURIForNode(idx int) string {
+	if idx < 0 {
+		return e.LinkURI()
+	}
+	e.mu.RLock()
+	var l *gft.Link
+	if idx < len(e.config.Nodes) && e.config.Nodes[idx] != nil {
+		cp := *e.config.Nodes[idx]
+		l = &cp
+	}
 	e.mu.RUnlock()
 	if l == nil {
 		return ""

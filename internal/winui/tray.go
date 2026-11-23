@@ -373,10 +373,12 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 		onOpen()
 	case cmd == cmdToggle:
 		if state == client.StateConnected || state == client.StateConnecting {
-			_ = eng.SetAutoConnect(false)
-			eng.Disconnect()
-			onToast("已断开安全隧道", false)
-			onRefresh()
+			go func() {
+				_ = eng.SetAutoConnect(false)
+				eng.Disconnect()
+				onToast("已断开安全隧道", false)
+				onRefresh()
+			}()
 		} else {
 			go func() {
 				if err := eng.Connect(); err != nil {
@@ -388,14 +390,23 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 			}()
 		}
 	case cmd == cmdRouteRule:
-		_ = eng.SetRouteMode(client.RouteRule)
-		onToast("模式已切换: Rule (智能分流)", false)
+		go func() {
+			_ = eng.SetRouteMode(client.RouteRule)
+			onToast("模式已切换: Rule (智能分流)", false)
+			onRefresh()
+		}()
 	case cmd == cmdRouteGlob:
-		_ = eng.SetRouteMode(client.RouteGlobal)
-		onToast("模式已切换: Global (全局代理)", false)
+		go func() {
+			_ = eng.SetRouteMode(client.RouteGlobal)
+			onToast("模式已切换: Global (全局代理)", false)
+			onRefresh()
+		}()
 	case cmd == cmdRouteCore:
-		_ = eng.SetRouteMode(client.RouteCore)
-		onToast("模式已切换: Core (仅端口)", false)
+		go func() {
+			_ = eng.SetRouteMode(client.RouteCore)
+			onToast("模式已切换: Core (仅端口)", false)
+			onRefresh()
+		}()
 	case cmd == cmdTransAuto:
 		go func() {
 			_ = eng.SetTransport("auto")
@@ -415,15 +426,17 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 			onRefresh()
 		}()
 	case cmd == cmdToggleIPv6:
-		next := !eng.IPv6Enabled()
-		if err := eng.SetEnableIPv6(next); err != nil {
-			onToast("切换 IPv6 失败: "+err.Error(), true)
-		} else if next {
-			onToast("IPv6 双栈分流已开启", false)
-		} else {
-			onToast("IPv6 已关闭 (仅 IPv4 / 防泄露)", false)
-		}
-		onRefresh()
+		go func() {
+			next := !eng.IPv6Enabled()
+			if err := eng.SetEnableIPv6(next); err != nil {
+				onToast("切换 IPv6 失败: "+err.Error(), true)
+			} else if next {
+				onToast("IPv6 双栈分流已开启", false)
+			} else {
+				onToast("IPv6 已关闭 (仅 IPv4 / 防泄露)", false)
+			}
+			onRefresh()
+		}()
 	case cmd == cmdImport:
 		onImport()
 	case cmd == cmdQuit:

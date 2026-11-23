@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,13 @@ var (
 	lookupIPv6Fn         = defaultLookupIPv6
 	lookupHostIPsFn      = defaultLookupHostIPs
 )
+
+func isDefaultLookupHostIPsFn(fn func(context.Context, string) ([]net.IP, error)) bool {
+	if fn == nil {
+		return true
+	}
+	return reflect.ValueOf(fn).Pointer() == reflect.ValueOf(defaultLookupHostIPs).Pointer()
+}
 
 func defaultLookupIPv6(ctx context.Context, host string) ([]net.IP, error) {
 	ips, err := DirectLookupHostIPs(ctx, host)
@@ -268,19 +276,25 @@ func ResolveUDPTarget(ctx context.Context, hostport string) (*net.UDPAddr, error
 	return ua, err
 }
 
-func resolveDirectEndpoint(ctx context.Context, hostport, familyPrefix string, allowIPv6 bool) (dialNet string, resolvedIP net.IP, zone string, port int, err error) {
+// DirectEndpoint represents a resolved concrete dial network ("tcp4"/"tcp6") and ip:port address.
+type DirectEndpoint struct {
+	DialNet string
+	Addr    string
+}
+
+func resolveDirectEndpointMulti(ctx context.Context, hostport, familyPrefix string, allowIPv6 bool) (dialNets []string, resolvedIPs []net.IP, zone string, port int, err error) {
 	h, pStr, splitErr := net.SplitHostPort(strings.TrimSpace(hostport))
 	if splitErr != nil {
-		return "", nil, "", 0, splitErr
+		return nil, nil, "", 0, splitErr
 	}
 	port, err = strconv.Atoi(pStr)
 	if err != nil || port <= 0 || port > 65535 {
-		return "", nil, "", 0, errors.New("netbind: invalid target port")
+		return nil, nil, "", 0, errors.New("netbind: invalid target port")
 	}
 
 	rawHost := strings.TrimSpace(strings.Trim(h, "[]"))
 	if rawHost == "" {
-		return "", nil, "", 0, errors.New("netbind: empty target host")
+		return nil, nil, "", 0, errors.New("netbind: empty target host")
 	}
 	hostNoZone := rawHost
 	if zIdx := strings.IndexByte(rawHost, '%'); zIdx >= 0 {
@@ -296,94 +310,145 @@ func resolveDirectEndpoint(ctx context.Context, hostport, familyPrefix string, a
 
 	if strings.EqualFold(hostNoZone, "localhost") {
 		if pureV6 {
-			return familyPrefix + "6", net.IPv6loopback, "", port, nil
+			return []string{familyPrefix + "6"}, []net.IP{net.IPv6loopback}, "", port, nil
 		}
-		return familyPrefix + "4", net.IPv4(127, 0, 0, 1), "", port, nil
+		return []string{familyPrefix + "4"}, []net.IP{net.IPv4(127, 0, 0, 1)}, "", port, nil
 	}
 
 	if ip := net.ParseIP(hostNoZone); ip != nil {
 		if IsFakeIP(ip) {
-			return "", nil, "", 0, ErrFakeIPBlocked
+			return nil, nil, "", 0, ErrFakeIPBlocked
 		}
 		if ip4 := ip.To4(); ip4 != nil {
 			if pureV6 {
 				if pref, ok := DiscoverNAT64Prefix(ctx); ok {
 					if synth := SynthesizeNAT64IPv4(pref, ip4); synth != nil {
-						return familyPrefix + "6", synth, "", port, nil
+						return []string{familyPrefix + "6"}, []net.IP{synth}, "", port, nil
 					}
 				}
-				return "", nil, "", 0, errors.New("netbind: NAT64 synthesis failed on pure-IPv6 interface")
+				return nil, nil, "", 0, errors.New("netbind: NAT64 synthesis failed on pure-IPv6 interface")
 			}
-			return familyPrefix + "4", ip4, "", port, nil
+			return []string{familyPrefix + "4"}, []net.IP{ip4}, "", port, nil
 		}
 		if !allowIPv6 && !pureV6 && !ip.IsLoopback() {
-			return "", nil, "", 0, ErrIPv6Disabled
+			return nil, nil, "", 0, ErrIPv6Disabled
 		}
-		return familyPrefix + "6", ip, zone, port, nil
+		return []string{familyPrefix + "6"}, []net.IP{ip}, zone, port, nil
 	}
 
-	ips, err := lookupFn(ctx, hostNoZone)
+	var ips []net.IP
+	if !allowIPv6 && !pureV6 && lookupFn != nil {
+		// Use explicit IPv4 ("ip4") direct DNS lookup when IPv6 is disabled to avoid wasted AAAA queries.
+		nat64Mu.RLock()
+		isDefault := isDefaultLookupHostIPsFn(lookupFn)
+		nat64Mu.RUnlock()
+		if isDefault {
+			ips, err = DirectLookupHostIPsFamily(ctx, hostNoZone, "ip4")
+		} else {
+			ips, err = lookupFn(ctx, hostNoZone)
+		}
+	} else {
+		ips, err = lookupFn(ctx, hostNoZone)
+	}
 	if err != nil {
-		return "", nil, "", 0, err
+		return nil, nil, "", 0, err
 	}
 	clean, hadFake := filterNonFakeIPs(ips)
 	if len(clean) == 0 {
 		if hadFake {
-			return "", nil, "", 0, ErrFakeIPBlocked
+			return nil, nil, "", 0, ErrFakeIPBlocked
 		}
-		return "", nil, "", 0, &net.DNSError{Err: "no direct IP resolved", Name: hostNoZone, IsNotFound: true}
+		return nil, nil, "", 0, &net.DNSError{Err: "no direct IP resolved", Name: hostNoZone, IsNotFound: true}
 	}
 
-	var firstV4, firstV6 net.IP
+	var v4List, v6List []net.IP
 	for _, ip := range clean {
 		if ip4 := ip.To4(); ip4 != nil {
-			if firstV4 == nil {
-				firstV4 = ip4
-			}
-		} else if firstV6 == nil {
-			firstV6 = ip
+			v4List = append(v4List, ip4)
+		} else {
+			v6List = append(v6List, ip)
 		}
 	}
 
 	if pureV6 {
-		if firstV6 != nil {
-			return familyPrefix + "6", firstV6, "", port, nil
+		for _, ip6 := range v6List {
+			dialNets = append(dialNets, familyPrefix+"6")
+			resolvedIPs = append(resolvedIPs, ip6)
 		}
-		if firstV4 != nil {
+		if len(v4List) > 0 {
 			if pref, ok := DiscoverNAT64Prefix(ctx); ok {
-				if synth := SynthesizeNAT64IPv4(pref, firstV4); synth != nil {
-					return familyPrefix + "6", synth, "", port, nil
+				for _, ip4 := range v4List {
+					if synth := SynthesizeNAT64IPv4(pref, ip4); synth != nil {
+						dialNets = append(dialNets, familyPrefix+"6")
+						resolvedIPs = append(resolvedIPs, synth)
+					}
 				}
 			}
 		}
-		return "", nil, "", 0, errors.New("netbind: no usable IPv6/NAT64 address for pure-IPv6 interface")
+		if len(resolvedIPs) > 0 {
+			return dialNets, resolvedIPs, "", port, nil
+		}
+		return nil, nil, "", 0, errors.New("netbind: no usable IPv6/NAT64 address for pure-IPv6 interface")
 	}
 
-	if firstV4 != nil {
-		return familyPrefix + "4", firstV4, "", port, nil
+	for _, ip4 := range v4List {
+		dialNets = append(dialNets, familyPrefix+"4")
+		resolvedIPs = append(resolvedIPs, ip4)
 	}
-	if firstV6 != nil {
-		if !allowIPv6 {
-			return "", nil, "", 0, ErrIPv6Disabled
+	if allowIPv6 {
+		for _, ip6 := range v6List {
+			dialNets = append(dialNets, familyPrefix+"6")
+			resolvedIPs = append(resolvedIPs, ip6)
 		}
-		return familyPrefix + "6", firstV6, "", port, nil
 	}
-	return "", nil, "", 0, &net.DNSError{Err: "no usable direct IP resolved", Name: hostNoZone, IsNotFound: true}
+	if len(resolvedIPs) > 0 {
+		return dialNets, resolvedIPs, "", port, nil
+	}
+	if len(v6List) > 0 && !allowIPv6 {
+		return nil, nil, "", 0, ErrIPv6Disabled
+	}
+	return nil, nil, "", 0, &net.DNSError{Err: "no usable direct IP resolved", Name: hostNoZone, IsNotFound: true}
+}
+
+func resolveDirectEndpoint(ctx context.Context, hostport, familyPrefix string, allowIPv6 bool) (dialNet string, resolvedIP net.IP, zone string, port int, err error) {
+	dialNets, resolvedIPs, z, port, err := resolveDirectEndpointMulti(ctx, hostport, familyPrefix, allowIPv6)
+	if err != nil {
+		return "", nil, "", 0, err
+	}
+	return dialNets[0], resolvedIPs[0], z, port, nil
+}
+
+// ResolveDirectTCPAddrs resolves addr ("host:port") into an ordered slice of concrete IP literal
+// targets ("ip:port") and networks ("tcp4" or "tcp6") for sequential multi-IP tolerance.
+func ResolveDirectTCPAddrs(ctx context.Context, addr string, allowIPv6 bool) ([]DirectEndpoint, error) {
+	dialNets, resolvedIPs, zone, port, err := resolveDirectEndpointMulti(ctx, addr, "tcp", allowIPv6)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DirectEndpoint, 0, len(resolvedIPs))
+	portStr := strconv.Itoa(port)
+	for i, ip := range resolvedIPs {
+		hostStr := ip.String()
+		if zone != "" && ip.To4() == nil {
+			hostStr = hostStr + "%" + zone
+		}
+		out = append(out, DirectEndpoint{
+			DialNet: dialNets[i],
+			Addr:    net.JoinHostPort(hostStr, portStr),
+		})
+	}
+	return out, nil
 }
 
 // ResolveDirectTCPAddr resolves addr ("host:port") into a concrete IP literal string ("ip:port")
 // and matching network ("tcp4" or "tcp6") using physical-interface-bound direct DNS, Fake-IP
 // rejection, and pure-IPv6 NAT64 synthesis. It never delegates host resolution to net.DefaultResolver.
 func ResolveDirectTCPAddr(ctx context.Context, addr string, allowIPv6 bool) (dialNet string, resolvedAddr string, err error) {
-	dialNet, ip, zone, port, err := resolveDirectEndpoint(ctx, addr, "tcp", allowIPv6)
+	eps, err := ResolveDirectTCPAddrs(ctx, addr, allowIPv6)
 	if err != nil {
 		return "", "", err
 	}
-	hostStr := ip.String()
-	if zone != "" && ip.To4() == nil {
-		hostStr = hostStr + "%" + zone
-	}
-	return dialNet, net.JoinHostPort(hostStr, strconv.Itoa(port)), nil
+	return eps[0].DialNet, eps[0].Addr, nil
 }
 
 // ResolveDirectUDPAddr resolves addr ("host:port") into a concrete *net.UDPAddr and matching network

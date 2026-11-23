@@ -108,7 +108,15 @@ var (
 	gdi32    = windows.NewLazySystemDLL("gdi32.dll")
 	dwmapi   = windows.NewLazySystemDLL("dwmapi.dll")
 	shell32  = windows.NewLazySystemDLL("shell32.dll")
+	ole32    = windows.NewLazySystemDLL("ole32.dll")
 	gdiplus  = windows.NewLazySystemDLL("gdiplus.dll")
+
+	pCoInitializeEx                = ole32.NewProc("CoInitializeEx")
+	pCoUninitialize                = ole32.NewProc("CoUninitialize")
+	pShellExecuteW                 = shell32.NewProc("ShellExecuteW")
+	pCreateSolidBrush              = gdi32.NewProc("CreateSolidBrush")
+	pFillRect                      = user32.NewProc("FillRect")
+	pMessageBoxW                   = user32.NewProc("MessageBoxW")
 
 	pGetModuleHandleW              = kernel32.NewProc("GetModuleHandleW")
 	pOpenMutexW                    = kernel32.NewProc("OpenMutexW")
@@ -343,8 +351,8 @@ func windowDPI(hwnd uintptr) int32 {
 	return int32(r)
 }
 
-func applyDarkWindowChrome(hwnd uintptr) {
-	dark := uint32(1)
+func applyLightWindowChrome(hwnd uintptr) {
+	dark := uint32(0)
 	_, _, _ = pDwmSetWindowAttribute.Call(hwnd, dwmwaUseImmersiveDarkMode, uintptr(unsafe.Pointer(&dark)), unsafe.Sizeof(dark))
 	round := uint32(dwmwcpRound)
 	_, _, _ = pDwmSetWindowAttribute.Call(hwnd, dwmwaWindowCornerPreference, uintptr(unsafe.Pointer(&round)), unsafe.Sizeof(round))

@@ -7,6 +7,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -262,5 +264,68 @@ func TestResolveDirectTCPAndUDPAddr(t *testing.T) {
 	dNetV4, addrV4, err := ResolveDirectTCPAddr(ctx, "dual.example.cn:443", false)
 	if err != nil || dNetV4 != "tcp4" || addrV4 != "110.242.68.66:443" {
 		t.Fatalf("expected tcp4 A-record resolution on non-pure-IPv6, got net=%q addr=%q err=%v", dNetV4, addrV4, err)
+	}
+}
+
+func TestDirectLookupHostIPsSingleflightAndIPv4Family(t *testing.T) {
+	ClearDirectDNSCache()
+	t.Cleanup(func() {
+		directDNSCacheMu.Lock()
+		directDNSServersOverride = nil
+		directDNSCacheMu.Unlock()
+		ClearDirectDNSCache()
+	})
+
+	var aQueries atomic.Int32
+	var aaaaQueries atomic.Int32
+	srvAddr := startMockUDPDNSServer(t, func(qname string, qtype uint16) [][]byte {
+		if qtype == 28 {
+			aaaaQueries.Add(1)
+			return [][]byte{net.ParseIP("2408:871a:2100:2::1").To16()}
+		}
+		if qtype == 1 {
+			aQueries.Add(1)
+			time.Sleep(60 * time.Millisecond)
+			return [][]byte{{110, 242, 68, 66}, {110, 242, 68, 67}}
+		}
+		return nil
+	})
+	directDNSCacheMu.Lock()
+	directDNSServersOverride = []string{srvAddr}
+	directDNSCacheMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Concurrent IPv4-only lookups must coalesce via singleflight to a single A query and 0 AAAA queries.
+	const workers = 10
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			ips, err := DirectLookupHostIPsFamily(ctx, "sf.example.cn", "ip4")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if len(ips) != 2 {
+				errs <- errors.New("expected 2 IPv4 addresses")
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if q := aQueries.Load(); q != 1 {
+		t.Fatalf("expected exactly 1 coalesced A query, got %d", q)
+	}
+	if q6 := aaaaQueries.Load(); q6 != 0 {
+		t.Fatalf("expected 0 AAAA queries for ip4 family, got %d", q6)
 	}
 }

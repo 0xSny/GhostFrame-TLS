@@ -1075,3 +1075,226 @@ func TestDirectDialContextFakeIPRecoveryAndBypass(t *testing.T) {
 		t.Fatalf("expected echo 'ping', got %q err=%v", string(buf[:]), err)
 	}
 }
+
+func TestRuleModeStaticDirectAllowedWhileDisconnected(t *testing.T) {
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			c, aerr := echoLn.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+	echoPort := echoLn.Addr().(*net.TCPAddr).Port
+
+	cfgPath := filepath.Join(t.TempDir(), "cfg.json")
+	eng, err := NewEngine(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	// RouteRule with custom DIRECT domain mapped via system lookup to local echo server.
+	if err := eng.SetRouteMode(RouteRule); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetCustomRules([]string{"DOMAIN-SUFFIX,cn-direct.test,DIRECT"}); err != nil {
+		t.Fatal(err)
+	}
+	eng.fakeIPLookupMu.Lock()
+	eng.systemLookupIPFn = func(_ context.Context, _ string, host string) ([]net.IP, error) {
+		if strings.EqualFold(host, "www.cn-direct.test") {
+			return []net.IP{net.IPv4(127, 0, 0, 1)}, nil
+		}
+		return nil, errors.New("unexpected host lookup")
+	}
+	eng.fakeIPLookupMu.Unlock()
+
+	eng.OverrideListenAddrs(
+		fmt.Sprintf("127.0.0.1:%d", freeTestPort(t)),
+		fmt.Sprintf("127.0.0.1:%d", freeTestPort(t)),
+	)
+	if err := eng.StartServers(); err != nil {
+		t.Fatal(err)
+	}
+
+	httpAddr := eng.Status()["http_addr"].(string)
+	socksAddr := eng.Status()["socks_addr"].(string)
+	directTarget := net.JoinHostPort("www.cn-direct.test", fmt.Sprintf("%d", echoPort))
+
+	// 1. Disconnected HTTP CONNECT for static DIRECT domain must succeed cleanly.
+	hc, err := net.DialTimeout("tcp", httpAddr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = fmt.Fprintf(hc, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", directTarget, directTarget)
+	hBr := bufio.NewReader(hc)
+	statusLine, err := hBr.ReadString('\n')
+	if err != nil || !strings.Contains(statusLine, "200") {
+		_ = hc.Close()
+		t.Fatalf("HTTP CONNECT static direct while disconnected failed: line=%q err=%v", statusLine, err)
+	}
+	for {
+		ln, rerr := hBr.ReadString('\n')
+		if rerr != nil || ln == "\r\n" {
+			break
+		}
+	}
+	_, _ = hc.Write([]byte("pong"))
+	var hbuf [4]byte
+	if _, err := io.ReadFull(hBr, hbuf[:]); err != nil || string(hbuf[:]) != "pong" {
+		_ = hc.Close()
+		t.Fatalf("HTTP direct echo failed: %q err=%v", string(hbuf[:]), err)
+	}
+	_ = hc.Close()
+
+	// 2. Disconnected HTTP CONNECT for remote proxy domain must still fail with 503.
+	hcProxy, err := net.DialTimeout("tcp", httpAddr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = hcProxy.Write([]byte("CONNECT 1.1.1.1:443 HTTP/1.1\r\nHost: 1.1.1.1:443\r\n\r\n"))
+	pLine, _ := bufio.NewReader(hcProxy).ReadString('\n')
+	_ = hcProxy.Close()
+	if !strings.Contains(pLine, "503") {
+		t.Fatalf("expected 503 for ActionProxy target while disconnected, got %q", pLine)
+	}
+
+	// 3. Disconnected SOCKS5 CONNECT for static DIRECT domain must succeed cleanly.
+	sc, err := net.DialTimeout("tcp", socksAddr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = sc.Write([]byte{0x05, 0x01, 0x00})
+	var authResp [2]byte
+	if _, err := io.ReadFull(sc, authResp[:]); err != nil || authResp[1] != 0x00 {
+		_ = sc.Close()
+		t.Fatalf("SOCKS5 auth failed: %v %v", authResp, err)
+	}
+	host := "www.cn-direct.test"
+	sreq := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}
+	sreq = append(sreq, host...)
+	sreq = append(sreq, byte(echoPort>>8), byte(echoPort&0xff))
+	_, _ = sc.Write(sreq)
+	var srep [10]byte
+	if _, err := io.ReadFull(sc, srep[:]); err != nil || srep[1] != 0x00 {
+		_ = sc.Close()
+		t.Fatalf("SOCKS5 static direct while disconnected failed: rep=%v err=%v", srep, err)
+	}
+	_, _ = sc.Write([]byte("s5ok"))
+	var sbuf [4]byte
+	if _, err := io.ReadFull(sc, sbuf[:]); err != nil || string(sbuf[:]) != "s5ok" {
+		_ = sc.Close()
+		t.Fatalf("SOCKS5 direct echo failed: %q err=%v", string(sbuf[:]), err)
+	}
+	_ = sc.Close()
+
+	// 4. Disconnected SOCKS5 CONNECT for proxy target (1.1.1.1:443) still rejected with 0x05.
+	scProxy, err := net.DialTimeout("tcp", socksAddr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = scProxy.Write([]byte{0x05, 0x01, 0x00})
+	_, _ = io.ReadFull(scProxy, authResp[:])
+	_, _ = scProxy.Write([]byte{0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0x01, 0xbb})
+	var srepFail [10]byte
+	if _, err := io.ReadFull(scProxy, srepFail[:]); err != nil || srepFail[1] != 0x05 {
+		_ = scProxy.Close()
+		t.Fatalf("expected SOCKS5 0x05 for proxy target while disconnected, got rep=%v err=%v", srepFail, err)
+	}
+	_ = scProxy.Close()
+}
+
+func TestDesktopDirectDialPrefersSystemDNSFallbackAndMultiIP(t *testing.T) {
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			c, aerr := echoLn.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+	echoPort := fmt.Sprintf("%d", echoLn.Addr().(*net.TCPAddr).Port)
+
+	cfgPath := filepath.Join(t.TempDir(), "cfg.json")
+	eng, err := NewEngine(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	// Desktop mode: DirectDNSBypassEnabled == false.
+	eng.SetDirectDNSBypass(false)
+
+	// 1. System DNS succeeds with multi-IP where first IP (127.0.0.99) is not listening and second (127.0.0.1) works.
+	eng.fakeIPLookupMu.Lock()
+	eng.systemLookupIPFn = func(_ context.Context, network, host string) ([]net.IP, error) {
+		if network != "ip4" {
+			return nil, fmt.Errorf("expected ip4 when IPv6 disabled, got %s", network)
+		}
+		return []net.IP{net.IPv4(127, 0, 0, 99), net.IPv4(127, 0, 0, 1)}, nil
+	}
+	eng.fakeIPLookupMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c1, err := eng.DirectDialContext(ctx, "tcp", net.JoinHostPort("cdn.corp.internal", echoPort))
+	if err != nil {
+		t.Fatalf("desktop DirectDialContext multi-IP fallback failed: %v", err)
+	}
+	_, _ = c1.Write([]byte("ok"))
+	var b1 [2]byte
+	_, err = io.ReadFull(c1, b1[:])
+	_ = c1.Close()
+	if err != nil || string(b1[:]) != "ok" {
+		t.Fatalf("multi-IP dial echo mismatch: %q err=%v", string(b1[:]), err)
+	}
+
+	// 2. When system DNS returns a Fake-IP (198.18.0.8), desktop mode must ignore it and fall back to DirectLookupHostIPs.
+	eng.fakeIPLookupMu.Lock()
+	eng.systemLookupIPFn = func(_ context.Context, _ string, _ string) ([]net.IP, error) {
+		return []net.IP{net.IPv4(198, 18, 0, 8)}, nil
+	}
+	eng.fakeIPLookupMu.Unlock()
+
+	restoreNAT64 := netbind.SetNAT64TestHooks(nil, nil, func(_ context.Context, _ string) ([]net.IP, error) {
+		return []net.IP{net.IPv4(127, 0, 0, 1)}, nil
+	})
+	defer restoreNAT64()
+
+	c2, err := eng.DirectDialContext(ctx, "tcp", net.JoinHostPort("fallback.example.cn", echoPort))
+	if err != nil {
+		t.Fatalf("desktop Fake-IP fallback to DirectLookupHostIPs failed: %v", err)
+	}
+	_ = c2.Close()
+}
+
+func TestWindowsProxyOverrideAndNoSysProxyEnv(t *testing.T) {
+	for _, want := range []string{"[::1]", "169.254.*", "172.16.*", "172.20.*", "172.31.*", "192.168.*", "<local>"} {
+		if !strings.Contains(WindowsProxyOverride, want) {
+			t.Fatalf("WindowsProxyOverride missing %q: %s", want, WindowsProxyOverride)
+		}
+	}
+	t.Setenv("GFT_NO_SYSPROXY", "1")
+	if !IsMockSysProxy() {
+		t.Fatal("expected IsMockSysProxy() == true when GFT_NO_SYSPROXY=1")
+	}
+}

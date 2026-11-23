@@ -153,7 +153,16 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		}
 	}
 
-	if !s.engine.IsConnected() {
+	target := req.Host
+	if req.Method == http.MethodConnect {
+		if !strings.Contains(target, ":") {
+			target += ":443"
+		}
+	} else if !strings.Contains(target, ":") {
+		target += ":80"
+	}
+
+	if !s.engine.IsConnected() && !s.engine.CanStaticDirect(target) {
 		s.logDisconnectedThrottled()
 		resp := "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nKestrel not connected to server\r\n"
 		_, _ = c.Write([]byte(resp))
@@ -161,10 +170,6 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 	}
 
 	if req.Method == http.MethodConnect {
-		target := req.Host
-		if !strings.Contains(target, ":") {
-			target += ":443"
-		}
 		var sniffConn net.Conn = c
 		if br.Buffered() > 0 {
 			buffered := make([]byte, br.Buffered())
@@ -201,10 +206,6 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		return
 	}
 
-	target := req.Host
-	if !strings.Contains(target, ":") {
-		target += ":80"
-	}
 	req.RequestURI = ""
 	if req.URL.Scheme == "" {
 		req.URL.Scheme = "http"

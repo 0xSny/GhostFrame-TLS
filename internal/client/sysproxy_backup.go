@@ -34,6 +34,9 @@ func SetNoSysProxy(disable bool) {
 	noSysProxy.Store(disable)
 }
 
+// WindowsProxyOverride lists all loopback, RFC1918, link-local, and local bypass ranges for WinINET.
+const WindowsProxyOverride = "localhost;127.*;[::1];10.*;169.254.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>"
+
 // IsMockSysProxy returns true when any sandbox condition is active:
 // Go test execution, -no-sysproxy flag, KSL_NO_SYSPROXY=1, or KSL_MOCK_SYSPROXY=1 (legacy GFT_* aliases supported).
 func IsMockSysProxy() bool {
@@ -41,7 +44,7 @@ func IsMockSysProxy() bool {
 		noSysProxy.Load() ||
 		os.Getenv("KSL_NO_SYSPROXY") == "1" ||
 		os.Getenv("KSL_MOCK_SYSPROXY") == "1" ||
-		os.Getenv("KSL_NO_SYSPROXY") == "1" ||
+		os.Getenv("GFT_NO_SYSPROXY") == "1" ||
 		os.Getenv("GFT_MOCK_SYSPROXY") == "1"
 }
 
@@ -50,7 +53,7 @@ func setMockSystemProxy(addr string, enable bool) {
 	mockProxyVal.Enabled = enable
 	if enable && addr != "" {
 		mockProxyVal.Server = addr
-		mockProxyVal.Override = "localhost;127.*;10.*;172.16.*;192.168.*;<local>"
+		mockProxyVal.Override = WindowsProxyOverride
 	}
 	mockProxyMu.Unlock()
 }
