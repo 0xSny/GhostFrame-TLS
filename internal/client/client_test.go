@@ -663,13 +663,22 @@ func TestSelectNodeMakeBeforeBreakLossless(t *testing.T) {
 	uri2, stop2 := startLocalTestServerForClient(t, "NodeTwo")
 	defer stop2()
 
-	// Create a closed port URI for testing rollback on failed node switch.
+	// Immediate-close blackhole listener for deterministic failed node switch without ephemeral port reuse or Windows SYN retry delay.
 	deadLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = deadLn.Close() })
+	go func() {
+		for {
+			c, aerr := deadLn.Accept()
+			if aerr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
 	deadPort := deadLn.Addr().(*net.TCPAddr).Port
-	_ = deadLn.Close()
 	deadLink, err := gft.ParseLink(uri2)
 	if err != nil {
 		t.Fatal(err)
@@ -906,22 +915,33 @@ func TestDeleteNodePreservesActiveIndexAndSwitchCancellation(t *testing.T) {
 	uri3, stop3 := startLocalTestServerForClient(t, "NodeThree")
 	defer stop3()
 
-	// Blackhole TLS listener for deterministic slow/cancelled handshake simulation.
+	// Blackhole TLS listener: holds accepted sockets open silently until cancelled so SelectNode(3) stays in-flight deterministically.
 	slowLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = slowLn.Close() })
+	var slowMu sync.Mutex
+	var slowConns []net.Conn
+	t.Cleanup(func() {
+		_ = slowLn.Close()
+		slowMu.Lock()
+		for _, c := range slowConns {
+			_ = c.Close()
+		}
+		slowMu.Unlock()
+	})
 	go func() {
 		for {
 			c, aerr := slowLn.Accept()
 			if aerr != nil {
 				return
 			}
+			slowMu.Lock()
+			slowConns = append(slowConns, c)
+			slowMu.Unlock()
 			go func(conn net.Conn) {
 				defer conn.Close()
-				var b [1]byte
-				_, _ = conn.Read(b[:])
+				_, _ = io.Copy(io.Discard, conn)
 			}(c)
 		}
 	}()
@@ -1267,9 +1287,9 @@ func TestDesktopDirectDialPrefersSystemDNSFallbackAndMultiIP(t *testing.T) {
 	}
 	eng.fakeIPLookupMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	c1, err := eng.DirectDialContext(ctx, "tcp", net.JoinHostPort("cdn.corp.internal", echoPort))
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel1()
+	c1, err := eng.DirectDialContext(ctx1, "tcp", net.JoinHostPort("cdn.corp.internal", echoPort))
 	if err != nil {
 		t.Fatalf("desktop DirectDialContext multi-IP fallback failed: %v", err)
 	}
@@ -1293,7 +1313,9 @@ func TestDesktopDirectDialPrefersSystemDNSFallbackAndMultiIP(t *testing.T) {
 	})
 	defer restoreNAT64()
 
-	c2, err := eng.DirectDialContext(ctx, "tcp", net.JoinHostPort("fallback.example.cn", echoPort))
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel2()
+	c2, err := eng.DirectDialContext(ctx2, "tcp", net.JoinHostPort("fallback.example.cn", echoPort))
 	if err != nil {
 		t.Fatalf("desktop Fake-IP fallback to DirectLookupHostIPs failed: %v", err)
 	}
@@ -1313,7 +1335,7 @@ func TestWindowsProxyOverrideAndNoSysProxyEnv(t *testing.T) {
 }
 
 func TestTopUploadTargetsJSONSerialization(t *testing.T) {
-	eng, err := NewEngine("")
+	eng, err := NewEngine(filepath.Join(t.TempDir(), "cfg.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

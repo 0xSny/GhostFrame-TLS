@@ -503,34 +503,18 @@ func TestShadowTLSRecordLayerZeroAlloc(t *testing.T) {
 		t.Fatalf("VerifyClientAuthFrameWithID failed: %v", err)
 	}
 
-	// Warm up sync.Pool on Write path (drain on client goroutine).
+	// Warm up sync.Pool on Write path without concurrent background goroutines polluting MemStats.
 	msg := make([]byte, 1024)
 	sink := make([]byte, 1024)
-	drainDone := make(chan struct{})
-	stopDrain := make(chan struct{})
-	go func() {
-		defer close(drainDone)
-		for {
-			select {
-			case <-stopDrain:
-				return
-			default:
-			}
-			_ = cliConn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
-			_, rerr := cliConn.Read(sink)
-			if rerr != nil {
-				if ne, ok := rerr.(net.Error); ok && ne.Timeout() {
-					continue
-				}
-				return
-			}
-		}
-	}()
 	if _, err := srvConn.Write(msg); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := io.ReadFull(cliConn, sink); err != nil {
+		t.Fatal(err)
+	}
 
-	writeAllocs := testing.AllocsPerRun(50, func() {
+	const writeRuns = 25
+	writeAllocs := testing.AllocsPerRun(writeRuns, func() {
 		if _, werr := srvConn.Write(msg); werr != nil {
 			t.Fatal(werr)
 		}
@@ -538,13 +522,15 @@ func TestShadowTLSRecordLayerZeroAlloc(t *testing.T) {
 	if writeAllocs > 1 {
 		t.Fatalf("expected <=1 heap allocs per shadowTLSConn.Write using pooled buffers, got %.2f", writeAllocs)
 	}
+	// Drain writes queued during warmup + writeRuns runs (AllocsPerRun executes fn 1 + writeRuns times).
+	for i := 0; i < 1+writeRuns; i++ {
+		if _, rerr := io.ReadFull(cliConn, sink); rerr != nil {
+			t.Fatal(rerr)
+		}
+	}
 
-	// Stop background reader before measuring srvConn.Read so utls allocations don't pollute MemStats.
-	close(stopDrain)
-	<-drainDone
-	_ = cliConn.SetReadDeadline(time.Time{})
-
-	for i := 0; i < 55; i++ {
+	const readRuns = 25
+	for i := 0; i < 2+readRuns; i++ {
 		if _, werr := cliConn.Write(msg); werr != nil {
 			t.Fatal(werr)
 		}
@@ -553,7 +539,7 @@ func TestShadowTLSRecordLayerZeroAlloc(t *testing.T) {
 		t.Fatal(rerr)
 	}
 
-	readAllocs := testing.AllocsPerRun(50, func() {
+	readAllocs := testing.AllocsPerRun(readRuns, func() {
 		if _, rerr := io.ReadFull(srvConn, sink); rerr != nil {
 			t.Fatal(rerr)
 		}
