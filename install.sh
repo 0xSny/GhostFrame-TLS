@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Kestrel (Kestrel-RTC) v4.1.0 Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
+# Kestrel (Kestrel-RTC) v4.2.0 Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
 REPO="Spittingjiu/Ghost"
 ROLE="server"
 UNATTENDED=0
@@ -23,7 +23,7 @@ die()  { printf "\033[1;31m[×]\033[0m %s\n" "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-Kestrel (Kestrel-RTC) v4.1.0 Installer
+Kestrel (Kestrel-RTC) v4.2.0 Installer
 
 Usage:
   install.sh [options]
@@ -440,7 +440,7 @@ EOF
 
   cat > /etc/systemd/system/kestrel.service <<'EOF'
 [Unit]
-Description=Kestrel (Kestrel-RTC) v4.1.0 Dual-Stack Server
+Description=Kestrel (Kestrel-RTC) v4.2.0 Dual-Stack Server
 After=network-online.target
 Wants=network-online.target
 
@@ -492,7 +492,7 @@ install_client() {
     fi
     cat > /etc/systemd/system/kestrel-core.service <<EOF
 [Unit]
-Description=Kestrel (Kestrel-RTC) v4.1.0 Headless Core Daemon
+Description=Kestrel (Kestrel-RTC) v4.2.0 Headless Core Daemon
 After=network-online.target
 Wants=network-online.target
 

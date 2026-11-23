@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -26,10 +27,11 @@ import (
 	"ghostframe/internal/gft"
 	"ghostframe/internal/gftrtc"
 	"ghostframe/internal/netbind"
+	"ghostframe/internal/sni"
 )
 
 // Version is the canonical server build identifier (overridable via -ldflags -X).
-var Version = "v4.1.0"
+var Version = "v4.2.0"
 
 const (
 	MaxUDPAssocPerClient = 256
@@ -58,13 +60,15 @@ type Server struct {
 	panelListener *chanListener
 	started       time.Time
 
-	testUDPPC net.PacketConn // optional injection for tests
-	cfgMu     sync.RWMutex
-	cfgPath   string
-	rtcActive atomic.Int64
-	tcpAddrMu sync.RWMutex
-	tcpAddr   net.Addr
-	udpAddr   net.Addr
+	testUDPPC     net.PacketConn // optional injection for tests
+	cfgMu         sync.RWMutex
+	cfgPath       string
+	rtcActive     atomic.Int64
+	tcpAddrMu     sync.RWMutex
+	tcpAddr       net.Addr
+	udpAddr       net.Addr
+	certReloader  *certReloader
+	shadowProfile atomic.Pointer[sni.CamouflageProfile]
 
 	smu       sync.Mutex
 	sessions  map[uint64]*sessEntry
@@ -141,6 +145,16 @@ func (s *Server) UDPAddr() net.Addr {
 // SetTestUDPConn injects a custom net.PacketConn for Kestrel-RTC unit tests.
 func (s *Server) SetTestUDPConn(pc net.PacketConn) {
 	s.testUDPPC = pc
+}
+
+// ShadowProfile returns the currently cached upstream CamouflageTarget TLS 1.3 profile (or nil).
+func (s *Server) ShadowProfile() *sni.CamouflageProfile {
+	return s.shadowProfile.Load()
+}
+
+// SetShadowProfileForTest overrides the cached ShadowTLS profile in unit tests.
+func (s *Server) SetShadowProfileForTest(p *sni.CamouflageProfile) {
+	s.shadowProfile.Store(p)
 }
 
 func (s *Server) buildFallbackHandler() http.Handler {
@@ -287,6 +301,7 @@ func (s *Server) buildTLSConfig(ctx context.Context) (*tls.Config, error) {
 		if err != nil {
 			return nil, err
 		}
+		s.certReloader = reloader
 		tlsCfg.GetCertificate = reloader.getCertificate
 		go func() {
 			t := time.NewTicker(5 * time.Minute)
@@ -381,6 +396,35 @@ func (s *Server) Run(ctx context.Context) error {
 	wg.Add(4)
 	go func() { defer wg.Done(); _ = hs.Serve(s.fallback) }()
 	go func() { defer wg.Done(); _ = panelSrv.Serve(s.panelListener) }()
+	if !strings.EqualFold(s.cfg.CertMode, "acme") && strings.TrimSpace(s.cfg.CamouflageTarget) != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			refresh := func() {
+				pCtx, pCancel := context.WithTimeout(ctx, 3*time.Second)
+				prof, perr := sni.ProbeCamouflageProfile(pCtx, s.cfg.CamouflageTarget, s.cfg.SNI)
+				pCancel()
+				if perr == nil && prof != nil {
+					s.shadowProfile.Store(prof)
+					s.logger.Printf("shadowtls profile refreshed target=%s cipher=0x%04x group=0x%04x alpn=%s flight2=%v tickets=%v",
+						s.cfg.CamouflageTarget, prof.CipherSuite, prof.KeyShareGroup, prof.ALPN, prof.Flight2RecordLens, prof.PostTicketRecordLens)
+				} else if perr != nil && ctx.Err() == nil {
+					s.logger.Printf("shadowtls profile probe skipped (%s): %v", s.cfg.CamouflageTarget, perr)
+				}
+			}
+			refresh()
+			t := time.NewTicker(2 * time.Hour)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					refresh()
+				}
+			}
+		}()
+	}
 	go func() {
 		defer wg.Done()
 		t := time.NewTicker(time.Second)
@@ -649,17 +693,38 @@ func (s *Server) handleTCP(ctx context.Context, raw net.Conn, tlsCfg *tls.Config
 		return
 	}
 
-	// Validated stego ClientHello -> proceed to TLS 1.3 handshake
-	tc := tls.Server(rc, tlsCfg)
-	_ = tc.SetDeadline(time.Now().Add(10 * time.Second))
-	if err := tc.HandshakeContext(ctx); err != nil {
-		_ = raw.Close()
-		return
+	// Validated stego ClientHello -> proceed to TLS 1.3 handshake (ShadowTLS 1.3 when profile is ready)
+	var tlsConn net.Conn
+	var alpn string
+	if prof := s.shadowProfile.Load(); prof != nil && !strings.EqualFold(s.cfg.CertMode, "acme") && s.certReloader != nil {
+		if cert, cerr := s.certReloader.getCertificate(nil); cerr == nil && len(cert.Certificate) > 0 {
+			if signer, ok := cert.PrivateKey.(crypto.Signer); ok {
+				hsCtx, hsCancel := context.WithTimeout(ctx, 10*time.Second)
+				sc, scALPN, serr := gft.PerformShadowTLS13Server(hsCtx, rc, cert.Certificate[0], signer, prof)
+				hsCancel()
+				if serr != nil {
+					_ = raw.Close()
+					return
+				}
+				tlsConn = sc
+				alpn = scALPN
+			}
+		}
 	}
-	_ = tc.SetDeadline(time.Time{})
+	if tlsConn == nil {
+		tc := tls.Server(rc, tlsCfg)
+		_ = tc.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := tc.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return
+		}
+		_ = tc.SetDeadline(time.Time{})
+		tlsConn = tc
+		alpn = tc.ConnectionState().NegotiatedProtocol
+	}
 
 	// Post-TLS ClientAuthFrame verification (defense-in-depth)
-	authRC := gft.NewRewindConn(tc)
+	authRC := gft.NewRewindConn(tlsConn)
 	if salt, clientID, err := s.stego.VerifyClientAuthFrameWithID(authRC); err == nil {
 		authRC.StopRecording()
 		ack, aerr := gft.BuildServerAuthAck(s.psk, salt, s.params.Get())
@@ -677,7 +742,7 @@ func (s *Server) handleTCP(ctx context.Context, raw net.Conn, tlsCfg *tls.Config
 		s.audit.Record(ip, res.String())
 		_ = authRC.SetReadDeadline(time.Time{})
 		authRC.Rewind()
-		s.serveHTTPFallback(ctx, &tlsRewindConn{Conn: authRC, proto: tc.ConnectionState().NegotiatedProtocol})
+		s.serveHTTPFallback(ctx, &tlsRewindConn{Conn: authRC, proto: alpn})
 		return
 	}
 	ack, err := gft.BuildServerAck(s.psk, salt2, s.params.Get())
@@ -765,7 +830,7 @@ func (s *Server) serveTCPSession(ctx context.Context, conn net.Conn, ip string, 
 	s.sessions[id] = &sessEntry{ID: id, IP: ip, Since: time.Now(), Sess: sess}
 	s.smu.Unlock()
 	s.logger.Printf("tcp session %d opened from %s", id, ip)
-	_ = sess.Run()
+	runErr := sess.Run()
 	if !shared {
 		udpMgr.closeAll()
 	}
@@ -773,7 +838,7 @@ func (s *Server) serveTCPSession(ctx context.Context, conn net.Conn, ip string, 
 	s.smu.Lock()
 	delete(s.sessions, id)
 	s.smu.Unlock()
-	s.logger.Printf("tcp session %d closed", id)
+	s.logger.Printf("tcp session %d closed: %v", id, runErr)
 }
 
 var errBlockedTarget = errors.New("blocked target")

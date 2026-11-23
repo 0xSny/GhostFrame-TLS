@@ -498,7 +498,7 @@ func (c *Config) Link(p gft.Params) *gft.Link {
 		Pin:       c.Pin,
 		FP:        "chrome",
 		Transport: "auto",
-		SplitSNI:  true,
+		SplitSNI:  false,
 		HopRange:  c.HopRange,
 		UpMbps:    c.UpMbps,
 		DownMbps:  c.DownMbps,

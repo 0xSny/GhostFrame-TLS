@@ -906,13 +906,26 @@ func TestDeleteNodePreservesActiveIndexAndSwitchCancellation(t *testing.T) {
 	uri3, stop3 := startLocalTestServerForClient(t, "NodeThree")
 	defer stop3()
 
-	// Unreachable port for slow/cancelled handshake simulation.
-	deadLn, err := net.Listen("tcp", "127.0.0.1:0")
+	// Blackhole TLS listener for deterministic slow/cancelled handshake simulation.
+	slowLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadPort := deadLn.Addr().(*net.TCPAddr).Port
-	_ = deadLn.Close()
+	t.Cleanup(func() { _ = slowLn.Close() })
+	go func() {
+		for {
+			c, aerr := slowLn.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				var b [1]byte
+				_, _ = conn.Read(b[:])
+			}(c)
+		}
+	}()
+	deadPort := slowLn.Addr().(*net.TCPAddr).Port
 	deadLink, err := gft.ParseLink(uri0)
 	if err != nil {
 		t.Fatal(err)

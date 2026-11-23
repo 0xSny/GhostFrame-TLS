@@ -92,7 +92,7 @@ func DialV3StealthWithID(ctx context.Context, l *Link, timeout time.Duration, cl
 	}
 	netbind.TuneTCPConn(raw)
 	var transport net.Conn = raw
-	if l.SplitSNI || l.V >= 3 {
+	if l.SplitSNI {
 		transport = NewRecordSplitConn(raw)
 	}
 	uc := newUClientWithHardware(transport, ucfg, clientHelloIDFor(l.EffectiveFP()))

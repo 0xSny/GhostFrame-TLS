@@ -25,6 +25,7 @@ import (
 	"golang.org/x/net/http2"
 
 	"ghostframe/internal/gft"
+	"ghostframe/internal/sni"
 )
 
 func waitForTCPAddr(t *testing.T, s *Server) string {
@@ -834,5 +835,87 @@ func TestServerMultiTCPBondedStreamEndToEnd(t *testing.T) {
 	t.Logf("ProbeNow done ms=%d mode=%s err=%v elapsed=%v", ms, mode, perr, time.Since(tStart))
 	if perr != nil || ms <= 0 || mode != "TCP-uTLS" {
 		t.Fatalf("expected live ProbeNow over TCP-uTLS, got ms=%d mode=%q err=%v", ms, mode, perr)
+	}
+}
+
+func TestServerShadowTLS13Integration(t *testing.T) {
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			c, aerr := echoLn.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(cc net.Conn) {
+				defer cc.Close()
+				_, _ = io.Copy(cc, cc)
+			}(c)
+		}
+	}()
+
+	AllowPrivateTargets = true
+	defer func() { AllowPrivateTargets = false }()
+
+	srv, sec, addr, stop := startTestServer(t, InitOptions{
+		SNI:          "ftp.jaist.ac.jp",
+		CertMode:     "self_signed_90d",
+		FallbackMode: "builtin_blog",
+	}, false, nil)
+	defer stop()
+
+	srv.SetShadowProfileForTest(&sni.CamouflageProfile{
+		CipherSuite:          0x1302,
+		KeyShareGroup:        0x001d,
+		ServerHelloExtOrder:  []uint16{0x0033, 0x002b},
+		SendCCS:              true,
+		Flight2RecordLens:    []int{39, 1200, 128, 69},
+		PostTicketRecordLens: []int{265, 265},
+		ALPN:                 "h2",
+	})
+
+	link, err := gft.ParseLink(sec.Link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if link.SplitSNI {
+		t.Fatalf("expected newly exported v4 link to have SplitSNI=false by default")
+	}
+	_, portStr, _ := net.SplitHostPort(addr)
+	link.Port = mustAtoi(portStr)
+	link.Host = "127.0.0.1"
+	link.Transport = "tcp"
+
+	ps := gft.NewParamStore(gft.DefaultParams())
+	sess, _, err := gft.DialSessionWithID(context.Background(), link, ps, 0, 5*time.Second, gft.DefaultClientID)
+	if err != nil {
+		t.Fatalf("DialSessionWithID over Server ShadowTLS 1.3 failed: %v", err)
+	}
+	defer sess.Close()
+
+	st, err := sess.OpenStream(echoLn.Addr().String(), []byte("SHADOW-OK:"))
+	if err != nil {
+		t.Fatalf("OpenStream failed: %v", err)
+	}
+	defer st.Close()
+	msg := bytes.Repeat([]byte("REALITY-SHADOWTLS-"), 512)
+	if _, werr := st.Write(msg); werr != nil {
+		t.Fatalf("st.Write failed: %v", werr)
+	}
+
+	got := make([]byte, len("SHADOW-OK:")+len(msg))
+	if rn, err := io.ReadFull(st, got); err != nil {
+		t.Fatalf("ReadFull echo failed (rn=%d/%d): %v", rn, len(got), err)
+	}
+	_ = st.CloseWrite()
+	var tail [1]byte
+	if tn, terr := st.Read(tail[:]); tn != 0 || terr != io.EOF {
+		t.Fatalf("expected clean EOF after CloseWrite, got n=%d err=%v", tn, terr)
+	}
+	if !bytes.Equal(got, append([]byte("SHADOW-OK:"), msg...)) {
+		t.Fatal("echo payload mismatch over Server ShadowTLS 1.3")
 	}
 }

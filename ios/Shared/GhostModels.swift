@@ -315,7 +315,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         if !short.isEmpty {
             return short.hasPrefix("v") ? short : "v\(short)"
         }
-        return "v4.1.0"
+        return "v4.2.0"
     }
 
     init() {
