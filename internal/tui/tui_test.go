@@ -295,7 +295,7 @@ func setupOTATestController(t *testing.T, oldBin []byte) (string, *Controller, s
 func TestOTAUpgradeSuccessAndSHA256Verify(t *testing.T) {
 	oldBin := []byte("old-gft-server-v3.2.0")
 	newBin := []byte("new-gft-server-v4.1.0-elf")
-	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusOK)
+	srv := newMockOTAServer(t, "v9.9.0", newBin, "", http.StatusOK)
 
 	_, c, target := setupOTATestController(t, oldBin)
 
@@ -326,7 +326,7 @@ func TestOTAUpgradeSuccessAndSHA256Verify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PerformOTAUpgrade failed: %v", err)
 	}
-	if res.AlreadyLatest || res.ToVersion != "v4.1.0" || restarted != 1 || verifiedPath == "" || probedPort != 443 {
+	if res.AlreadyLatest || res.ToVersion != "v9.9.0" || restarted != 1 || verifiedPath == "" || probedPort != 443 {
 		t.Fatalf("unexpected upgrade result: %+v restarted=%d probed=%d verified=%q", res, restarted, probedPort, verifiedPath)
 	}
 
@@ -343,7 +343,7 @@ func TestOTAUpgradeSuccessAndSHA256Verify(t *testing.T) {
 func TestOTAUpgradeSHA256MismatchAborts(t *testing.T) {
 	oldBin := []byte("original-intact-binary")
 	newBin := []byte("tampered-binary-payload")
-	srv := newMockOTAServer(t, "v4.1.0", newBin, strings.Repeat("0", 64), http.StatusOK)
+	srv := newMockOTAServer(t, "v9.9.0", newBin, strings.Repeat("0", 64), http.StatusOK)
 
 	_, c, target := setupOTATestController(t, oldBin)
 
@@ -373,7 +373,7 @@ func TestOTAUpgradeSHA256MismatchAborts(t *testing.T) {
 func TestOTAUpgradeRollbackOnRestartFailure(t *testing.T) {
 	oldBin := []byte("healthy-old-binary")
 	newBin := []byte("crashing-new-binary")
-	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusOK)
+	srv := newMockOTAServer(t, "v9.9.0", newBin, "", http.StatusOK)
 
 	_, c, target := setupOTATestController(t, oldBin)
 
@@ -415,7 +415,7 @@ func TestOTAUpgradeRollbackOnRestartFailure(t *testing.T) {
 func TestOTAUpgradeRedirectFallbackOnAPIRateLimit(t *testing.T) {
 	oldBin := []byte("old-binary")
 	newBin := []byte("new-binary-via-redirect")
-	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusForbidden)
+	srv := newMockOTAServer(t, "v9.9.0", newBin, "", http.StatusForbidden)
 
 	_, c, target := setupOTATestController(t, oldBin)
 
@@ -425,15 +425,15 @@ func TestOTAUpgradeRedirectFallbackOnAPIRateLimit(t *testing.T) {
 		WebBaseURL:    srv.URL,
 		HTTPClient:    srv.Client(),
 		SkipDiskCheck: true,
-		VerifyBinFn:   func(string) (string, error) { return "gft-server v4.1.0", nil },
+		VerifyBinFn:   func(string) (string, error) { return "gft-server v9.9.0", nil },
 		RestartFn:     func() error { return nil },
 		ActiveFn:      func() bool { return true },
 	})
 	if err != nil {
 		t.Fatalf("PerformOTAUpgrade via 302 redirect fallback failed: %v", err)
 	}
-	if res.ToVersion != "v4.1.0" {
-		t.Fatalf("expected ToVersion v4.1.0, got %q", res.ToVersion)
+	if res.ToVersion != "v9.9.0" {
+		t.Fatalf("expected ToVersion v9.9.0, got %q", res.ToVersion)
 	}
 	gotBin, _ := os.ReadFile(target)
 	if !bytes.Equal(gotBin, newBin) {
@@ -444,7 +444,7 @@ func TestOTAUpgradeRedirectFallbackOnAPIRateLimit(t *testing.T) {
 func TestOTAUpgradeRollbackOnPortProbeFailure(t *testing.T) {
 	oldBin := []byte("healthy-v400-binary")
 	newBin := []byte("broken-bind-binary")
-	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusOK)
+	srv := newMockOTAServer(t, "v9.9.0", newBin, "", http.StatusOK)
 
 	_, c, target := setupOTATestController(t, oldBin)
 
@@ -476,7 +476,7 @@ func TestOTAUpgradeRollbackOnPortProbeFailure(t *testing.T) {
 func TestOTAManualRollbackSuccess(t *testing.T) {
 	oldBin := []byte("known-good-v400")
 	newBin := []byte("canary-v410")
-	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusOK)
+	srv := newMockOTAServer(t, "v9.9.0", newBin, "", http.StatusOK)
 
 	_, c, target := setupOTATestController(t, oldBin)
 
@@ -520,7 +520,7 @@ func TestOTAManualRollbackSuccess(t *testing.T) {
 func TestOTAUpgradeConcurrentLockPreventsRace(t *testing.T) {
 	oldBin := []byte("locked-binary")
 	newBin := []byte("should-not-overwrite")
-	srv := newMockOTAServer(t, "v4.1.0", newBin, "", http.StatusOK)
+	srv := newMockOTAServer(t, "v9.9.0", newBin, "", http.StatusOK)
 
 	_, c, target := setupOTATestController(t, oldBin)
 	if err := os.WriteFile(c.Tx.LockPath, []byte("99999\n"), 0o600); err != nil {

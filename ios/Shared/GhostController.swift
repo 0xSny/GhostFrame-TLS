@@ -66,6 +66,7 @@ final class GhostAppViewModel: ObservableObject {
     private let storageKeyCustomRules: String
 
     private var toastClearTask: DispatchWorkItem?
+    private var isProgrammaticSync: Bool = false
 
     init(edition: GhostEdition, backend: GhostBackend) {
         self.edition = edition
@@ -151,6 +152,19 @@ final class GhostAppViewModel: ObservableObject {
         backend.connect(config: config, node: node)
     }
 
+    private func beginProgrammaticSync(_ body: () -> Void) {
+        isProgrammaticSync = true
+        body()
+        DispatchQueue.main.async { [weak self] in
+            self?.isProgrammaticSync = false
+        }
+    }
+
+    func applySettingsFromPicker() {
+        guard !isProgrammaticSync else { return }
+        applySettings()
+    }
+
     @discardableResult
     func importLink(_ rawURI: String) -> Bool {
         let trimmed = rawURI.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -158,46 +172,82 @@ final class GhostAppViewModel: ObservableObject {
             errorBanner = "请输入有效的 ksl4:// 或 gft3:// 节点链接"
             return false
         }
-        switch GhostMobileBridge.parseLink(uri: trimmed) {
-        case .success(let parsed):
-            if let existingIdx = nodes.firstIndex(where: { $0.uri == parsed.uri || ($0.host == parsed.host && $0.port == parsed.port && $0.sni == parsed.sni) }) {
-                var updated = parsed
-                updated.id = nodes[existingIdx].id
-                nodes[existingIdx] = updated
-                selectedNodeID = updated.id
-            } else {
-                nodes.append(parsed)
-                selectedNodeID = parsed.id
+        let lines = trimmed
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let schemeLines = lines.filter { line in
+            let lower = line.lowercased()
+            return lower.hasPrefix("ksl4://") || lower.hasPrefix("gft3://") || lower.hasPrefix("gft2://") || lower.hasPrefix("gft://")
+        }
+        let candidates = schemeLines.isEmpty ? [trimmed] : schemeLines
+
+        var importedNodes: [GhostNode] = []
+        var firstImportedID: String?
+        var lastError: Error?
+
+        for candidate in candidates {
+            switch GhostMobileBridge.parseLink(uri: candidate) {
+            case .success(let parsed):
+                var targetNode = parsed
+                if let existingIdx = nodes.firstIndex(where: { $0.uri == parsed.uri || ($0.host == parsed.host && $0.port == parsed.port && $0.sni == parsed.sni) }) {
+                    targetNode.id = nodes[existingIdx].id
+                    nodes[existingIdx] = targetNode
+                } else {
+                    nodes.append(targetNode)
+                }
+                if firstImportedID == nil {
+                    firstImportedID = targetNode.id
+                }
+                importedNodes.append(targetNode)
+                appendLocalLog("Imported node \(targetNode.remark) (\(targetNode.host):\(targetNode.port))")
+            case .failure(let err):
+                lastError = err
             }
-            if let t = GhostTransportMode(rawValue: parsed.transport) {
-                transportMode = t
-            }
-            if parsed.upMbps > 0 || parsed.downMbps > 0 {
-                upMbpsText = "\(parsed.upMbps)"
-                downMbpsText = "\(parsed.downMbps)"
-            }
-            savePreferences()
-            errorBanner = ""
-            appendLocalLog("Imported node \(parsed.remark) (\(parsed.host):\(parsed.port))")
-            showToast("已导入节点：\(parsed.remark)")
-            if isConnected {
-                applySettings()
-            }
-            return true
-        case .failure(let err):
-            errorBanner = err.localizedDescription
-            showToast("解析失败：\(err.localizedDescription)")
+        }
+
+        guard let activeImported = importedNodes.first, let targetID = firstImportedID else {
+            let msg = lastError?.localizedDescription ?? "无效的节点链接"
+            errorBanner = msg
+            showToast("解析失败：\(msg)")
             return false
         }
+
+        selectedNodeID = targetID
+        beginProgrammaticSync {
+            if let t = GhostTransportMode(rawValue: activeImported.transport) {
+                transportMode = t
+            }
+            if activeImported.upMbps == 0 && activeImported.downMbps == 0 {
+                upMbpsText = "0"
+                downMbpsText = "0"
+            } else {
+                upMbpsText = "\(activeImported.upMbps)"
+                downMbpsText = "\(activeImported.downMbps)"
+            }
+        }
+        savePreferences()
+        errorBanner = ""
+        if importedNodes.count > 1 {
+            showToast("已批量导入 \(importedNodes.count) 个节点并激活 \(activeImported.remark)")
+        } else {
+            showToast("已导入节点：\(activeImported.remark)")
+        }
+        if isConnected {
+            applySettings()
+        }
+        return true
     }
 
     func selectNode(_ node: GhostNode) {
         selectedNodeID = node.id
-        if let t = GhostTransportMode(rawValue: node.transport) {
-            transportMode = t
+        beginProgrammaticSync {
+            if let t = GhostTransportMode(rawValue: node.transport) {
+                transportMode = t
+            }
+            upMbpsText = "\(node.upMbps)"
+            downMbpsText = "\(node.downMbps)"
         }
-        upMbpsText = "\(node.upMbps)"
-        downMbpsText = "\(node.downMbps)"
         savePreferences()
         appendLocalLog("Switched node -> \(node.remark)")
         if isConnected {

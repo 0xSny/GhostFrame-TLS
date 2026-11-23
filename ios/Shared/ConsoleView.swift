@@ -383,7 +383,7 @@ struct ConsoleView: View {
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: viewModel.routeMode) { _ in
-                    viewModel.applySettings()
+                    viewModel.applySettingsFromPicker()
                 }
             }
 
@@ -398,7 +398,7 @@ struct ConsoleView: View {
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: viewModel.transportMode) { _ in
-                    viewModel.applySettings()
+                    viewModel.applySettingsFromPicker()
                 }
             }
 

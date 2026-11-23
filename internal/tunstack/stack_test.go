@@ -1,6 +1,7 @@
 package tunstack
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"net"
@@ -334,10 +335,19 @@ func TestFakeIPv6AndStackIPv6Toggle(t *testing.T) {
 	copy(dst6[:], net.ParseIP("fd18:c612::1").To16())
 	pkt6 := buildIPv6UDPPacket(src6, dst6, 44444, 53, buildDNSQuery(0x8888, "ipv6test.example.org", 28))
 
-	// With IPv6 disabled by default, PushPacket drops IPv6 without incrementing PacketsIn.
+	// With IPv6 disabled by default, PushPacket injects IPv6 packets for fast-reject (DNS AAAA NODATA / TCP RST).
 	st.PushPacket(pkt6)
-	if st.Stats().PacketsIn != 0 {
-		t.Fatalf("expected IPv6 packet dropped when engine IPv6 disabled, PacketsIn=%d", st.Stats().PacketsIn)
+	if st.Stats().PacketsIn == 0 {
+		t.Fatalf("expected IPv6 packet injected for fast-reject when engine IPv6 disabled, PacketsIn=%d", st.Stats().PacketsIn)
+	}
+	select {
+	case out := <-w.ch:
+		ans := out[header.IPv6MinimumSize+header.UDPMinimumSize:]
+		if binary.BigEndian.Uint16(ans[6:8]) != 0 {
+			t.Fatalf("expected 0 AAAA answers when IPv6 disabled, got %d", binary.BigEndian.Uint16(ans[6:8]))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for AAAA NODATA response when IPv6 disabled")
 	}
 
 	// Enable IPv6: PushPacket injects IPv6 packet and DNS responder returns Fake-IPv6 AAAA packet over IPv6!
@@ -399,5 +409,143 @@ func TestStackRegistersFakeIPLookupAndBlocksFakeIPDirectUDP(t *testing.T) {
 	st.Close()
 	if _, err := eng.RecoverFakeIPTarget(net.JoinHostPort(fakeIP.String(), "443")); err != netbind.ErrFakeIPBlocked {
 		t.Fatalf("expected ErrFakeIPBlocked after Stack.Close cleared FakeIPLookupFunc, got %v", err)
+	}
+}
+
+func buildIPv6TCPSYNPacket(srcIP, dstIP [16]byte, srcPort, dstPort uint16) []byte {
+	const tcpLen = header.TCPMinimumSize
+	pkt := make([]byte, header.IPv6MinimumSize+tcpLen)
+
+	ip := header.IPv6(pkt[:header.IPv6MinimumSize])
+	ip.Encode(&header.IPv6Fields{
+		PayloadLength:     tcpLen,
+		TransportProtocol: header.TCPProtocolNumber,
+		HopLimit:          64,
+		SrcAddr:           tcpip.AddrFrom16(srcIP),
+		DstAddr:           tcpip.AddrFrom16(dstIP),
+	})
+
+	tcpHdr := header.TCP(pkt[header.IPv6MinimumSize:])
+	tcpHdr.Encode(&header.TCPFields{
+		SrcPort:    srcPort,
+		DstPort:    dstPort,
+		SeqNum:     0x11223344,
+		AckNum:     0,
+		DataOffset: header.TCPMinimumSize,
+		Flags:      header.TCPFlagSyn,
+		WindowSize: 65535,
+	})
+	xsum := header.PseudoHeaderChecksum(
+		header.TCPProtocolNumber,
+		tcpip.AddrFrom16(srcIP),
+		tcpip.AddrFrom16(dstIP),
+		uint16(tcpLen),
+	)
+	xsum = checksum.Checksum(tcpHdr, xsum)
+	tcpHdr.SetChecksum(^xsum)
+	return pkt
+}
+
+func TestStackIPv6DisabledTCPFastRSTAndLargeUDPRelay(t *testing.T) {
+	client.SetNoSysProxy(true)
+	eng, err := client.NewEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if err := eng.SetRouteMode(client.RouteRule); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetCustomRules([]string{"DOMAIN-SUFFIX,largeudp.test,DIRECT"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.SetEnableIPv6(false); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &captureWriter{ch: make(chan []byte, 16)}
+	st, err := NewWithOptions(eng, w, 8000, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// 1. Inject IPv6 TCP SYN while IPv6 disabled -> must get immediate TCP RST packet (not silent timeout).
+	var src6, dst6 [16]byte
+	copy(src6[:], net.ParseIP("fd18:c612::2").To16())
+	copy(dst6[:], net.ParseIP("2606:4700:4700::1111").To16())
+	syn6 := buildIPv6TCPSYNPacket(src6, dst6, 51234, 443)
+	st.PushPacket(syn6)
+
+	select {
+	case out := <-w.ch:
+		if len(out) < header.IPv6MinimumSize+header.TCPMinimumSize || (out[0]>>4) != 6 {
+			t.Fatalf("expected valid IPv6 TCP RST packet, got len=%d ver=%d", len(out), out[0]>>4)
+		}
+		if out[6] != uint8(header.TCPProtocolNumber) {
+			t.Fatalf("expected NextHeader=TCP(6), got %d", out[6])
+		}
+		flags := header.TCP(out[header.IPv6MinimumSize:]).Flags()
+		if !flags.Contains(header.TCPFlagRst) {
+			t.Fatalf("expected TCP RST flag set, got flags=%v", flags)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for immediate IPv6 TCP RST when IPv6 disabled")
+	}
+
+	// 2. Verify >4KB UDP datagrams pass losslessly through relayUDPDirect (udpBufPool 16KB, not 2KB dnsBufPool).
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	readyCh := make(chan struct{})
+	go func() {
+		close(readyCh)
+		buf := make([]byte, 16384)
+		for {
+			n, addr, rerr := pc.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			_, _ = pc.WriteTo(buf[:n], addr)
+		}
+	}()
+	<-readyCh
+	echoPort := uint16(pc.LocalAddr().(*net.UDPAddr).Port)
+
+	fakeIP := st.fakeIP.Allocate("echo.largeudp.test")
+	restoreNAT64 := netbind.SetNAT64TestHooks(nil, nil, func(_ context.Context, host string) ([]net.IP, error) {
+		if host == "echo.largeudp.test" {
+			return []net.IP{net.IPv4(127, 0, 0, 1)}, nil
+		}
+		return nil, nil
+	})
+	defer restoreNAT64()
+
+	bigPayload := bytes.Repeat([]byte("KESTREL-UDP-4KB-"), 282) // 16 * 282 = 4512 bytes (>4KB)
+	udpPkt := buildIPv4UDPPacket([4]byte{198, 18, 0, 2}, fakeIP, 55555, echoPort, bigPayload)
+
+	var out []byte
+	for attempt := 0; attempt < 5; attempt++ {
+		st.PushPacket(udpPkt)
+		select {
+		case out = <-w.ch:
+		case <-time.After(300 * time.Millisecond):
+		}
+		if out != nil {
+			break
+		}
+	}
+	if out == nil {
+		t.Fatal("timed out waiting for >4KB UDP echo through TUN stack")
+	}
+	if len(out) < header.IPv4MinimumSize+header.UDPMinimumSize+len(bigPayload) {
+		t.Fatalf("expected full >4KB UDP echo packet without 2KB truncation, got total len=%d", len(out))
+	}
+	ihl := int(out[0]&0x0F) * 4
+	gotPayload := out[ihl+header.UDPMinimumSize:]
+	if !bytes.Equal(gotPayload, bigPayload) {
+		t.Fatalf("echoed >4KB UDP payload mismatch: got %d bytes want %d bytes", len(gotPayload), len(bigPayload))
 	}
 }

@@ -6,6 +6,11 @@ private struct MobileActionEnvelope: Decodable {
     let error: String?
 }
 
+struct MobileResolvedIPs: Decodable {
+    let v4: [String]?
+    let v6: [String]?
+}
+
 private struct MobileParseLinkEnvelope: Decodable {
     let ok: Bool
     let error: String?
@@ -123,6 +128,15 @@ enum GhostMobileBridge {
 
     static func buildBypassRule(serverHost: String) -> String {
         MobileBuildBypassRule(serverHost)
+    }
+
+    static func resolveHostIPs(host: String) -> (v4: [String], v6: [String]) {
+        let raw = MobileResolveHostIPsJSON(host)
+        guard let data = raw.data(using: .utf8),
+              let parsed = try? JSONDecoder().decode(MobileResolvedIPs.self, from: data) else {
+            return ([], [])
+        }
+        return (parsed.v4 ?? [], parsed.v6 ?? [])
     }
 
     static func startTUN(writer: MobileTunPacketWriterProtocol, mtu: Int = 1400) -> Result<Void, Error> {

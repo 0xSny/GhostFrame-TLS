@@ -44,7 +44,7 @@ jobs:
           elif [ "$REF_TYPE" = "tag" ]; then
             REL_VER="$REF_NAME"
           else
-            REL_VER="v4.0.$((15 + RUN_NUM))-LTS"
+            REL_VER="v4.1.0"
           fi
 
           export CGO_ENABLED=0
@@ -114,14 +114,14 @@ jobs:
           elif [ "$REF_TYPE" = "tag" ]; then
             REL_VER="$REF_NAME"
           else
-            REL_VER="v4.0.$((15 + RUN_NUM))-LTS"
+            REL_VER="v4.1.0"
           fi
-          if [[ "$REL_VER" =~ ^v?(4\.0\.([0-9]+)) ]]; then
+          if [[ "$REL_VER" =~ ^v?(([0-9]+)\.([0-9]+)\.([0-9]+)) ]]; then
             IOS_APP_VER="${BASH_REMATCH[1]}"
-            DIST_BUILD_NUM="${BASH_REMATCH[2]}"
+            DIST_BUILD_NUM="$((BASH_REMATCH[2] * 100 + BASH_REMATCH[3] * 10 + BASH_REMATCH[4]))"
           else
-            DIST_BUILD_NUM=$((15 + RUN_NUM))
-            IOS_APP_VER="4.0.${DIST_BUILD_NUM}"
+            DIST_BUILD_NUM=$((410 + RUN_NUM))
+            IOS_APP_VER="4.1.0"
           fi
 
           go install golang.org/x/mobile/cmd/gomobile@latest
@@ -238,7 +238,7 @@ jobs:
           elif [ "$REF_TYPE" = "tag" ]; then
             TAG="$REF_NAME"
           else
-            TAG="v4.0.$((15 + RUN_NUM))-LTS"
+            TAG="v4.1.0"
           fi
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
 
@@ -254,10 +254,10 @@ jobs:
           DUO_SIZE="$(stat -c%s release-out/Kestrel-Duo-Unsigned.ipa)"
           AIR_SIZE="$(stat -c%s release-out/Kestrel-Air-Unsigned.ipa)"
           NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          if [[ "$TAG" =~ ^v?(4\.0\.([0-9]+)) ]]; then
+          if [[ "$TAG" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
             APP_VER="${BASH_REMATCH[1]}"
           else
-            APP_VER="4.0.$((15 + RUN_NUM))"
+            APP_VER="4.1.0"
           fi
           BASE_DL="https://github.com/${TARGET_REPO}/releases/download/${TAG}"
 

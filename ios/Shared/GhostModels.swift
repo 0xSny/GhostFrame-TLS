@@ -313,9 +313,9 @@ struct GhostStatusSnapshot: Codable, Equatable {
         let short = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !short.isEmpty {
-            return short.hasPrefix("v") ? short : "v\(short)-LTS"
+            return short.hasPrefix("v") ? short : "v\(short)"
         }
-        return "v4.0.40-LTS"
+        return "v4.1.0"
     }
 
     init() {

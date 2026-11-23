@@ -55,6 +55,7 @@ private final class PacketFlowTunWriter: NSObject, MobileTunPacketWriterProtocol
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pathMonitor: NWPathMonitor?
     private let monitorQueue = DispatchQueue(label: "com.kestrel.duo.tunnel.pathmonitor")
+    private let reloadQueue = DispatchQueue(label: "com.kestrel.duo.tunnel.reload")
     private var lastPhysicalIface: String = ""
     private var lastPathSignature: String = ""
     private var pathDebounceWorkItem: DispatchWorkItem?
@@ -278,50 +279,59 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: "Missing configJSON for reload"), completionHandler: completionHandler)
                     return
                 }
-                let decodedCfg = GhostEngineConfig.decode(from: cfgJSON)
-                var serverHost = ""
-                if let linkURI = decodedCfg?.linkURI, case .success(let node) = GhostMobileBridge.parseLink(uri: linkURI) {
-                    serverHost = node.host
-                }
-                let newHTTPPort = decodedCfg?.httpPort ?? self.currentHTTPPort
-                let newRouteMode = (decodedCfg?.routeMode ?? self.currentRouteMode).lowercased()
-                let newEnableIPv6 = decodedCfg?.enableIPv6 ?? self.currentEnableIPv6
-                let startConfigJSON: String
-                if var cfg = decodedCfg {
-                    cfg.asyncConnect = true
-                    startConfigJSON = cfg.toJSONString()
-                } else {
-                    startConfigJSON = cfgJSON
-                }
-
-                self.stopTUNForwarding()
-                _ = GhostMobileBridge.stopEngine()
-                switch GhostMobileBridge.startEngine(configJSON: startConfigJSON) {
-                case .failure(let err):
-                    self.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
-                case .success:
-                    if newHTTPPort != self.currentHTTPPort || serverHost != self.currentServerHost || newRouteMode != self.currentRouteMode || newEnableIPv6 != self.currentEnableIPv6 {
-                        self.currentHTTPPort = newHTTPPort
-                        self.currentServerHost = serverHost
-                        self.currentRouteMode = newRouteMode
-                        self.currentEnableIPv6 = newEnableIPv6
-                        let settings = self.buildNetworkSettings(httpPort: newHTTPPort, serverHost: serverHost, routeMode: newRouteMode, enableIPv6: newEnableIPv6)
-                        self.setTunnelNetworkSettings(settings) { [weak self] err in
-                            if let err = err {
-                                self?.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
-                            } else {
-                                if newRouteMode != "core" {
-                                    _ = self?.startTUNForwarding(mtu: 1400)
-                                }
-                                self?.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
-                            }
-                        }
+                self.reloadQueue.async { [weak self] in
+                    guard let self = self else {
+                        completionHandler?(nil)
                         return
                     }
-                    if newRouteMode != "core" {
-                        _ = self.startTUNForwarding(mtu: 1400)
+                    let decodedCfg = GhostEngineConfig.decode(from: cfgJSON)
+                    var serverHost = ""
+                    if let linkURI = decodedCfg?.linkURI, case .success(let node) = GhostMobileBridge.parseLink(uri: linkURI) {
+                        serverHost = node.host
                     }
-                    self.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
+                    let newHTTPPort = decodedCfg?.httpPort ?? self.currentHTTPPort
+                    let newRouteMode = (decodedCfg?.routeMode ?? self.currentRouteMode).lowercased()
+                    let newEnableIPv6 = decodedCfg?.enableIPv6 ?? self.currentEnableIPv6
+                    let startConfigJSON: String
+                    if var cfg = decodedCfg {
+                        cfg.asyncConnect = true
+                        startConfigJSON = cfg.toJSONString()
+                    } else {
+                        startConfigJSON = cfgJSON
+                    }
+
+                    self.stopTUNForwarding()
+                    _ = GhostMobileBridge.stopEngine()
+                    switch GhostMobileBridge.startEngine(configJSON: startConfigJSON) {
+                    case .failure(let err):
+                        self.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
+                    case .success:
+                        if newHTTPPort != self.currentHTTPPort || serverHost != self.currentServerHost || newRouteMode != self.currentRouteMode || newEnableIPv6 != self.currentEnableIPv6 {
+                            self.currentHTTPPort = newHTTPPort
+                            self.currentServerHost = serverHost
+                            self.currentRouteMode = newRouteMode
+                            self.currentEnableIPv6 = newEnableIPv6
+                            let settings = self.buildNetworkSettings(httpPort: newHTTPPort, serverHost: serverHost, routeMode: newRouteMode, enableIPv6: newEnableIPv6)
+                            let applySem = DispatchSemaphore(value: 0)
+                            self.setTunnelNetworkSettings(settings) { [weak self] err in
+                                if let err = err {
+                                    self?.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
+                                } else {
+                                    if newRouteMode != "core" {
+                                        _ = self?.startTUNForwarding(mtu: 1400)
+                                    }
+                                    self?.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
+                                }
+                                applySem.signal()
+                            }
+                            _ = applySem.wait(timeout: .now() + 6)
+                            return
+                        }
+                        if newRouteMode != "core" {
+                            _ = self.startTUNForwarding(mtu: 1400)
+                        }
+                        self.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
+                    }
                 }
 
             default:
@@ -361,11 +371,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             NEIPv4Route(destinationAddress: "224.0.0.0", subnetMask: "240.0.0.0"),
             NEIPv4Route(destinationAddress: "255.255.255.255", subnetMask: "255.255.255.255")
         ]
+        var resolvedRemoteIPs: (v4: [String], v6: [String])? = nil
         if !serverHost.isEmpty {
-            if isValidIPv4(serverHost) {
-                excluded.append(NEIPv4Route(destinationAddress: serverHost, subnetMask: "255.255.255.255"))
-            } else {
-                for resolvedIP in resolveIPv4Addresses(serverHost) {
+            let cleanServerHost = serverHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            if isValidIPv4(cleanServerHost) {
+                excluded.append(NEIPv4Route(destinationAddress: cleanServerHost, subnetMask: "255.255.255.255"))
+            } else if !isValidIPv6(cleanServerHost) {
+                let res = GhostMobileBridge.resolveHostIPs(host: cleanServerHost)
+                resolvedRemoteIPs = res
+                for resolvedIP in res.v4 {
                     excluded.append(NEIPv4Route(destinationAddress: resolvedIP, subnetMask: "255.255.255.255"))
                 }
             }
@@ -375,7 +389,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // Capture IPv6 default route into TUN in both modes:
         // - enableIPv6 == true : dual-stack Fake-IP (fd18:c612::/64) + AAAA proxy/direct routing
-        // - enableIPv6 == false: AAAA NODATA + gVisor PushPacket drop (anti-IPv6 leak on Wi-Fi/5G)
+        // - enableIPv6 == false: AAAA NODATA + gVisor 0ms RST / Port Unreachable (anti-IPv6 leak without stalls)
         let ipv6 = NEIPv6Settings(addresses: ["fd18:c612::2"], networkPrefixLengths: [64])
         ipv6.includedRoutes = [NEIPv6Route.default()]
         var excluded6: [NEIPv6Route] = [
@@ -389,8 +403,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let cleanServerHost = serverHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
             if isValidIPv6(cleanServerHost) {
                 excluded6.append(NEIPv6Route(destinationAddress: cleanServerHost, networkPrefixLength: 128))
-            } else {
-                for resolvedIP6 in resolveIPv6Addresses(cleanServerHost) {
+            } else if !isValidIPv4(cleanServerHost) {
+                let res = resolvedRemoteIPs ?? GhostMobileBridge.resolveHostIPs(host: cleanServerHost)
+                for resolvedIP6 in res.v6 {
                     excluded6.append(NEIPv6Route(destinationAddress: resolvedIP6, networkPrefixLength: 128))
                 }
             }
@@ -434,41 +449,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return settings
     }
 
-    private func resolveIPv4Addresses(_ host: String) -> [String] {
-        var hints = addrinfo()
-        hints.ai_family = AF_INET
-        hints.ai_socktype = SOCK_STREAM
-        var res: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, nil, &hints, &res) == 0, let first = res else {
-            return []
-        }
-        defer { freeaddrinfo(res) }
-
-        var ips: [String] = []
-        var cursor: UnsafeMutablePointer<addrinfo>? = first
-        while let cur = cursor {
-            if let sa = cur.pointee.ai_addr, sa.pointee.sa_family == sa_family_t(AF_INET) {
-                var sin = sockaddr_in()
-                memcpy(&sin, sa, MemoryLayout<sockaddr_in>.size)
-                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                var addrCopy = sin.sin_addr
-                if inet_ntop(AF_INET, &addrCopy, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
-                    let ipU32 = UInt32(bigEndian: sin.sin_addr.s_addr)
-                    if (ipU32 & 0xFFFE_0000) == 0xC612_0000 { // Exclude 198.18.0.0/15 Fake-IP pool
-                        cursor = cur.pointee.ai_next
-                        continue
-                    }
-                    let s = String(cString: buf)
-                    if !ips.contains(s) {
-                        ips.append(s)
-                    }
-                }
-            }
-            cursor = cur.pointee.ai_next
-        }
-        return ips
-    }
-
     private func isValidIPv4(_ host: String) -> Bool {
         var addr = in_addr()
         return host.withCString { inet_pton(AF_INET, $0, &addr) == 1 }
@@ -477,36 +457,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func isValidIPv6(_ host: String) -> Bool {
         var addr = in6_addr()
         return host.withCString { inet_pton(AF_INET6, $0, &addr) == 1 }
-    }
-
-    private func resolveIPv6Addresses(_ host: String) -> [String] {
-        var hints = addrinfo()
-        hints.ai_family = AF_INET6
-        hints.ai_socktype = SOCK_STREAM
-        var res: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, nil, &hints, &res) == 0, let first = res else {
-            return []
-        }
-        defer { freeaddrinfo(res) }
-
-        var ips: [String] = []
-        var cursor: UnsafeMutablePointer<addrinfo>? = first
-        while let cur = cursor {
-            if let sa = cur.pointee.ai_addr, sa.pointee.sa_family == sa_family_t(AF_INET6) {
-                var sin6 = sockaddr_in6()
-                memcpy(&sin6, sa, MemoryLayout<sockaddr_in6>.size)
-                var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-                var addrCopy = sin6.sin6_addr
-                if inet_ntop(AF_INET6, &addrCopy, &buf, socklen_t(INET6_ADDRSTRLEN)) != nil {
-                    let s = String(cString: buf)
-                    if !s.lowercased().hasPrefix("fd18:c612:") && !ips.contains(s) {
-                        ips.append(s)
-                    }
-                }
-            }
-            cursor = cur.pointee.ai_next
-        }
-        return ips
     }
 
     private func startNetworkMonitorAndDetectInitialInterface(timeout: TimeInterval) -> String {

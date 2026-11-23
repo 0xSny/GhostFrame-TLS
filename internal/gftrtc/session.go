@@ -217,7 +217,7 @@ func (c *closedIDSet) insertChunkLocked(key uint64) bool {
 	return true
 }
 
-func (c *closedIDSet) markChunkAccounted(id, seq uint32) bool {
+func (c *closedIDSet) markChunkAccounted(id, seq uint32, nBytes int) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.reconciled[id]; ok {
@@ -226,7 +226,14 @@ func (c *closedIDSet) markChunkAccounted(id, seq uint32) bool {
 	if base, ok := c.baseSeq[id]; ok && seq < base {
 		return false
 	}
-	return c.insertChunkLocked((uint64(id) << 32) | uint64(seq))
+	if !c.insertChunkLocked((uint64(id) << 32) | uint64(seq)) {
+		return false
+	}
+	if nBytes > 0 {
+		c.ensureRingLocked(id)
+		c.acctBytes[id] += int64(nBytes)
+	}
+	return true
 }
 
 func (c *closedIDSet) has(id uint32) bool {
@@ -764,6 +771,10 @@ func (s *RTCSession) removeStreamWithSeqs(id uint32, baseSeq uint32, extraSeqs [
 
 func (s *RTCSession) removeStreamWithAcct(id uint32, baseSeq uint32, extraSeqs []uint32, rxAcct int64, finalReconciled bool) {
 	s.closedIDs.addWithAcct(id, baseSeq, extraSeqs, rxAcct, finalReconciled)
+	s.removeStreamFromMaps(id)
+}
+
+func (s *RTCSession) removeStreamFromMaps(id uint32) {
 	s.mu.Lock()
 	delete(s.streams, id)
 	delete(s.pendingStreams, id)
@@ -1793,7 +1804,7 @@ func (s *RTCSession) dispatchFrames(b []byte, now time.Time) (ackEliciting bool)
 			st := s.getOrCreatePendingStream(streamID)
 			if st != nil {
 				st.deliverChunk(seq, payload)
-			} else if len(payload) > 0 && s.closedIDs.markChunkAccounted(streamID, seq) {
+			} else if len(payload) > 0 && s.closedIDs.markChunkAccounted(streamID, seq, len(payload)) {
 				s.onStreamBytesConsumed(len(payload))
 			}
 

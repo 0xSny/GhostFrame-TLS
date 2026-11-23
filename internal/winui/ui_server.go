@@ -244,6 +244,8 @@ func (s *uiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.requirePost(w, r, s.handleClearLogs)
 	case "/api/diagnostic":
 		s.requirePost(w, r, s.handleDiagnostic)
+	case "/api/clipboard":
+		s.handleClipboard(w, r)
 	default:
 		writeJSONError(w, http.StatusNotFound, "not found")
 	}
@@ -807,4 +809,30 @@ func (s *uiServer) handleDiagnostic(w http.ResponseWriter, r *http.Request) {
 		"copied": res.copied,
 		"text":   res.text,
 	})
+}
+
+func (s *uiServer) handleClipboard(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		txt := GetClipboardText(s.hwnd)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":   true,
+			"text": txt,
+		})
+	case http.MethodPost:
+		var req struct {
+			Text string `json:"text"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+		if !SetClipboardText(s.hwnd, req.Text) {
+			writeJSONError(w, http.StatusInternalServerError, "写入系统剪贴板失败")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }

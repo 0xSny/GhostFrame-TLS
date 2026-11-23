@@ -18,12 +18,14 @@ const (
 	highUploadAlertWindowSecs = 10
 )
 
-// TargetTrafficStat holds cumulative upload/download bytes for a single host:port destination.
+// TargetTrafficStat holds cumulative and 10s sliding-window upload/download stats for a destination.
 type TargetTrafficStat struct {
-	Target    string
-	UpBytes   uint64
-	DownBytes uint64
-	LastSeen  time.Time
+	Target      string    `json:"target"`
+	UpBytes     uint64    `json:"total_up"`
+	DownBytes   uint64    `json:"total_down"`
+	Window10sUp uint64    `json:"window_10s_up"`
+	HighUpload  bool      `json:"high_upload"`
+	LastSeen    time.Time `json:"last_seen"`
 }
 
 type uploadSecBucket struct {
@@ -51,6 +53,17 @@ func newTargetTrafficTracker() *targetTrafficTracker {
 		entries: make(map[string]*targetTrafficEntry, 128),
 		nowFn:   time.Now,
 	}
+}
+
+func windowUploadLocked(ent *targetTrafficEntry, nowSec int64) uint64 {
+	var winUp uint64
+	for i := range ent.win {
+		b := ent.win[i]
+		if nowSec-b.sec >= 0 && nowSec-b.sec < highUploadAlertWindowSecs {
+			winUp += b.bytes
+		}
+	}
+	return winUp
 }
 
 func (t *targetTrafficTracker) Record(target string, upBytes, downBytes uint64) (alertMsg string) {
@@ -97,13 +110,7 @@ func (t *targetTrafficTracker) Record(target string, upBytes, downBytes uint64) 
 		} else {
 			ent.win[slot].bytes += upBytes
 		}
-		var winUp uint64
-		for i := range ent.win {
-			b := ent.win[i]
-			if nowSec-b.sec >= 0 && nowSec-b.sec < highUploadAlertWindowSecs {
-				winUp += b.bytes
-			}
-		}
+		winUp := windowUploadLocked(ent, nowSec)
 		if winUp > highUploadAlertThreshold && (ent.lastAlertAt.IsZero() || now.Sub(ent.lastAlertAt) >= highUploadAlertCooldown) {
 			ent.lastAlertAt = now
 			alertMsg = fmt.Sprintf("[TrafficAlert] High upload: %s (↑%.1f MB in 10s)", clean, float64(winUp)/(1024*1024))
@@ -117,14 +124,18 @@ func (t *targetTrafficTracker) TopUpload(limit int) []TargetTrafficStat {
 	if limit <= 0 {
 		limit = 10
 	}
+	nowSec := t.nowFn().Unix()
 	t.mu.Lock()
 	out := make([]TargetTrafficStat, 0, len(t.entries))
 	for _, ent := range t.entries {
+		winUp := windowUploadLocked(ent, nowSec)
 		out = append(out, TargetTrafficStat{
-			Target:    ent.target,
-			UpBytes:   ent.upBytes,
-			DownBytes: ent.downBytes,
-			LastSeen:  ent.lastSeen,
+			Target:      ent.target,
+			UpBytes:     ent.upBytes,
+			DownBytes:   ent.downBytes,
+			Window10sUp: winUp,
+			HighUpload:  winUp >= highUploadAlertThreshold,
+			LastSeen:    ent.lastSeen,
 		})
 	}
 	t.mu.Unlock()

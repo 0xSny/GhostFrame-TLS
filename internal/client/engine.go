@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.0.41-LTS"
+var Version = "v4.1.0"
 
 type ConnState string
 
@@ -655,6 +655,8 @@ func (e *Engine) SelectNode(idx int) error {
 	e.state = StateConnected
 	e.lastErr = ""
 	e.pingMs = st.RTTMs
+	e.prevUp = st.TotalUp
+	e.prevDown = st.TotalDown
 	e.switchingNode = -1
 	e.switchingName = ""
 	e.config.ActiveNode = newIdx
@@ -1758,6 +1760,8 @@ func (e *Engine) Connect() error {
 	e.state = StateConnected
 	e.lastErr = ""
 	e.pingMs = st.RTTMs
+	e.prevUp = 0
+	e.prevDown = 0
 	mode := e.config.RouteMode
 	httpAddr := e.config.HTTPAddr
 	socksAddr := e.config.SocksAddr
@@ -1798,6 +1802,10 @@ func (e *Engine) Disconnect() {
 	e.connectGen++
 	e.switchingNode = -1
 	e.switchingName = ""
+	e.prevUp = 0
+	e.prevDown = 0
+	e.curUpBps = 0
+	e.curDownBps = 0
 	connSched := e.connectingSched
 	e.connectingSched = nil
 	sched := e.sched
@@ -2160,6 +2168,46 @@ type NodeSummary struct {
 func (e *Engine) ClearLogs() {
 	if e.logRing != nil {
 		e.logRing.Clear()
+	}
+}
+
+// TrayStatus returns a lightweight status snapshot for periodic tray icon/tooltip updates
+// without serializing Clash YAML, node lists, or recent route logs.
+func (e *Engine) TrayStatus() map[string]any {
+	e.mu.RLock()
+	state := e.state
+	sched := e.sched
+	pingMs := e.pingMs
+	l := e.activeLinkLocked()
+	e.mu.RUnlock()
+
+	activeMode := ""
+	if sched != nil {
+		st := sched.Stats()
+		activeMode = st.Mode
+		if st.RTTMs > 0 {
+			pingMs = st.RTTMs
+		}
+	}
+
+	var nodeName, tPref string
+	if l != nil {
+		nodeName = l.Remark
+		if nodeName == "" {
+			nodeName = fmt.Sprintf("%s:%d", l.Host, l.Port)
+		}
+		tPref = l.EffectiveTransport()
+	}
+	if tPref == "" {
+		tPref = "auto"
+	}
+
+	return map[string]any{
+		"state":            string(state),
+		"active_transport": activeMode,
+		"transport_pref":   tPref,
+		"ping_ms":          pingMs,
+		"node_name":        nodeName,
 	}
 }
 

@@ -157,7 +157,7 @@ func Run(eng *client.Engine) error {
 
 	_, _, _ = pShowWindow.Call(hwnd, swShow)
 	_, _, _ = pUpdateWindow.Call(hwnd)
-	_, _, _ = pSetTimer.Call(hwnd, timerRefreshID, 450, 0)
+	_, _, _ = pSetTimer.Call(hwnd, timerRefreshID, 1500, 0)
 
 	var msg msgW
 	for {
@@ -212,7 +212,7 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 
 	case wmTimer:
 		if wParam == timerRefreshID && a.tray != nil && a.eng != nil {
-			a.tray.update(a.eng.Status())
+			a.tray.update(a.eng.TrayStatus())
 		}
 		return 0
 
@@ -235,7 +235,7 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 
 	case wmAppRefresh:
 		if a.tray != nil && a.eng != nil {
-			a.tray.update(a.eng.Status())
+			a.tray.update(a.eng.TrayStatus())
 		}
 		return 0
 

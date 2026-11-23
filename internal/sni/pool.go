@@ -5,7 +5,9 @@ import (
 	"os"
 )
 
-const DefaultCandidatesPath = "/etc/gft/sni_candidates.json"
+const DefaultCandidatesPath = "/etc/kestrel/sni_candidates.json"
+
+const legacyCandidatesPath = "/etc/gft/sni_candidates.json"
 
 // DefaultRegionalPool contains verified, high-reputation, non-CDN university/research
 // TLS 1.3 + HTTP/2 origins grouped by geographic region.
@@ -67,10 +69,16 @@ func LoadPool(extraPath string) map[string][]string {
 		}
 		out[reg] = cp
 	}
+	var b []byte
+	var err error
 	if extraPath == "" {
-		extraPath = DefaultCandidatesPath
+		b, err = os.ReadFile(DefaultCandidatesPath)
+		if err != nil {
+			b, err = os.ReadFile(legacyCandidatesPath)
+		}
+	} else {
+		b, err = os.ReadFile(extraPath)
 	}
-	b, err := os.ReadFile(extraPath)
 	if err != nil {
 		return out
 	}

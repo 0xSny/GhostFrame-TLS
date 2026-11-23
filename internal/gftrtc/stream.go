@@ -306,7 +306,7 @@ func (s *RTCStream) deliverChunk(seq uint32, data []byte) {
 	if s.aborted != nil || s.rEOF || (s.hasFIN && seq >= s.finSeq) {
 		_, dup := s.reorderBuf[seq]
 		reconciled := s.finalReconciled
-		if !reconciled && !dup && len(data) > 0 && !s.sess.closedIDs.isFinalReconciled(s.id) && s.sess.closedIDs.markChunkAccounted(s.id, seq) {
+		if !reconciled && !dup && len(data) > 0 && !s.sess.closedIDs.isFinalReconciled(s.id) && s.sess.closedIDs.markChunkAccounted(s.id, seq, len(data)) {
 			s.rxAccountedBytes += int64(len(data))
 			s.mu.Unlock()
 			s.sess.onStreamBytesConsumed(len(data))
@@ -403,11 +403,12 @@ func (s *RTCStream) deliverFIN(finalSeq uint32) {
 	if bothDone {
 		baseSeq, extraSeqs = s.collectAccountedSeqsLocked()
 		rxAcc = s.rxAccountedBytes
+		s.sess.closedIDs.addWithAcct(s.id, baseSeq, extraSeqs, rxAcc, false)
 	}
 	s.rcond.Broadcast()
 	s.mu.Unlock()
 	if bothDone {
-		s.sess.removeStreamWithAcct(s.id, baseSeq, extraSeqs, rxAcc, false)
+		s.sess.removeStreamFromMaps(s.id)
 	}
 }
 
@@ -427,6 +428,7 @@ func (s *RTCStream) deliverRSTFinal(finalWireBytes uint64) {
 		s.aborted = ErrStreamReset
 	}
 	s.rEOF = true
+	wasWClosed := s.wClosed
 	s.wClosed = true
 	discardQueued := 0
 	for i := range s.sendQ {
@@ -434,7 +436,8 @@ func (s *RTCStream) deliverRSTFinal(finalWireBytes uint64) {
 	}
 	s.sendQ = nil
 	s.finQueued = false
-	needPrune := !s.resetSent && s.txWireBytes > 0
+	ownFinalWire := s.txWireBytes
+	needPrune := !s.resetSent && (ownFinalWire > 0 || !wasWClosed)
 	if needPrune {
 		s.resetSent = true
 	}
@@ -451,6 +454,7 @@ func (s *RTCStream) deliverRSTFinal(finalWireBytes uint64) {
 	}
 	s.rxAccountedBytes += delta
 	rxAcc := s.rxAccountedBytes
+	s.sess.closedIDs.addWithAcct(s.id, baseSeq, extraSeqs, rxAcc, true)
 	s.rcond.Broadcast()
 	s.wcond.Broadcast()
 	s.mu.Unlock()
@@ -458,17 +462,20 @@ func (s *RTCStream) deliverRSTFinal(finalWireBytes uint64) {
 	if discardQueued > 0 {
 		s.sess.releaseQueuedTxBytes(discardQueued)
 	}
-	if needPrune {
-		s.sess.pruneStreamRetransmits(s.id)
-	}
 	if unread > 0 || delta > 0 {
 		s.sess.accountStreamWindow(unread, int(delta))
 	}
 	s.sess.winCond.Broadcast()
+	if needPrune {
+		s.sess.pruneStreamRetransmits(s.id)
+		if s.sess.flowAcctV2.Load() {
+			s.sess.enqueueReliableFrame(encodeFrameStreamRSTFinal(s.id, ownFinalWire))
+		}
+	}
 	if s.closed.CompareAndSwap(false, true) {
 		s.sess.decStreams()
 	}
-	s.sess.removeStreamWithAcct(s.id, baseSeq, extraSeqs, rxAcc, true)
+	s.sess.removeStreamFromMaps(s.id)
 }
 
 func (s *RTCStream) updatePeerMaxSeq(maxAllowed uint32) {
@@ -512,6 +519,7 @@ func (s *RTCStream) abort(err error, sendRST bool) {
 	}
 	rxAcc := s.rxAccountedBytes
 	reconciled := s.finalReconciled
+	s.sess.closedIDs.addWithAcct(s.id, baseSeq, extraSeqs, rxAcc, reconciled)
 	s.rcond.Broadcast()
 	s.wcond.Broadcast()
 	s.mu.Unlock()
@@ -534,7 +542,7 @@ func (s *RTCStream) abort(err error, sendRST bool) {
 	if s.closed.CompareAndSwap(false, true) {
 		s.sess.decStreams()
 	}
-	s.sess.removeStreamWithAcct(s.id, baseSeq, extraSeqs, rxAcc, reconciled)
+	s.sess.removeStreamFromMaps(s.id)
 }
 
 // Read reads contiguous in-order stream bytes.
@@ -788,6 +796,7 @@ func (s *RTCStream) Close() error {
 		finalWire = s.txWireBytes
 		rxAcc = s.rxAccountedBytes
 		reconciled = s.finalReconciled
+		s.sess.closedIDs.addWithAcct(s.id, baseSeq, extraSeqs, rxAcc, reconciled)
 		s.rcond.Broadcast()
 		s.wcond.Broadcast()
 		s.mu.Unlock()
@@ -812,7 +821,7 @@ func (s *RTCStream) Close() error {
 		if s.closed.CompareAndSwap(false, true) {
 			s.sess.decStreams()
 		}
-		s.sess.removeStreamWithAcct(s.id, baseSeq, extraSeqs, rxAcc, reconciled)
+		s.sess.removeStreamFromMaps(s.id)
 	})
 	return nil
 }

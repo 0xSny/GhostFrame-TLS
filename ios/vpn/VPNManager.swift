@@ -26,6 +26,10 @@ final class VPNManager: GhostBackend {
     private var lastDisconnectErrorText: String = ""
     private var lastIPCLogAt: Date = .distantPast
     private var currentHTTPPort: Int = 10809
+    private var appliedServerHost: String = ""
+    private var appliedRouteMode: String = "rule"
+    private var appliedEnableIPv6: Bool = false
+    private var appliedHTTPPort: Int = 10809
     private var telemetryChannel: String = "pending"
     private var loggedHTTPTelemetry: Bool = false
     private let directSession: URLSession = {
@@ -89,6 +93,10 @@ final class VPNManager: GhostBackend {
         userInitiatedDisconnect = false
         lastDisconnectErrorText = ""
         currentHTTPPort = config.httpPort
+        appliedServerHost = node.host
+        appliedRouteMode = config.routeMode.lowercased()
+        appliedEnableIPv6 = config.enableIPv6
+        appliedHTTPPort = config.httpPort
         telemetryChannel = "pending"
         loggedHTTPTelemetry = false
         connectAttemptToken &+= 1
@@ -142,6 +150,11 @@ final class VPNManager: GhostBackend {
 
     func applyLiveConfig(config: GhostEngineConfig, node: GhostNode) {
         currentHTTPPort = config.httpPort
+        let newRouteMode = config.routeMode.lowercased()
+        let needsNetworkReconfig = node.host != appliedServerHost ||
+            newRouteMode != appliedRouteMode ||
+            config.enableIPv6 != appliedEnableIPv6 ||
+            config.httpPort != appliedHTTPPort
         loadOrCreateManager { [weak self] result in
             guard let self = self else { return }
             switch result {
@@ -164,7 +177,18 @@ final class VPNManager: GhostBackend {
                                     if !resp.ok, let msg = resp.error {
                                         self.onLogMessage?("Live reload error: \(msg)")
                                     } else {
+                                        self.appliedServerHost = node.host
+                                        self.appliedRouteMode = newRouteMode
+                                        self.appliedEnableIPv6 = config.enableIPv6
+                                        self.appliedHTTPPort = config.httpPort
                                         self.pollStatusOnce()
+                                    }
+                                } else if needsNetworkReconfig {
+                                    // HTTP fallback cannot update NEPacketTunnelNetworkSettings; trigger fast reconnect cleanly.
+                                    self.onLogMessage?("Duo: IPC unavailable with network settings delta; triggering fast tunnel reconnect...")
+                                    mgr.connection.stopVPNTunnel()
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+                                        self?.connect(config: config, node: node)
                                     }
                                 } else if let body = cfgJSON.data(using: .utf8) {
                                     self.fetchLoopbackHTTP(method: "POST", path: "/_ksl/reload", body: body) { [weak self] data, _ in

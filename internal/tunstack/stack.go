@@ -8,6 +8,7 @@ import (
 	"net"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -252,7 +253,7 @@ func (s *Stack) PushPacket(pkt []byte) {
 	case 4:
 		proto = header.IPv4ProtocolNumber
 	case 6:
-		if !s.engine.IPv6Enabled() || len(pkt) < header.IPv6MinimumSize {
+		if len(pkt) < header.IPv6MinimumSize {
 			return
 		}
 		proto = header.IPv6ProtocolNumber
@@ -397,13 +398,18 @@ func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 		r.Complete(true)
 		return
 	}
+	id := r.ID()
+	if !s.engine.IPv6Enabled() && id.LocalAddress.Len() == 16 {
+		// Fast-reject IPv6 TCP immediately (0ms TCP RST) so Happy Eyeballs falls back to IPv4 without stalling.
+		r.Complete(true)
+		return
+	}
 	if cur := s.activeTCP.Add(1); cur > s.maxActiveTCP {
 		s.activeTCP.Add(-1)
 		r.Complete(true)
 		return
 	}
 
-	id := r.ID()
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
@@ -472,6 +478,11 @@ func (s *Stack) handleUDP(r *udp.ForwarderRequest) bool {
 		return true
 	}
 
+	if !s.engine.IPv6Enabled() && id.LocalAddress.Len() == 16 {
+		// Fast-reject non-DNS IPv6 UDP (0ms ICMPv6 Port Unreachable) so QUIC/HTTP3 falls back to IPv4.
+		return false
+	}
+
 	if cur := s.activeUDP.Add(1); cur > s.maxActiveUDP {
 		s.activeUDP.Add(-1)
 		return false
@@ -532,6 +543,11 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 	}
 	defer assoc.Close()
 
+	metricTarget := strings.TrimSpace(routeTarget)
+	if metricTarget == "" {
+		metricTarget = dialTarget
+	}
+
 	idle := s.udpIdle
 	done := make(chan struct{})
 	go func() {
@@ -548,11 +564,12 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 				if _, werr := conn.Write(pkt.Data); werr != nil {
 					return
 				}
+				s.engine.RecordTargetTraffic(metricTarget, 0, uint64(len(pkt.Data)))
 			}
 		}
 	}()
 
-	bufPtr := dnsBufPool.Get().(*[]byte)
+	bufPtr := udpBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(idle))
@@ -563,8 +580,9 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 		if werr := assoc.SendTo(dialTarget, buf[:n]); werr != nil {
 			break
 		}
+		s.engine.RecordTargetTraffic(metricTarget, uint64(n), 0)
 	}
-	dnsBufPool.Put(bufPtr)
+	udpBufPool.Put(bufPtr)
 	_ = assoc.Close()
 	<-done
 }
@@ -608,7 +626,7 @@ func (s *Stack) relayUDPDirect(conn *gonet.UDPConn, dialTarget string) {
 		}
 	}()
 
-	bufPtr := dnsBufPool.Get().(*[]byte)
+	bufPtr := udpBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(idle))
@@ -621,7 +639,7 @@ func (s *Stack) relayUDPDirect(conn *gonet.UDPConn, dialTarget string) {
 			break
 		}
 	}
-	dnsBufPool.Put(bufPtr)
+	udpBufPool.Put(bufPtr)
 	_ = remote.Close()
 	<-done
 }

@@ -22,7 +22,7 @@ import (
 )
 
 // Version is the mobile runtime identifier (overridable via -ldflags -X).
-var Version = "v4.0.41-LTS"
+var Version = "v4.1.0"
 
 const (
 	defaultSocksPort = 10808
@@ -624,6 +624,48 @@ func BuildBypassRule(serverHost string) string {
 		return fmt.Sprintf("IP-CIDR6,%s/128,DIRECT", ip.String())
 	}
 	return fmt.Sprintf("DOMAIN,%s,DIRECT", host)
+}
+
+// ResolveHostIPsJSON resolves host via physical-interface-bound DirectLookupHostIPs (1.5s timeout),
+// bypassing iOS utun Fake-IP DNS (198.18.0.1) so PacketTunnelProvider never blocks in getaddrinfo.
+func ResolveHostIPsJSON(host string) string {
+	clean := strings.TrimSpace(strings.Trim(host, "[]"))
+	out := struct {
+		V4 []string `json:"v4"`
+		V6 []string `json:"v6"`
+	}{}
+	if clean != "" {
+		if ip := net.ParseIP(clean); ip != nil {
+			if !netbind.IsFakeIP(ip) {
+				if ip4 := ip.To4(); ip4 != nil {
+					out.V4 = append(out.V4, ip4.String())
+				} else {
+					out.V6 = append(out.V6, ip.String())
+				}
+			}
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			ips, err := netbind.DirectLookupHostIPs(ctx, clean)
+			cancel()
+			if err == nil {
+				for _, ip := range ips {
+					if ip == nil || netbind.IsFakeIP(ip) {
+						continue
+					}
+					if ip4 := ip.To4(); ip4 != nil {
+						out.V4 = append(out.V4, ip4.String())
+					} else {
+						out.V6 = append(out.V6, ip.String())
+					}
+				}
+			}
+		}
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return `{"v4":[],"v6":[]}`
+	}
+	return string(b)
 }
 
 func handleLocalMgmt(method, path string, body []byte) (int, string, []byte) {

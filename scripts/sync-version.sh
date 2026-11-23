@@ -12,13 +12,13 @@ fi
 RAW_VER="$(tr -d ' \t\r\n' < "${VERSION_FILE}")"
 VER="${RAW_VER#v}"
 VER="${VER%-LTS}"
-if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.([0-9]+)$ ]]; then
-  echo "Invalid VERSION '${RAW_VER}' (expected X.Y.Z, e.g. 4.0.40)" >&2
+if [[ ! "${VER}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+  echo "Invalid VERSION '${RAW_VER}' (expected X.Y.Z, e.g. 4.1.0)" >&2
   exit 1
 fi
 
-BUILD_NUM="${BASH_REMATCH[1]}"
-TAG_VER="v${VER}-LTS"
+BUILD_NUM="$((BASH_REMATCH[1] * 100 + BASH_REMATCH[2] * 10 + BASH_REMATCH[3]))"
+TAG_VER="v${VER}"
 
 PYTHON_BIN=""
 if command -v python3 >/dev/null 2>&1 && python3 -c "import sys" >/dev/null 2>&1; then

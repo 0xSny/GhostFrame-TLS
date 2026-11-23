@@ -48,9 +48,10 @@ jobs:
           gomobile init
           go get golang.org/x/mobile/bind
           mkdir -p ios/Frameworks dist
-          BUILD_NUM=$((3 + GITHUB_RUN_NUMBER))
-          IOS_APP_VER="4.0.${BUILD_NUM}"
-          REL_VER="v${IOS_APP_VER}-LTS"
+          RAW_VER="$(tr -d ' \t\r\n' < VERSION)"
+          IOS_APP_VER="${RAW_VER#v}"
+          IOS_APP_VER="${IOS_APP_VER%-LTS}"
+          REL_VER="v${IOS_APP_VER}"
           gomobile bind \
             -target=ios/arm64 \
             -iosversion=15.0 \
@@ -95,8 +96,14 @@ jobs:
           plutil -p "$CTRL_APPEX/Info.plist"
           plutil -p "$CTRL_APPEX/Info.plist" | grep -q "com.apple.widgetkit-extension"
 
-          BUILD_NUM=$((3 + GITHUB_RUN_NUMBER))
-          IOS_APP_VER="4.0.${BUILD_NUM}"
+          RAW_VER="$(tr -d ' \t\r\n' < VERSION)"
+          IOS_APP_VER="${RAW_VER#v}"
+          IOS_APP_VER="${IOS_APP_VER%-LTS}"
+          if [[ "${IOS_APP_VER}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            BUILD_NUM="$((BASH_REMATCH[1] * 100 + BASH_REMATCH[2] * 10 + BASH_REMATCH[3]))"
+          else
+            BUILD_NUM=$((410 + GITHUB_RUN_NUMBER))
+          fi
           for plist in "$VPN_APP/Info.plist" "$APPEX/Info.plist" "$CTRL_APPEX/Info.plist"; do
             /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${IOS_APP_VER}" "$plist"
             /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUM}" "$plist"
@@ -163,8 +170,14 @@ jobs:
           plutil -p "$COMP_APP/Info.plist" | grep -q "audio"
           plutil -p "$COMP_APP/Info.plist" | grep -q "shadowrocket"
 
-          BUILD_NUM=$((3 + GITHUB_RUN_NUMBER))
-          IOS_APP_VER="4.0.${BUILD_NUM}"
+          RAW_VER="$(tr -d ' \t\r\n' < VERSION)"
+          IOS_APP_VER="${RAW_VER#v}"
+          IOS_APP_VER="${IOS_APP_VER%-LTS}"
+          if [[ "${IOS_APP_VER}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            BUILD_NUM="$((BASH_REMATCH[1] * 100 + BASH_REMATCH[2] * 10 + BASH_REMATCH[3]))"
+          else
+            BUILD_NUM=$((410 + GITHUB_RUN_NUMBER))
+          fi
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${IOS_APP_VER}" "$COMP_APP/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUM}" "$COMP_APP/Info.plist"
 

@@ -1418,3 +1418,119 @@ func TestLowMemLossyConcurrentOpenRST64MBZeroDeadlock(t *testing.T) {
 		cli.peerSessMax.Load(),
 	)
 }
+
+func TestLowMemLossyServerPushClientAbort100LoopsWindowConservation(t *testing.T) {
+	origLowMem := IsLowMemMode()
+	SetLowMemMode(true)
+	t.Cleanup(func() { SetLowMemMode(origLowMem) })
+
+	psk := make([]byte, 32)
+	_, _ = rand.Read(psk)
+
+	// 25% random packet loss + 2% reorder + 1% duplicate + 1ms path delay.
+	sw := NewLossyUDPSwitch("127.0.0.1:21543", 25, 2, 1, time.Millisecond)
+	defer sw.CloseAll()
+
+	ln, err := NewListener(sw.srvConn, false, psk, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var srvSessRef atomic.Pointer[RTCSession]
+	srvDone := make(chan struct{})
+	go func() {
+		defer close(srvDone)
+		srvSess, aerr := ln.Accept(ctx)
+		if aerr != nil {
+			return
+		}
+		srvSessRef.Store(srvSess)
+		downPayload := bytes.Repeat([]byte{0xD4, 0x4D, 0x91, 0x19}, 8*1024) // 32KB chunk
+		srvSess.SetHandlers(func(st *RTCStream, target string, first []byte) {
+			defer st.Close()
+			// Server pushes 256KB+ per stream so client aborts mid-download.
+			for k := 0; k < 9; k++ {
+				if _, werr := st.Write(downPayload); werr != nil {
+					return
+				}
+			}
+			_ = st.CloseWrite()
+		}, nil, nil)
+	}()
+
+	var cli *RTCSession
+	for attempt := 0; attempt < 4; attempt++ {
+		ce := sw.NewClientEnd()
+		cli, _, err = DialWithPacketConn(ctx, ce, true, sw.srvAddr, DialOptions{
+			Host:     "127.0.0.1",
+			Port:     21543,
+			PSK:      psk,
+			ClientID: [8]byte{9, 8, 7, 6, 5, 4, 3, 2},
+			Timeout:  5 * time.Second,
+		})
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		t.Fatalf("DialWithPacketConn failed under 25%% loss: %v", err)
+	}
+	defer cli.Close()
+
+	<-srvDone
+	srv := srvSessRef.Load()
+	if srv == nil {
+		t.Fatal("server session not accepted")
+	}
+
+	const iterations = 100
+	var readBuf [16 * 1024]byte
+	for i := 0; i < iterations; i++ {
+		st, serr := cli.OpenStream(fmt.Sprintf("abort-down-%d.example:443", i), []byte("GET"))
+		if serr != nil {
+			t.Fatalf("iter %d OpenStream failed (window stalled?): %v", i, serr)
+		}
+		// Read partial server stream (~32KB..64KB), then actively abort mid-download!
+		got := 0
+		targetRead := 32*1024 + (i%3)*16*1024
+		for got < targetRead {
+			n, rerr := st.Read(readBuf[:])
+			got += n
+			if rerr != nil {
+				break
+			}
+		}
+		_ = st.Close()
+	}
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		cTx := cli.txStreamBytes.Load()
+		sRx := srv.rxConsumedBytes.Load()
+		sTx := srv.txStreamBytes.Load()
+		cRx := cli.rxConsumedBytes.Load()
+		cQ := cli.txQueuedBytes.Load()
+		sQ := srv.txQueuedBytes.Load()
+		if cTx == sRx && sTx == cRx && cTx == cQ && sTx == sQ {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	if cli.txStreamBytes.Load() != srv.rxConsumedBytes.Load() {
+		t.Fatalf("client->server byte conservation mismatch: cli.txStreamBytes=%d srv.rxConsumedBytes=%d",
+			cli.txStreamBytes.Load(), srv.rxConsumedBytes.Load())
+	}
+	if srv.txStreamBytes.Load() != cli.rxConsumedBytes.Load() {
+		t.Fatalf("server->client byte conservation mismatch (reverse RSTFinal missing?): srv.txStreamBytes=%d cli.rxConsumedBytes=%d",
+			srv.txStreamBytes.Load(), cli.rxConsumedBytes.Load())
+	}
+	if cli.txQueuedBytes.Load() != cli.txStreamBytes.Load() || srv.txQueuedBytes.Load() != srv.txStreamBytes.Load() {
+		t.Fatalf("txQueued leak detected: cliQ=%d cliTx=%d srvQ=%d srvTx=%d",
+			cli.txQueuedBytes.Load(), cli.txStreamBytes.Load(), srv.txQueuedBytes.Load(), srv.txStreamBytes.Load())
+	}
+}

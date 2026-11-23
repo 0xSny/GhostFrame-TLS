@@ -1298,3 +1298,47 @@ func TestWindowsProxyOverrideAndNoSysProxyEnv(t *testing.T) {
 		t.Fatal("expected IsMockSysProxy() == true when GFT_NO_SYSPROXY=1")
 	}
 }
+
+func TestTopUploadTargetsJSONSerialization(t *testing.T) {
+	eng, err := NewEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	const threshold = 20 * 1024 * 1024
+	eng.RecordTargetTraffic("heavy.example.com:443", threshold+512, 4096)
+	eng.RecordTargetTraffic("light.example.com:443", 1024, 8192)
+
+	stats := eng.TopUploadTargets(10)
+	b, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatalf("json.Marshal(TopUploadTargets) failed: %v", err)
+	}
+
+	var decoded []map[string]any
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	if len(decoded) != 2 {
+		t.Fatalf("expected 2 targets in JSON output, got %d (%s)", len(decoded), string(b))
+	}
+
+	heavy := decoded[0]
+	if heavy["target"] != "heavy.example.com:443" {
+		t.Fatalf("expected heavy target first, got %v", heavy)
+	}
+	if uint64(heavy["total_up"].(float64)) != threshold+512 ||
+		uint64(heavy["total_down"].(float64)) != 4096 ||
+		uint64(heavy["window_10s_up"].(float64)) != threshold+512 ||
+		heavy["high_upload"] != true {
+		t.Fatalf("unexpected heavy TargetTrafficStat JSON fields: %v", heavy)
+	}
+
+	light := decoded[1]
+	if light["target"] != "light.example.com:443" ||
+		uint64(light["window_10s_up"].(float64)) != 1024 ||
+		light["high_upload"] != false {
+		t.Fatalf("unexpected light TargetTrafficStat JSON fields: %v", light)
+	}
+}
