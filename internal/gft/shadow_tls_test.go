@@ -514,18 +514,31 @@ func TestShadowTLSRecordLayerZeroAlloc(t *testing.T) {
 	}
 
 	const writeRuns = 25
-	writeAllocs := testing.AllocsPerRun(writeRuns, func() {
-		if _, werr := srvConn.Write(msg); werr != nil {
-			t.Fatal(werr)
+	if !testRaceEnabled {
+		writeAllocs := testing.AllocsPerRun(writeRuns, func() {
+			if _, werr := srvConn.Write(msg); werr != nil {
+				t.Fatal(werr)
+			}
+		})
+		if writeAllocs > 1 {
+			t.Fatalf("expected <=1 heap allocs per shadowTLSConn.Write using pooled buffers, got %.2f", writeAllocs)
 		}
-	})
-	if writeAllocs > 1 {
-		t.Fatalf("expected <=1 heap allocs per shadowTLSConn.Write using pooled buffers, got %.2f", writeAllocs)
-	}
-	// Drain writes queued during warmup + writeRuns runs (AllocsPerRun executes fn 1 + writeRuns times).
-	for i := 0; i < 1+writeRuns; i++ {
-		if _, rerr := io.ReadFull(cliConn, sink); rerr != nil {
-			t.Fatal(rerr)
+		// Drain writes queued during warmup + writeRuns runs (AllocsPerRun executes fn 1 + writeRuns times).
+		for i := 0; i < 1+writeRuns; i++ {
+			if _, rerr := io.ReadFull(cliConn, sink); rerr != nil {
+				t.Fatal(rerr)
+			}
+		}
+	} else {
+		for i := 0; i < writeRuns; i++ {
+			if _, werr := srvConn.Write(msg); werr != nil {
+				t.Fatal(werr)
+			}
+		}
+		for i := 0; i < writeRuns; i++ {
+			if _, rerr := io.ReadFull(cliConn, sink); rerr != nil {
+				t.Fatal(rerr)
+			}
 		}
 	}
 
@@ -539,13 +552,21 @@ func TestShadowTLSRecordLayerZeroAlloc(t *testing.T) {
 		t.Fatal(rerr)
 	}
 
-	readAllocs := testing.AllocsPerRun(readRuns, func() {
-		if _, rerr := io.ReadFull(srvConn, sink); rerr != nil {
-			t.Fatal(rerr)
+	if !testRaceEnabled {
+		readAllocs := testing.AllocsPerRun(readRuns, func() {
+			if _, rerr := io.ReadFull(srvConn, sink); rerr != nil {
+				t.Fatal(rerr)
+			}
+		})
+		if readAllocs > 1 {
+			t.Fatalf("expected <=1 heap allocs per shadowTLSConn.Read using pooled buffers, got %.2f", readAllocs)
 		}
-	})
-	if readAllocs > 1 {
-		t.Fatalf("expected <=1 heap allocs per shadowTLSConn.Read using pooled buffers, got %.2f", readAllocs)
+	} else {
+		for i := 0; i < 1+readRuns; i++ {
+			if _, rerr := io.ReadFull(srvConn, sink); rerr != nil {
+				t.Fatal(rerr)
+			}
+		}
 	}
 }
 
