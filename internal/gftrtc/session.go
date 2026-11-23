@@ -2823,13 +2823,16 @@ func DialWithPacketConn(ctx context.Context, pc net.PacketConn, ownPC bool, radd
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Retry backoff schedule: 250ms, 400ms, 600ms, 600ms (up to 4 retries / 5 attempts total).
+	// Retry backoff schedule: 250ms, 400ms, 600ms, 600ms, 600ms, 800ms, 1000ms
+	// (strictly capped by dialCtx deadline so callers get their full Timeout under high packet loss).
 	retryWaits := []time.Duration{
 		250 * time.Millisecond,
 		400 * time.Millisecond,
 		600 * time.Millisecond,
 		600 * time.Millisecond,
 		600 * time.Millisecond,
+		800 * time.Millisecond,
+		1000 * time.Millisecond,
 	}
 
 	var rxMbps uint16

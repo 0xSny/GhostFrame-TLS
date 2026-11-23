@@ -1793,6 +1793,10 @@ func (e *Engine) Connect() error {
 
 // Disconnect stops the ApexScheduler and restores system proxy cleanly.
 func (e *Engine) Disconnect() {
+	e.disconnectWithWait(0)
+}
+
+func (e *Engine) disconnectWithWait(maxSchedWait time.Duration) {
 	e.mu.Lock()
 	if e.state != StateConnected && e.state != StateConnecting {
 		e.mu.Unlock()
@@ -1815,15 +1819,30 @@ func (e *Engine) Disconnect() {
 	e.sysProxyApplied = false
 	e.mu.Unlock()
 
-	if connSched != nil {
-		connSched.Close()
-	}
-	if sched != nil {
-		sched.Close()
-	}
 	if wasApplied {
 		_ = DisableAndRestoreSystemProxy(e.proxyBackupPath)
 		e.Logf("System proxy restored cleanly")
+	}
+	closeScheds := func() {
+		if connSched != nil {
+			connSched.Close()
+		}
+		if sched != nil {
+			sched.Close()
+		}
+	}
+	if maxSchedWait > 0 && (connSched != nil || sched != nil) {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			closeScheds()
+		}()
+		select {
+		case <-done:
+		case <-time.After(maxSchedWait):
+		}
+	} else {
+		closeScheds()
 	}
 	e.Logf("Disconnected from node")
 }
@@ -2424,7 +2443,6 @@ func (e *Engine) ClashYAML() string {
 // Close shuts down local proxy listeners, active tunnel, and restores system proxy if applied.
 func (e *Engine) Close() {
 	e.stopOnce.Do(func() { close(e.stopStats) })
-	e.Disconnect()
 	e.mu.Lock()
 	socksSrv := e.socksSrv
 	httpSrv := e.httpSrv
@@ -2437,5 +2455,6 @@ func (e *Engine) Close() {
 	if httpSrv != nil {
 		_ = httpSrv.Close()
 	}
+	e.disconnectWithWait(1200 * time.Millisecond)
 	_, _ = RecoverSystemProxyIfDirty(e.proxyBackupPath)
 }

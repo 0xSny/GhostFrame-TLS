@@ -284,6 +284,22 @@ jobs:
       - name: Package Android Release APK
         run: |
           set -euo pipefail
+          if [ -z "${KESTREL_KEYSTORE_PATH:-}" ]; then
+            CI_KS="$RUNNER_TEMP/kestrel-ci-release.jks"
+            if [ ! -f "$CI_KS" ]; then
+              keytool -genkeypair -noprompt -v \
+                -keystore "$CI_KS" \
+                -storetype PKCS12 \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -alias kestrel \
+                -storepass android -keypass android \
+                -dname "CN=Kestrel,O=GhostFrame,C=US" >/dev/null 2>&1
+            fi
+            export KESTREL_KEYSTORE_PATH="$CI_KS"
+            export KESTREL_KEYSTORE_PASS="android"
+            export KESTREL_KEY_ALIAS="kestrel"
+            export KESTREL_KEY_PASS="android"
+          fi
           gradle -p android assembleRelease --no-daemon
           APK_PATH="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1)"
           test -f "$APK_PATH"

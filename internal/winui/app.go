@@ -261,7 +261,9 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		return 0
 
 	case wmAppQuit:
+		_, _, _ = pShowWindow.Call(hwnd, swHide)
 		a.cleanup()
+		_, _, _ = pDestroyWindow.Call(hwnd)
 		_, _, _ = pPostQuitMessage.Call(0)
 		return 0
 

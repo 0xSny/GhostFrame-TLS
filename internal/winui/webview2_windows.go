@@ -417,26 +417,24 @@ func (h *webView2Host) Close() {
 	wv := h.webview
 	ctrl := h.ctrl
 	env := h.env
-	dll := h.dll
 	h.webview = 0
 	h.ctrl = 0
 	h.env = 0
 	h.dll = nil
 	h.mu.Unlock()
 
-	if wv != 0 {
-		comRelease(wv)
-	}
 	if ctrl != 0 {
 		// ICoreWebView2Controller::Close (vtable slot 24)
 		_, _, _ = syscall.SyscallN(comSlot(ctrl, 24), ctrl)
 		comRelease(ctrl)
 	}
+	if wv != 0 {
+		comRelease(wv)
+	}
 	if env != 0 {
 		comRelease(env)
 	}
-	if dll != nil {
-		_ = dll.Release()
-	}
+	// Intentionally skip FreeLibrary(EmbeddedBrowserWebView.dll) right before exit so
+	// lingering WebView2 COM STA apartment callbacks cannot stall or jump into unmapped pages.
 	h.pinner.Unpin()
 }

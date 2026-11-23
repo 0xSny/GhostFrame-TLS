@@ -104,7 +104,7 @@ func (s *uiServer) Close() {
 		return
 	}
 	if s.srv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
 		_ = s.srv.Shutdown(ctx)
 		cancel()
 	}

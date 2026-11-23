@@ -138,6 +138,7 @@ var (
 	pTranslateMessage              = user32.NewProc("TranslateMessage")
 	pDispatchMessageW              = user32.NewProc("DispatchMessageW")
 	pPostQuitMessage               = user32.NewProc("PostQuitMessage")
+	pDestroyWindow                 = user32.NewProc("DestroyWindow")
 	pPostMessageW                  = user32.NewProc("PostMessageW")
 	pSendMessageW                  = user32.NewProc("SendMessageW")
 	pInvalidateRect                = user32.NewProc("InvalidateRect")

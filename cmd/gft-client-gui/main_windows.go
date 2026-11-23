@@ -73,9 +73,13 @@ func main() {
 	if !primary {
 		return
 	}
-	if mutex != 0 {
-		defer windows.CloseHandle(mutex)
+	releaseMutex := func() {
+		if mutex != 0 {
+			_ = windows.CloseHandle(mutex)
+			mutex = 0
+		}
 	}
+	defer releaseMutex()
 
 	cfgPath := resolveConfigPath(*cfgFlag)
 	eng, err := client.NewEngine(cfgPath)
@@ -93,7 +97,9 @@ func main() {
 		go func() { _ = eng.Connect() }()
 	}
 
-	if err := winui.Run(eng); err != nil {
+	runErr := winui.Run(eng)
+	releaseMutex()
+	if runErr != nil {
 		os.Exit(1)
 	}
 }
