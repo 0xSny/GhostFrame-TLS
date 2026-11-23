@@ -85,9 +85,7 @@ func DialV3StealthWithID(ctx context.Context, l *Link, timeout time.Duration, cl
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	if tc, ok := raw.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-	}
+	netbind.TuneTCPConn(raw)
 	var transport net.Conn = raw
 	if l.SplitSNI || l.V >= 3 {
 		transport = NewRecordSplitConn(raw)
@@ -136,9 +134,7 @@ func DialKnock(ctx context.Context, l *Link, poolFlags uint16, timeout time.Dura
 	if err != nil {
 		return nil, salt, 0, err
 	}
-	if tc, ok := raw.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-	}
+	netbind.TuneTCPConn(raw)
 
 	uc := newUClientWithHardware(raw, ucfg, clientHelloIDFor(l.EffectiveFP()))
 	t0 := time.Now()

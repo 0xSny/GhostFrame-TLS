@@ -321,18 +321,19 @@ func (p *SessionPool) reapAndCheck() (activeCount int, needed int) {
 
 func (p *SessionPool) inBandPingLoop() {
 	defer p.wg.Done()
-	// Fire an initial in-band ping shortly after startup, then every 6..10s on least-loaded socket.
+	// Fire an initial health probe shortly after startup, then probe ALL non-draining slots
+	// every 5..7s so every carrier keeps a fresh RTT score and blackholed sockets are evicted in <15s.
 	select {
 	case <-p.ctx.Done():
 		return
 	case <-time.After(1200 * time.Millisecond):
-		_, _ = p.PingNow(p.ctx)
+		p.probeAllHealth()
 	}
 
 	t := time.NewTimer(time.Hour)
 	defer t.Stop()
 	for {
-		wait := time.Duration(randRange(6000, 10000)) * time.Millisecond
+		wait := time.Duration(randRange(5000, 7000)) * time.Millisecond
 		if !t.Stop() {
 			select {
 			case <-t.C:
@@ -344,8 +345,73 @@ func (p *SessionPool) inBandPingLoop() {
 		case <-p.ctx.Done():
 			return
 		case <-t.C:
-			_, _ = p.PingNow(p.ctx)
+			p.probeAllHealth()
 		}
+	}
+}
+
+func (p *SessionPool) probeAllHealth() {
+	p.mu.Lock()
+	var targets []*poolEntry
+	for _, e := range p.entries {
+		if e.draining {
+			continue
+		}
+		select {
+		case <-e.sess.Done():
+			continue
+		default:
+		}
+		targets = append(targets, e)
+	}
+	p.mu.Unlock()
+
+	if len(targets) == 0 {
+		return
+	}
+
+	pCtx, cancel := context.WithTimeout(p.ctx, 3*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var bestMs atomic.Int64
+	for _, e := range targets {
+		wg.Add(1)
+		go func(ent *poolEntry) {
+			defer wg.Done()
+			rtt, err := ent.sess.SendPingReqAndWait(pCtx)
+			if err != nil {
+				if p.ctx.Err() != nil {
+					return
+				}
+				if fails := ent.sess.RecordPingFail(); fails >= 2 {
+					if p.onLog != nil {
+						p.onLog("[TCP] Pool slot #%d blackholed (%d ping timeouts), closing to reconnect", ent.id, fails)
+					}
+					ent.sess.Close()
+				}
+				return
+			}
+			ent.sess.ResetPingFail()
+			ms := rtt.Milliseconds()
+			if ms <= 0 {
+				ms = 1
+			}
+			ent.sess.SetLastRTTMs(ms)
+			for {
+				cur := bestMs.Load()
+				if cur != 0 && ms >= cur {
+					break
+				}
+				if bestMs.CompareAndSwap(cur, ms) {
+					break
+				}
+			}
+		}(e)
+	}
+	wg.Wait()
+	if b := bestMs.Load(); b > 0 {
+		p.rttMs.Store(b)
 	}
 }
 

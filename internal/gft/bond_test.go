@@ -251,3 +251,151 @@ func TestBondGroupEarlyDataBeforeBondOpenAcrossSockets(t *testing.T) {
 		t.Fatal("timed out waiting for early-buffered bonded stream")
 	}
 }
+
+type dropBondDataConn struct {
+	net.Conn
+	dropAfter atomic.Int32
+	writes    atomic.Int32
+}
+
+func (d *dropBondDataConn) Write(p []byte) (int, error) {
+	if limit := d.dropAfter.Load(); limit > 0 {
+		if d.writes.Add(1) > limit {
+			// Silently swallow CmdBondData payload frames on this stalled carrier without closing TCP.
+			if len(p) >= HeaderLen && p[0] == CmdBondData {
+				return len(p), nil
+			}
+		}
+	}
+	return d.Conn.Write(p)
+}
+
+func TestBondNackCrossSocketStallRecoveryAndPenalty(t *testing.T) {
+	ps := NewParamStore(DefaultParams())
+	srvGrp := NewBondGroup(func(st DataStream, target string, first []byte) {
+		defer st.Close()
+		_ = CopyBuf(st, st, nil)
+	})
+	cliGrp := NewBondGroup(nil)
+
+	var dropConn *dropBondDataConn
+	var srvSess0 *Session
+	var all []*Session
+	for i := 0; i < 4; i++ {
+		cConn, sConn := net.Pipe()
+		var srvC net.Conn = sConn
+		if i == 0 {
+			dropConn = &dropBondDataConn{Conn: sConn}
+			srvC = dropConn
+		}
+		srv := NewSession(srvC, false, ps, nil)
+		cli := NewSession(cConn, true, ps, nil)
+		if i == 0 {
+			srvSess0 = srv
+		}
+		srvGrp.AddSession(srv)
+		cliGrp.AddSession(cli)
+		all = append(all, srv, cli)
+		go func() { _ = srv.Run() }()
+		go func() { _ = cli.Run() }()
+		_ = srv.SendBondCap()
+	}
+	defer func() {
+		cliGrp.CloseAll(ErrSessionClosed)
+		srvGrp.CloseAll(ErrSessionClosed)
+		for _, s := range all {
+			s.Close()
+		}
+	}()
+
+	// Arm silent packet swallow on carrier 0 after initial capability handshake.
+	time.Sleep(50 * time.Millisecond)
+	dropConn.dropAfter.Store(1)
+
+	st, err := cliGrp.OpenStream(2002, "nack.example:443", nil)
+	if err != nil {
+		t.Fatalf("OpenStream failed: %v", err)
+	}
+	payload := make([]byte, 512*1024)
+	_, _ = rand.Read(payload)
+	wantHash := sha256.Sum256(payload)
+
+	go func() {
+		_, _ = st.Write(payload)
+		_ = st.CloseWrite()
+	}()
+
+	got := make([]byte, len(payload))
+	done := make(chan error, 1)
+	go func() {
+		_, rerr := io.ReadFull(st, got)
+		done <- rerr
+	}()
+
+	select {
+	case rerr := <-done:
+		if rerr != nil {
+			t.Fatalf("ReadFull failed under silent carrier drop: %v", rerr)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatalf("timed out waiting for CmdBondNack cross-socket recovery: %s", st.DebugState())
+	}
+	if sha256.Sum256(got) != wantHash {
+		t.Fatal("SHA-256 mismatch after CmdBondNack recovery")
+	}
+	if !srvSess0.BondPenaltyActive(time.Now().UnixNano()) {
+		t.Fatal("expected stalled carrier srvSess0 to carry bondPenaltyUntil after CmdBondNack")
+	}
+}
+
+func TestSessionPoolEvictsBlackholedSocketViaProbeAllHealth(t *testing.T) {
+	ps := NewParamStore(DefaultParams())
+	l := &Link{V: 3, Host: "127.0.0.1", Port: 443}
+	pool := NewSessionPool(l, ps, 2, nil)
+	defer pool.Close()
+
+	// Slot 0: dead/silent responder (reads everything, never replies with PingResp)
+	c0, s0 := net.Pipe()
+	go func() {
+		_, _ = io.Copy(io.Discard, s0)
+	}()
+	cli0 := NewSession(c0, true, ps, nil)
+	go func() { _ = cli0.Run() }()
+	defer c0.Close()
+	defer s0.Close()
+
+	// Slot 1: healthy responder
+	c1, s1 := net.Pipe()
+	srv1 := NewSession(s1, false, ps, nil)
+	cli1 := NewSession(c1, true, ps, nil)
+	go func() { _ = srv1.Run() }()
+	go func() { _ = cli1.Run() }()
+	defer srv1.Close()
+	defer cli1.Close()
+
+	pool.mu.Lock()
+	pool.entries = []*poolEntry{
+		{id: 1, sess: cli0, createdAt: time.Now(), maxAge: time.Hour},
+		{id: 2, sess: cli1, createdAt: time.Now(), maxAge: time.Hour},
+	}
+	pool.mu.Unlock()
+
+	pool.probeAllHealth()
+	select {
+	case <-cli0.Done():
+		t.Fatal("cli0 should tolerate 1 ping timeout before eviction")
+	default:
+	}
+
+	pool.probeAllHealth()
+	select {
+	case <-cli0.Done():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected cli0 to be evicted after 2 consecutive ping timeouts")
+	}
+	select {
+	case <-cli1.Done():
+		t.Fatal("healthy cli1 must remain open")
+	default:
+	}
+}

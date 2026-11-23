@@ -25,6 +25,7 @@ import (
 
 	"ghostframe/internal/gft"
 	"ghostframe/internal/gftrtc"
+	"ghostframe/internal/netbind"
 )
 
 // Version is the canonical server build identifier (overridable via -ldflags -X).
@@ -72,6 +73,7 @@ type Server struct {
 	udpMgrs   map[[8]byte]*udpManager
 	bondMgrMu sync.Mutex
 	bondMgrs  map[[8]byte]*gft.BondGroup
+	bondGrace map[[8]byte]*time.Timer
 	logger    *log.Logger
 }
 
@@ -105,9 +107,10 @@ func New(cfg *Config, logger *log.Logger) (*Server, error) {
 		verifier: gft.NewKnockVerifier(psk),
 		outbound: NewFastOutbound(),
 		sessions: map[uint64]*sessEntry{},
-		udpMgrs:  map[[8]byte]*udpManager{},
-		bondMgrs: map[[8]byte]*gft.BondGroup{},
-		started:  time.Now(),
+		udpMgrs:   map[[8]byte]*udpManager{},
+		bondMgrs:  map[[8]byte]*gft.BondGroup{},
+		bondGrace: map[[8]byte]*time.Timer{},
+		started:   time.Now(),
 		logger:   logger,
 	}
 	s.params = gft.NewParamStore(s.loadParams())
@@ -446,12 +449,20 @@ func (s *Server) Run(ctx context.Context) error {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		if tcpC, ok := c.(*net.TCPConn); ok {
-			_ = tcpC.SetNoDelay(true)
-		}
+		netbind.TuneTCPConn(c)
 		go s.handleTCP(ctx, c, tlsCfg)
 	}
 	wg.Wait()
+	s.bondMgrMu.Lock()
+	for cid, tm := range s.bondGrace {
+		tm.Stop()
+		delete(s.bondGrace, cid)
+	}
+	for cid, bg := range s.bondMgrs {
+		bg.CloseAll(gft.ErrSessionClosed)
+		delete(s.bondMgrs, cid)
+	}
+	s.bondMgrMu.Unlock()
 	s.audit.Flush()
 	return nil
 }
@@ -543,6 +554,10 @@ func (s *Server) attachBondSession(clientID [8]byte, sess *gft.Session) *gft.Bon
 		return nil
 	}
 	s.bondMgrMu.Lock()
+	if tm, exists := s.bondGrace[clientID]; exists {
+		tm.Stop()
+		delete(s.bondGrace, clientID)
+	}
 	bg, ok := s.bondMgrs[clientID]
 	if !ok {
 		bg = gft.NewBondGroup(func(st gft.DataStream, target string, first []byte) {
@@ -555,20 +570,47 @@ func (s *Server) attachBondSession(clientID [8]byte, sess *gft.Session) *gft.Bon
 	return bg
 }
 
-func (s *Server) releaseBondSession(clientID [8]byte, bg *gft.BondGroup, sess *gft.Session) {
+func (s *Server) releaseBondSession(ctx context.Context, clientID [8]byte, bg *gft.BondGroup, sess *gft.Session) {
 	if bg == nil || sess == nil {
 		return
 	}
-	rem := bg.RemoveSession(sess, true)
-	if rem == 0 {
-		s.bondMgrMu.Lock()
-		if cur := s.bondMgrs[clientID]; cur == bg {
-			if bg.NumStreams() == 0 {
-				delete(s.bondMgrs, clientID)
-			}
+	// Detach without immediately aborting active streams so transient client reconnects
+	// sharing the same clientID can attach within a brief 4s grace window.
+	rem := bg.RemoveSession(sess, false)
+	if rem != 0 {
+		return
+	}
+	s.bondMgrMu.Lock()
+	cur := s.bondMgrs[clientID]
+	if cur != bg {
+		s.bondMgrMu.Unlock()
+		return
+	}
+	if bg.NumStreams() == 0 || ctx.Err() != nil {
+		delete(s.bondMgrs, clientID)
+		if tm, ok := s.bondGrace[clientID]; ok {
+			tm.Stop()
+			delete(s.bondGrace, clientID)
 		}
 		s.bondMgrMu.Unlock()
+		bg.CloseAll(gft.ErrSessionClosed)
+		return
 	}
+	if prev, ok := s.bondGrace[clientID]; ok {
+		prev.Stop()
+	}
+	s.bondGrace[clientID] = time.AfterFunc(4*time.Second, func() {
+		s.bondMgrMu.Lock()
+		delete(s.bondGrace, clientID)
+		if s.bondMgrs[clientID] == bg && bg.NumStreams() >= 0 {
+			delete(s.bondMgrs, clientID)
+			s.bondMgrMu.Unlock()
+			bg.CloseAll(gft.ErrSessionClosed)
+			return
+		}
+		s.bondMgrMu.Unlock()
+	})
+	s.bondMgrMu.Unlock()
 }
 
 func addrIP(a net.Addr) string {
@@ -701,7 +743,7 @@ func (s *Server) mirrorBridge(clientConn net.Conn, target string) {
 	wg.Wait()
 }
 
-func (s *Server) serveTCPSession(_ context.Context, conn net.Conn, ip string, clientID [8]byte) {
+func (s *Server) serveTCPSession(ctx context.Context, conn net.Conn, ip string, clientID [8]byte) {
 	sess := gft.NewSession(conn, false, s.params, func(st *gft.Stream, target string, first []byte) {
 		s.handleDataStream(st, target, first)
 	})
@@ -714,7 +756,7 @@ func (s *Server) serveTCPSession(_ context.Context, conn net.Conn, ip string, cl
 		udpMgr.handleClose(id)
 	})
 	if bondGrp := s.attachBondSession(clientID, sess); bondGrp != nil {
-		defer s.releaseBondSession(clientID, bondGrp, sess)
+		defer s.releaseBondSession(ctx, clientID, bondGrp, sess)
 		_ = sess.SendBondCap()
 	}
 

@@ -30,6 +30,7 @@ const (
 	CmdBondData    byte = 0x0B
 	CmdBondClose   byte = 0x0C
 	CmdBondWindow  byte = 0x0D
+	CmdBondNack    byte = 0x0E
 
 	HeaderLen       = 8
 	MaxPayload      = 65535
@@ -83,6 +84,11 @@ type StreamInfo struct {
 	Down   uint64
 }
 
+type txFrame struct {
+	bp *[]byte
+	n  int
+}
+
 // Session multiplexes TCP streams and UDP associations over one post-knock connection.
 type Session struct {
 	conn     net.Conn
@@ -111,8 +117,13 @@ type Session struct {
 
 	wmu               sync.Mutex
 	sent              int
+	ctrlQ             chan txFrame
+	dataQ             chan txFrame
 	pendingWriteBytes atomic.Int64
+	writeStartNs      atomic.Int64
 	lastRTTMs         atomic.Int64
+	consecPingFails   atomic.Int32
+	bondPenaltyUntil  atomic.Int64
 
 	pingWaitMu  sync.Mutex
 	pingWaiters map[int64]chan time.Duration
@@ -139,9 +150,12 @@ func NewSession(c net.Conn, isClient bool, ps *ParamStore, h ConnectHandler) *Se
 		streams:    make(map[uint16]*Stream),
 		udpStreams: make(map[uint16]*UDPStream),
 		nextID:     1,
+		ctrlQ:      make(chan txFrame, 256),
+		dataQ:      make(chan txFrame, 4),
 		done:       make(chan struct{}),
 	}
 	s.lastReal.Store(time.Now().UnixNano())
+	go s.writeLoop()
 	return s
 }
 
@@ -187,7 +201,31 @@ func (s *Session) SetBondHandler(h BondHandler) {
 func (s *Session) SupportsBond() bool              { return s.bondSupported.Load() }
 func (s *Session) PendingWriteBytes() int64        { return s.pendingWriteBytes.Load() }
 func (s *Session) LastRTTMs() int64                { return s.lastRTTMs.Load() }
-func (s *Session) SendBondCap() error              { return s.writeFrame(CmdBondCap, 0, 0, nil, 0) }
+func (s *Session) SetLastRTTMs(ms int64)           { s.lastRTTMs.Store(ms) }
+func (s *Session) WriteStallMs() int64 {
+	st := s.writeStartNs.Load()
+	if st == 0 {
+		return 0
+	}
+	ms := (time.Now().UnixNano() - st) / int64(time.Millisecond)
+	if ms < 0 {
+		return 0
+	}
+	return ms
+}
+func (s *Session) NoteBondNackPenalty(d time.Duration) {
+	until := time.Now().Add(d).UnixNano()
+	for {
+		cur := s.bondPenaltyUntil.Load()
+		if until <= cur || s.bondPenaltyUntil.CompareAndSwap(cur, until) {
+			return
+		}
+	}
+}
+func (s *Session) BondPenaltyActive(nowNs int64) bool { return s.bondPenaltyUntil.Load() > nowNs }
+func (s *Session) RecordPingFail() int32              { return s.consecPingFails.Add(1) }
+func (s *Session) ResetPingFail()                     { s.consecPingFails.Store(0) }
+func (s *Session) SendBondCap() error                 { return s.writeFrame(CmdBondCap, 0, 0, nil, 0) }
 func (s *Session) SetUDPHandler(h UDPHandler, c UDPCloseHandler) {
 	s.udpH = h
 	s.udpClose = c
@@ -284,7 +322,134 @@ func (s *Session) computePadding(cmd byte, payload []byte, streamFrameIdx int64,
 	}
 }
 
-// writeFrame serialises one Ghost Frame v3 (8B header | payload | padding) via pooled buffer.
+func isPriorityControlFrame(cmd, flags byte, plen int) bool {
+	switch cmd {
+	case CmdPing, CmdWindow, CmdBondWindow, CmdBondNack, CmdBondOpen, CmdBondClose, CmdBondCap, CmdParam, CmdUDPClose, CmdConnect:
+		return true
+	case CmdClose:
+		return flags == CloseRST
+	case CmdBondData:
+		// BondedStream carries explicit chunk seq numbers so small interactive responses
+		// (TLS ServerHello, API/HTTP headers, <=2KB) safely bypass bulk 32KB queues.
+		return plen <= 12+2048
+	case CmdUDPDatagram:
+		return plen <= 512
+	default:
+		return false
+	}
+}
+
+func (s *Session) drainWriteQueues() {
+	for {
+		select {
+		case f := <-s.ctrlQ:
+			s.pendingWriteBytes.Add(-int64(f.n))
+			PutBuf(f.bp)
+		case f := <-s.dataQ:
+			s.pendingWriteBytes.Add(-int64(f.n))
+			PutBuf(f.bp)
+		default:
+			return
+		}
+	}
+}
+
+func (s *Session) writeLoop() {
+	batchBP := GetBuf()
+	defer func() {
+		PutBuf(batchBP)
+		s.drainWriteQueues()
+	}()
+	batch := *batchBP
+
+	popNext := func(limit int) (txFrame, bool) {
+		select {
+		case f := <-s.ctrlQ:
+			if f.n <= limit {
+				return f, true
+			}
+			// Won't fit in current batch: cannot unread cleanly, handled below by not using popNext when oversized
+			return f, true
+		default:
+		}
+		select {
+		case f := <-s.dataQ:
+			return f, true
+		default:
+			return txFrame{}, false
+		}
+	}
+
+	var leftover *txFrame
+	for {
+		var f txFrame
+		if leftover != nil {
+			f = *leftover
+			leftover = nil
+		} else {
+			select {
+			case <-s.done:
+				return
+			case f = <-s.ctrlQ:
+			default:
+				select {
+				case <-s.done:
+					return
+				case f = <-s.ctrlQ:
+				case f = <-s.dataQ:
+				}
+			}
+		}
+
+		// Coalesce additional already-queued frames up to batch capacity so small control/open frames
+		// ride inside a single TLS record + syscall rather than separate writes.
+		var out []byte
+		totalBytes := f.n
+		needPutSingle := false
+		if (len(s.ctrlQ) > 0 || len(s.dataQ) > 0) && f.n < len(batch) {
+			used := copy(batch, (*f.bp)[:f.n])
+			PutBuf(f.bp)
+			for used < len(batch) {
+				nf, ok := popNext(len(batch) - used)
+				if !ok {
+					break
+				}
+				if used+nf.n > len(batch) {
+					cp := nf
+					leftover = &cp
+					break
+				}
+				used += copy(batch[used:], (*nf.bp)[:nf.n])
+				PutBuf(nf.bp)
+				totalBytes += nf.n
+			}
+			out = batch[:used]
+		} else {
+			out = (*f.bp)[:f.n]
+			needPutSingle = true
+		}
+
+		s.writeStartNs.Store(time.Now().UnixNano())
+		_, err := s.conn.Write(out)
+		s.writeStartNs.Store(0)
+		if needPutSingle {
+			PutBuf(f.bp)
+		}
+		s.pendingWriteBytes.Add(-int64(totalBytes))
+
+		if err != nil {
+			if leftover != nil {
+				s.pendingWriteBytes.Add(-int64(leftover.n))
+				PutBuf(leftover.bp)
+			}
+			s.fail(err)
+			return
+		}
+	}
+}
+
+// writeFrame serialises one Ghost Frame v3 (8B header | payload | padding) via pooled buffer
+// and submits it to the priority-aware async writer (control/NACK/window/open bypass data backlog).
 func (s *Session) writeFrame(cmd, flags byte, id uint16, payload []byte, streamFrameIdx int64) error {
 	if len(payload) > MaxPayload {
 		return ErrProtocol
@@ -315,15 +480,20 @@ func (s *Session) writeFrame(cmd, flags byte, id uint16, payload []byte, streamF
 	s.pendingWriteBytes.Add(int64(n))
 	s.wmu.Lock()
 	s.sent++
-	_, err := s.conn.Write(buf[:n])
 	s.wmu.Unlock()
-	s.pendingWriteBytes.Add(-int64(n))
-	PutBuf(bp)
 
-	if err != nil {
-		s.fail(err)
-		return err
+	q := s.dataQ
+	if isPriorityControlFrame(cmd, flags, len(payload)) {
+		q = s.ctrlQ
 	}
+	select {
+	case <-s.done:
+		s.pendingWriteBytes.Add(-int64(n))
+		PutBuf(bp)
+		return ErrSessionClosed
+	case q <- txFrame{bp: bp, n: n}:
+	}
+
 	if cmd == CmdConnect || cmd == CmdData || cmd == CmdUDPDatagram {
 		s.touchReal()
 	}
@@ -481,6 +651,7 @@ func (s *Session) dispatch(cmd, flags byte, id uint16, pl []byte) error {
 					ms = 1
 				}
 				s.lastRTTMs.Store(ms)
+				s.consecPingFails.Store(0)
 				s.pingWaitMu.Lock()
 				ch := s.pingWaiters[sentNs]
 				delete(s.pingWaiters, sentNs)
@@ -511,7 +682,7 @@ func (s *Session) dispatch(cmd, flags byte, id uint16, pl []byte) error {
 			onCap()
 		}
 
-	case CmdBondOpen, CmdBondData, CmdBondClose, CmdBondWindow:
+	case CmdBondOpen, CmdBondData, CmdBondClose, CmdBondWindow, CmdBondNack:
 		s.touchReal()
 		s.mu.Lock()
 		bh := s.bondH
