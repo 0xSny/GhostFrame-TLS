@@ -5,18 +5,14 @@ package netbind
 /*
 #include <dns_sd.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
 
-extern void ghostNetbindDNSAddrInfoCB(
-	DNSServiceRef sdRef,
-	DNSServiceFlags flags,
+extern DNSServiceErrorType ghostStartDNSGetAddrInfo(
+	DNSServiceRef *sdRef,
 	uint32_t interfaceIndex,
-	DNSServiceErrorType errorCode,
 	const char *hostname,
-	const struct sockaddr *address,
-	uint32_t ttl,
-	void *context
+	void *ctxPtr
 );
 */
 import "C"
@@ -37,7 +33,7 @@ const dnsSDLookupTimeout = 1500 * time.Millisecond
 
 type dnsSDAddrState struct {
 	ips     []net.IP
-	errCode C.DNSServiceErrorType
+	errCode int32
 	done    bool
 }
 
@@ -45,15 +41,12 @@ func init() {
 	lookupIPv6Fn = darwinDNSServiceLookupIPv6
 }
 
-//export ghostNetbindDNSAddrInfoCB
-func ghostNetbindDNSAddrInfoCB(
-	_ C.DNSServiceRef,
-	flags C.DNSServiceFlags,
-	_ C.uint32_t,
-	errorCode C.DNSServiceErrorType,
-	_ *C.char,
-	address *C.struct_sockaddr,
-	_ C.uint32_t,
+//export ghostNetbindOnAddrInfo
+func ghostNetbindOnAddrInfo(
+	errorCode int32,
+	moreComing int32,
+	family int32,
+	addrBytes unsafe.Pointer,
 	contextPtr unsafe.Pointer,
 ) {
 	if contextPtr == nil {
@@ -64,20 +57,19 @@ func ghostNetbindDNSAddrInfoCB(
 	if !ok || state == nil {
 		return
 	}
-	if errorCode != C.kDNSServiceErr_NoError {
+	if errorCode != 0 {
 		state.errCode = errorCode
 		state.done = true
 		return
 	}
-	if address != nil && address.sa_family == C.AF_INET6 {
-		addr6 := (*C.struct_sockaddr_in6)(unsafe.Pointer(address))
-		raw := C.GoBytes(unsafe.Pointer(&addr6.sin6_addr), 16)
+	if family == int32(C.AF_INET6) && addrBytes != nil {
+		raw := C.GoBytes(addrBytes, 16)
 		ip := net.IP(raw)
 		if !IsFakeIP(ip) && !ip.IsUnspecified() {
 			state.ips = append(state.ips, ip)
 		}
 	}
-	if flags&C.kDNSServiceFlagsMoreComing == 0 {
+	if moreComing == 0 {
 		state.done = true
 	}
 }
@@ -110,13 +102,10 @@ func darwinDNSServiceLookupIPv6(ctx context.Context, host string) ([]net.IP, err
 	defer C.free(unsafe.Pointer(cHost))
 
 	var sdRef C.DNSServiceRef
-	errCode := C.DNSServiceGetAddrInfo(
+	errCode := C.ghostStartDNSGetAddrInfo(
 		&sdRef,
-		0,
 		C.uint32_t(iface.Index),
-		C.kDNSServiceProtocol_IPv6,
 		cHost,
-		(C.DNSServiceGetAddrInfoReply)(C.ghostNetbindDNSAddrInfoCB),
 		ctxPtr,
 	)
 	if errCode != C.kDNSServiceErr_NoError || sdRef == nil {
