@@ -30,16 +30,51 @@ var excludedPrefixes = []string{
 	"vmenet",
 }
 
+// SocketProtector protects outbound socket file descriptors from looping back
+// into an active OS VPN TUN interface (used by Android VpnService.protect).
+type SocketProtector interface {
+	ProtectFD(fd int32) bool
+}
+
 var (
 	preferredMu        sync.RWMutex
 	preferredIface     string
 	directBindEnabled  atomic.Bool
 	outboundMark       atomic.Int32
 	physicalFamiliesFn = defaultPhysicalInterfaceFamilies
+
+	protectorMu     sync.RWMutex
+	socketProtector SocketProtector
 )
 
 func init() {
 	directBindEnabled.Store(true)
+}
+
+// SetSocketProtector registers (or clears with nil) a platform VPN socket protector.
+func SetSocketProtector(p SocketProtector) {
+	protectorMu.Lock()
+	socketProtector = p
+	protectorMu.Unlock()
+}
+
+// HasSocketProtector reports whether a platform VPN socket protector is registered.
+func HasSocketProtector() bool {
+	protectorMu.RLock()
+	has := socketProtector != nil
+	protectorMu.RUnlock()
+	return has
+}
+
+// ProtectSocketFD invokes the registered SocketProtector on fd if present.
+func ProtectSocketFD(fd uintptr) bool {
+	protectorMu.RLock()
+	p := socketProtector
+	protectorMu.RUnlock()
+	if p == nil {
+		return true
+	}
+	return p.ProtectFD(int32(fd))
 }
 
 // SetOutboundMark configures the Linux SO_MARK value (e.g. 0xff) attached to

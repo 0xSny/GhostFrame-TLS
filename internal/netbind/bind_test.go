@@ -125,3 +125,31 @@ func TestOutboundMarkToggle(t *testing.T) {
 		t.Fatalf("expected negative OutboundMark clamped to 0, got %d", got)
 	}
 }
+
+type mockProtector struct {
+	lastFD int32
+}
+
+func (m *mockProtector) ProtectFD(fd int32) bool {
+	m.lastFD = fd
+	return fd > 0
+}
+
+func TestSocketProtectorRoundTrip(t *testing.T) {
+	if HasSocketProtector() {
+		t.Fatal("expected HasSocketProtector() == false initially")
+	}
+	mp := &mockProtector{}
+	SetSocketProtector(mp)
+	t.Cleanup(func() { SetSocketProtector(nil) })
+
+	if !HasSocketProtector() {
+		t.Fatal("expected HasSocketProtector() == true after registration")
+	}
+	if !ProtectSocketFD(42) || mp.lastFD != 42 {
+		t.Fatalf("expected ProtectSocketFD(42) true with lastFD=42, got lastFD=%d", mp.lastFD)
+	}
+	if ProtectSocketFD(0) {
+		t.Fatal("expected ProtectSocketFD(0) false")
+	}
+}

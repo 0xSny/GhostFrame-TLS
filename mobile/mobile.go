@@ -158,6 +158,21 @@ func initCoreLocked(dataDir string, isTunnelExt bool) {
 	}
 }
 
+// SocketProtector mirrors netbind.SocketProtector so gomobile exports a clean
+// Java/Kotlin interface for Android VpnService.protect(fd).
+type SocketProtector interface {
+	ProtectFD(fd int32) bool
+}
+
+// SetSocketProtector registers (or clears with nil) a platform VPN socket protector.
+func SetSocketProtector(p SocketProtector) {
+	if p == nil {
+		netbind.SetSocketProtector(nil)
+		return
+	}
+	netbind.SetSocketProtector(p)
+}
+
 // StartEngine starts the local SOCKS5/HTTP listeners and dials the configured GhostFrame server.
 func StartEngine(configJSON string) error {
 	return startEngineWithOptions(configJSON, false)
@@ -165,6 +180,12 @@ func StartEngine(configJSON string) error {
 
 func reloadEngineFromHTTP(configJSON string) error {
 	return startEngineWithOptions(configJSON, true)
+}
+
+// ReloadEngineJSON hot-reloads the running engine configuration while keeping an active
+// TUN stack attached (used by iOS and Android live settings/route updates).
+func ReloadEngineJSON(configJSON string) string {
+	return marshalEnvelope(startEngineWithOptions(configJSON, true), nil)
 }
 
 func startEngineWithOptions(configJSON string, preserveTUN bool) error {

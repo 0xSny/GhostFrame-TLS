@@ -20,6 +20,7 @@ var (
 	tunStack      *tunstack.Stack
 	lastTunWriter TunPacketWriter
 	lastTunMTU    int
+	tunCloseHook  func()
 )
 
 // StartTUN attaches a memory-bounded gVisor L3/L4 TUN stack to the active mobile Engine.
@@ -91,6 +92,16 @@ func detachTUNForReload() (TunPacketWriter, int) {
 	return w, m
 }
 
+func setTUNCloseHook(fn func()) {
+	tunMu.Lock()
+	old := tunCloseHook
+	tunCloseHook = fn
+	tunMu.Unlock()
+	if old != nil {
+		old()
+	}
+}
+
 // StopTUN closes the active userspace TUN stack if running and flushes persisted FakeIP cache.
 func StopTUN() {
 	tunMu.Lock()
@@ -98,7 +109,12 @@ func StopTUN() {
 	tunStack = nil
 	lastTunWriter = nil
 	lastTunMTU = 0
+	hook := tunCloseHook
+	tunCloseHook = nil
 	tunMu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if st != nil {
 		st.Close()
 	}

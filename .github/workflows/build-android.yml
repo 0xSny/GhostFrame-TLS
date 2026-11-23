@@ -1,0 +1,113 @@
+name: Build Android APK (Kestrel)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "mobile/**"
+      - "android/**"
+      - "internal/netbind/**"
+      - "internal/gftrtc/**"
+      - "internal/gft/**"
+      - "internal/client/**"
+      - "internal/tunstack/**"
+      - "VERSION"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/build-android.yml"
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    env:
+      KSL_NO_SYSPROXY: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Ensure Android SDK & NDK
+        run: |
+          set -euo pipefail
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_HOME="$SDK_DIR"
+          export ANDROID_SDK_ROOT="$SDK_DIR"
+          SDKMAN="$(command -v sdkmanager || find "$SDK_DIR/cmdline-tools" -name sdkmanager 2>/dev/null | head -n 1 || true)"
+          if [ -n "$SDKMAN" ]; then
+            yes | "$SDKMAN" --sdk_root="$SDK_DIR" --licenses >/dev/null || true
+            if [ ! -d "$SDK_DIR/platforms/android-35" ] || [ ! -d "$SDK_DIR/build-tools/35.0.0" ]; then
+              "$SDKMAN" --sdk_root="$SDK_DIR" "platforms;android-35" "build-tools;35.0.0"
+            fi
+            NDK_DIR="$(ls -1d "$SDK_DIR"/ndk/* 2>/dev/null | sort -V | tail -n 1 || true)"
+            if [ -z "$NDK_DIR" ]; then
+              "$SDKMAN" --sdk_root="$SDK_DIR" "ndk;27.2.12479018"
+              NDK_DIR="$(ls -1d "$SDK_DIR"/ndk/* 2>/dev/null | sort -V | tail -n 1)"
+            fi
+          else
+            NDK_DIR="$(ls -1d "$SDK_DIR"/ndk/* 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          test -d "$NDK_DIR"
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+
+      - name: Verify Android Go Core & Mobile Bridge
+        run: |
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go vet ./mobile ./internal/netbind ./internal/tunstack
+          CGO_ENABLED=0 go test -count=1 ./internal/netbind ./internal/tunstack ./mobile
+
+      - name: Build GhostMobile.aar (gomobile)
+        run: |
+          set -euo pipefail
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile init
+          go get golang.org/x/mobile/bind
+          mkdir -p android/app/libs dist
+          RAW_VER="$(tr -d ' \t\r\n' < VERSION)"
+          APP_VER="${RAW_VER#v}"
+          APP_VER="${APP_VER%-LTS}"
+          REL_VER="v${APP_VER}"
+          gomobile bind \
+            -target=android/arm64,android/arm,android/amd64 \
+            -androidapi=24 \
+            -trimpath \
+            -ldflags="-s -w -X ghostframe/internal/client.Version=${REL_VER} -X ghostframe/mobile.Version=${REL_VER}" \
+            -o android/app/libs/GhostMobile.aar \
+            ./mobile
+          git checkout -- go.mod go.sum
+          test -f android/app/libs/GhostMobile.aar
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build Kestrel Android Release APK
+        run: |
+          set -euo pipefail
+          gradle -p android assembleRelease --no-daemon
+          APK_PATH="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1)"
+          test -f "$APK_PATH"
+          cp "$APK_PATH" dist/Kestrel-Android.apk
+          ls -lh dist/Kestrel-Android.apk
+
+      - name: Upload Android APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kestrel-Android-apk
+          path: dist/Kestrel-Android.apk
+          if-no-files-found: error

@@ -1,0 +1,4 @@
+-keep class go.** { *; }
+-keep class mobile.** { *; }
+-dontwarn go.**
+-dontwarn mobile.**

@@ -203,8 +203,102 @@ jobs:
           path: dist/*.ipa
           if-no-files-found: error
 
+  build-android:
+    runs-on: ubuntu-latest
+    env:
+      KSL_NO_SYSPROXY: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Ensure Android SDK & NDK
+        run: |
+          set -euo pipefail
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_HOME="$SDK_DIR"
+          export ANDROID_SDK_ROOT="$SDK_DIR"
+          SDKMAN="$(command -v sdkmanager || find "$SDK_DIR/cmdline-tools" -name sdkmanager 2>/dev/null | head -n 1 || true)"
+          if [ -n "$SDKMAN" ]; then
+            yes | "$SDKMAN" --sdk_root="$SDK_DIR" --licenses >/dev/null || true
+            if [ ! -d "$SDK_DIR/platforms/android-35" ] || [ ! -d "$SDK_DIR/build-tools/35.0.0" ]; then
+              "$SDKMAN" --sdk_root="$SDK_DIR" "platforms;android-35" "build-tools;35.0.0"
+            fi
+            NDK_DIR="$(ls -1d "$SDK_DIR"/ndk/* 2>/dev/null | sort -V | tail -n 1 || true)"
+            if [ -z "$NDK_DIR" ]; then
+              "$SDKMAN" --sdk_root="$SDK_DIR" "ndk;27.2.12479018"
+              NDK_DIR="$(ls -1d "$SDK_DIR"/ndk/* 2>/dev/null | sort -V | tail -n 1)"
+            fi
+          else
+            NDK_DIR="$(ls -1d "$SDK_DIR"/ndk/* 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+
+      - name: Build GhostMobile.aar & Kestrel-Android.apk
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            REL_VER="$INPUT_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            REL_VER="$REF_NAME"
+          else
+            REL_VER="v4.2.0"
+          fi
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile init
+          go get golang.org/x/mobile/bind
+          mkdir -p android/app/libs dist
+          gomobile bind \
+            -target=android/arm64,android/arm,android/amd64 \
+            -androidapi=24 \
+            -trimpath \
+            -ldflags="-s -w -X ghostframe/internal/client.Version=${REL_VER} -X ghostframe/mobile.Version=${REL_VER}" \
+            -o android/app/libs/GhostMobile.aar \
+            ./mobile
+          git checkout -- go.mod go.sum
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Package Android Release APK
+        run: |
+          set -euo pipefail
+          gradle -p android assembleRelease --no-daemon
+          APK_PATH="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1)"
+          test -f "$APK_PATH"
+          cp "$APK_PATH" dist/Kestrel-Android.apk
+          ls -lh dist/Kestrel-Android.apk
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-android-apk
+          path: dist/Kestrel-Android.apk
+          if-no-files-found: error
+
   publish-release:
-    needs: [build-binaries, build-ios]
+    needs: [build-binaries, build-ios, build-android]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -229,6 +323,7 @@ jobs:
           mkdir -p release-out
           cp dist-stage/release-linux-windows-router/* release-out/
           cp dist-stage/release-ios-ipas/*.ipa release-out/
+          cp dist-stage/release-android-apk/Kestrel-Android.apk release-out/
           cp ios/Shared/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png release-out/icon-kestrel.png
 
           if [ -n "$INPUT_TAG" ]; then
@@ -336,7 +431,7 @@ jobs:
             gh release create "$RELEASE_TAG" release-out/* \
               --repo Spittingjiu/Ghost \
               --title "Kestrel ${RELEASE_TAG} (All Platforms)" \
-              --notes "Automated pure-binary multi-platform release (${RELEASE_TAG}). Includes Kestrel Server, Kestrel Pro (Windows), KestrelBox (iStoreOS arm64/amd64), Kestrel Duo & Kestrel Air (iOS), OmniSign source.json, and sha256 checksums."
+              --notes "Automated pure-binary multi-platform release (${RELEASE_TAG}). Includes Kestrel Server, Kestrel Pro (Windows), KestrelBox (iStoreOS arm64/amd64), Kestrel Duo & Kestrel Air (iOS), Kestrel Android (APK), OmniSign source.json, and sha256 checksums."
           fi
 
       - name: Fallback Release on Current Repository (when DIST_PUSH_TOKEN not set)

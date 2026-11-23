@@ -83,5 +83,14 @@ for rel in plist_updates:
         raise RuntimeError(f"failed to update plist versions in {rel}")
     p.write_text(text, encoding="utf-8", newline="\n")
 
+android_gradle = root / "android/app/build.gradle.kts"
+if android_gradle.exists():
+    gtext = android_gradle.read_text(encoding="utf-8")
+    gtext, gc1 = re.subn(r'(versionCode\s*=\s*)[0-9]+', rf'\g<1>{build_num}', gtext, count=1)
+    gtext, gc2 = re.subn(r'(versionName\s*=\s*")[^"]*(")', rf'\g<1>{ver}\2', gtext, count=1)
+    if gc1 != 1 or gc2 != 1:
+        raise RuntimeError("failed to update Android versions in android/app/build.gradle.kts")
+    android_gradle.write_text(gtext, encoding="utf-8", newline="\n")
+
 print(f"Synced version -> VER={ver} BUILD={build_num} TAG={tag_ver}")
 PY

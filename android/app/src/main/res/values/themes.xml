@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.KestrelAndroid" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@color/kestrel_bg</item>
+        <item name="android:navigationBarColor">@color/kestrel_bg</item>
+    </style>
+</resources>
