@@ -59,8 +59,8 @@ func mockGFTLoop(t *testing.T) (*gft.Link, func()) {
 }
 
 func TestSOCKS5HandshakeAndProxy(t *testing.T) {
-	// Create a dummy engine
-	eng, err := NewEngine("")
+	// Create a dummy engine with isolated config.
+	eng, err := NewEngine(filepath.Join(t.TempDir(), "cfg.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestSOCKS5HandshakeAndProxy(t *testing.T) {
 	}
 	defer socks.Close()
 
-	// 1. When disconnected, SOCKS5 CONNECT returns error
+	// 1. When disconnected, SOCKS5 CONNECT for proxy target returns 0x05.
 	c, err := net.Dial("tcp", socks.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -86,8 +86,8 @@ func TestSOCKS5HandshakeAndProxy(t *testing.T) {
 		t.Fatalf("greeting reply: %v %v", err, rep)
 	}
 
-	// Request: CONNECT 127.0.0.1:80 (IPv4)
-	req := []byte{0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80}
+	// Request: CONNECT 8.8.8.8:443 (non-LAN ActionProxy target)
+	req := []byte{0x05, 0x01, 0x00, 0x01, 8, 8, 8, 8, 0x01, 0xbb}
 	_, _ = c.Write(req)
 	var resp [10]byte
 	if _, err := io.ReadFull(c, resp[:]); err != nil {
@@ -99,7 +99,7 @@ func TestSOCKS5HandshakeAndProxy(t *testing.T) {
 }
 
 func TestHTTPProxyRejectionWhenDisconnected(t *testing.T) {
-	eng, err := NewEngine("")
+	eng, err := NewEngine(filepath.Join(t.TempDir(), "cfg.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
