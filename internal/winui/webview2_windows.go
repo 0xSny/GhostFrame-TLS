@@ -81,6 +81,7 @@ type webView2Host struct {
 	ctrlVtbl    comCallbackVtbl
 	envHandler  *comEnvCompletedHandler
 	ctrlHandler *comCtrlCompletedHandler
+	pinner      runtime.Pinner
 
 	ready    bool
 	failed   bool
@@ -157,8 +158,8 @@ func defaultWebViewUserDataDir() string {
 }
 
 func comSlot(obj uintptr, index uintptr) uintptr {
-	vtbl := *(*uintptr)(unsafe.Pointer(obj))
-	return *(*uintptr)(unsafe.Pointer(vtbl + index*unsafe.Sizeof(uintptr(0))))
+	vtbl := *(*uintptr)(osPtr(obj))
+	return *(*uintptr)(unsafe.Add(osPtr(vtbl), index*unsafe.Sizeof(uintptr(0))))
 }
 
 func comAddRef(obj uintptr) {
@@ -211,6 +212,10 @@ func newWebView2Host(hwnd uintptr, startURL string, onFailed func(string)) (*web
 	h.envHandler.refCount.Store(1)
 	h.ctrlHandler = &comCtrlCompletedHandler{vtbl: &h.ctrlVtbl, host: h}
 	h.ctrlHandler.refCount.Store(1)
+	h.pinner.Pin(h.envHandler)
+	h.pinner.Pin(h.ctrlHandler)
+	h.pinner.Pin(&h.envVtbl)
+	h.pinner.Pin(&h.ctrlVtbl)
 
 	userDataPtr := utf16Ptr(defaultWebViewUserDataDir())
 	// CreateWebViewEnvironmentWithOptionsInternal(checkEdgeBinary=1, runtimeType=0, userDataFolder, envOpts=0, handler)
@@ -232,28 +237,28 @@ func envHandlerQueryInterface(this, riid, ppv uintptr) uintptr {
 	if ppv == 0 || riid == 0 {
 		return eNoInterface
 	}
-	g := *(*windows.GUID)(unsafe.Pointer(riid))
+	g := *(*windows.GUID)(osPtr(riid))
 	if g == iidUnknown || g == iidEnvCompletedHandler {
-		*(*uintptr)(unsafe.Pointer(ppv)) = this
+		*(*uintptr)(osPtr(ppv)) = this
 		envHandlerAddRef(this)
 		return sOK
 	}
-	*(*uintptr)(unsafe.Pointer(ppv)) = 0
+	*(*uintptr)(osPtr(ppv)) = 0
 	return eNoInterface
 }
 
 func envHandlerAddRef(this uintptr) uintptr {
-	h := (*comEnvCompletedHandler)(unsafe.Pointer(this))
+	h := (*comEnvCompletedHandler)(osPtr(this))
 	return uintptr(h.refCount.Add(1))
 }
 
 func envHandlerRelease(this uintptr) uintptr {
-	h := (*comEnvCompletedHandler)(unsafe.Pointer(this))
+	h := (*comEnvCompletedHandler)(osPtr(this))
 	return uintptr(h.refCount.Add(-1))
 }
 
 func envHandlerInvoke(this, errorCode, createdEnv uintptr) uintptr {
-	cb := (*comEnvCompletedHandler)(unsafe.Pointer(this))
+	cb := (*comEnvCompletedHandler)(osPtr(this))
 	h := cb.host
 	if int32(errorCode) < 0 || createdEnv == 0 {
 		h.markFailed(fmt.Sprintf("WebView2 Environment 创建失败 (0x%x)", uint32(errorCode)))
@@ -283,28 +288,28 @@ func ctrlHandlerQueryInterface(this, riid, ppv uintptr) uintptr {
 	if ppv == 0 || riid == 0 {
 		return eNoInterface
 	}
-	g := *(*windows.GUID)(unsafe.Pointer(riid))
+	g := *(*windows.GUID)(osPtr(riid))
 	if g == iidUnknown || g == iidCtrlCompletedHandler {
-		*(*uintptr)(unsafe.Pointer(ppv)) = this
+		*(*uintptr)(osPtr(ppv)) = this
 		ctrlHandlerAddRef(this)
 		return sOK
 	}
-	*(*uintptr)(unsafe.Pointer(ppv)) = 0
+	*(*uintptr)(osPtr(ppv)) = 0
 	return eNoInterface
 }
 
 func ctrlHandlerAddRef(this uintptr) uintptr {
-	h := (*comCtrlCompletedHandler)(unsafe.Pointer(this))
+	h := (*comCtrlCompletedHandler)(osPtr(this))
 	return uintptr(h.refCount.Add(1))
 }
 
 func ctrlHandlerRelease(this uintptr) uintptr {
-	h := (*comCtrlCompletedHandler)(unsafe.Pointer(this))
+	h := (*comCtrlCompletedHandler)(osPtr(this))
 	return uintptr(h.refCount.Add(-1))
 }
 
 func ctrlHandlerInvoke(this, errorCode, createdCtrl uintptr) uintptr {
-	cb := (*comCtrlCompletedHandler)(unsafe.Pointer(this))
+	cb := (*comCtrlCompletedHandler)(osPtr(this))
 	h := cb.host
 	if int32(errorCode) < 0 || createdCtrl == 0 {
 		h.markFailed(fmt.Sprintf("WebView2 Controller 创建失败 (0x%x)", uint32(errorCode)))
@@ -433,4 +438,5 @@ func (h *webView2Host) Close() {
 	if dll != nil {
 		_ = dll.Release()
 	}
+	h.pinner.Unpin()
 }
