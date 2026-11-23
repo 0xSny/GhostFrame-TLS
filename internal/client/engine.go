@@ -94,6 +94,8 @@ type Engine struct {
 	trafficTracker     *targetTrafficTracker
 	directCNResolveFn  DirectCNDNSFunc
 	tunnelDNSResolveFn TunnelDNSFunc
+	fakeIPLookupMu     sync.RWMutex
+	fakeIPLookupFn     func(net.IP) (string, bool)
 	socksSrv           *SOCKS5Server
 	httpSrv            *HTTPProxyServer
 	sysProxyApplied    bool
@@ -1033,47 +1035,121 @@ func (e *Engine) SetDirectDNSBypass(enabled bool) {
 	e.directDNSBypass.Store(enabled)
 }
 
+// DirectDNSBypassEnabled reports whether direct physical DNS bypass is active on this Engine.
+func (e *Engine) DirectDNSBypassEnabled() bool {
+	return e.directDNSBypass.Load()
+}
+
+// SetFakeIPLookupFunc registers a reverse-lookup callback (e.g. from tunstack.FakeIPPool)
+// so any direct outbound path receiving a Fake-IP can recover its original hostname before dialing.
+func (e *Engine) SetFakeIPLookupFunc(fn func(net.IP) (string, bool)) {
+	e.fakeIPLookupMu.Lock()
+	e.fakeIPLookupFn = fn
+	e.fakeIPLookupMu.Unlock()
+}
+
+// RecoverFakeIPTarget checks whether target uses a Fake-IP (198.18.0.0/15 or fd18:c612::/64).
+// If so, it attempts to recover the mapped domain via fakeIPLookupFn and returns netbind.ErrFakeIPBlocked
+// if the Fake-IP cannot be recovered. Non-Fake-IP targets are returned unchanged.
+func (e *Engine) RecoverFakeIPTarget(target string) (string, error) {
+	trimmed := strings.TrimSpace(target)
+	if trimmed == "" {
+		return trimmed, nil
+	}
+	host := trimmed
+	port := ""
+	hasPort := false
+	if h, p, err := net.SplitHostPort(trimmed); err == nil {
+		host = h
+		port = p
+		hasPort = true
+	}
+	cleanHost := strings.Trim(strings.TrimSpace(host), "[]")
+	if idx := strings.IndexByte(cleanHost, '%'); idx >= 0 {
+		cleanHost = cleanHost[:idx]
+	}
+	ip := net.ParseIP(cleanHost)
+	if ip == nil || !netbind.IsFakeIP(ip) {
+		return target, nil
+	}
+	e.fakeIPLookupMu.RLock()
+	fn := e.fakeIPLookupFn
+	e.fakeIPLookupMu.RUnlock()
+	if fn != nil {
+		if realHost, ok := fn(ip); ok && realHost != "" {
+			if hasPort {
+				return net.JoinHostPort(realHost, port), nil
+			}
+			return realHost, nil
+		}
+	}
+	return "", netbind.ErrFakeIPBlocked
+}
+
 // DirectDialer returns a net.Dialer bound to the physical interface and, when TUN Fake-IP DNS is active,
-// configured with a direct CN DNS resolver bypassing the TUN virtual DNS server.
+// configured with the physical-interface-bound pure-Go direct DNS resolver bypassing mDNSResponder.
 func (e *Engine) DirectDialer(timeout time.Duration) net.Dialer {
 	if timeout <= 0 {
 		timeout = 8 * time.Second
 	}
 	d := net.Dialer{Timeout: timeout, Control: netbind.Control}
 	if e.directDNSBypass.Load() {
-		d.Resolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				nd := net.Dialer{Timeout: 3 * time.Second, Control: netbind.Control}
-				candidates := make([]string, 0, 3)
-				for _, host := range []string{"223.5.5.5", "119.29.29.29"} {
-					if ua, err := netbind.ResolveUDPAddr(ctx, host, 53); err == nil && ua != nil {
-						candidates = append(candidates, ua.String())
-					} else {
-						candidates = append(candidates, net.JoinHostPort(host, "53"))
-					}
-				}
-				if netbind.IsPureIPv6Physical() {
-					candidates = append(candidates, "[2400:3200::1]:53", "[2402:4e00::]:53")
-				}
-				var lastErr error
-				for _, addr := range candidates {
-					if c, err := nd.DialContext(ctx, "udp", addr); err == nil {
-						return c, nil
-					} else {
-						lastErr = err
-					}
-				}
-				return nil, lastErr
-			},
-		}
+		d.Resolver = netbind.DirectResolver()
 	}
 	return d
+}
+
+// DirectDialContext dials addr directly over the physical interface, recovering Fake-IP targets
+// via reverse lookup (or rejecting unmapped Fake-IPs with netbind.ErrFakeIPBlocked) and resolving
+// domain names via physical-interface-bound DNS + pure-IPv6 NAT64 synthesis before dialing.
+func (e *Engine) DirectDialContext(ctx context.Context, _ string, addr string) (net.Conn, error) {
+	recovered, err := e.RecoverFakeIPTarget(addr)
+	if err != nil {
+		return nil, err
+	}
+	resolveCtx := ctx
+	var cancel context.CancelFunc
+	if resolveCtx == nil {
+		resolveCtx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	} else if _, hasDeadline := resolveCtx.Deadline(); !hasDeadline {
+		resolveCtx, cancel = context.WithTimeout(resolveCtx, 3*time.Second)
+	}
+	dialNet, resolvedAddr, rerr := netbind.ResolveDirectTCPAddr(resolveCtx, recovered, e.IPv6Enabled())
+	if cancel != nil {
+		cancel()
+	}
+	if rerr != nil {
+		if errors.Is(rerr, netbind.ErrIPv6Disabled) {
+			return nil, errIPv6DisabledClient
+		}
+		return nil, rerr
+	}
+	if ctx == nil {
+		var dcancel context.CancelFunc
+		ctx, dcancel = context.WithTimeout(context.Background(), 8*time.Second)
+		defer dcancel()
+	}
+	d := e.DirectDialer(8 * time.Second)
+	return d.DialContext(ctx, dialNet, resolvedAddr)
 }
 
 // OpenTargetStreamWithRoute classifies routing using routeTarget (e.g. sniffed TLS SNI)
 // while opening the connection to dialTarget without local DNS leakage on known overseas hosts.
 func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first []byte) (gft.DataStream, RouteAction, error) {
+	if recovered, rerr := e.RecoverFakeIPTarget(dialTarget); rerr != nil {
+		return nil, ActionReject, rerr
+	} else if recovered != dialTarget {
+		if routeTarget == "" || routeTarget == dialTarget {
+			routeTarget = recovered
+		}
+		dialTarget = recovered
+	}
+	if routeTarget != "" {
+		if recoveredRoute, rerr := e.RecoverFakeIPTarget(routeTarget); rerr == nil {
+			routeTarget = recoveredRoute
+		}
+	}
+
 	if e.IsNodeHost(dialTarget) || (routeTarget != "" && e.IsNodeHost(routeTarget)) {
 		e.logAntiLoopThrottled("TCP", dialTarget)
 		return nil, ActionReject, errNodeLoopRejected
@@ -1100,21 +1176,13 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 		metricTarget = dialTarget
 	}
 	if act == ActionDirect {
-		dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
-		dialTargetDirect := netbind.ResolveTCPTarget(dctx, resolvedDial)
+		dctx, dcancel := context.WithTimeout(context.Background(), 8*time.Second)
+		c, err := e.DirectDialContext(dctx, "tcp", resolvedDial)
 		dcancel()
-		dialNet := "tcp"
-		if !e.IPv6Enabled() && !netbind.IsPureIPv6Physical() {
-			if dh, _, herr := net.SplitHostPort(dialTargetDirect); herr == nil {
-				if ip := net.ParseIP(strings.Trim(strings.TrimSpace(dh), "[]")); ip != nil && ip.To4() == nil {
-					return nil, ActionReject, errIPv6DisabledClient
-				}
-			}
-			dialNet = "tcp4"
-		}
-		d := e.DirectDialer(8 * time.Second)
-		c, err := d.Dial(dialNet, dialTargetDirect)
 		if err != nil {
+			if errors.Is(err, errIPv6DisabledClient) || errors.Is(err, netbind.ErrFakeIPBlocked) {
+				return nil, ActionReject, err
+			}
 			return nil, ActionDirect, err
 		}
 		if tc, ok := c.(*net.TCPConn); ok {
@@ -1357,17 +1425,26 @@ func (e *Engine) NodeHostIPs() []string {
 			}
 			continue
 		}
-		d := e.DirectDialer(3 * time.Second)
-		res := d.Resolver
-		if res == nil {
-			res = net.DefaultResolver
-		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		addrs, err := res.LookupIPAddr(ctx, clean)
+		resolvedIPs, err := netbind.DirectLookupHostIPs(ctx, clean)
 		cancel()
+		if err != nil && !e.directDNSBypass.Load() {
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+			addrs, lerr := net.DefaultResolver.LookupIPAddr(ctx2, clean)
+			cancel2()
+			if lerr == nil {
+				for _, a := range addrs {
+					resolvedIPs = append(resolvedIPs, a.IP)
+				}
+				err = nil
+			}
+		}
 		if err == nil {
-			for _, a := range addrs {
-				if ip4 := a.IP.To4(); ip4 != nil {
+			for _, rip := range resolvedIPs {
+				if netbind.IsFakeIP(rip) {
+					continue
+				}
+				if ip4 := rip.To4(); ip4 != nil {
 					s := ip4.String()
 					if _, ok := seen[s]; !ok {
 						seen[s] = struct{}{}
@@ -1412,18 +1489,27 @@ func (e *Engine) NodeHostIPv6s() []string {
 			}
 			continue
 		}
-		d := e.DirectDialer(3 * time.Second)
-		res := d.Resolver
-		if res == nil {
-			res = net.DefaultResolver
-		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		addrs, err := res.LookupIPAddr(ctx, clean)
+		resolvedIPs, err := netbind.DirectLookupHostIPs(ctx, clean)
 		cancel()
+		if err != nil && !e.directDNSBypass.Load() {
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+			addrs, lerr := net.DefaultResolver.LookupIPAddr(ctx2, clean)
+			cancel2()
+			if lerr == nil {
+				for _, a := range addrs {
+					resolvedIPs = append(resolvedIPs, a.IP)
+				}
+				err = nil
+			}
+		}
 		if err == nil {
-			for _, a := range addrs {
-				if a.IP.To4() == nil && a.IP.To16() != nil {
-					s := a.IP.String()
+			for _, rip := range resolvedIPs {
+				if netbind.IsFakeIP(rip) {
+					continue
+				}
+				if rip.To4() == nil && rip.To16() != nil {
+					s := rip.String()
 					if _, ok := seen[s]; !ok {
 						seen[s] = struct{}{}
 						ips = append(ips, s)

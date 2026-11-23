@@ -2,12 +2,17 @@ package netbind
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// ErrIPv6Disabled is returned when a direct resolution only has IPv6 addresses
+// while IPv6 is disabled on a non-pure-IPv6 interface.
+var ErrIPv6Disabled = errors.New("netbind: ipv6 disabled")
 
 const (
 	nat64CacheTTL         = 30 * time.Second
@@ -30,31 +35,35 @@ var (
 )
 
 func defaultLookupIPv6(ctx context.Context, host string) ([]net.IP, error) {
-	if ctx == nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
+	ips, err := DirectLookupHostIPs(ctx, host)
+	if err != nil {
+		return nil, err
 	}
-	return net.DefaultResolver.LookupIP(ctx, "ip6", host)
+	out := make([]net.IP, 0, len(ips))
+	for _, ip := range ips {
+		if ip != nil && ip.To4() == nil && ip.To16() != nil && !IsFakeIP(ip) {
+			out = append(out, ip)
+		}
+	}
+	if len(out) == 0 {
+		return nil, &net.DNSError{Err: "no direct IPv6 address found", Name: host, IsNotFound: true}
+	}
+	return out, nil
 }
 
 func defaultLookupHostIPs(ctx context.Context, host string) ([]net.IP, error) {
-	if ctx == nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-	}
-	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+	return DirectLookupHostIPs(ctx, host)
 }
 
-// ResetNAT64Cache clears any cached carrier NAT64 /96 prefix so the next dial
-// re-evaluates DNS64/ipv4only.arpa after a network transition (Wi-Fi <-> 4G/5G).
+// ResetNAT64Cache clears any cached carrier NAT64 /96 prefix and direct DNS cache
+// so the next dial re-evaluates DNS64/ipv4only.arpa after a network transition (Wi-Fi <-> 4G/5G).
 func ResetNAT64Cache() {
 	nat64Mu.Lock()
 	nat64HasPrefix = false
 	nat64Prefix = [12]byte{}
 	nat64ExpiresAt = time.Time{}
 	nat64Mu.Unlock()
+	ClearDirectDNSCache()
 }
 
 // IsPureIPv6Physical reports whether the active physical interface is pure-IPv6.
@@ -206,17 +215,21 @@ func ResolveTargetHost(ctx context.Context, host string) string {
 	}
 
 	if ips, err := hostLookupFn(ctx, h); err == nil && len(ips) > 0 {
-		for _, ip := range ips {
+		clean, _ := filterNonFakeIPs(ips)
+		for _, ip := range clean {
 			if ip.To4() == nil && ip.To16() != nil {
 				return ip.String()
 			}
 		}
-		if ip4 := ips[0].To4(); ip4 != nil {
-			if prefix, ok := DiscoverNAT64Prefix(ctx); ok {
-				if synth := SynthesizeNAT64IPv4(prefix, ip4); synth != nil {
-					return synth.String()
+		if len(clean) > 0 {
+			if ip4 := clean[0].To4(); ip4 != nil {
+				if prefix, ok := DiscoverNAT64Prefix(ctx); ok {
+					if synth := SynthesizeNAT64IPv4(prefix, ip4); synth != nil {
+						return synth.String()
+					}
 				}
 			}
+			return clean[0].String()
 		}
 	}
 	return h
@@ -227,10 +240,11 @@ func ResolveTCPHostPort(ctx context.Context, host string, port int) string {
 	return net.JoinHostPort(ResolveTargetHost(ctx, host), strconv.Itoa(port))
 }
 
-// ResolveUDPAddr resolves host:port with automatic NAT64 IPv6 synthesis on pure-IPv6 networks.
+// ResolveUDPAddr resolves host:port with automatic NAT64 IPv6 synthesis on pure-IPv6 networks
+// using physical-interface-bound direct DNS (bypassing net.DefaultResolver).
 func ResolveUDPAddr(ctx context.Context, host string, port int) (*net.UDPAddr, error) {
-	resolved := ResolveTargetHost(ctx, host)
-	return net.ResolveUDPAddr("udp", net.JoinHostPort(resolved, strconv.Itoa(port)))
+	_, ua, err := ResolveDirectUDPAddr(ctx, net.JoinHostPort(host, strconv.Itoa(port)), true)
+	return ua, err
 }
 
 // ResolveTCPTarget translates a "host:port" string for outbound TCP dialing,
@@ -248,15 +262,137 @@ func ResolveTCPTarget(ctx context.Context, hostport string) string {
 }
 
 // ResolveUDPTarget resolves a "host:port" string into a *net.UDPAddr with automatic
-// NAT64 IPv6 synthesis on pure-IPv6 networks.
+// NAT64 IPv6 synthesis on pure-IPv6 networks (bypassing net.DefaultResolver).
 func ResolveUDPTarget(ctx context.Context, hostport string) (*net.UDPAddr, error) {
-	h, p, err := net.SplitHostPort(strings.TrimSpace(hostport))
-	if err != nil {
-		return net.ResolveUDPAddr("udp", hostport)
+	_, ua, err := ResolveDirectUDPAddr(ctx, hostport, true)
+	return ua, err
+}
+
+func resolveDirectEndpoint(ctx context.Context, hostport, familyPrefix string, allowIPv6 bool) (dialNet string, resolvedIP net.IP, zone string, port int, err error) {
+	h, pStr, splitErr := net.SplitHostPort(strings.TrimSpace(hostport))
+	if splitErr != nil {
+		return "", nil, "", 0, splitErr
 	}
-	port, err := strconv.Atoi(p)
+	port, err = strconv.Atoi(pStr)
 	if err != nil || port <= 0 || port > 65535 {
-		return net.ResolveUDPAddr("udp", hostport)
+		return "", nil, "", 0, errors.New("netbind: invalid target port")
 	}
-	return ResolveUDPAddr(ctx, h, port)
+
+	rawHost := strings.TrimSpace(strings.Trim(h, "[]"))
+	if rawHost == "" {
+		return "", nil, "", 0, errors.New("netbind: empty target host")
+	}
+	hostNoZone := rawHost
+	if zIdx := strings.IndexByte(rawHost, '%'); zIdx >= 0 {
+		hostNoZone = rawHost[:zIdx]
+		zone = rawHost[zIdx+1:]
+	}
+
+	nat64Mu.RLock()
+	pureFn := isPureIPv6PhysicalFn
+	lookupFn := lookupHostIPsFn
+	nat64Mu.RUnlock()
+	pureV6 := pureFn != nil && pureFn()
+
+	if strings.EqualFold(hostNoZone, "localhost") {
+		if pureV6 {
+			return familyPrefix + "6", net.IPv6loopback, "", port, nil
+		}
+		return familyPrefix + "4", net.IPv4(127, 0, 0, 1), "", port, nil
+	}
+
+	if ip := net.ParseIP(hostNoZone); ip != nil {
+		if IsFakeIP(ip) {
+			return "", nil, "", 0, ErrFakeIPBlocked
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			if pureV6 {
+				if pref, ok := DiscoverNAT64Prefix(ctx); ok {
+					if synth := SynthesizeNAT64IPv4(pref, ip4); synth != nil {
+						return familyPrefix + "6", synth, "", port, nil
+					}
+				}
+				return "", nil, "", 0, errors.New("netbind: NAT64 synthesis failed on pure-IPv6 interface")
+			}
+			return familyPrefix + "4", ip4, "", port, nil
+		}
+		if !allowIPv6 && !pureV6 && !ip.IsLoopback() {
+			return "", nil, "", 0, ErrIPv6Disabled
+		}
+		return familyPrefix + "6", ip, zone, port, nil
+	}
+
+	ips, err := lookupFn(ctx, hostNoZone)
+	if err != nil {
+		return "", nil, "", 0, err
+	}
+	clean, hadFake := filterNonFakeIPs(ips)
+	if len(clean) == 0 {
+		if hadFake {
+			return "", nil, "", 0, ErrFakeIPBlocked
+		}
+		return "", nil, "", 0, &net.DNSError{Err: "no direct IP resolved", Name: hostNoZone, IsNotFound: true}
+	}
+
+	var firstV4, firstV6 net.IP
+	for _, ip := range clean {
+		if ip4 := ip.To4(); ip4 != nil {
+			if firstV4 == nil {
+				firstV4 = ip4
+			}
+		} else if firstV6 == nil {
+			firstV6 = ip
+		}
+	}
+
+	if pureV6 {
+		if firstV6 != nil {
+			return familyPrefix + "6", firstV6, "", port, nil
+		}
+		if firstV4 != nil {
+			if pref, ok := DiscoverNAT64Prefix(ctx); ok {
+				if synth := SynthesizeNAT64IPv4(pref, firstV4); synth != nil {
+					return familyPrefix + "6", synth, "", port, nil
+				}
+			}
+		}
+		return "", nil, "", 0, errors.New("netbind: no usable IPv6/NAT64 address for pure-IPv6 interface")
+	}
+
+	if firstV4 != nil {
+		return familyPrefix + "4", firstV4, "", port, nil
+	}
+	if firstV6 != nil {
+		if !allowIPv6 {
+			return "", nil, "", 0, ErrIPv6Disabled
+		}
+		return familyPrefix + "6", firstV6, "", port, nil
+	}
+	return "", nil, "", 0, &net.DNSError{Err: "no usable direct IP resolved", Name: hostNoZone, IsNotFound: true}
+}
+
+// ResolveDirectTCPAddr resolves addr ("host:port") into a concrete IP literal string ("ip:port")
+// and matching network ("tcp4" or "tcp6") using physical-interface-bound direct DNS, Fake-IP
+// rejection, and pure-IPv6 NAT64 synthesis. It never delegates host resolution to net.DefaultResolver.
+func ResolveDirectTCPAddr(ctx context.Context, addr string, allowIPv6 bool) (dialNet string, resolvedAddr string, err error) {
+	dialNet, ip, zone, port, err := resolveDirectEndpoint(ctx, addr, "tcp", allowIPv6)
+	if err != nil {
+		return "", "", err
+	}
+	hostStr := ip.String()
+	if zone != "" && ip.To4() == nil {
+		hostStr = hostStr + "%" + zone
+	}
+	return dialNet, net.JoinHostPort(hostStr, strconv.Itoa(port)), nil
+}
+
+// ResolveDirectUDPAddr resolves addr ("host:port") into a concrete *net.UDPAddr and matching network
+// ("udp4" or "udp6") using physical-interface-bound direct DNS, Fake-IP rejection, and pure-IPv6
+// NAT64 synthesis.
+func ResolveDirectUDPAddr(ctx context.Context, addr string, allowIPv6 bool) (dialNet string, resolvedUDP *net.UDPAddr, err error) {
+	dialNet, ip, zone, port, err := resolveDirectEndpoint(ctx, addr, "udp", allowIPv6)
+	if err != nil {
+		return "", nil, err
+	}
+	return dialNet, &net.UDPAddr{IP: ip, Port: port, Zone: zone}, nil
 }

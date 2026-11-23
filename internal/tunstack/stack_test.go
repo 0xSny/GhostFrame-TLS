@@ -1,6 +1,7 @@
 package tunstack
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"sync"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"ghostframe/internal/client"
+	"ghostframe/internal/netbind"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checksum"
@@ -354,5 +356,48 @@ func TestFakeIPv6AndStackIPv6Toggle(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for TUN IPv6 AAAA DNS response")
+	}
+}
+
+func TestStackRegistersFakeIPLookupAndBlocksFakeIPDirectUDP(t *testing.T) {
+	if !IsFakeIP(net.ParseIP("198.19.12.34")) {
+		t.Fatal("expected tunstack.IsFakeIP to match 198.18.0.0/15")
+	}
+
+	client.SetNoSysProxy(true)
+	eng, err := client.NewEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	w := &captureWriter{ch: make(chan []byte, 4)}
+	st, err := NewWithOptions(eng, w, 1400, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Allocate a Fake-IP -> verify Engine.RecoverFakeIPTarget resolves it via registered callback.
+	fakeIPArr := st.fakeIP.Allocate("direct.example.cn")
+	fakeIP := net.IP(fakeIPArr[:])
+	rec, err := eng.RecoverFakeIPTarget(net.JoinHostPort(fakeIP.String(), "443"))
+	if err != nil || rec != "direct.example.cn:443" {
+		t.Fatalf("expected Engine.RecoverFakeIPTarget to recover hostname, got rec=%q err=%v", rec, err)
+	}
+	// Unmapped Fake-IP must return ErrFakeIPBlocked.
+	if _, err := eng.RecoverFakeIPTarget("198.19.88.88:53"); err != netbind.ErrFakeIPBlocked {
+		t.Fatalf("expected ErrFakeIPBlocked for unmapped Fake-IP, got %v", err)
+	}
+
+	// DirectDialer + relayUDPDirect must drop unmapped Fake-IP without hitting external sockets.
+	_, _, errResolver := netbind.ResolveDirectUDPAddr(context.Background(), "198.18.99.99:5353", true)
+	if errResolver != netbind.ErrFakeIPBlocked {
+		t.Fatalf("expected ResolveDirectUDPAddr to reject Fake-IP, got %v", errResolver)
+	}
+
+	// Closing Stack must clear FakeIPLookupFunc from Engine.
+	st.Close()
+	if _, err := eng.RecoverFakeIPTarget(net.JoinHostPort(fakeIP.String(), "443")); err != netbind.ErrFakeIPBlocked {
+		t.Fatalf("expected ErrFakeIPBlocked after Stack.Close cleared FakeIPLookupFunc, got %v", err)
 	}
 }

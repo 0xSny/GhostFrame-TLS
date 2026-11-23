@@ -336,13 +336,19 @@ func defaultDirectCNProbe(ctx context.Context, host string) ([]net.IP, []byte, e
 				return
 			}
 			v4, _, _, okParse := ParseDNSResponse(buf[:n])
-			if !okParse || len(v4) == 0 {
+			filtered := v4[:0]
+			for _, ip := range v4 {
+				if ip != nil && !netbind.IsFakeIP(ip) {
+					filtered = append(filtered, ip)
+				}
+			}
+			if !okParse || len(filtered) == 0 {
 				ch <- probeRes{err: errors.New("cn dns empty A answer")}
 				return
 			}
 			out := make([]byte, n)
 			copy(out, buf[:n])
-			ch <- probeRes{ips: v4, wire: out}
+			ch <- probeRes{ips: filtered, wire: out}
 		}(srv)
 	}
 
@@ -554,8 +560,7 @@ func (e *Engine) ResolveSmartDNS(mode RouteMode, qname string, txID []byte) (act
 }
 
 func isFakeOrVirtualIP(ip net.IP) bool {
-	ip4 := ip.To4()
-	return ip4 != nil && ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19)
+	return netbind.IsFakeIP(ip)
 }
 
 // RecentRoutes returns up to 80 recent routing decisions newest-first.

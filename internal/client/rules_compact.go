@@ -411,10 +411,9 @@ func (e *Engine) fetchRuleBundleBytes(ctx context.Context, targetURL string) ([]
 	}
 
 	// Fallback: direct physical interface dialer (e.g., when user configured a reachable mirror URL).
-	directDialer := e.DirectDialer(12 * time.Second)
 	trDirect := &http.Transport{
 		DisableKeepAlives: true,
-		DialContext:       directDialer.DialContext,
+		DialContext:       e.DirectDialContext,
 	}
 	b, err := httpGetBounded(ctx, trDirect, targetURL, maxRuleBundleBytes)
 	trDirect.CloseIdleConnections()

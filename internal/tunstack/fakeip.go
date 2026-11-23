@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"ghostframe/internal/netbind"
 )
 
 const (
@@ -120,23 +122,9 @@ func (p *FakeIPPool) flushLoop() {
 	}
 }
 
-// IsFakeIP reports whether ip falls inside 198.18.0.0/16 or fd18:c612::/64.
+// IsFakeIP reports whether ip falls inside 198.18.0.0/15 or fd18:c612::/64.
 func IsFakeIP(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	if ip4 := ip.To4(); ip4 != nil {
-		return ip4[0] == 198 && ip4[1] == 18
-	}
-	return isFakeIPv6Slice(ip.To16())
-}
-
-func isFakeIPv6Slice(ip16 net.IP) bool {
-	return len(ip16) == 16 &&
-		ip16[0] == 0xfd && ip16[1] == 0x18 &&
-		ip16[2] == 0xc6 && ip16[3] == 0x12 &&
-		ip16[4] == 0 && ip16[5] == 0 &&
-		ip16[6] == 0 && ip16[7] == 0
+	return netbind.IsFakeIP(ip)
 }
 
 func suffixToFakeIPv6(sfx uint64) [16]byte {
@@ -228,7 +216,7 @@ func (p *FakeIPPool) Lookup(ip net.IP) (string, bool) {
 		return host, ok
 	}
 	ip16 := ip.To16()
-	if !isFakeIPv6Slice(ip16) {
+	if !netbind.IsFakeIP(ip16) {
 		return "", false
 	}
 	sfx := binary.BigEndian.Uint64(ip16[8:16])

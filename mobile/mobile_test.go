@@ -21,8 +21,8 @@ func TestInitCoreGuardrails(t *testing.T) {
 	if !gft.IsLowMemMode() {
 		t.Fatal("expected LowMemMode=true for PacketTunnel extension")
 	}
-	if netbind.DirectBindEnabled() {
-		t.Fatal("expected DirectBindEnabled=false inside PacketTunnel extension")
+	if !netbind.DirectBindEnabled() {
+		t.Fatal("expected DirectBindEnabled=true inside PacketTunnel extension for physical socket pinning")
 	}
 	if got := gft.EffectiveUDPSocketBuffer(); got != 512*1024 {
 		t.Fatalf("expected 512KB UDP socket buffer in tunnel ext mode, got %d", got)
@@ -210,5 +210,95 @@ func TestIdleLifecycleAndStatusJSON(t *testing.T) {
 
 	if err := StopEngine(); err != nil {
 		t.Fatalf("StopEngine after async StartEngine failed: %v", err)
+	}
+}
+
+type noopTunWriter struct{}
+
+func (noopTunWriter) WritePacket([]byte, int)                     {}
+func (noopTunWriter) WritePacketBatch([]byte, []byte, int, int) {}
+
+func TestHTTPReloadPreservesTUNAndDirectDNSBypass(t *testing.T) {
+	tmp := t.TempDir()
+	InitCore(tmp, true)
+	t.Cleanup(func() {
+		_ = StopEngine()
+		InitCore(tmp, false)
+		netbind.SetDirectBindEnabled(true)
+	})
+
+	link := &gft.Link{
+		V:         3,
+		Host:      "127.0.0.1",
+		Port:      1,
+		SNI:       "cdn.example.net",
+		PSK:       strings.Repeat("ef", 32),
+		Verify:    "ca",
+		FP:        "ios",
+		Transport: "tcp",
+		Remark:    "ReloadTUNTest",
+	}
+	cfgBytes, err := json.Marshal(mobileStartConfig{
+		LinkURI:      link.Encode(),
+		SocksPort:    29181,
+		HTTPPort:     29182,
+		RouteMode:    "rule",
+		AsyncConnect: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := StartEngine(string(cfgBytes)); err != nil {
+		t.Fatalf("StartEngine failed: %v", err)
+	}
+
+	// Verify DirectDNSBypass is already enabled in tunnelExt Rule mode before StartTUN runs.
+	mu.Lock()
+	engBefore := engineInst
+	mu.Unlock()
+	if engBefore == nil {
+		t.Fatal("expected non-nil engine after StartEngine")
+	}
+	if !engBefore.DirectDNSBypassEnabled() {
+		t.Fatalf("expected DirectDNSBypassEnabled=true immediately in tunnel Rule mode before StartTUN")
+	}
+
+	if err := StartTUN(noopTunWriter{}, 1400); err != nil {
+		t.Fatalf("StartTUN failed: %v", err)
+	}
+
+	// Simulate HTTP fallback /_ksl/reload adding a custom rule.
+	reloadBytes, err := json.Marshal(mobileStartConfig{
+		LinkURI:      link.Encode(),
+		SocksPort:    29181,
+		HTTPPort:     29182,
+		RouteMode:    "rule",
+		CustomRules:  []string{"DOMAIN-SUFFIX,baidu.com,DIRECT"},
+		AsyncConnect: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal reload config: %v", err)
+	}
+	code, _, respBody := handleLocalMgmt("POST", "/_ksl/reload", reloadBytes)
+	if code != http.StatusOK || !strings.Contains(string(respBody), `"ok":true`) {
+		t.Fatalf("POST /_ksl/reload failed: code=%d body=%s", code, string(respBody))
+	}
+
+	if stats := currentTUNStats(); stats == nil || !stats.Active {
+		t.Fatalf("expected TUN stack to remain active after /_ksl/reload, got %+v", stats)
+	}
+	mu.Lock()
+	engAfter := engineInst
+	mu.Unlock()
+	if engAfter == nil || engAfter == engBefore {
+		t.Fatalf("expected fresh Engine instance after /_ksl/reload")
+	}
+	if !engAfter.DirectDNSBypassEnabled() {
+		t.Fatalf("expected DirectDNSBypassEnabled=true preserved after /_ksl/reload")
+	}
+
+	_ = StopEngine()
+	if w, mtu := peekLastTUN(); w != nil || mtu != 0 {
+		t.Fatalf("expected StopEngine to clear saved TUN writer, got w=%v mtu=%d", w, mtu)
 	}
 }

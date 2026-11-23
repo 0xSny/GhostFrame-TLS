@@ -16,8 +16,10 @@ type TunPacketWriter interface {
 }
 
 var (
-	tunMu    sync.Mutex
-	tunStack *tunstack.Stack
+	tunMu         sync.Mutex
+	tunStack      *tunstack.Stack
+	lastTunWriter TunPacketWriter
+	lastTunMTU    int
 )
 
 // StartTUN attaches a memory-bounded gVisor L3/L4 TUN stack to the active mobile Engine.
@@ -50,6 +52,8 @@ func StartTUN(writer TunPacketWriter, mtu int) error {
 	tunMu.Lock()
 	old := tunStack
 	tunStack = st
+	lastTunWriter = writer
+	lastTunMTU = mtu
 	tunMu.Unlock()
 	if old != nil {
 		old.Close()
@@ -64,11 +68,36 @@ func StartTUNJSON(writer TunPacketWriter, mtu int) string {
 	return marshalEnvelope(StartTUN(writer, mtu), nil)
 }
 
+func peekLastTUN() (TunPacketWriter, int) {
+	tunMu.Lock()
+	w := lastTunWriter
+	m := lastTunMTU
+	tunMu.Unlock()
+	return w, m
+}
+
+// detachTUNForReload tears down the active userspace TUN stack while preserving lastTunWriter
+// and lastTunMTU so HTTP-triggered engine reloads can immediately reattach TUN forwarding.
+func detachTUNForReload() (TunPacketWriter, int) {
+	tunMu.Lock()
+	st := tunStack
+	tunStack = nil
+	w := lastTunWriter
+	m := lastTunMTU
+	tunMu.Unlock()
+	if st != nil {
+		st.Close()
+	}
+	return w, m
+}
+
 // StopTUN closes the active userspace TUN stack if running and flushes persisted FakeIP cache.
 func StopTUN() {
 	tunMu.Lock()
 	st := tunStack
 	tunStack = nil
+	lastTunWriter = nil
+	lastTunMTU = 0
 	tunMu.Unlock()
 	if st != nil {
 		st.Close()

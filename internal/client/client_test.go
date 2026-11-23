@@ -1005,3 +1005,73 @@ func TestDeleteNodePreservesActiveIndexAndSwitchCancellation(t *testing.T) {
 		t.Fatalf("unexpected state after superseding switch: %+v", stAfter)
 	}
 }
+
+func TestDirectDialContextFakeIPRecoveryAndBypass(t *testing.T) {
+	SetNoSysProxy(true)
+	eng, err := NewEngine(filepath.Join(t.TempDir(), "client.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	// 1. SetDirectDNSBypass(true) must attach a pure-Go direct resolver to DirectDialer.
+	eng.SetDirectDNSBypass(true)
+	d := eng.DirectDialer(2 * time.Second)
+	if d.Resolver == nil || !d.Resolver.PreferGo {
+		t.Fatalf("expected pure-Go netbind.DirectResolver attached when SetDirectDNSBypass(true), got %+v", d.Resolver)
+	}
+
+	// 2. Start a local TCP echo server and register Fake-IP -> "localhost" mapping.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	eng.SetFakeIPLookupFunc(func(ip net.IP) (string, bool) {
+		if ip.Equal(net.IPv4(198, 18, 2, 10)) {
+			return "localhost", true
+		}
+		return "", false
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Unmapped Fake-IPs must be blocked by DirectDialContext.
+	for _, unmapped := range []string{"198.18.9.9:80", "[fd18:c612::99]:443"} {
+		if c, derr := eng.DirectDialContext(ctx, "tcp", unmapped); !errors.Is(derr, netbind.ErrFakeIPBlocked) {
+			if c != nil {
+				c.Close()
+			}
+			t.Fatalf("DirectDialContext(%s) expected ErrFakeIPBlocked, got %v", unmapped, derr)
+		}
+	}
+
+	// Mapped Fake-IP must recover "localhost" and connect cleanly to our local echo server.
+	conn, err := eng.DirectDialContext(ctx, "tcp", net.JoinHostPort("198.18.2.10", portStr))
+	if err != nil {
+		t.Fatalf("DirectDialContext on mapped Fake-IP failed: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	var buf [4]byte
+	if _, err := io.ReadFull(conn, buf[:]); err != nil || string(buf[:]) != "ping" {
+		t.Fatalf("expected echo 'ping', got %q err=%v", string(buf[:]), err)
+	}
+}

@@ -214,6 +214,7 @@ func NewWithOptions(eng *client.Engine, writer PacketWriter, mtu int, lowMem boo
 	ctx, cancel := context.WithCancel(context.Background())
 	fp := NewFakeIPPoolWithPersistence(fakeCap, fakeCachePath)
 	fp.SetIPv6Enabled(eng.IPv6Enabled())
+	eng.SetFakeIPLookupFunc(fp.Lookup)
 	s := &Stack{
 		engine:       eng,
 		writer:       writer,
@@ -295,6 +296,9 @@ func (s *Stack) Close() {
 	s.ns.Close()
 	if s.fakeIP != nil {
 		s.fakeIP.Close()
+	}
+	if s.engine != nil {
+		s.engine.SetFakeIPLookupFunc(nil)
 	}
 }
 
@@ -566,24 +570,19 @@ func (s *Stack) relayUDP(conn *gonet.UDPConn, dstAddr tcpip.Address, dstPort uin
 }
 
 func (s *Stack) relayUDPDirect(conn *gonet.UDPConn, dialTarget string) {
+	recovered, err := s.engine.RecoverFakeIPTarget(dialTarget)
+	if err != nil {
+		return
+	}
 	allowV6 := s.engine.IPv6Enabled() || netbind.IsPureIPv6Physical()
-	dialNet := "udp"
-	if !allowV6 {
-		ua, rerr := net.ResolveUDPAddr("udp4", dialTarget)
-		if rerr != nil || ua == nil {
-			return
-		}
-		dialTarget = ua.String()
-		dialNet = "udp4"
-	} else {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if ua, rerr := netbind.ResolveUDPTarget(ctx, dialTarget); rerr == nil && ua != nil {
-			dialTarget = ua.String()
-		}
-		cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	dialNet, ua, rerr := netbind.ResolveDirectUDPAddr(ctx, recovered, allowV6)
+	cancel()
+	if rerr != nil || ua == nil || ua.IP == nil || netbind.IsFakeIP(ua.IP) {
+		return
 	}
 	d := s.engine.DirectDialer(5 * time.Second)
-	remote, err := d.Dial(dialNet, dialTarget)
+	remote, err := d.Dial(dialNet, ua.String())
 	if err != nil {
 		return
 	}

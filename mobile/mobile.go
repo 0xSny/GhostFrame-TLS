@@ -147,7 +147,7 @@ func initCoreLocked(dataDir string, isTunnelExt bool) {
 		debug.SetMemoryLimit(18 << 20)
 		debug.SetGCPercent(20)
 		gft.SetLowMemMode(true)
-		netbind.SetDirectBindEnabled(false)
+		netbind.SetDirectBindEnabled(true)
 		startMemScrubberLocked()
 	} else {
 		stopMemScrubberLocked()
@@ -160,6 +160,14 @@ func initCoreLocked(dataDir string, isTunnelExt bool) {
 
 // StartEngine starts the local SOCKS5/HTTP listeners and dials the configured GhostFrame server.
 func StartEngine(configJSON string) error {
+	return startEngineWithOptions(configJSON, false)
+}
+
+func reloadEngineFromHTTP(configJSON string) error {
+	return startEngineWithOptions(configJSON, true)
+}
+
+func startEngineWithOptions(configJSON string, preserveTUN bool) error {
 	var cfg mobileStartConfig
 	if err := json.Unmarshal([]byte(strings.TrimSpace(configJSON)), &cfg); err != nil {
 		return fmt.Errorf("mobile: invalid config json: %w", err)
@@ -207,7 +215,8 @@ func StartEngine(configJSON string) error {
 	if !initialized {
 		initCoreLocked("", false)
 	}
-	if tunnelExtState {
+	isTunnel := tunnelExtState
+	if isTunnel {
 		startMemScrubberLocked()
 	}
 	stopReconnectLoopLocked()
@@ -217,9 +226,17 @@ func StartEngine(configJSON string) error {
 	lastConfigRaw = configJSON
 	mu.Unlock()
 
+	var savedWriter TunPacketWriter
+	var savedMTU int
 	if oldEngine != nil {
-		StopTUN()
+		if preserveTUN {
+			savedWriter, savedMTU = detachTUNForReload()
+		} else {
+			StopTUN()
+		}
 		oldEngine.Close()
+	} else if preserveTUN {
+		savedWriter, savedMTU = peekLastTUN()
 	}
 
 	client.SetNoSysProxy(true)
@@ -246,9 +263,25 @@ func StartEngine(configJSON string) error {
 		eng.Close()
 		return fmt.Errorf("mobile: apply link failed: %w", err)
 	}
+	if isTunnel && routeMode != client.RouteCore {
+		eng.SetDirectDNSBypass(true)
+	}
 	if err := eng.StartServers(); err != nil {
 		eng.Close()
 		return fmt.Errorf("mobile: start local proxy failed: %w", err)
+	}
+
+	restoreTUNIfNeeded := func() {
+		if !preserveTUN || savedWriter == nil {
+			return
+		}
+		if routeMode == client.RouteCore {
+			StopTUN()
+			return
+		}
+		if tunErr := StartTUN(savedWriter, savedMTU); tunErr != nil {
+			eng.Logf("[TUN] reload restore warning: %v", tunErr)
+		}
 	}
 
 	mu.Lock()
@@ -260,6 +293,7 @@ func StartEngine(configJSON string) error {
 		reconnectStopCh = stopCh
 		reconnectWakeCh = wakeCh
 		mu.Unlock()
+		restoreTUNIfNeeded()
 		go connectWithRetryAsync(eng, stopCh, wakeCh)
 		return nil
 	}
@@ -275,6 +309,7 @@ func StartEngine(configJSON string) error {
 		eng.Close()
 		return fmt.Errorf("mobile: tunnel connect failed: %w", err)
 	}
+	restoreTUNIfNeeded()
 	return nil
 }
 
@@ -636,7 +671,7 @@ func handleLocalMgmt(method, path string, body []byte) (int, string, []byte) {
 		if strings.ToUpper(strings.TrimSpace(method)) != "POST" {
 			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
 		}
-		return 200, "application/json; charset=utf-8", []byte(StartEngineJSON(string(body)))
+		return 200, "application/json; charset=utf-8", []byte(marshalEnvelope(reloadEngineFromHTTP(string(body)), nil))
 	default:
 		return 404, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"not found"}`)
 	}

@@ -398,18 +398,18 @@ func (s *SOCKS5Server) handleUDPAssociate(ctrl net.Conn) {
 			continue
 		}
 		if act == ActionDirect {
-			allowV6 := s.engine.IPv6Enabled() || netbind.IsPureIPv6Physical()
-			var uaDst *net.UDPAddr
-			var err error
-			if !allowV6 {
-				uaDst, err = net.ResolveUDPAddr("udp4", resolvedTarget)
-			} else {
-				uaDst, err = netbind.ResolveUDPTarget(context.Background(), resolvedTarget)
-			}
-			if err != nil || uaDst == nil {
+			recovered, rerr := s.engine.RecoverFakeIPTarget(resolvedTarget)
+			if rerr != nil {
 				continue
 			}
-			isV6 := uaDst.IP != nil && uaDst.IP.To4() == nil
+			allowV6 := s.engine.IPv6Enabled() || netbind.IsPureIPv6Physical()
+			dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_, uaDst, err := netbind.ResolveDirectUDPAddr(dctx, recovered, allowV6)
+			dcancel()
+			if err != nil || uaDst == nil || uaDst.IP == nil || netbind.IsFakeIP(uaDst.IP) {
+				continue
+			}
+			isV6 := uaDst.IP.To4() == nil
 			if isV6 && !allowV6 {
 				continue
 			}

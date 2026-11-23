@@ -14,6 +14,20 @@ const (
 
 func init() {
 	isPureIPv6PhysicalFn = isPureIPv6PhysicalDarwin
+	physicalFamiliesFn = physicalInterfaceFamiliesDarwin
+}
+
+func physicalInterfaceFamiliesDarwin() (bool, bool) {
+	iface, ok := resolveTargetInterface()
+	if !ok {
+		return true, false
+	}
+	hasV4 := interfaceHasRoutableFamily(iface, true)
+	hasV6 := interfaceHasRoutableFamily(iface, false)
+	if !hasV4 && !hasV6 {
+		return true, false
+	}
+	return hasV4, hasV6
 }
 
 func isPureIPv6PhysicalDarwin() bool {
@@ -64,42 +78,19 @@ func resolveTargetInterface() (*net.Interface, bool) {
 	return iface, true
 }
 
-func interfaceHasRoutableFamily(iface *net.Interface, wantV4 bool) bool {
-	if iface == nil {
-		return false
-	}
-	addrs, err := iface.Addrs()
-	if err != nil {
-		return false
-	}
-	for _, addr := range addrs {
-		var ip net.IP
-		switch v := addr.(type) {
-		case *net.IPNet:
-			ip = v.IP
-		case *net.IPAddr:
-			ip = v.IP
-		}
-		if !isRoutableUnicastIP(ip) {
-			continue
-		}
-		if wantV4 && ip.To4() != nil {
-			return true
-		}
-		if !wantV4 && ip.To4() == nil {
-			return true
-		}
-	}
-	return false
-}
-
 // Control implements net.Dialer.Control and net.ListenConfig.Control on Darwin/iOS.
-// When direct binding is enabled (e.g., Companion app running alongside an external utun),
-// it best-effort pins outbound sockets to the physical interface carrying the matching IP family.
-// Inside iOS NEPacketTunnelProvider (DirectBindEnabled == false), it leaves routing to the OS
-// so 4G/5G cellular (including NAT64/CLAT46) and Wi-Fi work seamlessly without EPERM/blackholes.
+// When DirectBindEnabled() is true (including inside NEPacketTunnelProvider when pinning
+// direct and proxy sockets around utun), it binds non-loopback sockets to the active
+// physical interface via IP_BOUND_IF/IPV6_BOUND_IF and rejects Fake-IP targets to block loops.
 func Control(network, address string, c syscall.RawConn) error {
-	if !DirectBindEnabled() || isLoopbackAddress(address) {
+	if isLoopbackAddress(address) {
+		return nil
+	}
+	hostIP := parseAddressIP(address)
+	if IsFakeIP(hostIP) {
+		return syscall.EADDRNOTAVAIL
+	}
+	if !DirectBindEnabled() {
 		return nil
 	}
 	iface, ok := resolveTargetInterface()
@@ -110,11 +101,6 @@ func Control(network, address string, c syscall.RawConn) error {
 	hasV6 := interfaceHasRoutableFamily(iface, false)
 	if !hasV4 && !hasV6 {
 		return nil
-	}
-
-	var hostIP net.IP
-	if host, _, splitErr := net.SplitHostPort(address); splitErr == nil {
-		hostIP = net.ParseIP(host)
 	}
 
 	_ = c.Control(func(fd uintptr) {

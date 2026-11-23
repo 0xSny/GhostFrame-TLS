@@ -517,6 +517,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var initialIface = ""
         var initialSig = ""
         var signaled = false
+        var timedOut = false
 
         monitor.pathUpdateHandler = { [weak self] path in
             let iface = GhostNetworkHelper.preferredPhysicalInterface(from: path)
@@ -527,8 +528,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 initialIface = iface
                 initialSig = sig
                 signaled = true
+                let wasTimedOut = timedOut
                 lock.unlock()
                 sem.signal()
+                if !wasTimedOut {
+                    return
+                }
+                guard let self = self else { return }
+                if !sig.isEmpty {
+                    self.lastPathSignature = sig
+                }
+                if !iface.isEmpty {
+                    self.lastPhysicalIface = iface
+                    GhostMobileBridge.onNetworkChanged(ifaceName: iface)
+                }
                 return
             }
             lock.unlock()
@@ -554,6 +567,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         pathMonitor = monitor
         _ = sem.wait(timeout: .now() + timeout)
         lock.lock()
+        if !signaled {
+            timedOut = true
+        }
         let resolved = initialIface
         let resolvedSig = initialSig
         lock.unlock()
