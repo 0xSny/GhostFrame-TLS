@@ -261,7 +261,33 @@ type dropBondDataConn struct {
 func (d *dropBondDataConn) Write(p []byte) (int, error) {
 	if limit := d.dropAfter.Load(); limit > 0 {
 		if d.writes.Add(1) > limit {
-			// Silently swallow CmdBondData payload frames on this stalled carrier without closing TCP.
+			// Silently swallow CmdBondData payload frames on this stalled carrier without dropping
+			// coalesced control frames (such as CmdBondClose FIN) in the same writeLoop batch.
+			var kept []byte
+			off := 0
+			sawBondData := false
+			for off+HeaderLen <= len(p) {
+				plen := int(binary.BigEndian.Uint16(p[off+4 : off+6]))
+				pad := int(binary.BigEndian.Uint16(p[off+6 : off+8]))
+				flen := HeaderLen + plen + pad
+				if off+flen > len(p) {
+					break
+				}
+				if p[off] == CmdBondData {
+					sawBondData = true
+				} else {
+					kept = append(kept, p[off:off+flen]...)
+				}
+				off += flen
+			}
+			if off == len(p) && sawBondData {
+				if len(kept) > 0 {
+					if _, err := d.Conn.Write(kept); err != nil {
+						return 0, err
+					}
+				}
+				return len(p), nil
+			}
 			if len(p) >= HeaderLen && p[0] == CmdBondData {
 				return len(p), nil
 			}
