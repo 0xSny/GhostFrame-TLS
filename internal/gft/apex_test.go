@@ -192,14 +192,20 @@ func TestGFT3LinkRoundTrip(t *testing.T) {
 		t.Fatalf("legacy gft3:// backward compatibility failed: %v", err)
 	}
 	lo, hi, ok := dec.ParseHopRange()
-	if !ok || lo != 20000 || hi != 40000 || !dec.SplitSNI || dec.EffectiveTransport() != "auto" || dec.UpMbps != 30 || dec.DownMbps != 100 {
+	if !ok || lo != 20000 || hi != 40000 || !dec.SplitSNI || dec.EffectiveTransport() != "rtc" || dec.UpMbps != 30 || dec.DownMbps != 100 {
 		t.Fatalf("unexpected decoded v3 fields: %+v", dec)
 	}
 
-	// Legacy "quic" transport seamlessly normalizes to "rtc"
-	legacy := &Link{V: 3, Host: "example.com", Port: 443, SNI: "cdn.example.com", PSK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", Verify: "ca", Transport: "quic"}
-	if legacy.EffectiveTransport() != "rtc" {
-		t.Fatalf("expected legacy 'quic' normalized to 'rtc', got %q", legacy.EffectiveTransport())
+	// Legacy "quic" and "auto" transports normalize to "rtc" (UDP-first), "tcp_first" normalizes to "tcp".
+	for _, raw := range []string{"", "auto", "quic", "udp", "udp_first"} {
+		legacy := &Link{V: 3, Host: "example.com", Port: 443, SNI: "cdn.example.com", PSK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", Verify: "ca", Transport: raw}
+		if legacy.EffectiveTransport() != "rtc" {
+			t.Fatalf("expected %q normalized to 'rtc', got %q", raw, legacy.EffectiveTransport())
+		}
+	}
+	tcpLink := &Link{V: 3, Host: "example.com", Port: 443, SNI: "cdn.example.com", PSK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", Verify: "ca", Transport: "tcp_first"}
+	if tcpLink.EffectiveTransport() != "tcp" {
+		t.Fatalf("expected 'tcp_first' normalized to 'tcp', got %q", tcpLink.EffectiveTransport())
 	}
 }
 
@@ -673,6 +679,128 @@ func TestApexSchedulerZeroMsFailoverToTCP(t *testing.T) {
 		t.Fatalf("expected TCP-Fallback mode, got %+v", stStats)
 	}
 	_ = binary.BigEndian
+}
+
+func TestApexSchedulerTCPFirstAndFailoverToRTC(t *testing.T) {
+	ps := NewParamStore(DefaultParams())
+	link := &Link{
+		V:         3,
+		Host:      "127.0.0.1",
+		Port:      443,
+		SNI:       "ftp.jaist.ac.jp",
+		PSK:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		Verify:    "ca",
+		Transport: "tcp",
+	}
+	psk, _ := link.PSKBytes()
+
+	sw := newTestUDPSwitch("127.0.0.1:443")
+	defer sw.closeAll()
+	ln, err := gftrtc.NewListener(sw.srvConn, false, psk, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for {
+			ss, aerr := ln.Accept(ctx)
+			if aerr != nil {
+				return
+			}
+			ss.SetHandlers(func(st *gftrtc.RTCStream, _ string, first []byte) {
+				defer st.Close()
+				_, _ = st.Write(append([]byte("rtc:"), first...))
+				_ = st.CloseWrite()
+				_, _ = io.Copy(io.Discard, st)
+			}, nil, nil)
+		}
+	}()
+
+	sched := NewApexScheduler(link, ps, 1, nil)
+	sched.SetDialJitterForTest(0, 0, 100)
+	var mu sync.Mutex
+	var tcpBlock atomic.Bool
+	var srvConns []net.Conn
+	defer func() {
+		sched.Close()
+		mu.Lock()
+		for _, c := range srvConns {
+			_ = c.Close()
+		}
+		mu.Unlock()
+	}()
+
+	sched.pool.dialFn = func(dctx context.Context, _ *Link, store *ParamStore, _ uint16, _ time.Duration) (*Session, time.Duration, error) {
+		if tcpBlock.Load() {
+			return nil, 0, errors.New("mock tcp blocked")
+		}
+		c, s := net.Pipe()
+		srv := NewSession(s, false, store, func(st *Stream, target string, first []byte) {
+			defer st.Close()
+			_, _ = st.Write(append([]byte("tcp:"), first...))
+		})
+		go srv.Run()
+		mu.Lock()
+		srvConns = append(srvConns, s)
+		mu.Unlock()
+		cli := NewSession(c, true, store, nil)
+		go cli.Run()
+		return cli, 5 * time.Millisecond, nil
+	}
+	sched.SetRTCDialHookForTest(func(dctx context.Context, dl *Link, dps *ParamStore, hopPort int, timeout time.Duration, clientID [8]byte) (*gftrtc.RTCSession, time.Duration, error) {
+		return DialRTCWithPacketConnAndID(dctx, sw.newClientEnd(), true, sw.srvAddr, hopPort, dl, dps, timeout, clientID)
+	})
+
+	if err := sched.Start(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	// Phase 1: TCP-first prefers TCP even while RTC is connected.
+	st1, err := sched.OpenStream("example.org:443", []byte("one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 32)
+	n, _ := st1.Read(buf)
+	_ = st1.Close()
+	if string(buf[:n]) != "tcp:one" {
+		t.Fatalf("expected TCP-first stream, got %q", buf[:n])
+	}
+	if mode := sched.Stats().Mode; mode != "TCP-uTLS" {
+		t.Fatalf("expected TCP-uTLS mode, got %q", mode)
+	}
+
+	// Phase 2: Break TCP connections -> 0ms failover to RTC.
+	tcpBlock.Store(true)
+	mu.Lock()
+	for _, c := range srvConns {
+		_ = c.Close()
+	}
+	mu.Unlock()
+
+	failoverDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(failoverDeadline) {
+		if st := sched.Stats(); st.Mode == "RTC-Fallback" {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	st2, err := sched.OpenStream("example.org:443", []byte("two"))
+	if err != nil {
+		t.Fatalf("expected 0ms failover to RTC stream, got err=%v", err)
+	}
+	n2, rerr2 := st2.Read(buf)
+	_ = st2.Close()
+	if string(buf[:n2]) != "rtc:two" {
+		t.Fatalf("expected rtc:two on failover (type=%T rerr=%v stats=%+v), got %q", st2, rerr2, sched.Stats(), buf[:n2])
+	}
+	if mode := sched.Stats().Mode; mode != "RTC-Fallback" {
+		t.Fatalf("expected RTC-Fallback mode, got %q", mode)
+	}
 }
 
 func TestApexSchedulerRapidStartCloseNoWaitGroupRace(t *testing.T) {

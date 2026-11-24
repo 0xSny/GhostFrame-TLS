@@ -22,7 +22,7 @@ import (
 )
 
 // Version is the mobile runtime identifier (overridable via -ldflags -X).
-var Version = "v4.2.0"
+var Version = "v4.2.1"
 
 const (
 	defaultSocksPort = 10808
@@ -462,7 +462,7 @@ func GetStatusJSON() string {
 			"state":            string(client.StateDisconnected),
 			"last_err":         cachedErr,
 			"active_transport": "",
-			"transport_pref":   "auto",
+			"transport_pref":   "rtc",
 			"route_mode":       string(client.RouteRule),
 			"rtc_ports":        [2]int{0, 0},
 			"socks_addr":       fmt.Sprintf("127.0.0.1:%d", defaultSocksPort),

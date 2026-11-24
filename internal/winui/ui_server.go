@@ -581,7 +581,15 @@ func (s *uiServer) handleSetTransport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t := strings.ToLower(strings.TrimSpace(req.Transport))
-	if t != "auto" && t != "rtc" && t != "tcp" {
+	var label string
+	switch t {
+	case "", "auto", "quic", "rtc", "udp", "udp_first":
+		t = "rtc"
+		label = "UDP 优先"
+	case "tcp", "tcp_first":
+		t = "tcp"
+		label = "TCP 优先"
+	default:
 		writeJSONError(w, http.StatusBadRequest, "unsupported transport mode")
 		return
 	}
@@ -589,7 +597,7 @@ func (s *uiServer) handleSetTransport(w http.ResponseWriter, r *http.Request) {
 		if err := s.eng.SetTransport(t); err != nil {
 			s.setToast("切换传输内核失败: "+err.Error(), true)
 		} else {
-			s.setToastSuccess("传输内核已切换: " + strings.ToUpper(t))
+			s.setToastSuccess("传输内核已切换: " + label)
 		}
 		s.notifyTray()
 	}()

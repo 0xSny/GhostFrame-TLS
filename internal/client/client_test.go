@@ -220,6 +220,18 @@ func TestEngineMultiNodeRouteTransportAndClashYAML(t *testing.T) {
 	if stT := eng.Status(); stT["transport_pref"] != "rtc" {
 		t.Fatalf("expected legacy quic normalized to rtc, got %v", stT["transport_pref"])
 	}
+	if err := eng.SetTransport("auto"); err != nil {
+		t.Fatal(err)
+	}
+	if stT := eng.Status(); stT["transport_pref"] != "rtc" {
+		t.Fatalf("expected legacy auto normalized to rtc, got %v", stT["transport_pref"])
+	}
+	if err := eng.SetTransport("tcp_first"); err != nil {
+		t.Fatal(err)
+	}
+	if stT := eng.Status(); stT["transport_pref"] != "tcp" {
+		t.Fatalf("expected tcp_first normalized to tcp, got %v", stT["transport_pref"])
+	}
 	if err := eng.SetBandwidthLimits(30, 100); err != nil {
 		t.Fatal(err)
 	}

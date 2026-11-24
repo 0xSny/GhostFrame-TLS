@@ -193,9 +193,8 @@ textarea{min-height:74px;resize:vertical;font-family:ui-monospace,SFMono-Regular
 
         <label>传输协议偏好</label>
         <div class="seg" id="transSeg">
-          <button data-t="auto" onclick="setTransport('auto')">Auto 双栈自动</button>
-          <button data-t="rtc" onclick="setTransport('rtc')">Kestrel-RTC 强制 UDP</button>
-          <button data-t="tcp" onclick="setTransport('tcp')">TCP-uTLS 强制 TCP</button>
+          <button data-t="rtc" onclick="setTransport('rtc')">UDP 优先</button>
+          <button data-t="tcp" onclick="setTransport('tcp')">TCP 优先</button>
         </div>
 
         <div class="row">
@@ -478,7 +477,7 @@ function refresh(){
 
     curGwMode = s.gateway_mode || 'rule';
     markSeg('gwModeSeg', 'data-m', curGwMode);
-    curTransport = s.transport_pref || 'auto';
+    curTransport = (s.transport_pref === 'tcp' || s.transport_pref === 'tcp_first') ? 'tcp' : 'rtc';
     markSeg('transSeg', 'data-t', curTransport);
 
     if(!formDirty){

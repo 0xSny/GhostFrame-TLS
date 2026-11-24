@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.2.0"
+var Version = "v4.2.1"
 
 type ConnState string
 
@@ -2147,13 +2147,14 @@ func (e *Engine) PingAllNodes(ctx context.Context) []NodePingResult {
 	return results
 }
 
-// SetTransport updates the active node's preferred transport ("auto", "rtc", "tcp").
-// Legacy "quic" values are normalized seamlessly to "rtc".
+// SetTransport updates the active node's preferred transport ("rtc" for UDP-first, "tcp" for TCP-first).
+// Legacy "", "auto", "quic", "udp", "udp_first" normalize to "rtc"; "tcp_first" normalizes to "tcp".
 func (e *Engine) SetTransport(mode string) error {
-	switch mode {
-	case "", "auto", "tcp", "rtc":
-	case "quic":
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "auto", "quic", "rtc", "udp", "udp_first":
 		mode = "rtc"
+	case "tcp", "tcp_first":
+		mode = "tcp"
 	default:
 		return fmt.Errorf("invalid transport mode: %s", mode)
 	}
@@ -2242,7 +2243,7 @@ func (e *Engine) TrayStatus() map[string]any {
 		tPref = l.EffectiveTransport()
 	}
 	if tPref == "" {
-		tPref = "auto"
+		tPref = "rtc"
 	}
 
 	return map[string]any{
@@ -2343,7 +2344,7 @@ func (e *Engine) Status() map[string]any {
 		downMbps = l.DownMbps
 	}
 	if tPref == "" {
-		tPref = "auto"
+		tPref = "rtc"
 	}
 
 	return map[string]any{

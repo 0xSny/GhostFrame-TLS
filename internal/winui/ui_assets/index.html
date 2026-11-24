@@ -811,9 +811,8 @@ tr.alert-row { background: #FFFBEB; }
           <div class="mode-group">
             <span class="mode-label">传输内核</span>
             <div id="segTransport" class="seg">
-              <button class="seg-btn" data-val="auto">Auto</button>
-              <button class="seg-btn" data-val="rtc">RTC</button>
-              <button class="seg-btn" data-val="tcp">TCP</button>
+              <button class="seg-btn" data-val="rtc">UDP 优先</button>
+              <button class="seg-btn" data-val="tcp">TCP 优先</button>
             </div>
           </div>
           <div class="switch-wrap" id="wrapIPv6Toggle">
@@ -1383,8 +1382,9 @@ function renderStatus(st) {
   $("statBwGoal").textContent = (upLim === 0 && dnLim === 0) ? "Smart-Brutal: 自动" : `目标: ↑${upLim} / ↓${dnLim} Mbps`;
 
   // Modes
+  const normTrans = (st.transport_pref === "tcp" || st.transport_pref === "tcp_first") ? "tcp" : "rtc";
   document.querySelectorAll("#segRouteMode .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.val === st.route_mode));
-  document.querySelectorAll("#segTransport .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.val === (st.transport_pref || "auto")));
+  document.querySelectorAll("#segTransport .seg-btn").forEach(b => b.classList.toggle("active", b.dataset.val === normTrans));
   $("swIPv6").classList.toggle("on", !!st.enable_ipv6);
   $("swSysProxy").classList.toggle("on", !!st.sys_proxy);
 

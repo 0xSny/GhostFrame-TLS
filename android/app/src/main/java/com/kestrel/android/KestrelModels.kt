@@ -17,13 +17,12 @@ enum class KestrelRouteMode(val rawValue: String, val label: String) {
 }
 
 enum class KestrelTransportMode(val rawValue: String, val label: String) {
-    AUTO("auto", "Auto 双栈"),
-    RTC("rtc", "RTC 极速"),
-    TCP("tcp", "TCP uTLS");
+    RTC("rtc", "UDP 优先"),
+    TCP("tcp", "TCP 优先");
 
     companion object {
         fun fromRaw(v: String?): KestrelTransportMode =
-            entries.firstOrNull { it.rawValue.equals(v?.trim(), ignoreCase = true) } ?: AUTO
+            if (v?.trim().equals("tcp", ignoreCase = true) || v?.trim().equals("tcp_first", ignoreCase = true)) TCP else RTC
     }
 }
 
@@ -66,7 +65,7 @@ data class KestrelNode(
                 port = port,
                 sni = obj.optString("sni", ""),
                 verify = obj.optString("verify", "ca"),
-                transport = obj.optString("transport", "auto"),
+                transport = obj.optString("transport", "rtc"),
                 hopRange = obj.optString("hop_range", ""),
                 upMbps = obj.optInt("up_mbps", 0),
                 downMbps = obj.optInt("down_mbps", 0),

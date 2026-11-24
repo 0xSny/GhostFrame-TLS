@@ -42,6 +42,15 @@ type CamouflageProfile struct {
 // the origin's TLS 1.3 ServerHello, CCS, Flight 2 0x17 record lengths, and
 // post-handshake NewSessionTicket record lengths over a 120ms window.
 func ProbeCamouflageProfile(ctx context.Context, targetHostPort, sniName string) (*CamouflageProfile, error) {
+	return ProbeCamouflageProfileWithNetwork(ctx, "tcp", targetHostPort, sniName)
+}
+
+// ProbeCamouflageProfileWithNetwork is like ProbeCamouflageProfile, allowing callers
+// to specify the TCP dial network (e.g. "tcp4" when IPv6 is disabled).
+func ProbeCamouflageProfileWithNetwork(ctx context.Context, network, targetHostPort, sniName string) (*CamouflageProfile, error) {
+	if strings.TrimSpace(network) == "" {
+		network = "tcp"
+	}
 	target := strings.TrimSpace(targetHostPort)
 	if target == "" {
 		return nil, errors.New("sni: empty camouflage target")
@@ -56,7 +65,7 @@ func ProbeCamouflageProfile(ctx context.Context, targetHostPort, sniName string)
 	}
 
 	dialer := &net.Dialer{Timeout: 3 * time.Second}
-	raw, err := dialer.DialContext(ctx, "tcp", target)
+	raw, err := dialer.DialContext(ctx, network, target)
 	if err != nil {
 		return nil, fmt.Errorf("sni: dial camouflage target %s: %w", target, err)
 	}
@@ -69,10 +78,12 @@ func ProbeCamouflageProfile(ctx context.Context, targetHostPort, sniName string)
 	}
 
 	tap := newProfileTapConn(raw)
+	cache := &countingSessionCache{}
 	ucfg := &utls.Config{
 		ServerName:         sniName,
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"h2", "http/1.1"},
+		ClientSessionCache: cache,
 	}
 	uc := utls.UClient(tap, ucfg, utls.HelloChrome_Auto)
 	if err := uc.BuildHandshakeState(); err != nil {
@@ -82,6 +93,7 @@ func ProbeCamouflageProfile(ctx context.Context, targetHostPort, sniName string)
 		sid := make([]byte, 32)
 		_, _ = rand.Read(sid)
 		uc.HandshakeState.Hello.SessionId = sid
+		uc.HandshakeState.Hello.Raw = nil
 	}
 
 	if err := uc.HandshakeContext(ctx); err != nil {
@@ -103,9 +115,30 @@ func ProbeCamouflageProfile(ctx context.Context, targetHostPort, sniName string)
 	if prof.CipherSuite == 0 {
 		return nil, errors.New("sni: camouflage target did not return a TLS 1.3 ServerHello")
 	}
+	// Trim any post-handshake HTTP/2 preface / SETTINGS application records captured after the tickets.
+	nTickets := int(cache.tickets.Load())
+	if nTickets <= 0 {
+		prof.PostTicketRecordLens = nil
+	} else if nTickets < len(prof.PostTicketRecordLens) {
+		prof.PostTicketRecordLens = prof.PostTicketRecordLens[:nTickets]
+	}
 	prof.ALPN = uc.ConnectionState().NegotiatedProtocol
 	prof.FetchedAt = time.Now()
 	return prof, nil
+}
+
+type countingSessionCache struct {
+	tickets atomic.Int32
+}
+
+func (c *countingSessionCache) Get(_ string) (*utls.ClientSessionState, bool) {
+	return nil, false
+}
+
+func (c *countingSessionCache) Put(_ string, cs *utls.ClientSessionState) {
+	if cs != nil {
+		c.tickets.Add(1)
+	}
 }
 
 type profileTapConn struct {

@@ -30,7 +30,7 @@ final class GhostAppViewModel: ObservableObject {
     @Published var nodes: [GhostNode] = []
     @Published var selectedNodeID: String = ""
     @Published var routeMode: GhostRouteMode = .rule
-    @Published var transportMode: GhostTransportMode = .auto
+    @Published var transportMode: GhostTransportMode = .rtc
     @Published var upMbpsText: String = "0"
     @Published var downMbpsText: String = "0"
     @Published var socksPortText: String = "10808"
@@ -215,9 +215,7 @@ final class GhostAppViewModel: ObservableObject {
 
         selectedNodeID = targetID
         beginProgrammaticSync {
-            if let t = GhostTransportMode(rawValue: activeImported.transport) {
-                transportMode = t
-            }
+            transportMode = GhostTransportMode(fromRaw: activeImported.transport)
             if activeImported.upMbps == 0 && activeImported.downMbps == 0 {
                 upMbpsText = "0"
                 downMbpsText = "0"
@@ -242,9 +240,7 @@ final class GhostAppViewModel: ObservableObject {
     func selectNode(_ node: GhostNode) {
         selectedNodeID = node.id
         beginProgrammaticSync {
-            if let t = GhostTransportMode(rawValue: node.transport) {
-                transportMode = t
-            }
+            transportMode = GhostTransportMode(fromRaw: node.transport)
             upMbpsText = "\(node.upMbps)"
             downMbpsText = "\(node.downMbps)"
         }
@@ -470,9 +466,8 @@ final class GhostAppViewModel: ObservableObject {
            let rm = GhostRouteMode(rawValue: rmRaw) {
             routeMode = rm
         }
-        if let tmRaw = defaults.string(forKey: storageKeyTransport),
-           let tm = GhostTransportMode(rawValue: tmRaw) {
-            transportMode = tm
+        if let tmRaw = defaults.string(forKey: storageKeyTransport) {
+            transportMode = GhostTransportMode(fromRaw: tmRaw)
         }
         if defaults.object(forKey: storageKeyUpMbps) != nil {
             upMbpsText = "\(defaults.integer(forKey: storageKeyUpMbps))"

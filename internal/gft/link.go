@@ -101,14 +101,15 @@ func (l *Link) EffectiveFP() string {
 	return fp
 }
 
-// EffectiveTransport returns normalized transport strategy: "auto", "rtc", or "tcp" (maps legacy "quic" -> "rtc").
+// EffectiveTransport returns normalized transport priority: "rtc" (UDP-first) or "tcp" (TCP-first).
+// Legacy "", "auto", "quic", "udp", "udp_first" normalize to "rtc"; "tcp_first" normalizes to "tcp".
 func (l *Link) EffectiveTransport() string {
 	t := strings.ToLower(strings.TrimSpace(l.Transport))
 	switch t {
-	case "", "auto":
-		return "auto"
-	case "quic", "rtc":
+	case "", "auto", "quic", "rtc", "udp", "udp_first":
 		return "rtc"
+	case "tcp", "tcp_first":
+		return "tcp"
 	default:
 		return t
 	}
@@ -171,7 +172,7 @@ func (l *Link) Validate() error {
 		return fmt.Errorf("unsupported fingerprint %q", l.FP)
 	}
 	switch l.EffectiveTransport() {
-	case "auto", "rtc", "tcp":
+	case "rtc", "tcp":
 	default:
 		return fmt.Errorf("unsupported transport %q", l.Transport)
 	}
@@ -201,7 +202,7 @@ func (l *Link) Encode() string {
 	} else {
 		cp.V = 4
 		if cp.Transport == "" {
-			cp.Transport = "auto"
+			cp.Transport = "rtc"
 		}
 	}
 	if cp.Verify == "" {

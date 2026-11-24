@@ -31,7 +31,7 @@ import (
 )
 
 // Version is the canonical server build identifier (overridable via -ldflags -X).
-var Version = "v4.2.0"
+var Version = "v4.2.1"
 
 const (
 	MaxUDPAssocPerClient = 256
@@ -402,7 +402,7 @@ func (s *Server) Run(ctx context.Context) error {
 			defer wg.Done()
 			refresh := func() {
 				pCtx, pCancel := context.WithTimeout(ctx, 3*time.Second)
-				prof, perr := sni.ProbeCamouflageProfile(pCtx, s.cfg.CamouflageTarget, s.cfg.SNI)
+				prof, perr := sni.ProbeCamouflageProfileWithNetwork(pCtx, s.camouflageDialNetwork(), s.cfg.CamouflageTarget, s.cfg.SNI)
 				pCancel()
 				if perr == nil && prof != nil {
 					s.shadowProfile.Store(prof)
@@ -413,7 +413,13 @@ func (s *Server) Run(ctx context.Context) error {
 				}
 			}
 			refresh()
-			t := time.NewTicker(2 * time.Hour)
+			nextInterval := func() time.Duration {
+				if s.shadowProfile.Load() == nil {
+					return 15 * time.Second
+				}
+				return 2 * time.Hour
+			}
+			t := time.NewTimer(nextInterval())
 			defer t.Stop()
 			for {
 				select {
@@ -421,6 +427,7 @@ func (s *Server) Run(ctx context.Context) error {
 					return
 				case <-t.C:
 					refresh()
+					t.Reset(nextInterval())
 				}
 			}
 		}()
@@ -778,10 +785,17 @@ func (s *Server) serveHTTPFallback(ctx context.Context, conn net.Conn) {
 	}
 }
 
+func (s *Server) camouflageDialNetwork() string {
+	if s.cfg != nil && s.cfg.DisableIPv6 {
+		return "tcp4"
+	}
+	return "tcp"
+}
+
 func (s *Server) mirrorBridge(clientConn net.Conn, target string) {
 	defer clientConn.Close()
 	d := net.Dialer{Timeout: 6 * time.Second}
-	upstream, err := d.Dial("tcp", target)
+	upstream, err := d.Dial(s.camouflageDialNetwork(), target)
 	if err != nil {
 		return
 	}

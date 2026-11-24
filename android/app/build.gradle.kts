@@ -14,8 +14,8 @@ android {
         applicationId = "com.kestrel.android"
         minSdk = 24
         targetSdk = 35
-        versionCode = 420
-        versionName = "4.2.0"
+        versionCode = 421
+        versionName = "4.2.1"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")

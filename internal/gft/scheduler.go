@@ -383,77 +383,95 @@ func (a *ApexScheduler) wakeTCPTrack() {
 	}
 }
 
-// Start connects initial tracks based on Link.EffectiveTransport ("auto", "rtc", "tcp").
+// Start connects initial tracks concurrently and prefers either UDP ("rtc") or TCP ("tcp")
+// based on Link.EffectiveTransport, maintaining the secondary track for 0ms failover.
 func (a *ApexScheduler) Start(connectTimeout time.Duration) error {
 	tr := a.link.EffectiveTransport()
-	switch tr {
-	case "tcp":
-		return a.pool.Start(connectTimeout)
-	case "rtc":
-		if err := a.dialRTCNow(connectTimeout); err != nil {
-			return err
-		}
-		a.launchLoop(a.rtcMaintainLoop)
-		return nil
-	default: // "auto": race Kestrel-RTC + TCP-uTLS simultaneously
-		type res struct {
-			kind string
-			err  error
-		}
-		ch := make(chan res, 2)
-		go func() {
-			ch <- res{"tcp", a.pool.Start(connectTimeout)}
-		}()
-		go func() {
-			ch <- res{"rtc", a.dialRTCNow(connectTimeout)}
-		}()
+	type res struct {
+		kind string
+		err  error
+	}
+	ch := make(chan res, 2)
+	go func() {
+		ch <- res{"tcp", a.pool.Start(connectTimeout)}
+	}()
+	go func() {
+		ch <- res{"rtc", a.dialRTCNow(connectTimeout)}
+	}()
 
-		r1 := <-ch
-		if r1.err == nil {
+	r1 := <-ch
+	if r1.err == nil {
+		// When TCP-first is selected and RTC finishes its 1-RTT handshake slightly ahead of TCP-uTLS,
+		// give TCP a brief grace window so initial streams land on the preferred TCP track.
+		var r2Pending *res
+		if tr == "tcp" && r1.kind == "rtc" {
+			grace := connectTimeout
+			if grace > 1500*time.Millisecond {
+				grace = 1500 * time.Millisecond
+			}
+			timer := time.NewTimer(grace)
+			select {
+			case r2 := <-ch:
+				timer.Stop()
+				r2Pending = &r2
+			case <-timer.C:
+			case <-a.ctx.Done():
+				timer.Stop()
+				return a.ctx.Err()
+			}
+		}
+
+		handleSecond := func(r2 res) {
+			if r2.err != nil {
+				if r2.kind == "tcp" {
+					if a.onLog != nil {
+						a.onLog("[TCP] Track deferred (%v); running on Kestrel-RTC Smart-Brutal", r2.err)
+					}
+					a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
+				} else if a.onLog != nil {
+					a.onLog("[RTC] Track unavailable (%v); 0ms fallback active on [TCP] uTLS", r2.err)
+				}
+			}
+		}
+
+		if r2Pending != nil {
+			handleSecond(*r2Pending)
+		} else {
 			a.launchLoop(func() {
 				defer a.wg.Done()
 				select {
 				case <-a.ctx.Done():
 					return
 				case r2 := <-ch:
-					if r2.err != nil {
-						if r2.kind == "tcp" {
-							if a.onLog != nil {
-								a.onLog("[TCP] Track deferred (%v); running on Kestrel-RTC Smart-Brutal", r2.err)
-							}
-							a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
-						} else if a.onLog != nil {
-							a.onLog("[RTC] Track unavailable (%v); 0ms fallback active on [TCP] uTLS", r2.err)
-						}
-					}
+					handleSecond(r2)
 				}
 			})
-			a.launchLoop(a.rtcMaintainLoop)
-			return nil
-		}
-
-		r2 := <-ch
-		if r2.err != nil {
-			rtcErr, tcpErr := r1.err, r2.err
-			if r1.kind == "tcp" {
-				tcpErr, rtcErr = r1.err, r2.err
-			}
-			if a.onLog != nil {
-				a.onLog("[Auto] Dual-track connect failed (rtc=%v | tcp=%v)", rtcErr, tcpErr)
-			}
-			return fmt.Errorf("rtc: %v; tcp: %v", rtcErr, tcpErr)
-		}
-		if r1.kind == "tcp" {
-			if a.onLog != nil {
-				a.onLog("[TCP] Track deferred (%v); running on Kestrel-RTC Smart-Brutal", r1.err)
-			}
-			a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
-		} else if a.onLog != nil {
-			a.onLog("[RTC] Track unavailable (%v); 0ms fallback active on [TCP] uTLS", r1.err)
 		}
 		a.launchLoop(a.rtcMaintainLoop)
 		return nil
 	}
+
+	r2 := <-ch
+	if r2.err != nil {
+		rtcErr, tcpErr := r1.err, r2.err
+		if r1.kind == "tcp" {
+			tcpErr, rtcErr = r1.err, r2.err
+		}
+		if a.onLog != nil {
+			a.onLog("[DualStack] Connect failed (rtc=%v | tcp=%v)", rtcErr, tcpErr)
+		}
+		return fmt.Errorf("rtc: %v; tcp: %v", rtcErr, tcpErr)
+	}
+	if r1.kind == "tcp" {
+		if a.onLog != nil {
+			a.onLog("[TCP] Track deferred (%v); running on Kestrel-RTC Smart-Brutal", r1.err)
+		}
+		a.launchLoop(func() { a.retryTCPStartLoop(connectTimeout) })
+	} else if a.onLog != nil {
+		a.onLog("[RTC] Track unavailable (%v); 0ms fallback active on [TCP] uTLS", r1.err)
+	}
+	a.launchLoop(a.rtcMaintainLoop)
+	return nil
 }
 
 func (a *ApexScheduler) retryTCPStartLoop(timeout time.Duration) {
@@ -924,9 +942,6 @@ func (a *ApexScheduler) handleEmergencyProbeAndHop(probeTimeout time.Duration, f
 }
 
 func (a *ApexScheduler) activeSlotForSend(exclude *gftrtc.RTCSession) *rtcSlot {
-	if a.link.EffectiveTransport() == "tcp" {
-		return nil
-	}
 	now := time.Now()
 	a.mu.Lock()
 	var best *rtcSlot
@@ -956,16 +971,6 @@ func (a *ApexScheduler) activeSlotForSend(exclude *gftrtc.RTCSession) *rtcSlot {
 		}
 	}
 	a.mu.Unlock()
-	if best == nil {
-		return nil
-	}
-	if a.link.EffectiveTransport() == "auto" {
-		rRTT := a.rtcRTTMs.Load()
-		tRTT := a.pool.rttMs.Load()
-		if rRTT > 180 && tRTT > 0 && rRTT > tRTT*2 && a.pool.Stats().ActiveConns > 0 {
-			return nil
-		}
-	}
 	return best
 }
 
@@ -998,17 +1003,7 @@ func (a *ApexScheduler) isRTCHealthy(r *gftrtc.RTCSession) bool {
 		}
 	}
 	a.mu.Unlock()
-	if !healthy {
-		return false
-	}
-	if a.link.EffectiveTransport() == "auto" {
-		rRTT := a.rtcRTTMs.Load()
-		tRTT := a.pool.rttMs.Load()
-		if rRTT > 180 && tRTT > 0 && rRTT > tRTT*2 && a.pool.Stats().ActiveConns > 0 {
-			return false
-		}
-	}
-	return true
+	return healthy
 }
 
 func (a *ApexScheduler) stickyRTCForSend(pinned *gftrtc.RTCSession) *gftrtc.RTCSession {
@@ -1043,9 +1038,7 @@ func (a *ApexScheduler) markRTCDegraded(r *gftrtc.RTCSession, err error) {
 	}
 }
 
-// OpenStream routes a TCP tunnel stream over Kestrel-RTC striped pool when healthy,
-// falling back in 0ms to the uTLS TCP SessionPool if UDP fails or is throttled.
-func (a *ApexScheduler) OpenStream(target string, first []byte) (DataStream, error) {
+func (a *ApexScheduler) openStreamViaRTC(target string, first []byte) (DataStream, error) {
 	if sl := a.activeSlotForSend(nil); sl != nil {
 		probeOK := true
 		if IsLowMemMode() && sl.sess.TimeSinceLastRecv() > 15*time.Second {
@@ -1071,37 +1064,70 @@ func (a *ApexScheduler) OpenStream(target string, first []byte) (DataStream, err
 			a.markRTCDegraded(alt.sess, err2)
 		}
 	}
-	if a.link.EffectiveTransport() == "rtc" {
-		return nil, errors.New("gft: rtc track unavailable")
+	return nil, errors.New("gft: rtc track unavailable")
+}
+
+// OpenStream routes a TCP tunnel stream over the preferred track ("rtc" UDP-first or "tcp" TCP-first),
+// failing over in 0ms to the secondary track if the primary track is unavailable or fails.
+func (a *ApexScheduler) OpenStream(target string, first []byte) (DataStream, error) {
+	if a.link.EffectiveTransport() == "tcp" {
+		st, tcpErr := a.pool.OpenDataStream(target, first)
+		if tcpErr == nil {
+			return st, nil
+		}
+		if st2, rtcErr := a.openStreamViaRTC(target, first); rtcErr == nil {
+			return st2, nil
+		}
+		return nil, tcpErr
 	}
-	st, err := a.pool.OpenDataStream(target, first)
-	if err != nil {
-		return nil, err
+	if st, err := a.openStreamViaRTC(target, first); err == nil {
+		return st, nil
 	}
-	return st, nil
+	return a.pool.OpenDataStream(target, first)
 }
 
 // ProbeNow executes an immediate live RTT measurement on the active transport track
 // (RTC ProbeRTT or least-congested TCP in-band CmdPing) rather than returning stale cached values.
 func (a *ApexScheduler) ProbeNow(ctx context.Context) (int64, string, error) {
+	if a.link.EffectiveTransport() == "tcp" {
+		if a.pool.Stats().ActiveConns > 0 {
+			ms, err := a.pool.PingNow(ctx)
+			if err == nil {
+				return ms, "TCP-uTLS", nil
+			}
+			if sl := a.activeSlotForSend(nil); sl != nil {
+				rtt, rerr := sl.sess.ProbeRTT(2500 * time.Millisecond)
+				if rerr == nil {
+					ms2 := max(rtt.Milliseconds(), 1)
+					a.rtcRTTMs.Store(ms2)
+					return ms2, "RTC-Fallback", nil
+				}
+			}
+			return ms, "TCP-uTLS", err
+		}
+		if sl := a.activeSlotForSend(nil); sl != nil {
+			rtt, err := sl.sess.ProbeRTT(2500 * time.Millisecond)
+			if err != nil {
+				return 0, "RTC-Fallback", err
+			}
+			ms := max(rtt.Milliseconds(), 1)
+			a.rtcRTTMs.Store(ms)
+			return ms, "RTC-Fallback", nil
+		}
+		ms, err := a.pool.PingNow(ctx)
+		return ms, "TCP-uTLS", err
+	}
 	if sl := a.activeSlotForSend(nil); sl != nil {
 		rtt, err := sl.sess.ProbeRTT(2500 * time.Millisecond)
 		if err != nil {
-			return 0, "RTC-Smart", err
+			return 0, "RTC-First", err
 		}
-		ms := rtt.Milliseconds()
-		if ms <= 0 {
-			ms = 1
-		}
+		ms := max(rtt.Milliseconds(), 1)
 		a.rtcRTTMs.Store(ms)
-		return ms, "RTC-Smart", nil
-	}
-	mode := "TCP-uTLS"
-	if a.link.EffectiveTransport() != "tcp" {
-		mode = "TCP-Fallback"
+		return ms, "RTC-First", nil
 	}
 	ms, err := a.pool.PingNow(ctx)
-	return ms, mode, err
+	return ms, "TCP-Fallback", err
 }
 
 // SchedulerUDPAssoc is a persistent virtual UDP association across RTC port hops
@@ -1254,13 +1280,7 @@ func (u *SchedulerUDPAssoc) clearPinnedRTC(r *gftrtc.RTCSession) {
 	u.mu.Unlock()
 }
 
-func (u *SchedulerUDPAssoc) SendTo(target string, data []byte) error {
-	select {
-	case <-u.done:
-		return ErrStreamClosed
-	default:
-	}
-
+func (u *SchedulerUDPAssoc) sendViaRTC(target string, data []byte) error {
 	pinned := u.getPinnedRTC()
 	if r := u.sched.stickyRTCForSend(pinned); r != nil {
 		if r != pinned {
@@ -1298,11 +1318,10 @@ func (u *SchedulerUDPAssoc) SendTo(target string, data []byte) error {
 			}
 		}
 	}
+	return errors.New("gft: rtc udp track unavailable")
+}
 
-	if u.sched.link.EffectiveTransport() == "rtc" {
-		return errors.New("gft: rtc udp track unavailable")
-	}
-
+func (u *SchedulerUDPAssoc) sendViaTCP(target string, data []byte) error {
 	s, err := u.sched.pool.Acquire()
 	if err != nil {
 		return err
@@ -1314,6 +1333,29 @@ func (u *SchedulerUDPAssoc) SendTo(target string, data []byte) error {
 		return err
 	}
 	return sub.SendTo(target, data)
+}
+
+func (u *SchedulerUDPAssoc) SendTo(target string, data []byte) error {
+	select {
+	case <-u.done:
+		return ErrStreamClosed
+	default:
+	}
+
+	if u.sched.link.EffectiveTransport() == "tcp" {
+		if err := u.sendViaTCP(target, data); err == nil {
+			return nil
+		} else if rtcErr := u.sendViaRTC(target, data); rtcErr == nil {
+			return nil
+		} else {
+			return err
+		}
+	}
+
+	if err := u.sendViaRTC(target, data); err == nil {
+		return nil
+	}
+	return u.sendViaTCP(target, data)
 }
 
 func (u *SchedulerUDPAssoc) Close() error {
@@ -1437,19 +1479,22 @@ func (a *ApexScheduler) Stats() ApexStats {
 	bestRTT := tRTT
 	conns := ps.ActiveConns + ps.DrainingConns + rAliveCount
 	rAlive := rAliveCount > 0
-	if rAlive {
-		if a.activeRTCForSend() != nil {
-			mode = "RTC-Smart"
+	if a.link.EffectiveTransport() == "tcp" {
+		if ps.ActiveConns > 0 {
+			mode = "TCP-uTLS"
+		} else if rAlive {
+			mode = "RTC-Fallback"
+			if rRTT > 0 {
+				bestRTT = rRTT
+			}
+		}
+	} else {
+		if rAlive && a.activeRTCForSend() != nil {
+			mode = "RTC-First"
 			if rRTT > 0 {
 				bestRTT = rRTT
 			}
 		} else if ps.ActiveConns > 0 {
-			mode = "TCP-Fallback"
-		}
-	} else if ps.ActiveConns > 0 {
-		if a.link.EffectiveTransport() == "tcp" {
-			mode = "TCP-uTLS"
-		} else {
 			mode = "TCP-Fallback"
 		}
 	}

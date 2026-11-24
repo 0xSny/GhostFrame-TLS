@@ -168,11 +168,36 @@ func PerformShadowTLS13Server(ctx context.Context, rawConn net.Conn, leafCertDER
 	if rawConn == nil {
 		return nil, "", errors.New("gft: nil rawConn")
 	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	if dl, ok := ctx.Deadline(); ok {
+		deadline = dl
+	}
+	_ = rawConn.SetDeadline(deadline)
+	clearDeadline := false
+	defer func() {
+		if clearDeadline {
+			_ = rawConn.SetDeadline(time.Time{})
+		}
+	}()
+
 	if len(leafCertDER) == 0 || signer == nil || profile == nil {
-		return fallbackStdlibTLSServer(ctx, rawConn, leafCertDER, signer, profile)
+		c, alpn, err := fallbackStdlibTLSServer(ctx, rawConn, leafCertDER, signer, profile)
+		if err == nil {
+			clearDeadline = true
+		}
+		return c, alpn, err
 	}
 
 	rc := NewRewindConn(rawConn)
+	runRewoundFallback := func() (net.Conn, string, error) {
+		c, alpn, ferr := fallbackRewoundStdlibTLSServer(ctx, rc, leafCertDER, signer, profile)
+		if ferr == nil {
+			clearDeadline = true
+		}
+		return c, alpn, ferr
+	}
+
 	ch, err := readClientHelloFromConn(ctx, rc)
 	if err != nil {
 		return nil, "", err
@@ -184,21 +209,21 @@ func PerformShadowTLS13Server(ctx context.Context, rawConn net.Conn, leafCertDER
 		extOrder = []uint16{tlsExtSupportedVersions, tlsExtKeyShare}
 	}
 	if !okSuite || !ch.supports13 || !containsUint16(ch.ciphers, spec.id) || !extOrderSupported(extOrder) {
-		return fallbackRewoundStdlibTLSServer(ctx, rc, leafCertDER, signer, profile)
+		return runRewoundFallback()
 	}
 
-	peerShare, okShare := ch.keyShares[profile.KeyShareGroup]
+	selectedGroup, peerShare, okShare := selectKeyShareGroup(profile.KeyShareGroup, ch.keyShares)
 	if !okShare {
-		return fallbackRewoundStdlibTLSServer(ctx, rc, leafCertDER, signer, profile)
+		return runRewoundFallback()
 	}
-	srvShare, sharedSecret, err := computeServerKeyShare(profile.KeyShareGroup, peerShare)
+	srvShare, sharedSecret, err := computeServerKeyShare(selectedGroup, peerShare)
 	if err != nil {
-		return fallbackRewoundStdlibTLSServer(ctx, rc, leafCertDER, signer, profile)
+		return runRewoundFallback()
 	}
 
 	sigScheme, sigHash, err := pickSignatureScheme(signer, ch.sigAlgs)
 	if err != nil {
-		return fallbackRewoundStdlibTLSServer(ctx, rc, leafCertDER, signer, profile)
+		return runRewoundFallback()
 	}
 
 	selectedALPN := selectProfileALPN(profile.ALPN, ch.alpnList)
@@ -214,7 +239,7 @@ func PerformShadowTLS13Server(ctx context.Context, rawConn net.Conn, leafCertDER
 		}
 	}
 
-	shBody := buildServerHelloBody(srvRandom, ch.sessionID, spec.id, profile.KeyShareGroup, srvShare, extOrder)
+	shBody := buildServerHelloBody(srvRandom, ch.sessionID, spec.id, selectedGroup, srvShare, extOrder)
 	shHandshake := wrapHandshakeMsg(0x02, shBody)
 
 	hFn := func() hash.Hash { return newHashForSuite(spec) }
@@ -240,11 +265,11 @@ func PerformShadowTLS13Server(ctx context.Context, rawConn net.Conn, leafCertDER
 
 	sHsAEAD, err := newAEADForSuite(spec, sHsKey)
 	if err != nil {
-		return fallbackRewoundStdlibTLSServer(ctx, rc, leafCertDER, signer, profile)
+		return runRewoundFallback()
 	}
 	cHsAEAD, err := newAEADForSuite(spec, cHsKey)
 	if err != nil {
-		return fallbackRewoundStdlibTLSServer(ctx, rc, leafCertDER, signer, profile)
+		return runRewoundFallback()
 	}
 
 	eeMsg := buildEncryptedExtensionsMsg(selectedALPN)
@@ -255,7 +280,7 @@ func PerformShadowTLS13Server(ctx context.Context, rawConn net.Conn, leafCertDER
 
 	cvMsg, err := buildCertificateVerifyMsg(signer, sigScheme, sigHash, certTranscriptHash)
 	if err != nil {
-		return fallbackRewoundStdlibTLSServer(ctx, rc, leafCertDER, signer, profile)
+		return runRewoundFallback()
 	}
 	_, _ = transcript.Write(cvMsg)
 	cvTranscriptHash := transcript.Sum(nil)
@@ -340,7 +365,24 @@ func PerformShadowTLS13Server(ctx context.Context, rawConn net.Conn, leafCertDER
 		}
 	}
 
+	clearDeadline = true
 	return sc, selectedALPN, nil
+}
+
+func selectKeyShareGroup(profileGroup uint16, clientShares map[uint16][]byte) (uint16, []byte, bool) {
+	candidates := [4]uint16{profileGroup, tlsGroupX25519, tlsGroupP256, tlsGroupX25519MLKEM}
+	for i, grp := range candidates {
+		if grp == 0 {
+			continue
+		}
+		if i > 0 && grp == profileGroup {
+			continue
+		}
+		if share, ok := clientShares[grp]; ok && len(share) > 0 {
+			return grp, share, true
+		}
+	}
+	return 0, nil, false
 }
 
 func fallbackStdlibTLSServer(ctx context.Context, rawConn net.Conn, leafCertDER []byte, signer crypto.Signer, profile *sni.CamouflageProfile) (net.Conn, string, error) {

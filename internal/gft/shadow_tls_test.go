@@ -625,3 +625,93 @@ func TestProbeCamouflageProfileAgainstShadowTLS13PostTickets(t *testing.T) {
 		t.Fatalf("round-trip profile mismatch:\n got: %+v\nwant: %+v", got, want)
 	}
 }
+
+func TestProbeCamouflageProfileTrimsPostTicketHTTP2Preface(t *testing.T) {
+	want := &sni.CamouflageProfile{
+		CipherSuite:          tlsCipherAES256GCM,
+		KeyShareGroup:        tlsGroupX25519,
+		ServerHelloExtOrder:  []uint16{tlsExtKeyShare, tlsExtSupportedVersions},
+		SendCCS:              true,
+		Flight2RecordLens:    []int{39, 1200, 128, 69},
+		PostTicketRecordLens: []int{265, 265},
+		ALPN:                 "h2",
+	}
+	certDER, key, _ := generateTestShadowCert(t, "origin.shadow.test")
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		raw, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer raw.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		sc, _, serr := PerformShadowTLS13Server(ctx, raw, certDER, key, want)
+		if serr != nil {
+			return
+		}
+		defer sc.Close()
+		// Simulate an upstream origin sending an HTTP/2 server SETTINGS preface immediately after tickets.
+		h2Settings := []byte{0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x64}
+		_, _ = sc.Write(h2Settings)
+		var buf [64]byte
+		_ = sc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		_, _ = sc.Read(buf[:])
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	got, err := sni.ProbeCamouflageProfile(ctx, ln.Addr().String(), "origin.shadow.test")
+	if err != nil {
+		t.Fatalf("ProbeCamouflageProfile failed: %v", err)
+	}
+	<-done
+
+	if !reflect.DeepEqual(got.PostTicketRecordLens, want.PostTicketRecordLens) {
+		t.Fatalf("expected HTTP/2 SETTINGS record stripped from PostTicketRecordLens, got %v want %v",
+			got.PostTicketRecordLens, want.PostTicketRecordLens)
+	}
+}
+
+func TestShadowTLS13CrossFingerprintKeyShareFallback(t *testing.T) {
+	// Profile sampled from Chrome (0x11ec X25519MLKEM768) should negotiate cleanly with ios/firefox
+	// clients that only offer classical X25519/P256 without falling back to stdlib tls.Server.
+	chromeSampledProfile := &sni.CamouflageProfile{
+		CipherSuite:          tlsCipherChaCha20,
+		KeyShareGroup:        tlsGroupX25519MLKEM,
+		ServerHelloExtOrder:  []uint16{tlsExtKeyShare, tlsExtSupportedVersions},
+		SendCCS:              true,
+		Flight2RecordLens:    []int{40, 1100, 150},
+		PostTicketRecordLens: []int{260},
+		ALPN:                 "h2",
+	}
+
+	for _, fp := range []string{"ios", "firefox"} {
+		t.Run("fp_"+fp, func(t *testing.T) {
+			snap := runShadowTLSRoundTrip(t, fp, chromeSampledProfile, 128*1024)
+			if snap.CipherSuite != chromeSampledProfile.CipherSuite {
+				t.Fatalf("CipherSuite mismatch: got 0x%04x want 0x%04x", snap.CipherSuite, chromeSampledProfile.CipherSuite)
+			}
+			if snap.KeyShareGroup != tlsGroupX25519 && snap.KeyShareGroup != tlsGroupP256 {
+				t.Fatalf("expected negotiated X25519 or P256 group, got 0x%04x", snap.KeyShareGroup)
+			}
+			if !reflect.DeepEqual(snap.ExtOrder, chromeSampledProfile.ServerHelloExtOrder) {
+				t.Fatalf("ServerHelloExtOrder mismatch: got %x want %x", snap.ExtOrder, chromeSampledProfile.ServerHelloExtOrder)
+			}
+			if !snap.SawCCS {
+				t.Fatal("expected ChangeCipherSpec record before Flight 2")
+			}
+			if !reflect.DeepEqual(snap.Flight2Lens, chromeSampledProfile.Flight2RecordLens) {
+				t.Fatalf("Flight2RecordLens mismatch: got %v want %v", snap.Flight2Lens, chromeSampledProfile.Flight2RecordLens)
+			}
+		})
+	}
+}

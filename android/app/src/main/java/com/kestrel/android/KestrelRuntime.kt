@@ -100,7 +100,7 @@ object KestrelRuntime {
             selectedId = nodes.firstOrNull()?.id ?: ""
         }
         val routeMode = KestrelRouteMode.fromRaw(prefs.getString(KEY_ROUTE_MODE, KestrelRouteMode.RULE.rawValue))
-        val transportMode = KestrelTransportMode.fromRaw(prefs.getString(KEY_TRANSPORT_MODE, KestrelTransportMode.AUTO.rawValue))
+        val transportMode = KestrelTransportMode.fromRaw(prefs.getString(KEY_TRANSPORT_MODE, KestrelTransportMode.RTC.rawValue))
         val upMbps = prefs.getString(KEY_UP_MBPS, "0") ?: "0"
         val downMbps = prefs.getString(KEY_DOWN_MBPS, "0") ?: "0"
         val socksPort = prefs.getString(KEY_SOCKS_PORT, "10808") ?: "10808"

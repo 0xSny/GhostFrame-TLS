@@ -352,3 +352,84 @@ func TestSessionPoolLeastLoadedAndDrain(t *testing.T) {
 	}
 	_ = binary.BigEndian
 }
+
+type writeGateConn struct {
+	net.Conn
+	firstEntered chan struct{}
+	firstRelease chan struct{}
+	once         sync.Once
+	mu           sync.Mutex
+	writes       [][]byte
+}
+
+func (g *writeGateConn) Write(p []byte) (int, error) {
+	cp := append([]byte(nil), p...)
+	g.mu.Lock()
+	idx := len(g.writes)
+	g.writes = append(g.writes, cp)
+	g.mu.Unlock()
+	if idx == 0 {
+		g.once.Do(func() { close(g.firstEntered) })
+		<-g.firstRelease
+	}
+	return len(p), nil
+}
+
+func TestMuxWriteLoopCmdPingSkipsCoalescing(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	gc := &writeGateConn{
+		Conn:         a,
+		firstEntered: make(chan struct{}),
+		firstRelease: make(chan struct{}),
+	}
+	ps := NewParamStore(DefaultParams())
+	sess := NewSession(gc, true, ps, nil)
+	defer sess.Close()
+
+	bulk := make([]byte, 2048)
+	// First data frame enters Write and blocks on firstRelease so dataQ + ctrlQ can build up.
+	if err := sess.writeFrame(CmdData, 0, 1, bulk, 10); err != nil {
+		t.Fatal(err)
+	}
+	<-gc.firstEntered
+
+	// Queue bulk data frames in dataQ and a CmdPing in ctrlQ while writeLoop is blocked.
+	if err := sess.writeFrame(CmdData, 0, 1, bulk, 11); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.writeFrame(CmdData, 0, 1, bulk, 12); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.SendPingReq(); err != nil {
+		t.Fatal(err)
+	}
+
+	close(gc.firstRelease)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		gc.mu.Lock()
+		nWrites := len(gc.writes)
+		gc.mu.Unlock()
+		if nWrites >= 3 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+	if len(gc.writes) < 3 {
+		t.Fatalf("expected >= 3 writes, got %d", len(gc.writes))
+	}
+	pingWrite := gc.writes[1]
+	if len(pingWrite) < HeaderLen || pingWrite[0] != CmdPing || pingWrite[1] != PingReq {
+		t.Fatalf("expected second write to be standalone CmdPing PingReq, got len=%d hdr=%x", len(pingWrite), pingWrite[:min(len(pingWrite), 8)])
+	}
+	if len(pingWrite) > 512 {
+		t.Fatalf("expected standalone small CmdPing write (no 64KB data coalescing), got len=%d", len(pingWrite))
+	}
+}

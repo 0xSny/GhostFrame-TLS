@@ -403,10 +403,12 @@ func (s *Session) writeLoop() {
 
 		// Coalesce additional already-queued frames up to batch capacity so small control/open frames
 		// ride inside a single TLS record + syscall rather than separate writes.
+		// Never coalesce behind CmdPing (PingReq/PingResp) so health checks/RTT probes flush immediately.
+		isPing := f.n >= HeaderLen && (*f.bp)[0] == CmdPing && ((*f.bp)[1] == PingReq || (*f.bp)[1] == PingResp)
 		var out []byte
 		totalBytes := f.n
 		needPutSingle := false
-		if (len(s.ctrlQ) > 0 || len(s.dataQ) > 0) && f.n < len(batch) {
+		if !isPing && (len(s.ctrlQ) > 0 || len(s.dataQ) > 0) && f.n < len(batch) {
 			used := copy(batch, (*f.bp)[:f.n])
 			PutBuf(f.bp)
 			for used < len(batch) {

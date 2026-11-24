@@ -41,7 +41,6 @@ enum GhostRouteMode: String, CaseIterable, Codable, Identifiable {
 }
 
 enum GhostTransportMode: String, CaseIterable, Codable, Identifiable {
-    case auto = "auto"
     case rtc = "rtc"
     case tcp = "tcp"
 
@@ -49,9 +48,17 @@ enum GhostTransportMode: String, CaseIterable, Codable, Identifiable {
 
     var label: String {
         switch self {
-        case .auto: return "Auto 双栈"
-        case .rtc: return "RTC 极速"
-        case .tcp: return "TCP uTLS"
+        case .rtc: return "UDP 优先"
+        case .tcp: return "TCP 优先"
+        }
+    }
+
+    init(fromRaw raw: String?) {
+        let norm = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if norm == "tcp" || norm == "tcp_first" {
+            self = .tcp
+        } else {
+            self = .rtc
         }
     }
 }
@@ -315,7 +322,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         if !short.isEmpty {
             return short.hasPrefix("v") ? short : "v\(short)"
         }
-        return "v4.2.0"
+        return "v4.2.1"
     }
 
     init() {
@@ -323,7 +330,7 @@ struct GhostStatusSnapshot: Codable, Equatable {
         state = "disconnected"
         lastErr = ""
         activeTransport = ""
-        transportPref = "auto"
+        transportPref = "rtc"
         routeMode = "rule"
         hopRange = ""
         rtcPort = 0

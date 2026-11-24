@@ -21,8 +21,7 @@ const (
 	cmdQuit      = 1005
 	cmdRouteRule = 1101
 	cmdRouteGlob = 1102
-	cmdRouteCore = 1103
-	cmdTransAuto  = 1201
+	cmdRouteCore  = 1103
 	cmdTransRTC   = 1202
 	cmdTransTCP   = 1203
 	cmdToggleIPv6 = 1301
@@ -323,13 +322,16 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 		val  string
 		name string
 	}{
-		{cmdTransAuto, "auto", "Auto (RTC+TCP 双栈竞速)"},
-		{cmdTransRTC, "rtc", "RTC (WebRTC拟态抗丢包)"},
-		{cmdTransTCP, "tcp", "TCP (uTLS 强稳健)"},
+		{cmdTransRTC, "rtc", "UDP 优先 (Kestrel-RTC 首选 / TCP 兜底)"},
+		{cmdTransTCP, "tcp", "TCP 优先 (uTLS 首选 / UDP 兜底)"},
+	}
+	normTrans := "rtc"
+	if transPref == "tcp" || transPref == "tcp_first" {
+		normTrans = "tcp"
 	}
 	for _, ti := range transItems {
 		f := uint32(mfString)
-		if transPref == ti.val || (ti.val == "rtc" && transPref == "quic") {
+		if normTrans == ti.val {
 			f |= mfChecked
 		}
 		appendItem(hTrans, f, ti.id, ti.name)
@@ -407,22 +409,16 @@ func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImpo
 			onToast("模式已切换: Core (仅端口)", false)
 			onRefresh()
 		}()
-	case cmd == cmdTransAuto:
-		go func() {
-			_ = eng.SetTransport("auto")
-			onToast("传输偏好已切换: Auto", false)
-			onRefresh()
-		}()
 	case cmd == cmdTransRTC:
 		go func() {
 			_ = eng.SetTransport("rtc")
-			onToast("传输偏好已切换: Kestrel-RTC", false)
+			onToast("传输偏好已切换: UDP 优先", false)
 			onRefresh()
 		}()
 	case cmd == cmdTransTCP:
 		go func() {
 			_ = eng.SetTransport("tcp")
-			onToast("传输偏好已切换: TCP", false)
+			onToast("传输偏好已切换: TCP 优先", false)
 			onRefresh()
 		}()
 	case cmd == cmdToggleIPv6:

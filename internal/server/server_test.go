@@ -919,3 +919,14 @@ func TestServerShadowTLS13Integration(t *testing.T) {
 		t.Fatal("echo payload mismatch over Server ShadowTLS 1.3")
 	}
 }
+
+func TestServerCamouflageDialNetworkDisableIPv6(t *testing.T) {
+	srv := &Server{cfg: &Config{}}
+	if got := srv.camouflageDialNetwork(); got != "tcp" {
+		t.Fatalf("expected default camouflageDialNetwork=tcp, got %q", got)
+	}
+	srv.cfg.DisableIPv6 = true
+	if got := srv.camouflageDialNetwork(); got != "tcp4" {
+		t.Fatalf("expected DisableIPv6 camouflageDialNetwork=tcp4, got %q", got)
+	}
+}
