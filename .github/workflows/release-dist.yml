@@ -53,6 +53,7 @@ jobs:
 
           GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kestrel-server-linux-amd64 ./cmd/gft-server
           GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kestrel-server-linux-arm64 ./cmd/gft-server
+          go run scripts/gen_win_rsrc.go
           GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H=windowsgui ${VER_X}" -o dist/Kestrel-Pro-windows-amd64.exe ./cmd/gft-client-gui
           GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kbox-linux-amd64     ./cmd/0ghost
           GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kbox-linux-arm64     ./cmd/0ghost

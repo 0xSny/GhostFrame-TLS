@@ -75,6 +75,7 @@ jobs:
         run: |
           mkdir -p dist
           REL_VER="v4.2.0"
+          go run scripts/gen_win_rsrc.go
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H=windowsgui -X ghostframe/internal/client.Version=${REL_VER}" -o dist/Kestrel-Pro.exe ./cmd/gft-client-gui
           ls -lh dist/Kestrel-Pro.exe
 
