@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.2.1"
+var Version = "v4.2.2"
 
 type ConnState string
 
@@ -583,6 +583,7 @@ func (e *Engine) SelectNode(idx int) error {
 	} else {
 		targetParams = e.paramStore.Get()
 	}
+	targetParams.SNIRTTMs = 0
 	nextStore := gft.NewParamStore(targetParams)
 	newSched := gft.NewApexScheduler(targetLink, nextStore, gft.EffectivePoolSize(), e.Logf)
 
@@ -663,9 +664,7 @@ func (e *Engine) SelectNode(idx int) error {
 	e.config.ActiveNode = newIdx
 	e.config.Link = targetLink
 	e.config.AutoConnect = true
-	if targetLink.Params != nil {
-		e.paramStore.Set(*targetLink.Params)
-	}
+	e.paramStore = nextStore
 	mode := e.config.RouteMode
 	httpAddr := e.config.HTTPAddr
 	e.config.SysProxy = mode != RouteCore
@@ -1756,6 +1755,9 @@ func (e *Engine) Connect() error {
 	e.lastErr = ""
 	e.connectGen++
 	gen := e.connectGen
+	pInit := e.paramStore.Get()
+	pInit.SNIRTTMs = 0
+	e.paramStore.Set(pInit)
 	sched := gft.NewApexScheduler(l, e.paramStore, gft.EffectivePoolSize(), e.Logf)
 	e.connectingSched = sched
 	e.mu.Unlock()
@@ -2218,6 +2220,7 @@ type NodeSummary struct {
 	Name      string `json:"name"`
 	Host      string `json:"host"`
 	Port      int    `json:"port"`
+	SNI       string `json:"sni,omitempty"`
 	Verify    string `json:"verify"`
 	Transport string `json:"transport"`
 	HopRange  string `json:"hop_range,omitempty"`
@@ -2303,12 +2306,14 @@ func (e *Engine) Status() map[string]any {
 			Name:      name,
 			Host:      n.Host,
 			Port:      n.Port,
+			SNI:       n.SNI,
 			Verify:    n.EffectiveVerify(),
 			Transport: n.EffectiveTransport(),
 			HopRange:  n.HopRange,
 		})
 	}
 	l := e.activeLinkLocked()
+	paramStore := e.paramStore
 	e.mu.RUnlock()
 
 	var totalUp, totalDown, fecRecovered, hopCount, rekeyCount uint64
@@ -2343,8 +2348,9 @@ func (e *Engine) Status() map[string]any {
 		}
 	}
 
-	var nodeName, nodeHost, tPref, verifyMode, hopRange string
+	var nodeName, nodeHost, nodeSNI, tPref, verifyMode, hopRange string
 	var nodePort, upMbps, downMbps int
+	var sniRTTMs int64
 	if l != nil {
 		nodeName = l.Remark
 		if nodeName == "" {
@@ -2352,11 +2358,15 @@ func (e *Engine) Status() map[string]any {
 		}
 		nodeHost = l.Host
 		nodePort = l.Port
+		nodeSNI = l.SNI
 		tPref = l.EffectiveTransport()
 		verifyMode = l.EffectiveVerify()
 		hopRange = l.HopRange
 		upMbps = l.UpMbps
 		downMbps = l.DownMbps
+	}
+	if state == StateConnected && paramStore != nil {
+		sniRTTMs = paramStore.Get().SNIRTTMs
 	}
 	if tPref == "" {
 		tPref = "rtc"
@@ -2405,6 +2415,8 @@ func (e *Engine) Status() map[string]any {
 		"node_name":        nodeName,
 		"node_host":        nodeHost,
 		"node_port":        nodePort,
+		"sni":              nodeSNI,
+		"sni_rtt_ms":       sniRTTMs,
 		"active_node":      activeIdx,
 		"nodes":            nodes,
 		"link_uri":         e.LinkURI(),

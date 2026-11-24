@@ -31,7 +31,7 @@ import (
 )
 
 // Version is the canonical server build identifier (overridable via -ldflags -X).
-var Version = "v4.2.1"
+var Version = "v4.2.2"
 
 const (
 	MaxUDPAssocPerClient = 256
@@ -406,8 +406,20 @@ func (s *Server) Run(ctx context.Context) error {
 				pCancel()
 				if perr == nil && prof != nil {
 					s.shadowProfile.Store(prof)
-					s.logger.Printf("shadowtls profile refreshed target=%s cipher=0x%04x group=0x%04x alpn=%s flight2=%v tickets=%v",
-						s.cfg.CamouflageTarget, prof.CipherSuite, prof.KeyShareGroup, prof.ALPN, prof.Flight2RecordLens, prof.PostTicketRecordLens)
+					sniRTT := prof.DialRTTMs
+					if sniRTT <= 0 {
+						sniRTT = prof.HandshakeRTTMs
+					}
+					if sniRTT > 0 {
+						p := s.params.Get()
+						p.SNIRTTMs = sniRTT
+						s.params.Set(p)
+						if rtcLn != nil {
+							rtcLn.SetParamsJSON(gft.MarshalParams(p))
+						}
+					}
+					s.logger.Printf("shadowtls profile refreshed target=%s sni_rtt=%dms cipher=0x%04x group=0x%04x alpn=%s flight2=%v tickets=%v",
+						s.cfg.CamouflageTarget, sniRTT, prof.CipherSuite, prof.KeyShareGroup, prof.ALPN, prof.Flight2RecordLens, prof.PostTicketRecordLens)
 				} else if perr != nil && ctx.Err() == nil {
 					s.logger.Printf("shadowtls profile probe skipped (%s): %v", s.cfg.CamouflageTarget, perr)
 				}

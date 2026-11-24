@@ -34,6 +34,8 @@ type CamouflageProfile struct {
 	Flight2RecordLens    []int     `json:"flight2_record_lens"`
 	PostTicketRecordLens []int     `json:"post_ticket_record_lens"`
 	ALPN                 string    `json:"alpn"`
+	DialRTTMs            int64     `json:"dial_rtt_ms,omitempty"`
+	HandshakeRTTMs       int64     `json:"handshake_rtt_ms,omitempty"`
 	FetchedAt            time.Time `json:"fetched_at"`
 }
 
@@ -65,9 +67,14 @@ func ProbeCamouflageProfileWithNetwork(ctx context.Context, network, targetHostP
 	}
 
 	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	dialStart := time.Now()
 	raw, err := dialer.DialContext(ctx, network, target)
 	if err != nil {
 		return nil, fmt.Errorf("sni: dial camouflage target %s: %w", target, err)
+	}
+	dialRTTMs := time.Since(dialStart).Milliseconds()
+	if dialRTTMs <= 0 {
+		dialRTTMs = 1
 	}
 	defer raw.Close()
 
@@ -99,6 +106,10 @@ func ProbeCamouflageProfileWithNetwork(ctx context.Context, network, targetHostP
 	if err := uc.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("sni: camouflage handshake failed: %w", err)
 	}
+	hsRTTMs := time.Since(dialStart).Milliseconds()
+	if hsRTTMs <= 0 {
+		hsRTTMs = 1
+	}
 	tap.markFlight3Started()
 
 	// Drain post-handshake NewSessionTicket records inside a 120ms window without sending HTTP traffic.
@@ -123,6 +134,8 @@ func ProbeCamouflageProfileWithNetwork(ctx context.Context, network, targetHostP
 		prof.PostTicketRecordLens = prof.PostTicketRecordLens[:nTickets]
 	}
 	prof.ALPN = uc.ConnectionState().NegotiatedProtocol
+	prof.DialRTTMs = dialRTTMs
+	prof.HandshakeRTTMs = hsRTTMs
 	prof.FetchedAt = time.Now()
 	return prof, nil
 }

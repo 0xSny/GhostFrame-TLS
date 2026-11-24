@@ -277,7 +277,7 @@ func InitWithOptions(opts InitOptions) (*Secrets, error) {
 func pickDefaultSNI(selfHost string) string {
 	pool := sni.FlattenPool(sni.LoadPool(""))
 	if !testing.Testing() {
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 9*time.Second)
 		pick, _, err := sni.AutoSelectSNI(ctx, selfHost)
 		cancel()
 		if err == nil && pick.Domain != "" {

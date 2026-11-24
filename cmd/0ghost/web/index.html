@@ -76,6 +76,7 @@ textarea{min-height:74px;resize:vertical;font-family:ui-monospace,SFMono-Regular
     <div class="badges">
       <span class="pill"><span class="dot" id="stateDot"></span><span id="stateText">加载中</span></span>
       <span class="pill" id="protoBadge">协议: --</span>
+      <span class="pill" id="sniBadge">SNI: --</span>
       <span class="pill" id="fwBadge">防火墙: --</span>
       <span class="pill">SOCKS5 :10808 · HTTP :10809</span>
       <button class="btn primary" id="connBtn" onclick="toggleConn()">连接隧道</button>
@@ -451,6 +452,12 @@ function refresh(){
     cBtn.className = 'btn ' + ((curState==='connected'||curState==='connecting')?'danger':'primary');
 
     document.getElementById('protoBadge').textContent = '协议: ' + (s.active_transport || s.transport_pref || '--');
+    const sb = document.getElementById('sniBadge');
+    if (sb) {
+      const sniRtt = Number(s.sni_rtt_ms) || 0;
+      sb.textContent = s.sni ? ('SNI: ' + s.sni + (sniRtt > 0 ? ' (' + sniRtt + 'ms)' : '')) : 'SNI: --';
+      sb.style.color = sniRtt > 0 ? (sniRtt <= 20 ? '#34d399' : (sniRtt <= 50 ? '#fbbf24' : '#f87171')) : '';
+    }
     const tp = s.tproxy_stats || {};
     document.getElementById('fwBadge').textContent = '防火墙: ' + (tp.firewall_active ? tp.firewall_backend : (tp.firewall_backend || '未挂载'));
     document.getElementById('lanSub').textContent = `N1 网关 ${tp.lan_ip || '--'} · 网卡 ${tp.lan_iface || 'br-lan'} · 主路由 ${tp.gateway_ip || '--'}`;

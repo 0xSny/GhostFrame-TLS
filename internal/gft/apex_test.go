@@ -996,6 +996,7 @@ func TestSplitBandwidthAcrossDualRTCSessions(t *testing.T) {
 
 	ps := NewParamStore(DefaultParams())
 	sched := NewApexScheduler(link, ps, 1, nil)
+	sched.SetElasticPolicyForTest(1, DefaultRTCPoolSize, time.Minute)
 	sched.SetDialJitterForTest(0, 0, 100)
 
 	var seenUp, seenDown []int
@@ -1066,6 +1067,7 @@ func TestTCPCircuitBreakerCooldownAndInstantRTCFailoverWake(t *testing.T) {
 
 	ps := NewParamStore(DefaultParams())
 	sched := NewApexScheduler(link, ps, 1, nil)
+	sched.SetElasticPolicyForTest(1, DefaultRTCPoolSize, time.Minute)
 	sched.SetDialJitterForTest(0, 0, 100)
 	sched.SetTCPBackoffForTest(15*time.Millisecond, 3*time.Second, 6*time.Second)
 	sched.SetHopTimingsForTest(10*time.Second, 10*time.Second, 10*time.Second, 30*time.Millisecond)
@@ -1349,5 +1351,86 @@ func TestSchedulerUDPStickyPinnedSession(t *testing.T) {
 	}
 	if got := count0.Load() + count1.Load(); got < beforeFail+10 {
 		t.Fatalf("expected seamless failover to remaining healthy RTC track, got total=%d want=%d", got, beforeFail+10)
+	}
+}
+
+func TestElasticPoolOnDemandScaleAndIdleShrink(t *testing.T) {
+	ps := NewParamStore(DefaultParams())
+	link := &Link{V: 4, Host: "127.0.0.1", Port: 443, SNI: "example.com", PSK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
+
+	var mu sync.Mutex
+	var srvConns []net.Conn
+	defer func() {
+		mu.Lock()
+		for _, c := range srvConns {
+			_ = c.Close()
+		}
+		mu.Unlock()
+	}()
+
+	pool := NewSessionPool(link, ps, 4, nil)
+	pool.SetElasticPolicy(1, 250*time.Millisecond)
+	pool.dialFn = func(ctx context.Context, _ *Link, store *ParamStore, _ uint16, _ time.Duration) (*Session, time.Duration, error) {
+		c, s := net.Pipe()
+		srv := NewSession(s, false, store, nil)
+		go srv.Run()
+		mu.Lock()
+		srvConns = append(srvConns, s)
+		mu.Unlock()
+		cli := NewSession(c, true, store, nil)
+		go cli.Run()
+		return cli, 2 * time.Millisecond, nil
+	}
+
+	if err := pool.Start(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	// 1. When idle, elastic pool must stay at floor (1 conn), NOT burst to 4.
+	time.Sleep(150 * time.Millisecond)
+	if got := pool.Stats().ActiveConns; got != 1 {
+		t.Fatalf("expected elastic idle floor ActiveConns=1, got %d", got)
+	}
+
+	// 2. Under stream demand (>= scaleStreamsPerConn on the 1 active session), pool scales up smoothly.
+	s1, err := pool.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.mu.Lock()
+	for id := uint16(100); id < 100+scaleStreamsPerConn; id++ {
+		s1.streams[id] = newStream(s1, id)
+	}
+	s1.mu.Unlock()
+	pool.NoteDemand()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if pool.Stats().ActiveConns >= 2 {
+			break
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	if got := pool.Stats().ActiveConns; got < 2 {
+		t.Fatalf("expected elastic pool to scale up >=2 under stream demand, got %d", got)
+	}
+
+	// 3. Clear streams and wait for idleShrinkDur -> extra slot drains back to floor=1.
+	s1.mu.Lock()
+	for id := uint16(100); id < 100+scaleStreamsPerConn; id++ {
+		delete(s1.streams, id)
+	}
+	s1.mu.Unlock()
+
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if pool.Stats().ActiveConns == 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := pool.Stats().ActiveConns; got != 1 {
+		t.Fatalf("expected elastic pool to shrink back to ActiveConns=1 after idle, got %d", got)
 	}
 }

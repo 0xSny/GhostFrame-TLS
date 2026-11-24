@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Kestrel (Kestrel-RTC) v4.2.0 Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
+# Kestrel (Kestrel-RTC) v4.2.2 Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
 REPO="Spittingjiu/Ghost"
 ROLE="server"
 UNATTENDED=0
@@ -10,6 +10,7 @@ DEFAULT_HOP_RANGE="40000-65000"
 HOP_RANGE=""
 HOP_EXPLICIT=0
 SNI_OVERRIDE=""
+RESELECT_SNI=0
 CLIENT_LINK=""
 SOCKS_ADDR="127.0.0.1:10808"
 LOW_MEM=0
@@ -23,7 +24,7 @@ die()  { printf "\033[1;31m[×]\033[0m %s\n" "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-Kestrel (Kestrel-RTC) v4.2.0 Installer
+Kestrel (Kestrel-RTC) v4.2.2 Installer
 
 Usage:
   install.sh [options]
@@ -34,6 +35,7 @@ Options:
   --port <1-65535>         Server main TCP/RTC listen port (default: 443)
   --hop <min-max|none>     Server UDP port hopping range (default: 40000-65000; pass 'none' to disable)
   --sni <domain>           Override auto-selected non-CDN camouflage SNI
+  --reselect-sni           Re-probe all regions and switch existing node to nearest lowest-latency SNI
   --link <ksl4://...>      Client ksl4:// URI (or legacy gft3://) for --role client
   --socks <addr:port>      Client SOCKS5 listen address (default: 127.0.0.1:10808)
   --low-mem                Enable low-memory router mode (<35MB RSS, ideal for N1/S905D)
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --port)       LISTEN_PORT="$2"; shift 2 ;;
     --hop)        if [[ "${2:-}" == "none" || "${2:-}" == "off" ]]; then HOP_RANGE=""; else HOP_RANGE="$2"; fi; HOP_EXPLICIT=1; shift 2 ;;
     --sni)        SNI_OVERRIDE="$2"; shift 2 ;;
+    --reselect-sni) RESELECT_SNI=1; shift ;;
     --link)       CLIENT_LINK="$2"; shift 2 ;;
     --socks)      SOCKS_ADDR="$2"; shift 2 ;;
     --low-mem)    LOW_MEM=1; shift ;;
@@ -342,6 +345,13 @@ install_server() {
     if [[ -n "$existing_port" ]]; then
       LISTEN_PORT="$existing_port"
     fi
+    if [[ -n "$SNI_OVERRIDE" ]]; then
+      log "Updating camouflage SNI to user-specified: ${SNI_OVERRIDE}"
+      /opt/kestrel/kestrel-server reselect-sni -config /etc/kestrel/server.json -sni "$SNI_OVERRIDE" || warn "SNI update failed; keeping existing SNI."
+    elif [[ "$RESELECT_SNI" -eq 1 ]]; then
+      log "Re-probing all regional non-CDN origins to select nearest lowest-latency SNI..."
+      /opt/kestrel/kestrel-server reselect-sni -config /etc/kestrel/server.json || warn "Auto SNI reselection failed; keeping existing SNI."
+    fi
   else
     check_port_and_guide
     if [[ "$HOP_EXPLICIT" -eq 0 ]]; then
@@ -364,8 +374,13 @@ install_server() {
       init_args+=(--fallback-target "$CHOSEN_FALLBACK_TARGET")
     fi
 
-    log "Initializing server credentials & running non-CDN origin probe..."
+    log "Initializing server credentials & probing all regions for nearest low-latency non-CDN SNI..."
     /opt/kestrel/kestrel-server "${init_args[@]}" >/dev/null
+    local picked_sni
+    picked_sni="$(sed -n 's/.*"sni"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/kestrel/server.json | head -n1 || true)"
+    if [[ -n "$picked_sni" ]]; then
+      ok "Auto-selected nearby camouflage SNI: ${picked_sni}"
+    fi
   fi
 
   chown -R gft:gft /etc/kestrel /var/lib/kestrel

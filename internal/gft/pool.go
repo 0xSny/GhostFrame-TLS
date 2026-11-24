@@ -12,20 +12,29 @@ import (
 )
 
 const (
-	DefaultPoolSize = 4
-	MinPoolSize     = 1
-	MaxPoolSize     = 8
-	rotateMinAge    = 15 * time.Minute
-	rotateMaxAge    = 25 * time.Minute
-	rotateMaxBytes  = uint64(512 * 1024 * 1024)
+	DefaultPoolSize       = 4
+	MinPoolSize           = 1
+	MaxPoolSize           = 8
+	rotateMinAge          = 15 * time.Minute
+	rotateMaxAge          = 25 * time.Minute
+	rotateMaxBytes        = uint64(512 * 1024 * 1024)
+	defaultIdleShrinkDur  = 90 * time.Second
+	scaleStreamsPerConn   = 4
+	scaleRateBytesPerSec  = uint64(256 * 1024)
+	shrinkRateBytesPerSec = uint64(64 * 1024)
+	scaleUpCooldown       = 2 * time.Second
+	idlePingMinMs         = 25000
+	idlePingMaxMs         = 55000
 )
 
 type poolEntry struct {
-	id        uint64
-	sess      *Session
-	createdAt time.Time
-	maxAge    time.Duration
-	draining  bool
+	id           uint64
+	sess         *Session
+	createdAt    time.Time
+	lastActiveAt time.Time
+	lastBytes    uint64
+	maxAge       time.Duration
+	draining     bool
 }
 
 // PoolStats captures live metrics across the striped SessionPool.
@@ -53,12 +62,20 @@ type SessionPool struct {
 	shouldCoolDown func() bool
 	wakeCh         chan struct{}
 
-	mu          sync.Mutex
-	entries     []*poolEntry
-	nextEntryID uint64
-	retiredUp   uint64
-	retiredDown uint64
-	lastErr     string
+	mu             sync.Mutex
+	entries        []*poolEntry
+	nextEntryID    uint64
+	retiredUp      uint64
+	retiredDown    uint64
+	lastErr        string
+	minSize        int
+	idleShrinkDur  time.Duration
+	elastic        bool
+	lastScaleAt    time.Time
+	lastSampleAt   time.Time
+	lastTotalBytes uint64
+	recentBps      uint64
+	lastTrafficAt  time.Time
 
 	emergMu   sync.Mutex
 	emergWait chan struct{}
@@ -91,18 +108,90 @@ func NewSessionPool(l *Link, ps *ParamStore, size int, logf func(string, ...any)
 	epoch := binary.BigEndian.Uint32(ep[:]) | 1
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &SessionPool{
-		link:      l,
-		ps:        ps,
-		size:      size,
-		dialFn:    DialSession,
-		onLog:     logf,
-		wakeCh:    make(chan struct{}, 1),
-		bond:      NewBondGroup(nil),
-		poolEpoch: epoch,
-		ctx:       ctx,
-		cancel:    cancel,
+		link:          l,
+		ps:            ps,
+		size:          size,
+		minSize:       size,
+		idleShrinkDur: defaultIdleShrinkDur,
+		dialFn:        DialSession,
+		onLog:         logf,
+		wakeCh:        make(chan struct{}, 1),
+		bond:          NewBondGroup(nil),
+		poolEpoch:     epoch,
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 	return p
+}
+
+// SetElasticPolicy enables on-demand scaling between minSize (idle floor) and pool.size (ceiling),
+// shrinking excess idle connections back to minSize after idleShrink with low traffic.
+func (p *SessionPool) SetElasticPolicy(minSize int, idleShrink time.Duration) {
+	if p == nil {
+		return
+	}
+	if minSize < MinPoolSize {
+		minSize = MinPoolSize
+	}
+	if minSize > p.size {
+		minSize = p.size
+	}
+	if idleShrink <= 0 {
+		idleShrink = defaultIdleShrinkDur
+	}
+	p.mu.Lock()
+	p.elastic = true
+	p.minSize = minSize
+	p.idleShrinkDur = idleShrink
+	p.mu.Unlock()
+}
+
+// NoteDemand notifies the elastic pool of fresh traffic/stream demand so it can scale up smoothly.
+func (p *SessionPool) NoteDemand() {
+	if p == nil {
+		return
+	}
+	now := time.Now()
+	shouldWake := false
+	p.mu.Lock()
+	p.lastTrafficAt = now
+	if p.elastic {
+		activeCount := 0
+		totalStreams := 0
+		hasBacklog := false
+		for _, e := range p.entries {
+			if e.draining {
+				continue
+			}
+			select {
+			case <-e.sess.Done():
+				continue
+			default:
+			}
+			activeCount++
+			totalStreams += e.sess.NumStreams()
+			if e.sess.PendingWriteBytes() >= 64*1024 {
+				hasBacklog = true
+			}
+		}
+		bondStreams := 0
+		if p.bond != nil {
+			bondStreams = p.bond.NumStreams()
+			totalStreams += bondStreams
+		}
+		if activeCount < p.size && now.Sub(p.lastScaleAt) >= scaleUpCooldown {
+			if totalStreams >= activeCount*scaleStreamsPerConn ||
+				p.recentBps >= scaleRateBytesPerSec ||
+				hasBacklog ||
+				(bondStreams > 0 && activeCount < 2) {
+				shouldWake = true
+			}
+		}
+	}
+	p.mu.Unlock()
+	if shouldWake {
+		p.WakeReconnect()
+	}
 }
 
 // SetCooldownGuard registers a predicate indicating whether long circuit-breaker cooldowns
@@ -169,12 +258,14 @@ func (p *SessionPool) dialOne(timeout time.Duration) (*poolEntry, time.Duration,
 			p.bondReady.Store(true)
 		})
 	}
+	now := time.Now()
 	maxAge := time.Duration(randRange(int(rotateMinAge.Seconds()), int(rotateMaxAge.Seconds()))) * time.Second
 	entry := &poolEntry{
-		id:        id,
-		sess:      sess,
-		createdAt: time.Now(),
-		maxAge:    maxAge,
+		id:           id,
+		sess:         sess,
+		createdAt:    now,
+		lastActiveAt: now,
+		maxAge:       maxAge,
 	}
 	return entry, hs, nil
 }
@@ -272,6 +363,15 @@ func (p *SessionPool) reapAndCheck() (activeCount int, needed int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	bondStreams := 0
+	if p.bond != nil {
+		bondStreams = p.bond.NumStreams()
+	}
+
+	var totalBytes uint64 = p.retiredUp + p.retiredDown
+	totalStreams := bondStreams
+	hasBacklog := false
+
 	kept := make([]*poolEntry, 0, len(p.entries))
 	for _, e := range p.entries {
 		select {
@@ -284,20 +384,24 @@ func (p *SessionPool) reapAndCheck() (activeCount int, needed int) {
 		default:
 		}
 
-		if !e.draining && (now.Sub(e.createdAt) >= e.maxAge || e.sess.TotalBytes() >= rotateMaxBytes) {
+		curBytes := e.sess.TotalBytes()
+		totalBytes += curBytes
+		curStreams := e.sess.NumStreams()
+		if curStreams > 0 || curBytes != e.lastBytes {
+			e.lastActiveAt = now
+			e.lastBytes = curBytes
+		}
+
+		if !e.draining && (now.Sub(e.createdAt) >= e.maxAge || curBytes >= rotateMaxBytes) {
 			e.draining = true
 			e.sess.draining.Store(true)
 			if p.onLog != nil {
-				p.onLog("[TCP] Pool slot #%d entering graceful drain (age=%v, bytes=%dMB)", e.id, now.Sub(e.createdAt).Round(time.Second), e.sess.TotalBytes()>>20)
+				p.onLog("[TCP] Pool slot #%d entering graceful drain (age=%v, bytes=%dMB)", e.id, now.Sub(e.createdAt).Round(time.Second), curBytes>>20)
 			}
 		}
 
 		if e.draining {
-			bondStreams := 0
-			if p.bond != nil {
-				bondStreams = p.bond.NumStreams()
-			}
-			if e.sess.NumStreams() == 0 && (bondStreams == 0 || now.Sub(e.createdAt) >= e.maxAge+45*time.Second) {
+			if curStreams == 0 && (bondStreams == 0 || now.Sub(e.createdAt) >= e.maxAge+45*time.Second) {
 				p.retiredUp += e.sess.UpBytes.Load()
 				p.retiredDown += e.sess.DownBytes.Load()
 				p.bond.RemoveSession(e.sess, false)
@@ -309,20 +413,113 @@ func (p *SessionPool) reapAndCheck() (activeCount int, needed int) {
 		}
 
 		activeCount++
+		totalStreams += curStreams
+		if e.sess.PendingWriteBytes() >= 64*1024 {
+			hasBacklog = true
+		}
 		kept = append(kept, e)
 	}
 	p.entries = kept
 
-	if activeCount < p.size {
-		needed = p.size - activeCount
+	// Update aggregate throughput estimate for elastic scale-up / idle shrink decisions.
+	if p.lastSampleAt.IsZero() {
+		p.lastSampleAt = now
+		p.lastTotalBytes = totalBytes
+		if totalStreams > 0 {
+			p.lastTrafficAt = now
+		}
+	} else if dt := now.Sub(p.lastSampleAt); dt >= time.Second {
+		var delta uint64
+		if totalBytes > p.lastTotalBytes {
+			delta = totalBytes - p.lastTotalBytes
+		}
+		instBps := uint64(float64(delta) / dt.Seconds())
+		if p.recentBps == 0 {
+			p.recentBps = instBps
+		} else {
+			p.recentBps = (p.recentBps*3 + instBps*7) / 10
+		}
+		p.lastSampleAt = now
+		p.lastTotalBytes = totalBytes
+		if delta > 0 || totalStreams > 0 {
+			p.lastTrafficAt = now
+		}
 	}
-	return activeCount, needed
+
+	if !p.elastic {
+		if activeCount < p.size {
+			needed = p.size - activeCount
+		}
+		return activeCount, needed
+	}
+
+	// Elastic mode: maintain minSize floor when idle, scale up smoothly +1 under demand,
+	// and gracefully drain excess idle connections back to minSize.
+	minSz := p.minSize
+	if minSz < MinPoolSize {
+		minSz = MinPoolSize
+	}
+	if minSz > p.size {
+		minSz = p.size
+	}
+	if activeCount < minSz {
+		return activeCount, minSz - activeCount
+	}
+
+	// Scale up by at most +1 per cooldown interval when demand justifies more TCP stripes.
+	if activeCount < p.size && now.Sub(p.lastScaleAt) >= scaleUpCooldown {
+		if totalStreams >= activeCount*scaleStreamsPerConn ||
+			p.recentBps >= scaleRateBytesPerSec ||
+			hasBacklog ||
+			(bondStreams > 0 && activeCount < 2) {
+			p.lastScaleAt = now
+			return activeCount, 1
+		}
+	}
+
+	// Shrink at most 1 excess idle slot per tick when traffic is quiet.
+	if activeCount > minSz && bondStreams == 0 && p.recentBps < shrinkRateBytesPerSec {
+		for i := len(p.entries) - 1; i >= 0; i-- {
+			e := p.entries[i]
+			if e.draining || e.sess.NumStreams() > 0 {
+				continue
+			}
+			if now.Sub(e.lastActiveAt) >= p.idleShrinkDur {
+				e.draining = true
+				e.sess.draining.Store(true)
+				activeCount--
+				if p.onLog != nil {
+					p.onLog("[TCP] Pool slot #%d idle shrink (active=%d, floor=%d)", e.id, activeCount, minSz)
+				}
+				break
+			}
+		}
+	}
+
+	return activeCount, 0
+}
+
+func (p *SessionPool) isIdle(now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.elastic {
+		return false
+	}
+	if p.bond != nil && p.bond.NumStreams() > 0 {
+		return false
+	}
+	for _, e := range p.entries {
+		if !e.draining && e.sess.NumStreams() > 0 {
+			return false
+		}
+	}
+	return p.lastTrafficAt.IsZero() || now.Sub(p.lastTrafficAt) >= 20*time.Second
 }
 
 func (p *SessionPool) inBandPingLoop() {
 	defer p.wg.Done()
-	// Fire an initial health probe shortly after startup, then probe ALL non-draining slots
-	// every 5..7s so every carrier keeps a fresh RTT score and blackholed sockets are evicted in <15s.
+	// Fire an initial health probe shortly after startup, then probe active slots every 5..7s
+	// under load or 25..55s randomized when completely idle to avoid rhythmic heartbeat fingerprints.
 	select {
 	case <-p.ctx.Done():
 		return
@@ -333,7 +530,12 @@ func (p *SessionPool) inBandPingLoop() {
 	t := time.NewTimer(time.Hour)
 	defer t.Stop()
 	for {
-		wait := time.Duration(randRange(5000, 7000)) * time.Millisecond
+		var wait time.Duration
+		if p.isIdle(time.Now()) {
+			wait = time.Duration(randRange(idlePingMinMs, idlePingMaxMs)) * time.Millisecond
+		} else {
+			wait = time.Duration(randRange(5000, 7000)) * time.Millisecond
+		}
 		if !t.Stop() {
 			select {
 			case <-t.C:
@@ -649,7 +851,11 @@ func (p *SessionPool) OpenStream(target string, first []byte) (*Stream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.OpenStream(target, first)
+	st, err := s.OpenStream(target, first)
+	if err == nil {
+		p.NoteDemand()
+	}
+	return st, err
 }
 
 // OpenDataStream opens a Multi-TCP BondedStream when the server advertises CmdBondCap
@@ -658,6 +864,7 @@ func (p *SessionPool) OpenDataStream(target string, first []byte) (DataStream, e
 	if !IsLowMemMode() && p.bondReady.Load() && p.bond != nil {
 		bondID := (uint64(p.poolEpoch) << 32) | uint64(p.nextBondSeq.Add(1))
 		if bs, err := p.bond.OpenStream(bondID, target, first); err == nil {
+			p.NoteDemand()
 			return bs, nil
 		}
 	}
@@ -670,7 +877,11 @@ func (p *SessionPool) OpenUDP() (*UDPStream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.OpenUDP()
+	u, err := s.OpenUDP()
+	if err == nil {
+		p.NoteDemand()
+	}
+	return u, err
 }
 
 // Stats returns aggregated metrics across all pooled sessions.

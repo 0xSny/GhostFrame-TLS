@@ -30,7 +30,7 @@ func main() {
 	}
 
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: kestrel-server <run|init|link|menu|upgrade|rollback|show-card|sni-test|version> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: kestrel-server <run|init|link|menu|upgrade|rollback|show-card|sni-test|reselect-sni|version> [flags]")
 		os.Exit(2)
 	}
 
@@ -66,6 +66,8 @@ func main() {
 		}
 	case "sni-test":
 		runSNITest(os.Args[2:])
+	case "reselect-sni":
+		runReselectSNI(os.Args[2:])
 	case "run":
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
 		conf := fs.String("config", tui.DefaultConfigPath, "config file")
@@ -190,11 +192,14 @@ func runInit(args []string) {
 
 	chosenSNI := strings.TrimSpace(*sniFlag)
 	if *autoSNI || chosenSNI == "" || chosenSNI == "auto" {
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		pick, _, serr := sni.AutoSelectSNI(ctx, pubHost)
+		ctx, cancel := context.WithTimeout(context.Background(), 9*time.Second)
+		pick, all, serr := sni.AutoSelectSNI(ctx, pubHost)
 		cancel()
 		if serr == nil && pick.Domain != "" {
 			chosenSNI = pick.Domain
+			q := sni.QualifiedSorted(all)
+			fmt.Fprintf(os.Stderr, "[auto-sni] selected nearest low-latency origin: %s (region=%s, rtt=%dms, qualified=%d/%d)\n",
+				pick.Domain, pick.Region, pick.HandshakeRTT.Milliseconds(), len(q), len(all))
 		}
 	}
 
@@ -240,7 +245,7 @@ func runSNITest(args []string) {
 		ip = sni.DetectSelfPublicIP(ctx)
 		cancel()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 9*time.Second)
 	results := sni.ProbeAll(ctx, nil, sni.ProbeOptions{SelfPublicIP: ip})
 	cancel()
 
@@ -260,4 +265,43 @@ func runSNITest(args []string) {
 		fmt.Printf("%-28s %-12s %4dms%-3s %-10s %s\n",
 			r.Domain, r.Region, r.HandshakeRTT.Milliseconds(), warn, r.Protocol, r.CertIssuer)
 	}
+}
+
+func runReselectSNI(args []string) {
+	fs := flag.NewFlagSet("reselect-sni", flag.ExitOnError)
+	conf := fs.String("config", tui.DefaultConfigPath, "config file")
+	sniOverride := fs.String("sni", "", "optional explicit SNI domain (auto-probes nearest lowest-latency origin if empty)")
+	_ = fs.Parse(args)
+
+	cfgPath := resolveServerConfigPath(*conf)
+	cfg, err := server.LoadConfig(cfgPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	oldSNI := cfg.SNI
+	if target := strings.TrimSpace(*sniOverride); target != "" {
+		if _, err := server.RotateSNI(cfgPath, target); err != nil {
+			log.Fatalf("rotate sni failed: %v", err)
+		}
+		fmt.Printf("[sni] updated SNI: %s -> %s (SPKI Pin preserved)\n", oldSNI, target)
+		return
+	}
+	selfIP := strings.TrimSpace(cfg.PublicHost)
+	if selfIP == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		selfIP = sni.DetectSelfPublicIP(ctx)
+		cancel()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 9*time.Second)
+	pick, all, err := sni.AutoSelectSNI(ctx, selfIP)
+	cancel()
+	if err != nil || pick.Domain == "" {
+		log.Fatalf("auto-sni probe failed: %v", err)
+	}
+	if _, err := server.RotateSNI(cfgPath, pick.Domain); err != nil {
+		log.Fatalf("rotate sni failed: %v", err)
+	}
+	q := sni.QualifiedSorted(all)
+	fmt.Printf("[auto-sni] updated SNI: %s -> %s (region=%s, rtt=%dms, qualified=%d/%d, SPKI Pin preserved)\n",
+		oldSNI, pick.Domain, pick.Region, pick.HandshakeRTT.Milliseconds(), len(q), len(all))
 }

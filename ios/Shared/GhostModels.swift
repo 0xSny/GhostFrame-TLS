@@ -302,6 +302,8 @@ struct GhostStatusSnapshot: Codable, Equatable {
     var nodeName: String
     var nodeHost: String
     var nodePort: Int
+    var sni: String
+    var sniRttMs: Int64
     var isTunnelExt: Bool
     var enableIPv6: Bool
     var lowMemMode: Bool
@@ -358,6 +360,8 @@ struct GhostStatusSnapshot: Codable, Equatable {
         nodeName = ""
         nodeHost = ""
         nodePort = 0
+        sni = ""
+        sniRttMs = 0
         isTunnelExt = false
         enableIPv6 = false
         lowMemMode = false
@@ -404,6 +408,8 @@ struct GhostStatusSnapshot: Codable, Equatable {
         case nodeName = "node_name"
         case nodeHost = "node_host"
         case nodePort = "node_port"
+        case sni = "sni"
+        case sniRttMs = "sni_rtt_ms"
         case isTunnelExt = "is_tunnel_ext"
         case enableIPv6 = "enable_ipv6"
         case lowMemMode = "low_mem_mode"
@@ -452,6 +458,8 @@ struct GhostStatusSnapshot: Codable, Equatable {
         nodeName = (try? c.decode(String.self, forKey: .nodeName)) ?? ""
         nodeHost = (try? c.decode(String.self, forKey: .nodeHost)) ?? ""
         nodePort = (try? c.decode(Int.self, forKey: .nodePort)) ?? 0
+        sni = (try? c.decode(String.self, forKey: .sni)) ?? ""
+        sniRttMs = (try? c.decode(Int64.self, forKey: .sniRttMs)) ?? 0
         isTunnelExt = (try? c.decode(Bool.self, forKey: .isTunnelExt)) ?? false
         enableIPv6 = (try? c.decode(Bool.self, forKey: .enableIPv6)) ?? false
         lowMemMode = (try? c.decode(Bool.self, forKey: .lowMemMode)) ?? false

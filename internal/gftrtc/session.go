@@ -2844,9 +2844,11 @@ func DialWithPacketConn(ctx context.Context, pc net.PacketConn, ownPC bool, radd
 	defer func() { _ = pc.SetReadDeadline(time.Time{}) }()
 
 	for attempt, wait := range retryWaits {
-		// Attempts 0, 1, 4 use v4.0 FastMAC tickets; attempts 2, 3 fallback to v3.4 tickets
-		// so clients seamlessly connect to un-upgraded v3.4 servers without degrading v4.0 servers.
-		useLegacyV3 := attempt == 2 || attempt == 3
+		// Attempts 0, 1, 4 use Stealth STUN (100% RFC 5389/8489 standard attributes, zero 0xC057);
+		// attempt 2 falls back to legacy v4.0-v4.2.1 0xC057+FastMAC for un-upgraded v4.x servers;
+		// attempt 3 falls back to v3.4 tickets for un-upgraded v3.4 servers.
+		useLegacyV4 := attempt == 2
+		useLegacyV3 := attempt == 3
 		var (
 			reqPkt  []byte
 			cliPriv *ecdh.PrivateKey
@@ -2855,6 +2857,8 @@ func DialWithPacketConn(ctx context.Context, pc net.PacketConn, ownPC bool, radd
 		)
 		if useLegacyV3 {
 			reqPkt, cliPriv, txID, err = BuildClientBindingReqLegacyV3(opts.PSK, opts.ClientID, rxMbps, 0, time.Now())
+		} else if useLegacyV4 {
+			reqPkt, cliPriv, txID, err = BuildClientBindingReqLegacyV4(opts.PSK, opts.ClientID, rxMbps, 0, time.Now())
 		} else {
 			reqPkt, cliPriv, txID, err = BuildClientBindingReq(opts.PSK, opts.ClientID, rxMbps, 0, time.Now())
 		}
@@ -2924,7 +2928,7 @@ type RTCListener struct {
 	pc         net.PacketConn
 	ownPC      bool
 	psk        []byte
-	paramsJSON []byte
+	paramsJSON atomic.Pointer[[]byte]
 	txMbps     int
 	guard      *ReplayGuard
 	shards     [numSSRCShards]ssrcShard
@@ -2935,6 +2939,26 @@ type RTCListener struct {
 	nextSSRC   atomic.Uint32
 }
 
+// SetParamsJSON atomically updates the params JSON sent in future STUN Binding Responses.
+func (l *RTCListener) SetParamsJSON(paramsJSON []byte) {
+	if l == nil {
+		return
+	}
+	var pjCopy []byte
+	if len(paramsJSON) > 0 {
+		pjCopy = make([]byte, len(paramsJSON))
+		copy(pjCopy, paramsJSON)
+	}
+	l.paramsJSON.Store(&pjCopy)
+}
+
+func (l *RTCListener) getParamsJSON() []byte {
+	if p := l.paramsJSON.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
 // NewListener starts accepting Kestrel-RTC connections on pc.
 func NewListener(pc net.PacketConn, ownPC bool, psk []byte, serverTxMbps int, paramsJSON []byte) (*RTCListener, error) {
 	if len(psk) < 16 {
@@ -2942,21 +2966,16 @@ func NewListener(pc net.PacketConn, ownPC bool, psk []byte, serverTxMbps int, pa
 	}
 	pskCopy := make([]byte, len(psk))
 	copy(pskCopy, psk)
-	var pjCopy []byte
-	if len(paramsJSON) > 0 {
-		pjCopy = make([]byte, len(paramsJSON))
-		copy(pjCopy, paramsJSON)
-	}
 	ln := &RTCListener{
-		pc:         pc,
-		ownPC:      ownPC,
-		psk:        pskCopy,
-		paramsJSON: pjCopy,
-		txMbps:     serverTxMbps,
-		guard:      NewReplayGuard(),
-		acceptCh:   make(chan *RTCSession, 256),
-		done:       make(chan struct{}),
+		pc:       pc,
+		ownPC:    ownPC,
+		psk:      pskCopy,
+		txMbps:   serverTxMbps,
+		guard:    NewReplayGuard(),
+		acceptCh: make(chan *RTCSession, 256),
+		done:     make(chan struct{}),
 	}
+	ln.SetParamsJSON(paramsJSON)
 	var seed [4]byte
 	_, _ = rand.Read(seed[:])
 	ln.nextSSRC.Store(binary.BigEndian.Uint32(seed[:]))
@@ -3163,13 +3182,14 @@ func (l *RTCListener) handleSTUNHandshake(pkt []byte, addr net.Addr) {
 	}
 
 	ssrc := l.allocSSRC()
-	respPkt, keys, err := BuildServerBindingResp(l.psk, req, addr, ssrc, uint16(targetMbps), 0, l.paramsJSON)
+	pj := l.getParamsJSON()
+	respPkt, keys, err := BuildServerBindingResp(l.psk, req, addr, ssrc, uint16(targetMbps), 0, pj)
 	if err != nil {
 		l.dropped.Add(1)
 		return
 	}
 
-	sess := newRTCSession(false, ssrc, req.ClientID, "", 0, keys, targetMbps, l.paramsJSON, l)
+	sess := newRTCSession(false, ssrc, req.ClientID, "", 0, keys, targetMbps, pj, l)
 	sess.applyPeerHandshakeFlags(req.ClientFlags)
 	sess.connMu.Lock()
 	sess.curConn = l.pc

@@ -117,3 +117,44 @@ func TestProbeFiltersCDNAndSelfIPAndSelectsTopK(t *testing.T) {
 		}
 	}
 }
+
+func TestSelectNearestLowestLatencyPrefersNearbyCluster(t *testing.T) {
+	results := []ProbeResult{
+		{Region: "EU", Domain: "ftp.fau.de", Qualified: true, HandshakeRTT: 145 * time.Millisecond},
+		{Region: "APAC-JP-KR", Domain: "ftp.jaist.ac.jp", Qualified: true, HandshakeRTT: 118 * time.Millisecond},
+		{Region: "NA", Domain: "mirrors.ocf.berkeley.edu", Qualified: true, HandshakeRTT: 9 * time.Millisecond},
+		{Region: "NA", Domain: "mirror.arizona.edu", Qualified: true, HandshakeRTT: 16 * time.Millisecond},
+		{Region: "NA", Domain: "mirrors.mit.edu", Qualified: true, HandshakeRTT: 62 * time.Millisecond},
+	}
+
+	for i := 0; i < 30; i++ {
+		pick, err := SelectNearestLowestLatency(results)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pick.Domain != "mirrors.ocf.berkeley.edu" && pick.Domain != "mirror.arizona.edu" {
+			t.Fatalf("expected nearby low-latency NA cluster (<=21ms), got %s (%v)", pick.Domain, pick.HandshakeRTT)
+		}
+	}
+
+	// Verify FlattenPool has 340+ verified entries and interleaves all regions round-robin.
+	pool := LoadPool("")
+	flat := FlattenPool(pool)
+	if len(flat) < 340 {
+		t.Fatalf("expected expanded pool to have >=340 candidates, got %d", len(flat))
+	}
+	if len(pool["NA-WEST"]) < 150 {
+		t.Fatalf("expected NA-WEST pool to have >=150 LA/SJ/US-West candidates, got %d", len(pool["NA-WEST"]))
+	}
+	seenFirstWave := make(map[string]bool)
+	for i := 0; i < len(OrderedRegions); i++ {
+		seenFirstWave[flat[i].Region] = true
+	}
+	if len(seenFirstWave) != len(OrderedRegions) {
+		t.Fatalf("expected first %d candidates to cover all regions round-robin, got %+v", len(OrderedRegions), flat[:len(OrderedRegions)])
+	}
+	sampled := SamplePerRegion(pool, 16)
+	if len(sampled) != len(OrderedRegions)*16 {
+		t.Fatalf("expected SamplePerRegion(16) to yield %d candidates, got %d", len(OrderedRegions)*16, len(sampled))
+	}
+}

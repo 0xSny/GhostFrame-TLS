@@ -145,6 +145,11 @@ type ApexScheduler struct {
 	tcpRetryBase     time.Duration
 	tcpCoolMin       time.Duration
 	tcpCoolMax       time.Duration
+	rtcElastic       bool
+	rtcMinSlots      int
+	rtcIdleShrinkDur time.Duration
+	rtcLastScaleAt   time.Time
+	rtcIdleSince     time.Time
 
 	upMbps   atomic.Int64
 	downMbps atomic.Int64
@@ -224,6 +229,9 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 		tcpRetryBase:     4 * time.Second,
 		tcpCoolMin:       5 * time.Minute,
 		tcpCoolMax:       15 * time.Minute,
+		rtcElastic:       true,
+		rtcMinSlots:      1,
+		rtcIdleShrinkDur: defaultIdleShrinkDur,
 		udpAssocs:        make(map[uint16]*SchedulerUDPAssoc),
 		tcpWakeCh:        make(chan struct{}, 1),
 		wakeHopCh:        make(chan struct{}, 1),
@@ -238,6 +246,7 @@ func NewApexScheduler(l *Link, ps *ParamStore, tcpPoolSize int, logf func(string
 		tcpPoolSize = 2
 	}
 	pool := NewSessionPool(schedLink, ps, tcpPoolSize, logf)
+	pool.SetElasticPolicy(MinPoolSize, defaultIdleShrinkDur)
 	pool.SetCooldownGuard(a.hasHealthyRTC)
 	pool.dialFn = func(dialCtx context.Context, dl *Link, dps *ParamStore, flags uint16, timeout time.Duration) (*Session, time.Duration, error) {
 		if err := tcpLim.Wait(dialCtx); err != nil {
@@ -274,9 +283,28 @@ func (a *ApexScheduler) SetHopTimingsForTest(minAge, maxAge, drainUDPIdle, tick 
 	if maxAge < 5*time.Second {
 		a.hopStagger = 0
 		a.idlePauseEnabled = false
+		a.rtcElastic = false
 	}
 	a.drainUDPIdle = drainUDPIdle
 	a.maintainTick = tick
+	a.mu.Unlock()
+}
+
+// SetElasticPolicyForTest configures on-demand pool/RTC elastic bounds and idle shrink timeouts in tests.
+func (a *ApexScheduler) SetElasticPolicyForTest(tcpMin, rtcMin int, idleShrink time.Duration) {
+	if a.pool != nil {
+		a.pool.SetElasticPolicy(tcpMin, idleShrink)
+	}
+	a.mu.Lock()
+	a.rtcElastic = true
+	if rtcMin < 1 {
+		rtcMin = 1
+	}
+	a.rtcMinSlots = rtcMin
+	if idleShrink <= 0 {
+		idleShrink = defaultIdleShrinkDur
+	}
+	a.rtcIdleShrinkDur = idleShrink
 	a.mu.Unlock()
 }
 
@@ -567,6 +595,20 @@ func (a *ApexScheduler) dialOneRTCSlotWithIndex(timeout time.Duration, channelId
 	}
 	port := PickHopPort(a.link)
 	poolN := a.rtcPoolTarget()
+	a.mu.Lock()
+	if a.rtcElastic {
+		eff := len(a.rtcSlots) + 1
+		if a.rtcMinSlots > eff {
+			eff = a.rtcMinSlots
+		}
+		if eff < poolN {
+			poolN = eff
+		}
+	}
+	a.mu.Unlock()
+	if poolN < 1 {
+		poolN = 1
+	}
 	scaledLink := *a.link
 	scaledLink.UpMbps = SplitBandwidthMbps(int(a.upMbps.Load()), poolN)
 	scaledLink.DownMbps = SplitBandwidthMbps(int(a.downMbps.Load()), poolN)
@@ -617,6 +659,11 @@ func (a *ApexScheduler) dialOneRTCSlotWithIndex(timeout time.Duration, channelId
 
 func (a *ApexScheduler) dialRTCNow(timeout time.Duration) error {
 	target := a.rtcPoolTarget()
+	a.mu.Lock()
+	if a.rtcElastic && a.rtcMinSlots > 0 && a.rtcMinSlots < target {
+		target = a.rtcMinSlots
+	}
+	a.mu.Unlock()
 	if target <= 1 {
 		target = 1
 	}
@@ -689,6 +736,29 @@ func (a *ApexScheduler) OnSystemWake() {
 	a.wakeTCPTrack()
 }
 
+func (a *ApexScheduler) isRTCIdle() bool {
+	a.udpMu.Lock()
+	udpN := len(a.udpAssocs)
+	a.udpMu.Unlock()
+	if udpN > 0 {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.rtcElastic {
+		return false
+	}
+	for _, sl := range a.rtcSlots {
+		if sl == nil || sl.sess == nil {
+			continue
+		}
+		if sl.sess.NumStreams() > 0 || sl.sess.Recent30sBytesPerSec() > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func (a *ApexScheduler) rtcMaintainLoop() {
 	defer a.wg.Done()
 	a.mu.Lock()
@@ -698,9 +768,23 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 		tickDur = 2 * time.Second
 	}
 	t := time.NewTicker(tickDur)
-	pingTicker := time.NewTicker(10 * time.Second)
+	pingTimer := time.NewTimer(10 * time.Second)
 	defer t.Stop()
-	defer pingTicker.Stop()
+	defer pingTimer.Stop()
+
+	resetPingTimer := func() {
+		wait := 10 * time.Second
+		if a.isRTCIdle() {
+			wait = time.Duration(randRange(30000, 55000)) * time.Millisecond
+		}
+		if !pingTimer.Stop() {
+			select {
+			case <-pingTimer.C:
+			default:
+			}
+		}
+		pingTimer.Reset(wait)
+	}
 
 	backoff := 2 * time.Second
 	for {
@@ -711,10 +795,12 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 			if a.handleEmergencyProbeAndHop(1500*time.Millisecond, true) {
 				a.reapAndTopUpSlots(&backoff)
 			}
-		case <-pingTicker.C:
+			resetPingTimer()
+		case <-pingTimer.C:
 			if a.handleEmergencyProbeAndHop(3*time.Second, false) {
 				a.reapAndTopUpSlots(&backoff)
 			}
+			resetPingTimer()
 		case <-t.C:
 			a.reapAndTopUpSlots(&backoff)
 		}
@@ -723,16 +809,22 @@ func (a *ApexScheduler) rtcMaintainLoop() {
 
 func (a *ApexScheduler) reapAndTopUpSlots(backoff *time.Duration) {
 	now := time.Now()
-	target := a.rtcPoolTarget()
+	maxTarget := a.rtcPoolTarget()
 	_, _, hasHop := a.link.ParseHopRange()
+
+	a.udpMu.Lock()
+	udpAssocCount := len(a.udpAssocs)
+	a.udpMu.Unlock()
 
 	a.mu.Lock()
 	var keepSlots []*rtcSlot
 	var dueHop []*rtcSlot
-	hasCh := make(map[int]bool, target)
+	hasCh := make(map[int]bool, maxTarget)
 	idlePause := a.idlePauseEnabled
 	idleThresh := a.idleRateThresh
 	bytesQuota := a.hopBytesQuota
+	activeStreams := 0
+	var totalRecentBps uint64
 	for _, sl := range a.rtcSlots {
 		select {
 		case <-sl.sess.Done():
@@ -743,8 +835,11 @@ func (a *ApexScheduler) reapAndTopUpSlots(backoff *time.Duration) {
 			a.retiredHops += st.HopCount
 			a.retiredRekey += st.RekeyCount
 		default:
+			st := sl.sess.Stats()
+			recentBps := sl.sess.Recent30sBytesPerSec()
+			activeStreams += sl.sess.NumStreams()
+			totalRecentBps += recentBps
 			if hasHop {
-				st := sl.sess.Stats()
 				totalTraffic := st.UpBytes + st.DownBytes
 				var bytesDelta uint64
 				if totalTraffic > sl.lastHopBytes {
@@ -753,7 +848,7 @@ func (a *ApexScheduler) reapAndTopUpSlots(backoff *time.Duration) {
 				if bytesQuota > 0 && bytesDelta >= bytesQuota {
 					dueHop = append(dueHop, sl)
 				} else if now.Sub(sl.lastHopAt) >= sl.maxAge {
-					if !idlePause || sl.sess.Recent30sBytesPerSec() >= idleThresh {
+					if !idlePause || recentBps >= idleThresh {
 						dueHop = append(dueHop, sl)
 					}
 				}
@@ -764,11 +859,75 @@ func (a *ApexScheduler) reapAndTopUpSlots(backoff *time.Duration) {
 			keepSlots = append(keepSlots, sl)
 		}
 	}
+
+	target := maxTarget
+	var shrunkSlot *rtcSlot
+	if a.rtcElastic {
+		minSlots := a.rtcMinSlots
+		if minSlots < 1 {
+			minSlots = 1
+		}
+		if minSlots > maxTarget {
+			minSlots = maxTarget
+		}
+		if len(keepSlots) < minSlots {
+			target = minSlots
+			a.rtcIdleSince = time.Time{}
+		} else if len(keepSlots) < maxTarget {
+			if (activeStreams >= len(keepSlots)*scaleStreamsPerConn || udpAssocCount >= 4 || totalRecentBps >= scaleRateBytesPerSec) &&
+				now.Sub(a.rtcLastScaleAt) >= scaleUpCooldown {
+				target = len(keepSlots) + 1
+				a.rtcLastScaleAt = now
+				a.rtcIdleSince = time.Time{}
+			} else {
+				target = len(keepSlots)
+			}
+		} else {
+			// At or above maxTarget: shrink back to minSlots when completely idle.
+			if len(keepSlots) > minSlots && activeStreams == 0 && udpAssocCount == 0 && totalRecentBps < shrinkRateBytesPerSec {
+				if a.rtcIdleSince.IsZero() {
+					a.rtcIdleSince = now
+				} else if now.Sub(a.rtcIdleSince) >= a.rtcIdleShrinkDur {
+					// Retire the highest-index extra slot cleanly.
+					rmIdx := len(keepSlots) - 1
+					for i := range keepSlots {
+						if keepSlots[i].channelIdx > keepSlots[rmIdx].channelIdx {
+							rmIdx = i
+						}
+					}
+					shrunkSlot = keepSlots[rmIdx]
+					keepSlots = append(keepSlots[:rmIdx], keepSlots[rmIdx+1:]...)
+					delete(hasCh, shrunkSlot.channelIdx)
+					st := shrunkSlot.sess.Stats()
+					a.retiredRUp += st.UpBytes
+					a.retiredRDown += st.DownBytes
+					a.retiredFEC += st.FECRecovered
+					a.retiredHops += st.HopCount
+					a.retiredRekey += st.RekeyCount
+					a.rtcIdleSince = time.Time{}
+					if a.onLog != nil {
+						a.onLog("[RTC#%d] Idle shrink: closing extra UDP channel (active=%d, floor=%d)", shrunkSlot.channelIdx, len(keepSlots), minSlots)
+					}
+				}
+			} else {
+				a.rtcIdleSince = time.Time{}
+			}
+			target = len(keepSlots)
+		}
+	}
+
 	a.rtcSlots = keepSlots
 	missing := target - len(keepSlots)
 	hopFn := a.rtcHopFn
 	allRTCDown := len(keepSlots) == 0
 	a.mu.Unlock()
+
+	if shrunkSlot != nil {
+		shrunkSlot.sess.Close()
+		if up := int(a.upMbps.Load()); up > 0 {
+			a.UpdateBandwidth(up, int(a.downMbps.Load()))
+		}
+	}
 
 	if allRTCDown {
 		a.wakeTCPTrack()

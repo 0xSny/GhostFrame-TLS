@@ -13,8 +13,9 @@ type Params struct {
 	PadMin  int `json:"pmin"`  // min small-packet perturbation padding (0..64)
 	PadMax  int `json:"pmax"`  // max small-packet perturbation padding (0..512)
 	PadProb int `json:"pprob"` // probability % for small-packet perturbation after frame 8 (0..100)
-	HbMinMs int `json:"hbmin"` // min idle-aware noise heartbeat interval (ms)
-	HbMaxMs int `json:"hbmax"` // max idle-aware noise heartbeat interval (ms)
+	HbMinMs  int   `json:"hbmin"`                // min idle-aware noise heartbeat interval (ms)
+	HbMaxMs  int   `json:"hbmax"`                // max idle-aware noise heartbeat interval (ms)
+	SNIRTTMs int64 `json:"sni_rtt_ms,omitempty"` // server-measured TCP RTT (ms) from VPS to camouflage SNI origin
 }
 
 // DefaultParams returns the v2 production defaults.

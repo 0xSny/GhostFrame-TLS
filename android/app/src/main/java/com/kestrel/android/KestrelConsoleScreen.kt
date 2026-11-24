@@ -651,6 +651,18 @@ private fun ConsoleTabContent(
                 MetricTile("活跃连接/流", "${state.status.activeConns} / ${state.status.activeStreams}", KestrelPalette.TextPrimary, Modifier.weight(1f))
                 MetricTile("Go 堆内存", memText, KestrelPalette.TextPrimary, Modifier.weight(1f))
             }
+            if (state.status.sni.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                val sniRtt = state.status.sniRttMs
+                val sniVal = if (sniRtt > 0) "${state.status.sni} (${sniRtt} ms)" else state.status.sni
+                val sniColor = when {
+                    sniRtt <= 0 -> KestrelPalette.TextPrimary
+                    sniRtt <= 20 -> KestrelPalette.Emerald
+                    sniRtt <= 50 -> KestrelPalette.Amber
+                    else -> KestrelPalette.Crimson
+                }
+                MetricTile("伪装 SNI · 距节点延迟", sniVal, sniColor, Modifier.fillMaxWidth())
+            }
         }
     }
 }

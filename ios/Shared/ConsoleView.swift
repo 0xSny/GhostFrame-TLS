@@ -457,6 +457,15 @@ struct ConsoleView: View {
                 subtitle: viewModel.status.lowMemMode ? "LowMem 守护中" : "标准模式",
                 accent: viewModel.status.memAllocMB > 40.0 ? KestrelPalette.crimson : KestrelPalette.textPrimary
             )
+            if !viewModel.status.sni.isEmpty {
+                let sniMs = viewModel.status.sniRttMs
+                telemetryTile(
+                    title: "伪装 SNI · 距节点延迟",
+                    value: sniMs > 0 ? "\(sniMs) ms" : "--",
+                    subtitle: viewModel.status.sni,
+                    accent: sniMs <= 0 ? KestrelPalette.textPrimary : (sniMs <= 20 ? KestrelPalette.emerald : (sniMs <= 50 ? KestrelPalette.amber : KestrelPalette.crimson))
+                )
+            }
         }
     }
 

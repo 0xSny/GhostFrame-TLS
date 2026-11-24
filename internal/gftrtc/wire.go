@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -58,13 +59,15 @@ const (
 	stunTypeBindingReq   = uint16(0x0001)
 	stunTypeBindingResp  = uint16(0x0101)
 	stunTypeBindingInd   = uint16(0x0011)
-	stunFingerprintXOR   = uint32(0x5354554E)
-	attrUsername         = uint16(0x0006)
-	attrXorMappedAddr    = uint16(0x0020)
-	attrPriority         = uint16(0x0024)
-	attrFingerprint      = uint16(0x8028)
-	attrIceControlling   = uint16(0x802A)
-	attrKSLTicket        = uint16(0xC057)
+	stunFingerprintXOR     = uint32(0x5354554E)
+	attrUsername           = uint16(0x0006)
+	attrNonce              = uint16(0x0015)
+	attrMsgIntegritySHA256 = uint16(0x001C)
+	attrXorMappedAddr      = uint16(0x0020)
+	attrPriority           = uint16(0x0024)
+	attrFingerprint        = uint16(0x8028)
+	attrIceControlling     = uint16(0x802A)
+	attrKSLTicket          = uint16(0xC057) // Legacy v3.4-v4.2.1 fallback only
 	stunTicketMagic      = "GRTC"
 	stunSkewSec          = int64(90)
 	stunReplayWindowSec  = int64(180)
@@ -378,6 +381,8 @@ func computeFastMACZeroAlloc(psk, stunHdr, ticketBody []byte) ([FastMACLen]byte,
 
 // PreScreenClientBindingReq validates STUN header, CRC32 FINGERPRINT, and 16-byte FastMAC
 // in constant time with zero heap allocations before any X25519 or AEAD allocation occurs.
+// Supports both standard-attribute Stealth STUN (USERNAME + MESSAGE-INTEGRITY-SHA256)
+// and legacy v4.0-v4.2.1 0xC057 packets for rolling upgrades.
 func PreScreenClientBindingReq(pkt, psk []byte) bool {
 	if len(psk) < 16 || len(pkt) < MinClientSTUNReqLen || len(pkt) > MaxUDPPayload {
 		return false
@@ -386,6 +391,17 @@ func PreScreenClientBindingReq(pkt, psk []byte) bool {
 	if !ok {
 		return false
 	}
+	// Primary path: RFC 5389/8489 standard USERNAME (0x0006) + MESSAGE-INTEGRITY-SHA256 (0x001C).
+	if uVal, okU := findSTUNAttr(attrs, attrUsername); okU && len(uVal) >= 97 && len(uVal) <= maxFastMACBody {
+		if macVal, okM := findSTUNAttr(attrs, attrMsgIntegritySHA256); okM && len(macVal) == FastMACLen {
+			wantMAC, ok := computeFastMACZeroAlloc(psk, pkt[:stunHeaderLen], uVal)
+			if ok && subtle.ConstantTimeCompare(wantMAC[:], macVal) == 1 {
+				return true
+			}
+			return false
+		}
+	}
+	// Legacy compatibility path: v4.0-v4.2.1 0xC057 ticket with trailing FastMAC.
 	ticket, ok := findSTUNAttr(attrs, attrKSLTicket)
 	if !ok || len(ticket) < 32+24+chacha20poly1305.Overhead+FastMACLen {
 		return false
@@ -622,9 +638,65 @@ func randomICEUser() string {
 	return string(b[:])
 }
 
-// BuildClientBindingReq builds an RFC 5389 ICE-STUN Binding Request carrying an
-// encrypted ephemeral X25519 + PSK auth ticket with 16-byte FastMAC anti-DoS tag inside 0xC057.
+func encodeStealthICEUsername(ticketBody []byte) []byte {
+	b64Len := base64.RawStdEncoding.EncodedLen(len(ticketBody))
+	tmp := make([]byte, b64Len)
+	base64.RawStdEncoding.Encode(tmp, ticketBody)
+	// Insert ':' at an ICE ufrag boundary (4..16 chars) so USERNAME is 100% RFC 8445 compliant.
+	split := 4 + mrand.IntN(13)
+	if split >= b64Len-4 {
+		split = b64Len / 2
+	}
+	out := make([]byte, b64Len+1)
+	copy(out[:split], tmp[:split])
+	out[split] = ':'
+	copy(out[split+1:], tmp[split:])
+	return out
+}
+
+func decodeStealthICEUsername(val []byte, dst []byte) ([]byte, bool) {
+	if len(val) < 9 || len(val) > maxFastMACBody {
+		return nil, false
+	}
+	var b64Buf [maxFastMACBody]byte
+	colonSeen := false
+	n := 0
+	for i := 0; i < len(val); i++ {
+		if val[i] == ':' {
+			if colonSeen {
+				return nil, false
+			}
+			colonSeen = true
+			continue
+		}
+		b64Buf[n] = val[i]
+		n++
+	}
+	if !colonSeen || n == 0 {
+		return nil, false
+	}
+	decLen := base64.RawStdEncoding.DecodedLen(n)
+	if decLen > len(dst) {
+		return nil, false
+	}
+	written, err := base64.RawStdEncoding.Decode(dst, b64Buf[:n])
+	if err != nil {
+		return nil, false
+	}
+	return dst[:written], true
+}
+
+// BuildClientBindingReq builds a 100% RFC 5389 / RFC 8489 standard ICE-STUN Binding Request
+// with zero private attributes (no 0xC057): the encrypted X25519 + PSK auth ticket is encoded
+// as an RFC 8445 ICE USERNAME (0x0006) and authenticated by a 16-byte FastMAC inside
+// MESSAGE-INTEGRITY-SHA256 (0x001C).
 func BuildClientBindingReq(psk []byte, clientID [8]byte, maxRxMbps, flags uint16, now time.Time) ([]byte, *ecdh.PrivateKey, [12]byte, error) {
+	return buildClientBindingReqStealth(psk, clientID, maxRxMbps, flags, now)
+}
+
+// BuildClientBindingReqLegacyV4 builds the legacy v4.0-v4.2.1 STUN Binding Request carrying
+// attribute 0xC057 with trailing 16-byte FastMAC for seamless connection to un-upgraded v4.x servers.
+func BuildClientBindingReqLegacyV4(psk []byte, clientID [8]byte, maxRxMbps, flags uint16, now time.Time) ([]byte, *ecdh.PrivateKey, [12]byte, error) {
 	return buildClientBindingReqInternal(psk, clientID, maxRxMbps, flags, now, true)
 }
 
@@ -632,6 +704,79 @@ func BuildClientBindingReq(psk []byte, clientID [8]byte, maxRxMbps, flags uint16
 // 16-byte FastMAC in attribute 0xC057) for backward compatibility with un-upgraded v3.4 servers.
 func BuildClientBindingReqLegacyV3(psk []byte, clientID [8]byte, maxRxMbps, flags uint16, now time.Time) ([]byte, *ecdh.PrivateKey, [12]byte, error) {
 	return buildClientBindingReqInternal(psk, clientID, maxRxMbps, flags, now, false)
+}
+
+func buildClientBindingReqStealth(psk []byte, clientID [8]byte, maxRxMbps, flags uint16, now time.Time) ([]byte, *ecdh.PrivateKey, [12]byte, error) {
+	var txID [12]byte
+	if len(psk) < 16 {
+		return nil, nil, txID, errors.New("gftrtc: invalid psk length")
+	}
+	if _, err := io.ReadFull(rand.Reader, txID[:]); err != nil {
+		return nil, nil, txID, err
+	}
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, txID, err
+	}
+	pub := priv.PublicKey().Bytes()
+
+	aead, err := hkdfAEADChaCha(psk, txID[:], "gftrtc-v1-c2s")
+	if err != nil {
+		return nil, nil, txID, err
+	}
+
+	flags |= FlagFlowAcctV2
+	if IsLowMemMode() {
+		flags |= FlagLowMemSession
+	}
+	if PrioritizeChaCha20() {
+		flags |= FlagPreferChaCha20
+	}
+	// Compact 4..20B random padding keeps total wire length in [176..196]B (meets MinClientSTUNReqLen anti-amplification).
+	padLen := 4 + mrand.IntN(17)
+	pt := make([]byte, 24+padLen)
+	copy(pt[0:4], stunTicketMagic)
+	binary.BigEndian.PutUint64(pt[4:12], uint64(now.Unix()))
+	copy(pt[12:20], clientID[:])
+	binary.BigEndian.PutUint16(pt[20:22], maxRxMbps)
+	binary.BigEndian.PutUint16(pt[22:24], flags)
+	fillFastRandom(pt[24:])
+
+	ticketBody := make([]byte, 32+len(pt)+aead.Overhead())
+	copy(ticketBody, pub)
+	aead.Seal(ticketBody[:32], txID[:], pt, pub)
+
+	userVal := encodeStealthICEUsername(ticketBody)
+
+	buf := make([]byte, 0, 224)
+	buf = binary.BigEndian.AppendUint16(buf, stunTypeBindingReq)
+	buf = binary.BigEndian.AppendUint16(buf, 0)
+	buf = binary.BigEndian.AppendUint32(buf, stunMagicCookie)
+	buf = append(buf, txID[:]...)
+
+	buf = appendSTUNAttr(buf, attrUsername, userVal)
+	var iceCtrl [8]byte
+	fillFastRandom(iceCtrl[:])
+	buf = appendSTUNAttr(buf, attrIceControlling, iceCtrl[:])
+	var prio [4]byte
+	binary.BigEndian.PutUint32(prio[:], 0x6E001EFF)
+	buf = appendSTUNAttr(buf, attrPriority, prio[:])
+
+	// Reserve MESSAGE-INTEGRITY-SHA256 (0x001C, 16B) and compute FastMAC over final header + USERNAME.
+	macValOff := len(buf) + 4
+	var zeroMAC [FastMACLen]byte
+	buf = appendSTUNAttr(buf, attrMsgIntegritySHA256, zeroMAC[:])
+
+	finalMsgLen := len(buf) + 8 - stunHeaderLen
+	binary.BigEndian.PutUint16(buf[2:4], uint16(finalMsgLen))
+	mac, ok := computeFastMACZeroAlloc(psk, buf[:stunHeaderLen], userVal)
+	if !ok {
+		return nil, nil, txID, errors.New("gftrtc: compute fastmac failed")
+	}
+	copy(buf[macValOff:macValOff+FastMACLen], mac[:])
+
+	buf = finalizeSTUNWithFingerprint(buf)
+	return buf, priv, txID, nil
 }
 
 func buildClientBindingReqInternal(psk []byte, clientID [8]byte, maxRxMbps, flags uint16, now time.Time, includeFastMAC bool) ([]byte, *ecdh.PrivateKey, [12]byte, error) {
@@ -721,6 +866,7 @@ type ParsedClientReq struct {
 	ClientRxMbps uint16
 	ClientFlags  uint16
 	WireLen      int
+	StealthSTUN  bool // true when client used standard RFC 5389/8489 attributes (no 0xC057)
 }
 
 // ParseClientBindingReq validates FastMAC, CRC32 fingerprint, ChaCha20 auth ticket, time skew (±90s), and replay cache.
@@ -732,11 +878,27 @@ func ParseClientBindingReq(pkt, psk []byte, guard *ReplayGuard, now time.Time) (
 	if !ok {
 		return nil, false
 	}
-	ticket, ok := findSTUNAttr(attrs, attrKSLTicket)
-	if !ok || len(ticket) < 32+24+chacha20poly1305.Overhead+FastMACLen {
-		return nil, false
+	var ticketBody []byte
+	var rawBuf [maxFastMACBody]byte
+	stealth := false
+
+	if uVal, okU := findSTUNAttr(attrs, attrUsername); okU {
+		if macVal, okM := findSTUNAttr(attrs, attrMsgIntegritySHA256); okM && len(macVal) == FastMACLen {
+			decoded, okDec := decodeStealthICEUsername(uVal, rawBuf[:])
+			if !okDec || len(decoded) < 32+24+chacha20poly1305.Overhead {
+				return nil, false
+			}
+			ticketBody = decoded
+			stealth = true
+		}
 	}
-	ticketBody := ticket[:len(ticket)-FastMACLen]
+	if !stealth {
+		ticket, okT := findSTUNAttr(attrs, attrKSLTicket)
+		if !okT || len(ticket) < 32+24+chacha20poly1305.Overhead+FastMACLen {
+			return nil, false
+		}
+		ticketBody = ticket[:len(ticket)-FastMACLen]
+	}
 	pubBytes := ticketBody[:32]
 	aead, err := hkdfAEADChaCha(psk, txID[:], "gftrtc-v1-c2s")
 	if err != nil {
@@ -771,6 +933,7 @@ func ParseClientBindingReq(pkt, psk []byte, guard *ReplayGuard, now time.Time) (
 		ClientRxMbps: binary.BigEndian.Uint16(pt[20:22]),
 		ClientFlags:  binary.BigEndian.Uint16(pt[22:24]),
 		WireLen:      len(pkt),
+		StealthSTUN:  stealth,
 	}
 	copy(res.ClientID[:], pt[12:20])
 	return res, true
@@ -854,16 +1017,33 @@ func BuildServerBindingResp(psk []byte, req *ParsedClientReq, clientAddr net.Add
 	buf = appendSTUNAttr(buf, attrXorMappedAddr, encodeXorMappedAddr(clientAddr, req.TxID))
 
 	padLen := 16 + mrand.IntN(33)
+	if req.StealthSTUN {
+		padLen = 8 + mrand.IntN(21)
+	}
 	if req.WireLen > 0 {
-		baseWithoutPad := len(buf) + 4 + 32 + 10 + len(paramsJSON) + ackAEAD.Overhead() + 8
-		// Account for up to 3B STUN 4-byte padding on attrKSLTicket.
 		maxTotal := 2 * req.WireLen
-		if baseWithoutPad+padLen+3 > maxTotal {
-			avail := maxTotal - baseWithoutPad - 3
-			if avail < 0 {
-				avail = 0
+		if req.StealthSTUN {
+			// Compute max raw padding such that base64-encoded NONCE (0x0015) + 4B padding stays <= 2*WireLen.
+			rawBase := 32 + 10 + len(paramsJSON) + ackAEAD.Overhead()
+			fixedOverhead := len(buf) + 4 + 8 // attr header + FINGERPRINT
+			for padLen > 0 {
+				encLen := base64.RawStdEncoding.EncodedLen(rawBase + padLen)
+				paddedEnc := (encLen + 3) &^ 3
+				if fixedOverhead+paddedEnc <= maxTotal {
+					break
+				}
+				padLen--
 			}
-			padLen = avail
+		} else {
+			baseWithoutPad := len(buf) + 4 + 32 + 10 + len(paramsJSON) + ackAEAD.Overhead() + 8
+			// Account for up to 3B STUN 4-byte padding on attrKSLTicket.
+			if baseWithoutPad+padLen+3 > maxTotal {
+				avail := maxTotal - baseWithoutPad - 3
+				if avail < 0 {
+					avail = 0
+				}
+				padLen = avail
+			}
 		}
 	}
 	pt := make([]byte, 10+len(paramsJSON)+padLen)
@@ -879,7 +1059,13 @@ func BuildServerBindingResp(psk []byte, req *ParsedClientReq, clientAddr net.Add
 	copy(ticket, srvPub)
 	ticket = ackAEAD.Seal(ticket, req.TxID[:], pt, srvPub)
 
-	buf = appendSTUNAttr(buf, attrKSLTicket, ticket)
+	if req.StealthSTUN {
+		nonceVal := make([]byte, base64.RawStdEncoding.EncodedLen(len(ticket)))
+		base64.RawStdEncoding.Encode(nonceVal, ticket)
+		buf = appendSTUNAttr(buf, attrNonce, nonceVal)
+	} else {
+		buf = appendSTUNAttr(buf, attrKSLTicket, ticket)
+	}
 	buf = finalizeSTUNWithFingerprint(buf)
 	if req.WireLen > 0 && len(buf) > 2*req.WireLen {
 		return nil, nil, fmt.Errorf("gftrtc: server binding resp %dB exceeds 2x amplification ceiling %dB", len(buf), 2*req.WireLen)
@@ -904,8 +1090,20 @@ func ParseServerBindingResp(pkt, psk []byte, cliPriv *ecdh.PrivateKey, expectedT
 	if !ok || txID != expectedTxID {
 		return nil, nil, false
 	}
-	ticket, ok := findSTUNAttr(attrs, attrKSLTicket)
-	if !ok || len(ticket) < 32+10+chacha20poly1305.Overhead {
+	var ticket []byte
+	if nonceVal, okN := findSTUNAttr(attrs, attrNonce); okN && len(nonceVal) > 0 {
+		dec := make([]byte, base64.RawStdEncoding.DecodedLen(len(nonceVal)))
+		n, err := base64.RawStdEncoding.Decode(dec, nonceVal)
+		if err != nil {
+			return nil, nil, false
+		}
+		ticket = dec[:n]
+	} else if legTicket, okL := findSTUNAttr(attrs, attrKSLTicket); okL {
+		ticket = legTicket
+	} else {
+		return nil, nil, false
+	}
+	if len(ticket) < 32+10+chacha20poly1305.Overhead {
 		return nil, nil, false
 	}
 	srvPubBytes := ticket[:32]

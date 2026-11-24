@@ -765,6 +765,7 @@ tr.alert-row { background: #FFFBEB; }
               <span id="heroHostPort" class="mono num">未选择节点</span>
               <span id="heroHopRange" class="num"></span>
               <span id="heroVerify"></span>
+              <span id="heroSNI" class="mono num"></span>
             </div>
           </div>
           <div class="hero-actions">
@@ -1347,6 +1348,18 @@ function renderStatus(st) {
   $("heroHostPort").textContent = st.node_host ? `${st.node_host}:${st.node_port}` : "请先在「节点管理」中导入节点";
   $("heroHopRange").textContent = st.hop_range ? `Hop ${st.hop_range}` : "";
   $("heroVerify").textContent = st.verify_mode ? `Verify ${st.verify_mode}` : "";
+  const heroSNI = $("heroSNI");
+  if (heroSNI) {
+    const sniName = st.sni || "";
+    const sniRtt = Number(st.sni_rtt_ms) || 0;
+    if (sniName) {
+      heroSNI.textContent = sniRtt > 0 ? `SNI ${sniName} (${sniRtt}ms)` : `SNI ${sniName}`;
+      heroSNI.style.color = sniRtt > 0 ? (sniRtt <= 20 ? "var(--green, #16a34a)" : (sniRtt <= 50 ? "var(--amber, #d97706)" : "var(--red, #dc2626)")) : "";
+    } else {
+      heroSNI.textContent = "";
+      heroSNI.style.color = "";
+    }
+  }
 
   const btnMain = $("btnMainConnect");
   if (isBusy) {

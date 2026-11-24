@@ -19,8 +19,10 @@ import (
 )
 
 const (
-	defaultConcurrency = 6
-	defaultTotalBudget = 3 * time.Second
+	defaultConcurrency      = 32
+	defaultTotalBudget      = 7 * time.Second
+	perOriginTimeout        = 2200 * time.Millisecond
+	defaultSamplePerRegion  = 16
 )
 
 var cdnKeywords = []string{
@@ -29,6 +31,13 @@ var cdnKeywords = []string{
 	"akamai",
 	"cloudfront",
 	"imperva",
+	"incapsula",
+	"sucuri",
+	"keycdn",
+	"bunnycdn",
+	"edgecast",
+	"cdn77",
+	"gcore",
 }
 
 // ProbeResult captures all 4 hygiene & latency checks for one SNI candidate.
@@ -180,6 +189,9 @@ func detectCDN(issuer, subject string, sans []string, hdrs http.Header) string {
 
 func observeLiveOrigin(ctx context.Context, domain string) ProbeObservation {
 	var obs ProbeObservation
+	subCtx, cancel := context.WithTimeout(ctx, perOriginTimeout)
+	defer cancel()
+	ctx = subCtx
 	r := &net.Resolver{PreferGo: true}
 	ipAddrs, err := r.LookupIPAddr(ctx, domain)
 	if err != nil {
@@ -271,10 +283,11 @@ func issuerLabel(cn string, org []string) string {
 	return cn
 }
 
-// ProbeAll concurrently probes candidate origins across all regions (max 6 workers, 3s total budget).
+// ProbeAll concurrently probes candidate origins across all regions (max 32 workers, 7s total budget).
+// When candidates is empty, samples up to 16 random origins per region (80 total) for fast full-geography coverage.
 func ProbeAll(ctx context.Context, candidates []Candidate, opts ProbeOptions) []ProbeResult {
 	if len(candidates) == 0 {
-		candidates = FlattenPool(LoadPool(opts.ExtraPath))
+		candidates = SamplePerRegion(LoadPool(opts.ExtraPath), defaultSamplePerRegion)
 	}
 	conc := opts.Concurrency
 	if conc <= 0 {
@@ -343,10 +356,45 @@ func SelectTopKRandom(results []ProbeResult, k int) (ProbeResult, error) {
 	return sorted[int(idxBig.Int64())], nil
 }
 
-// AutoSelectSNI runs concurrent pool probing and returns a Top-5 randomized non-CDN domain.
+// SelectNearestLowestLatency picks a qualified non-CDN TLS 1.3 + H2 origin from the tight
+// nearby-latency cluster around the fastest reachable origin (within max(best*1.5, best+12ms),
+// capped at best+25ms, up to Top-3), so every VPS automatically chooses a geographically close
+// low-latency mirror while retaining mild diversity among equally fast local mirrors.
+func SelectNearestLowestLatency(results []ProbeResult) (ProbeResult, error) {
+	sorted := QualifiedSorted(results)
+	if len(sorted) == 0 {
+		return ProbeResult{}, errors.New("no qualified non-CDN TLS 1.3 + H2 SNI candidates reachable")
+	}
+	best := sorted[0].HandshakeRTT
+	cutoff := best + 12*time.Millisecond
+	if scaled := (best * 3) / 2; scaled > cutoff {
+		cutoff = scaled
+	}
+	if maxCutoff := best + 25*time.Millisecond; cutoff > maxCutoff {
+		cutoff = maxCutoff
+	}
+	limit := 1
+	for i := 1; i < len(sorted) && i < 3; i++ {
+		if sorted[i].HandshakeRTT <= cutoff {
+			limit = i + 1
+		} else {
+			break
+		}
+	}
+	if limit <= 1 {
+		return sorted[0], nil
+	}
+	idxBig, err := rand.Int(rand.Reader, big.NewInt(int64(limit)))
+	if err != nil {
+		return sorted[0], nil
+	}
+	return sorted[int(idxBig.Int64())], nil
+}
+
+// AutoSelectSNI runs full-region concurrent pool probing and returns a nearest lowest-latency non-CDN domain.
 func AutoSelectSNI(ctx context.Context, selfPublicIP string) (ProbeResult, []ProbeResult, error) {
 	all := ProbeAll(ctx, nil, ProbeOptions{SelfPublicIP: selfPublicIP})
-	pick, err := SelectTopKRandom(all, 5)
+	pick, err := SelectNearestLowestLatency(all)
 	return pick, all, err
 }
 

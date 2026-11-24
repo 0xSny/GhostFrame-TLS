@@ -785,6 +785,7 @@ func TestDialLegacyV3Fallback(t *testing.T) {
 			}
 			ticket, ok := findSTUNAttr(attrs, attrKSLTicket)
 			if !ok || len(ticket) < 32 {
+				v3RejectedFastMAC.Add(1)
 				PutPktBuf(deferPut)
 				continue
 			}
@@ -1532,5 +1533,80 @@ func TestLowMemLossyServerPushClientAbort100LoopsWindowConservation(t *testing.T
 	if cli.txQueuedBytes.Load() != cli.txStreamBytes.Load() || srv.txQueuedBytes.Load() != srv.txStreamBytes.Load() {
 		t.Fatalf("txQueued leak detected: cliQ=%d cliTx=%d srvQ=%d srvTx=%d",
 			cli.txQueuedBytes.Load(), cli.txStreamBytes.Load(), srv.txQueuedBytes.Load(), srv.txStreamBytes.Load())
+	}
+}
+
+func TestStealthSTUNNoPrivateAttributesAndLegacyCompat(t *testing.T) {
+	psk := make([]byte, 32)
+	_, _ = rand.Read(psk)
+	var cid [8]byte
+	_, _ = rand.Read(cid[:])
+	now := time.Now()
+
+	// 1. New Stealth STUN Binding Request must NOT contain private 0xC057 attribute.
+	reqPkt, cliPriv, txID, err := BuildClientBindingReq(psk, cid, 200, 0, now)
+	if err != nil {
+		t.Fatalf("BuildClientBindingReq failed: %v", err)
+	}
+	_, reqAttrs, ok := verifySTUNBaseAndFingerprint(reqPkt, stunTypeBindingReq)
+	if !ok {
+		t.Fatal("Stealth STUN request failed base/fingerprint validation")
+	}
+	if _, hasPriv := findSTUNAttr(reqAttrs, attrKSLTicket); hasPriv {
+		t.Fatal("Stealth STUN request must NOT emit legacy private attribute 0xC057")
+	}
+	uVal, okU := findSTUNAttr(reqAttrs, attrUsername)
+	if !okU || !strings.Contains(string(uVal), ":") {
+		t.Fatalf("expected RFC 8445 USERNAME ufrag:ufrag in Stealth STUN request, got %q", string(uVal))
+	}
+	if macVal, okM := findSTUNAttr(reqAttrs, attrMsgIntegritySHA256); !okM || len(macVal) != FastMACLen {
+		t.Fatalf("expected 16B MESSAGE-INTEGRITY-SHA256 in Stealth STUN request, ok=%v len=%d", okM, len(macVal))
+	}
+
+	guard := NewReplayGuard()
+	parsed, ok := ParseClientBindingReq(reqPkt, psk, guard, now)
+	if !ok || !parsed.StealthSTUN {
+		t.Fatalf("ParseClientBindingReq failed or StealthSTUN=false: ok=%v parsed=%+v", ok, parsed)
+	}
+
+	// 2. Server response for Stealth STUN request must also omit 0xC057 and use NONCE (0x0015).
+	respPkt, srvKeys, err := BuildServerBindingResp(psk, parsed, &net.UDPAddr{IP: net.IPv4(198, 51, 100, 2), Port: 44444}, 0x11223344, 150, 0, []byte(`{"v":4}`))
+	if err != nil {
+		t.Fatalf("BuildServerBindingResp failed: %v", err)
+	}
+	_, respAttrs, ok := verifySTUNBaseAndFingerprint(respPkt, stunTypeBindingResp)
+	if !ok {
+		t.Fatal("Stealth STUN response failed base/fingerprint validation")
+	}
+	if _, hasPriv := findSTUNAttr(respAttrs, attrKSLTicket); hasPriv {
+		t.Fatal("Stealth STUN response must NOT emit legacy private attribute 0xC057")
+	}
+	if _, okN := findSTUNAttr(respAttrs, attrNonce); !okN {
+		t.Fatal("Stealth STUN response missing standard NONCE (0x0015) attribute")
+	}
+	parsedResp, cliKeys, ok := ParseServerBindingResp(respPkt, psk, cliPriv, txID)
+	if !ok || parsedResp.SessionSSRC != 0x11223344 || cliKeys.C2SMask != srvKeys.C2SMask {
+		t.Fatalf("ParseServerBindingResp failed or key mismatch: ok=%v resp=%+v", ok, parsedResp)
+	}
+
+	// 3. Legacy v4.0-v4.2.1 0xC057 client still passes PreScreen + Parse + legacy server response.
+	legReq, legPriv, legTxID, err := BuildClientBindingReqLegacyV4(psk, cid, 100, 0, now)
+	if err != nil {
+		t.Fatalf("BuildClientBindingReqLegacyV4 failed: %v", err)
+	}
+	if !PreScreenClientBindingReq(legReq, psk) {
+		t.Fatal("legacy v4.x client failed PreScreenClientBindingReq")
+	}
+	legParsed, ok := ParseClientBindingReq(legReq, psk, guard, now)
+	if !ok || legParsed.StealthSTUN {
+		t.Fatalf("legacy v4.x ParseClientBindingReq mismatch: ok=%v stealth=%v", ok, legParsed != nil && legParsed.StealthSTUN)
+	}
+	legResp, legSrvKeys, err := BuildServerBindingResp(psk, legParsed, &net.UDPAddr{IP: net.IPv4(198, 51, 100, 3), Port: 55555}, 0x55667788, 100, 0, nil)
+	if err != nil {
+		t.Fatalf("legacy BuildServerBindingResp failed: %v", err)
+	}
+	legParsedResp, legCliKeys, ok := ParseServerBindingResp(legResp, psk, legPriv, legTxID)
+	if !ok || legParsedResp.SessionSSRC != 0x55667788 || legCliKeys.C2SMask != legSrvKeys.C2SMask {
+		t.Fatalf("legacy ParseServerBindingResp failed: ok=%v", ok)
 	}
 }
