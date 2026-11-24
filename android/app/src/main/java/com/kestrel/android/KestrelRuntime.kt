@@ -26,7 +26,7 @@ data class KestrelUiState(
     val nodes: List<KestrelNode> = emptyList(),
     val selectedNodeId: String = "",
     val routeMode: KestrelRouteMode = KestrelRouteMode.RULE,
-    val transportMode: KestrelTransportMode = KestrelTransportMode.AUTO,
+    val transportMode: KestrelTransportMode = KestrelTransportMode.RTC,
     val upMbpsText: String = "0",
     val downMbpsText: String = "0",
     val socksPortText: String = "10808",
