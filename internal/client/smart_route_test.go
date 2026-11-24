@@ -352,6 +352,21 @@ func TestCompactRuleSetMemoryUnder2MiBAndHotReload(t *testing.T) {
 	}
 }
 
+func TestSelectProxyDialTargetPrefersSniffedDomain(t *testing.T) {
+	if got := selectProxyDialTarget("104.244.42.197:443", "www.google.com:443"); got != "www.google.com:443" {
+		t.Fatalf("expected sniffed domain over poisoned IP, got %q", got)
+	}
+	if got := selectProxyDialTarget("[2001:db8::1]:443", "www.google.com:443"); got != "www.google.com:443" {
+		t.Fatalf("expected sniffed domain over IPv6 target, got %q", got)
+	}
+	if got := selectProxyDialTarget("1.1.1.1:443", ""); got != "1.1.1.1:443" {
+		t.Fatalf("expected raw IP fallback when no domain sniffed, got %q", got)
+	}
+	if got := selectProxyDialTarget("1.1.1.1:443", "1.1.1.1:443"); got != "1.1.1.1:443" {
+		t.Fatalf("expected raw IP preserved when routeTarget is IP, got %q", got)
+	}
+}
+
 func BenchmarkCompactRuleSetMemory(b *testing.B) {
 	b.ReportAllocs()
 	var totalDelta uint64

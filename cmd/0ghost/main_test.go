@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"ghostframe/internal/gft"
+	"ghostframe/internal/tproxy"
 )
 
 func TestGatewayConsoleRoutesAndSettings(t *testing.T) {
@@ -163,5 +164,26 @@ func TestProbeDualConnectivityConcurrentSafe(t *testing.T) {
 	}
 	if _, ok := res["direct_ok"].(bool); !ok {
 		t.Fatalf("expected boolean direct_ok in probe result: %v", res)
+	}
+}
+
+func TestShouldSelfHealFirewall(t *testing.T) {
+	if !shouldSelfHealFirewall(true, tproxy.ModeRule, false, "standby (node disconnected)") {
+		t.Fatal("expected self-heal when connected in rule mode and firewall is standby/inactive")
+	}
+	if !shouldSelfHealFirewall(true, tproxy.ModeGlobal, false, "error") {
+		t.Fatal("expected self-heal when connected in global mode after firewall error")
+	}
+	if shouldSelfHealFirewall(true, tproxy.ModeRule, false, "paused (conflict detected)") {
+		t.Fatal("must not override conflict pause without user resolution")
+	}
+	if shouldSelfHealFirewall(true, tproxy.ModePort, false, "none (port-only)") {
+		t.Fatal("must not mount firewall in port-only mode")
+	}
+	if shouldSelfHealFirewall(false, tproxy.ModeRule, false, "standby (node disconnected)") {
+		t.Fatal("must not self-heal while disconnected")
+	}
+	if shouldSelfHealFirewall(true, tproxy.ModeRule, true, "nftables") {
+		t.Fatal("must not trigger redundant sync when firewall is already active")
 	}
 }

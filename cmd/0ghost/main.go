@@ -33,6 +33,7 @@ type GatewayService struct {
 	engine  *client.Engine
 
 	mu        sync.RWMutex
+	fwOpMu    sync.Mutex
 	gwCfg     tproxy.GatewayConfig
 	dnsSrv    *tproxy.SplitDNSServer
 	tcpSrv    *tproxy.TCPServer
@@ -47,6 +48,7 @@ type GatewayService struct {
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	syncCh   chan struct{}
 }
 
 func NewGatewayService(cfgPath, webOverride string) (*GatewayService, error) {
@@ -87,6 +89,7 @@ func NewGatewayService(cfgPath, webOverride string) (*GatewayService, error) {
 		lanIP:    lanIP,
 		gwIP:     gwIP,
 		stopCh:   make(chan struct{}),
+		syncCh:   make(chan struct{}, 1),
 	}
 	return s, nil
 }
@@ -217,6 +220,53 @@ func (s *GatewayService) Start() {
 	})
 }
 
+// TriggerSync wakes watchLoop to reconcile firewall state immediately.
+func (s *GatewayService) TriggerSync() {
+	if s.syncCh == nil {
+		return
+	}
+	select {
+	case s.syncCh <- struct{}{}:
+	default:
+	}
+}
+
+// syncAfterReconnect waits briefly for an asynchronous SetTransport/SetHopRange reconnect
+// to finish before syncing firewall rules, preventing a transient teardown from stranding rules.
+func (s *GatewayService) syncAfterReconnect(timeout time.Duration) {
+	go func() {
+		deadline := time.NewTimer(timeout)
+		defer deadline.Stop()
+		poll := time.NewTicker(150 * time.Millisecond)
+		defer poll.Stop()
+		for {
+			if s.engine.IsConnected() {
+				s.SyncFirewall()
+				s.TriggerSync()
+				return
+			}
+			select {
+			case <-s.stopCh:
+				return
+			case <-deadline.C:
+				s.SyncFirewall()
+				s.TriggerSync()
+				return
+			case <-poll.C:
+			}
+		}
+	}()
+}
+
+// shouldSelfHealFirewall returns true when the tunnel is connected and transparent mode is active
+// yet firewall rules are unexpectedly down (for example after a fast disconnect/reconnect inside one tick).
+func shouldSelfHealFirewall(connected bool, mode tproxy.GatewayMode, active bool, backend string) bool {
+	if !connected || mode == tproxy.ModePort || active {
+		return false
+	}
+	return !strings.HasPrefix(backend, "paused")
+}
+
 func (s *GatewayService) watchLoop() {
 	t := time.NewTicker(4 * time.Second)
 	defer t.Stop()
@@ -226,9 +276,20 @@ func (s *GatewayService) watchLoop() {
 		select {
 		case <-s.stopCh:
 			return
+		case <-s.syncCh:
+			connected := s.engine.IsConnected()
+			lastConnected = connected
+			healthTick = 0
+			s.SyncFirewall()
 		case <-t.C:
 			connected := s.engine.IsConnected()
-			if connected != lastConnected {
+			cfg := s.getGatewayConfig()
+			s.mu.RLock()
+			active := s.fwActive
+			backend := s.fwBackend
+			s.mu.RUnlock()
+
+			if connected != lastConnected || shouldSelfHealFirewall(connected, cfg.GatewayMode, active, backend) {
 				lastConnected = connected
 				healthTick = 0
 				s.SyncFirewall()
@@ -237,10 +298,6 @@ func (s *GatewayService) watchLoop() {
 			healthTick++
 			if healthTick >= 3 { // Every 12s verify fw4/iptables & ip-rule integrity
 				healthTick = 0
-				cfg := s.getGatewayConfig()
-				s.mu.RLock()
-				active := s.fwActive
-				s.mu.RUnlock()
 				if active && connected && cfg.GatewayMode != tproxy.ModePort {
 					if !tproxy.CheckFirewallHealthy(cfg.GatewayMode, 1, 100, cfg.EnableIPv6) {
 						s.engine.Logf("[KestrelBox] 巡检发现防火墙规则或策略路由异常脱落，立即自动修复...")
@@ -252,9 +309,12 @@ func (s *GatewayService) watchLoop() {
 	}
 }
 
-// SyncFirewall mounts or cleanly tears down `table inet ghost0` based on active node connection,
+// SyncFirewall mounts or cleanly tears down `table inet kbox` based on active node connection,
 // gateway mode, and conflict state so LAN traffic is never blackholed when idle or in Port mode.
 func (s *GatewayService) SyncFirewall() {
+	s.fwOpMu.Lock()
+	defer s.fwOpMu.Unlock()
+
 	cfg := s.getGatewayConfig()
 	rep := tproxy.DetectConflicts()
 	connected := s.engine.IsConnected()

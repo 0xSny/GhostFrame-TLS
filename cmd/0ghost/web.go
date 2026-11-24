@@ -290,20 +290,33 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 				return
 			}
 		}
+		reconnectingAsync := false
 		if req.Transport != nil {
+			wasConnected := s.engine.IsConnected()
 			if err := s.engine.SetTransport(strings.ToLower(strings.TrimSpace(*req.Transport))); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 				return
 			}
+			if wasConnected {
+				reconnectingAsync = true
+			}
 		}
 		if req.HopRange != nil {
+			wasConnected := s.engine.IsConnected()
 			if err := s.engine.SetHopRange(*req.HopRange); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 				return
 			}
+			if wasConnected {
+				reconnectingAsync = true
+			}
 		}
 
-		s.SyncFirewall()
+		if reconnectingAsync {
+			s.syncAfterReconnect(12 * time.Second)
+		} else {
+			s.SyncFirewall()
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}))
 

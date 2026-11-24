@@ -1403,7 +1403,8 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 	if act == ActionDirect {
 		return e.dialDirectTrackedStream(resolvedDial, metricTarget, first)
 	}
-	st, err := sched.OpenStream(dialTarget, first)
+	proxyDial := selectProxyDialTarget(dialTarget, routeTarget)
+	st, err := sched.OpenStream(proxyDial, first)
 	if err != nil {
 		return nil, ActionProxy, err
 	}
@@ -1415,6 +1416,20 @@ func (e *Engine) OpenTargetStreamWithRoute(dialTarget, routeTarget string, first
 		eng:        e,
 		target:     metricTarget,
 	}, ActionProxy, nil
+}
+
+// selectProxyDialTarget prefers a sniffed domain in routeTarget over a raw IP dialTarget
+// when opening an ActionProxy tunnel stream, so stale or GFW-poisoned client IPs never fail remotely.
+func selectProxyDialTarget(dialTarget, routeTarget string) string {
+	dHost, _, dErr := net.SplitHostPort(dialTarget)
+	rHost, _, rErr := net.SplitHostPort(routeTarget)
+	if dErr == nil && rErr == nil && net.ParseIP(strings.Trim(dHost, "[]")) != nil {
+		cleanR := strings.TrimSpace(rHost)
+		if cleanR != "" && net.ParseIP(strings.Trim(cleanR, "[]")) == nil && !strings.ContainsAny(cleanR, " /\\") {
+			return routeTarget
+		}
+	}
+	return dialTarget
 }
 
 // OpenStreamWithOptionalSNISniff performs 30ms TLS SNI sniffing when target is a raw public IP
