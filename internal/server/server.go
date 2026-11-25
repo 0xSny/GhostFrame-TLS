@@ -31,7 +31,7 @@ import (
 )
 
 // Version is the canonical server build identifier (overridable via -ldflags -X).
-var Version = "v4.2.3"
+var Version = "v4.2.4"
 
 const (
 	MaxUDPAssocPerClient = 256
