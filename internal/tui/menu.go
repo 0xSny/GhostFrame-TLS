@@ -844,21 +844,25 @@ func (c *Controller) handleUninstallMenu(sc *bufio.Scanner) bool {
 		_, _ = exec.Command("systemctl", "disable", svc).CombinedOutput()
 	}
 	_ = c.Tx.FW.RemoveHopRules()
-	_, _ = exec.Command("sysctl", "--system").CombinedOutput()
 	for _, p := range []string{
 		"/etc/systemd/system/kestrel.service",
 		"/etc/systemd/system/ghostframe.service",
 		SysctlConfPath,
+		"/etc/sysctl.d/99-ghostframe.conf",
 		"/usr/local/bin/ksl",
 		"/usr/local/bin/gft",
+		"/usr/local/bin/ksl-hop-sync",
 	} {
 		_ = os.Remove(p)
 	}
+	_, _ = exec.Command("sysctl", "--system").CombinedOutput()
 	_, _ = exec.Command("systemctl", "daemon-reload").CombinedOutput()
+	_, _ = exec.Command("systemctl", "reset-failed").CombinedOutput()
 	for _, dir := range []string{"/opt/kestrel", "/etc/kestrel", "/var/lib/kestrel", "/opt/ghostframe", "/etc/gft", "/var/lib/gft"} {
 		_ = os.RemoveAll(dir)
 	}
-	c.okMsg("Kestrel 已彻底卸载，宿主机现有规则与 SSH 端口未受任何影响。")
+	_, _ = exec.Command("userdel", "gft").CombinedOutput()
+	c.okMsg("Kestrel 已彻底卸载（含服务、跳频防火墙规则、sysctl、ksl-hop-sync 与数据目录），宿主机现有规则与 SSH 端口未受任何影响。")
 	return true
 }
 

@@ -585,7 +585,10 @@ struct ConsoleView: View {
                 }
             } else {
                 HStack(alignment: .center, spacing: 10) {
-                    Button(action: { viewModel.selectNode(node) }) {
+                    Button(action: {
+                        viewModel.selectNode(node)
+                        selectedTab = .console
+                    }) {
                         HStack(spacing: 10) {
                             Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                                 .font(.system(size: 18))

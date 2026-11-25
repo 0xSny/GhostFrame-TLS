@@ -1,4 +1,5 @@
 <resources>
     <color name="kestrel_bg">#F6F7FA</color>
     <color name="kestrel_brand">#0284C7</color>
+    <color name="ic_launcher_bg">#D8E3ED</color>
 </resources>

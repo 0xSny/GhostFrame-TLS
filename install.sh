@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Kestrel (Kestrel-RTC) v4.2.2 Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
+# Kestrel (Kestrel-RTC) v4.2.3 Installer (Server + Phicomm N1 / OpenWrt / Linux Client)
 REPO="Spittingjiu/Ghost"
 ROLE="server"
 UNATTENDED=0
@@ -11,6 +11,7 @@ HOP_RANGE=""
 HOP_EXPLICIT=0
 SNI_OVERRIDE=""
 RESELECT_SNI=0
+UNINSTALL=0
 CLIENT_LINK=""
 SOCKS_ADDR="127.0.0.1:10808"
 LOW_MEM=0
@@ -24,7 +25,7 @@ die()  { printf "\033[1;31m[×]\033[0m %s\n" "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-Kestrel (Kestrel-RTC) v4.2.2 Installer
+Kestrel (Kestrel-RTC) v4.2.3 Installer
 
 Usage:
   install.sh [options]
@@ -36,6 +37,7 @@ Options:
   --hop <min-max|none>     Server UDP port hopping range (default: 40000-65000; pass 'none' to disable)
   --sni <domain>           Override auto-selected non-CDN camouflage SNI
   --reselect-sni           Re-probe all regions and switch existing node to nearest lowest-latency SNI
+  --uninstall              Completely uninstall Kestrel server/client, firewall hop rules, sysctl & configs
   --link <ksl4://...>      Client ksl4:// URI (or legacy gft3://) for --role client
   --socks <addr:port>      Client SOCKS5 listen address (default: 127.0.0.1:10808)
   --low-mem                Enable low-memory router mode (<35MB RSS, ideal for N1/S905D)
@@ -53,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --hop)        if [[ "${2:-}" == "none" || "${2:-}" == "off" ]]; then HOP_RANGE=""; else HOP_RANGE="$2"; fi; HOP_EXPLICIT=1; shift 2 ;;
     --sni)        SNI_OVERRIDE="$2"; shift 2 ;;
     --reselect-sni) RESELECT_SNI=1; shift ;;
+    --uninstall)  UNINSTALL=1; shift ;;
     --link)       CLIENT_LINK="$2"; shift 2 ;;
     --socks)      SOCKS_ADDR="$2"; shift 2 ;;
     --low-mem)    LOW_MEM=1; shift ;;
@@ -550,6 +553,62 @@ EOF
     printf "/usr/local/bin/kestrel-core %s -socks %q -link %q\n" "$extra_flags" "$SOCKS_ADDR" "$CLIENT_LINK"
   fi
 }
+
+uninstall_all() {
+  log "Stopping and disabling Kestrel services..."
+  if [[ "$INIT_SYS" == "systemd" ]]; then
+    for svc in kestrel ghostframe kestrel-core gft-core; do
+      systemctl stop "$svc" >/dev/null 2>&1 || true
+      systemctl disable "$svc" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/${svc}.service"
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed >/dev/null 2>&1 || true
+  elif [[ "$INIT_SYS" == "procd" ]]; then
+    for svc in kestrel-core gft-core; do
+      "/etc/init.d/${svc}" stop >/dev/null 2>&1 || true
+      "/etc/init.d/${svc}" disable >/dev/null 2>&1 || true
+      rm -f "/etc/init.d/${svc}"
+    done
+  fi
+  pkill -x kestrel-server >/dev/null 2>&1 || true
+  pkill -x gft-server >/dev/null 2>&1 || true
+  pkill -x kestrel-core >/dev/null 2>&1 || true
+  pkill -x gft-core >/dev/null 2>&1 || true
+
+  log "Removing isolated Kestrel UDP port-hopping firewall rules..."
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table inet ksl_hop >/dev/null 2>&1 || true
+    nft delete table inet gft_hop >/dev/null 2>&1 || true
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    for ch in KSL_HOP GFT_HOP; do
+      iptables -t nat -D PREROUTING -p udp -j "$ch" >/dev/null 2>&1 || true
+      iptables -t nat -D PREROUTING -j "$ch" >/dev/null 2>&1 || true
+      iptables -t nat -F "$ch" >/dev/null 2>&1 || true
+      iptables -t nat -X "$ch" >/dev/null 2>&1 || true
+    done
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save >/dev/null 2>&1 || true
+    fi
+  fi
+
+  log "Removing binaries, scripts, sysctl tuning, configs and data directories..."
+  rm -f /usr/local/bin/ksl /usr/local/bin/gft /usr/local/bin/ksl-hop-sync \
+        /usr/local/bin/kestrel-core /usr/local/bin/gft-core \
+        /etc/sysctl.d/99-kestrel.conf /etc/sysctl.d/99-ghostframe.conf
+  rm -rf /opt/kestrel /etc/kestrel /var/lib/kestrel /opt/ghostframe /etc/gft /var/lib/gft
+  sysctl --system >/dev/null 2>&1 || true
+  if id -u gft >/dev/null 2>&1; then
+    userdel gft >/dev/null 2>&1 || true
+  fi
+  ok "Kestrel has been completely uninstalled; unrelated host services, firewall rules and SSH are untouched."
+}
+
+if [[ "$UNINSTALL" -eq 1 ]]; then
+  uninstall_all
+  exit 0
+fi
 
 case "$ROLE" in
   server) install_server ;;

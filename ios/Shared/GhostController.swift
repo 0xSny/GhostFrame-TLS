@@ -258,6 +258,13 @@ final class GhostAppViewModel: ObservableObject {
         nodes.removeAll { $0.id == node.id }
         if selectedNodeID == node.id {
             selectedNodeID = nodes.first?.id ?? ""
+            if let next = activeNode {
+                beginProgrammaticSync {
+                    transportMode = GhostTransportMode(fromRaw: next.transport)
+                    upMbpsText = "\(next.upMbps)"
+                    downMbpsText = "\(next.downMbps)"
+                }
+            }
         }
         savePreferences()
         showToast("已删除节点")
@@ -286,6 +293,11 @@ final class GhostAppViewModel: ObservableObject {
         httpPortText = "\(effectiveHttpPort)"
         upMbpsText = "\(effectiveUpMbps)"
         downMbpsText = "\(effectiveDownMbps)"
+        if let idx = nodes.firstIndex(where: { $0.id == selectedNodeID }) {
+            nodes[idx].transport = transportMode.rawValue
+            nodes[idx].upMbps = effectiveUpMbps
+            nodes[idx].downMbps = effectiveDownMbps
+        }
         savePreferences()
 
         if let node = activeNode, (isConnected || isTransitioning) {
@@ -466,14 +478,20 @@ final class GhostAppViewModel: ObservableObject {
            let rm = GhostRouteMode(rawValue: rmRaw) {
             routeMode = rm
         }
-        if let tmRaw = defaults.string(forKey: storageKeyTransport) {
-            transportMode = GhostTransportMode(fromRaw: tmRaw)
-        }
-        if defaults.object(forKey: storageKeyUpMbps) != nil {
-            upMbpsText = "\(defaults.integer(forKey: storageKeyUpMbps))"
-        }
-        if defaults.object(forKey: storageKeyDownMbps) != nil {
-            downMbpsText = "\(defaults.integer(forKey: storageKeyDownMbps))"
+        if let active = nodes.first(where: { $0.id == selectedNodeID }) ?? nodes.first {
+            transportMode = GhostTransportMode(fromRaw: active.transport)
+            upMbpsText = "\(active.upMbps)"
+            downMbpsText = "\(active.downMbps)"
+        } else {
+            if let tmRaw = defaults.string(forKey: storageKeyTransport) {
+                transportMode = GhostTransportMode(fromRaw: tmRaw)
+            }
+            if defaults.object(forKey: storageKeyUpMbps) != nil {
+                upMbpsText = "\(defaults.integer(forKey: storageKeyUpMbps))"
+            }
+            if defaults.object(forKey: storageKeyDownMbps) != nil {
+                downMbpsText = "\(defaults.integer(forKey: storageKeyDownMbps))"
+            }
         }
         if defaults.object(forKey: storageKeySocksPort) != nil {
             let sp = defaults.integer(forKey: storageKeySocksPort)

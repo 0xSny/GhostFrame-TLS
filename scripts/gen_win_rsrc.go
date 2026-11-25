@@ -65,6 +65,96 @@ func sdRoundedBox(px, py, halfW, halfH, r float64) float64 {
 	return math.Hypot(ox, oy) + math.Min(math.Max(qx, qy), 0) - r
 }
 
+// renderKestrelIconFromMaster loads the master 1024x1024 PNG artwork and downsamples it
+// with 4x4 supersampled bilinear filtering + clean rounded-square alpha for Windows ICO/EXE.
+func renderKestrelIconFromMaster(src image.Image, size int) *image.NRGBA {
+	sb := src.Bounds()
+	sw, sh := float64(sb.Dx()), float64(sb.Dy())
+	dst := image.NewNRGBA(image.Rect(0, 0, size, size))
+	const ss = 4
+	halfBox := 0.94
+	cornerR := 0.24
+
+	sampleBilinear := func(u, v float64) (float64, float64, float64) {
+		fx := clamp01(u)*(sw-1) + float64(sb.Min.X)
+		fy := clamp01(v)*(sh-1) + float64(sb.Min.Y)
+		x0 := int(math.Floor(fx))
+		y0 := int(math.Floor(fy))
+		x1 := x0 + 1
+		y1 := y0 + 1
+		if x1 >= sb.Max.X {
+			x1 = sb.Max.X - 1
+		}
+		if y1 >= sb.Max.Y {
+			y1 = sb.Max.Y - 1
+		}
+		tx := fx - float64(x0)
+		ty := fy - float64(y0)
+		c00 := color.NRGBAModel.Convert(src.At(x0, y0)).(color.NRGBA)
+		c10 := color.NRGBAModel.Convert(src.At(x1, y0)).(color.NRGBA)
+		c01 := color.NRGBAModel.Convert(src.At(x0, y1)).(color.NRGBA)
+		c11 := color.NRGBAModel.Convert(src.At(x1, y1)).(color.NRGBA)
+		r := lerp(lerp(float64(c00.R), float64(c10.R), tx), lerp(float64(c01.R), float64(c11.R), tx), ty)
+		g := lerp(lerp(float64(c00.G), float64(c10.G), tx), lerp(float64(c01.G), float64(c11.G), tx), ty)
+		b := lerp(lerp(float64(c00.B), float64(c10.B), tx), lerp(float64(c01.B), float64(c11.B), tx), ty)
+		return r, g, b
+	}
+
+	for y := 0; y < size; y++ {
+		for x := 0; x < size; x++ {
+			var sr, sg, sbAcc, sa float64
+			for sy := 0; sy < ss; sy++ {
+				for sx := 0; sx < ss; sx++ {
+					u := (float64(x) + (float64(sx)+0.5)/ss) / float64(size)
+					v := (float64(y) + (float64(sy)+0.5)/ss) / float64(size)
+					nx := u*2.0 - 1.0
+					ny := v*2.0 - 1.0
+					d := sdRoundedBox(nx, ny, halfBox, halfBox, cornerR)
+					if d > 0.03 {
+						continue
+					}
+					a := clamp01(0.5 - d*float64(size)*0.48)
+					if a <= 0 {
+						continue
+					}
+					// Map inner [-halfBox, halfBox] to [0, 1] of master artwork
+					mu := (nx/halfBox + 1.0) * 0.5
+					mv := (ny/halfBox + 1.0) * 0.5
+					r, g, b := sampleBilinear(mu, mv)
+					sr += r * a
+					sg += g * a
+					sbAcc += b * a
+					sa += a
+				}
+			}
+			n := float64(ss * ss)
+			if sa > 0 {
+				dst.SetNRGBA(x, y, color.NRGBA{
+					R: uint8(math.Round(clamp01(sr/sa/255.0) * 255.0)),
+					G: uint8(math.Round(clamp01(sg/sa/255.0) * 255.0)),
+					B: uint8(math.Round(clamp01(sbAcc/sa/255.0) * 255.0)),
+					A: uint8(math.Round(clamp01(sa/n) * 255.0)),
+				})
+			}
+		}
+	}
+	return dst
+}
+
+func loadMasterIconPNG() image.Image {
+	p := filepath.Join("ios", "Shared", "Assets.xcassets", "AppIcon.appiconset", "AppIcon-1024.png")
+	f, err := os.Open(p)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	img, err := png.Decode(f)
+	if err != nil {
+		return nil
+	}
+	return img
+}
+
 // renderKestrelIcon renders a crisp supersampled ARGB Kestrel Pro emblem.
 func renderKestrelIcon(size int) *image.NRGBA {
 	img := image.NewNRGBA(image.Rect(0, 0, size, size))
@@ -515,8 +605,14 @@ func main() {
 	var entries []rsrcEntry
 	const langENUS = 0x0409
 
+	masterIcon := loadMasterIconPNG()
 	for i, sz := range sizes {
-		img := renderKestrelIcon(sz)
+		var img *image.NRGBA
+		if masterIcon != nil {
+			img = renderKestrelIconFromMaster(masterIcon, sz)
+		} else {
+			img = renderKestrelIcon(sz)
+		}
 		data, err := encodeIconImage(img, sz == 256)
 		if err != nil {
 			panic(err)

@@ -180,7 +180,10 @@ fun KestrelConsoleScreen(
 
                 1 -> NodesTabContent(
                     state = state,
-                    onSelectNode = { KestrelRuntime.selectNode(it.id) },
+                    onSelectNode = {
+                        KestrelRuntime.selectNode(it.id)
+                        selectedTab = 0
+                    },
                     onRenameNode = {
                         renamingNode = it
                         renameDraft = it.remark

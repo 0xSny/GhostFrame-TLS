@@ -100,7 +100,12 @@ object KestrelRuntime {
             selectedId = nodes.firstOrNull()?.id ?: ""
         }
         val routeMode = KestrelRouteMode.fromRaw(prefs.getString(KEY_ROUTE_MODE, KestrelRouteMode.RULE.rawValue))
-        val transportMode = KestrelTransportMode.fromRaw(prefs.getString(KEY_TRANSPORT_MODE, KestrelTransportMode.RTC.rawValue))
+        val activeNode = nodes.firstOrNull { it.id == selectedId }
+        val transportMode = if (activeNode != null) {
+            KestrelTransportMode.fromRaw(activeNode.transport)
+        } else {
+            KestrelTransportMode.fromRaw(prefs.getString(KEY_TRANSPORT_MODE, KestrelTransportMode.RTC.rawValue))
+        }
         val upMbps = prefs.getString(KEY_UP_MBPS, "0") ?: "0"
         val downMbps = prefs.getString(KEY_DOWN_MBPS, "0") ?: "0"
         val socksPort = prefs.getString(KEY_SOCKS_PORT, "10808") ?: "10808"
@@ -295,8 +300,10 @@ object KestrelRuntime {
             targetId = parsed.id
         }
         saveNodes(current, targetId)
+        val importedTrans = KestrelTransportMode.fromRaw(parsed.transport)
+        prefs.edit().putString(KEY_TRANSPORT_MODE, importedTrans.rawValue).apply()
         _uiState.update {
-            it.copy(nodes = current, selectedNodeId = targetId, errorBanner = "")
+            it.copy(nodes = current, selectedNodeId = targetId, transportMode = importedTrans, errorBanner = "")
         }
         appendLocalLog("已导入节点：${parsed.remark}")
         showToast("已导入 ${parsed.remark}")
@@ -308,9 +315,13 @@ object KestrelRuntime {
 
     fun selectNode(id: String) {
         val node = _uiState.value.nodes.firstOrNull { it.id == id } ?: return
-        prefs.edit().putString(KEY_SELECTED_ID, id).apply()
-        _uiState.update { it.copy(selectedNodeId = id) }
-        appendLocalLog("切换节点：${node.remark}")
+        val nodeTrans = KestrelTransportMode.fromRaw(node.transport)
+        prefs.edit()
+            .putString(KEY_SELECTED_ID, id)
+            .putString(KEY_TRANSPORT_MODE, nodeTrans.rawValue)
+            .apply()
+        _uiState.update { it.copy(selectedNodeId = id, transportMode = nodeTrans) }
+        appendLocalLog("切换节点：${node.remark} (${nodeTrans.label})")
         if (_uiState.value.serviceActive) {
             reloadIfActive()
             showToast("正在无缝切换至 ${node.remark}")
@@ -336,7 +347,10 @@ object KestrelRuntime {
             _uiState.value.selectedNodeId
         }
         saveNodes(updated, nextSelected)
-        _uiState.update { it.copy(nodes = updated, selectedNodeId = nextSelected) }
+        val nextNode = updated.firstOrNull { it.id == nextSelected }
+        val nextTrans = if (nextNode != null) KestrelTransportMode.fromRaw(nextNode.transport) else _uiState.value.transportMode
+        prefs.edit().putString(KEY_TRANSPORT_MODE, nextTrans.rawValue).apply()
+        _uiState.update { it.copy(nodes = updated, selectedNodeId = nextSelected, transportMode = nextTrans) }
         showToast("已删除节点")
     }
 
@@ -349,8 +363,18 @@ object KestrelRuntime {
     }
 
     fun setTransportMode(mode: KestrelTransportMode) {
+        val cur = _uiState.value
+        val activeId = cur.selectedNodeId
+        val updatedNodes = if (activeId.isNotEmpty()) {
+            cur.nodes.map { n ->
+                if (n.id == activeId) n.copy(transport = mode.rawValue) else n
+            }
+        } else {
+            cur.nodes
+        }
+        saveNodes(updatedNodes, activeId)
         prefs.edit().putString(KEY_TRANSPORT_MODE, mode.rawValue).apply()
-        _uiState.update { it.copy(transportMode = mode) }
+        _uiState.update { it.copy(nodes = updatedNodes, transportMode = mode) }
         if (_uiState.value.serviceActive) {
             reloadIfActive()
         }
