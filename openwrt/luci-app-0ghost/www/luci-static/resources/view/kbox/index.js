@@ -82,7 +82,7 @@ return view.extend({
 
 		var frame = E('iframe', {
 			src: iframeSrc,
-			style: 'width:100%;height:calc(100vh - 180px);min-height:760px;border:1px solid #1d2a49;border-radius:14px;background:#060913;'
+			style: 'width:100%;height:calc(100dvh - 150px);min-height:600px;border:1px solid #1d2a49;border-radius:14px;background:#060913;'
 		});
 
 		var httpsNotice = E('div', {

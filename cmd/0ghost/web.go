@@ -12,9 +12,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
+	"ghostframe/internal/gft"
 	"ghostframe/internal/tproxy"
 )
 
@@ -103,19 +105,25 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 			URI string `json:"uri"`
 		}
 		if err := readJSON(r, &req); err != nil {
+			s.engine.Logf("[KestrelBox] 节点导入请求解析失败: %v", err)
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
+		uris := extractNodeURIs(req.URI)
+		wasConnected := s.engine.IsConnected()
 		imported := 0
+		firstIdx := -1
 		var lastErr error
-		for _, ln := range strings.Split(strings.ReplaceAll(req.URI, "\r\n", "\n"), "\n") {
-			u := extractNodeURI(ln)
-			if u == "" {
-				continue
-			}
-			if _, err := s.engine.ImportLink(u, imported == 0); err != nil {
+		for _, u := range uris {
+			// When already connected, avoid mutating ActiveNode before make-before-break SelectNode completes.
+			switchNow := !wasConnected && imported == 0
+			idx, err := s.engine.ImportLink(u, switchNow)
+			if err != nil {
 				lastErr = err
 			} else {
+				if firstIdx < 0 {
+					firstIdx = idx
+				}
 				imported++
 			}
 		}
@@ -124,16 +132,23 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 			if lastErr != nil {
 				msg = lastErr.Error()
 			}
+			s.engine.Logf("[KestrelBox] 节点导入失败: %s", msg)
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": msg})
 			return
 		}
-		go func() {
-			if !s.engine.IsConnected() {
-				_ = s.engine.Connect()
+		go func(idx int, hadConn bool) {
+			if hadConn && idx >= 0 {
+				if err := s.engine.SelectNode(idx); err != nil {
+					s.engine.Logf("[KestrelBox] 新节点自动切换失败（已保留原连接，可稍后手动点击切换）: %v", err)
+				}
+			} else if !s.engine.IsConnected() {
+				if err := s.engine.Connect(); err != nil {
+					s.engine.Logf("[KestrelBox] 新节点自动连接失败: %v", err)
+				}
 			}
 			s.SyncFirewall()
-		}()
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "imported": imported})
+		}(firstIdx, wasConnected)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "imported": imported, "active_index": firstIdx})
 	}))
 
 	mux.HandleFunc("/api/node/select", postOnly(func(w http.ResponseWriter, r *http.Request) {
@@ -574,19 +589,113 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func extractNodeURI(raw string) string {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return ""
+var nodeSchemeRe = regexp.MustCompile(`(?i)(?:ksl4|gft3|gft2|gft)://`)
+
+func cleanInvisibleImportChars(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	repl := strings.NewReplacer(
+		"\ufeff", "",
+		"\u200b", "",
+		"\u200c", "",
+		"\u200d", "",
+		"\u00a0", " ",
+	)
+	return repl.Replace(s)
+}
+
+func isBase64URLByte(b byte) bool {
+	return (b >= 'A' && b <= 'Z') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= '0' && b <= '9') ||
+		b == '-' || b == '_' || b == '='
+}
+
+// extractNodeURIs extracts one or more ksl4:// / gft3:// / gft2:// / gft:// links from raw pasted text,
+// tolerating terminal line wraps, embedded spaces/newlines inside base64 payloads, surrounding CLI flags,
+// quotes, and batch multi-link pastes.
+func extractNodeURIs(raw string) []string {
+	cleaned := strings.TrimSpace(cleanInvisibleImportChars(raw))
+	if cleaned == "" {
+		return nil
 	}
-	for _, scheme := range []string{"ksl4://", "gft3://", "gft2://", "gft://"} {
-		if idx := strings.Index(s, scheme); idx >= 0 {
-			sub := s[idx:]
-			if end := strings.IndexAny(sub, "\"' \t\r\n"); end >= 0 {
-				sub = sub[:end]
+	locs := nodeSchemeRe.FindAllStringIndex(cleaned, -1)
+	if len(locs) == 0 {
+		return []string{cleaned}
+	}
+	out := make([]string, 0, len(locs))
+	for i, loc := range locs {
+		segEnd := len(cleaned)
+		if i+1 < len(locs) {
+			segEnd = locs[i+1][0]
+		}
+		seg := cleaned[loc[0]:segEnd]
+		schemeLen := loc[1] - loc[0]
+		scheme := strings.ToLower(seg[:schemeLen])
+		rest := seg[schemeLen:]
+
+		// Fast path: contiguous token up to quote/whitespace already parses cleanly.
+		tok := rest
+		if end := strings.IndexAny(tok, "\"'`<> \t\r\n"); end >= 0 {
+			tok = tok[:end]
+		}
+		fast := scheme + strings.TrimSpace(tok)
+		if _, err := gft.ParseLink(fast); err == nil {
+			out = append(out, fast)
+			continue
+		}
+
+		// Recovery path: reassemble terminal-wrapped base64url payload across newlines/spaces/box borders.
+		var payload strings.Builder
+		pos := 0
+		for pos < len(rest) {
+			c := rest[pos]
+			if isBase64URLByte(c) {
+				payload.WriteByte(c)
+				pos++
+				continue
 			}
-			return strings.TrimSpace(sub)
+			if c == ' ' || c == '\t' || c == '\n' {
+				// If the accumulated payload is already a complete valid link, stop before trailing prose.
+				if payload.Len() >= 24 {
+					if _, err := gft.ParseLink(scheme + payload.String()); err == nil {
+						break
+					}
+				}
+				pos++
+				continue
+			}
+			// Skip UTF-8 box-drawing vertical bar "│" (0xE2 0x94 0x82) if terminal table wrapped the link.
+			if pos+2 < len(rest) && rest[pos] == 0xE2 && rest[pos+1] == 0x94 && rest[pos+2] == 0x82 {
+				pos += 3
+				continue
+			}
+			break
+		}
+		cand := scheme + payload.String()
+		if pos < len(rest) && rest[pos] == '#' {
+			rem := rest[pos+1:]
+			if end := strings.IndexAny(rem, "\"'`<>\n"); end >= 0 {
+				rem = rem[:end]
+			}
+			rem = strings.TrimSpace(rem)
+			if rem != "" {
+				cand += "#" + rem
+			}
+		}
+		if _, err := gft.ParseLink(cand); err == nil {
+			out = append(out, cand)
+		} else {
+			out = append(out, fast)
 		}
 	}
-	return s
+	return out
+}
+
+func extractNodeURI(raw string) string {
+	uris := extractNodeURIs(raw)
+	if len(uris) == 0 {
+		return ""
+	}
+	return uris[0]
 }

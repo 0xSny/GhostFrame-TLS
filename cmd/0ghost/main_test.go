@@ -24,8 +24,13 @@ func TestGatewayConsoleRoutesAndSettings(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:19080/", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "KestrelBox") {
+	html := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(html, "KestrelBox") {
 		t.Fatalf("expected HTTP 200 HTML console, got code=%d", rec.Code)
+	}
+	// Guard against Document.prototype.importNode() collision inside inline HTML event attributes.
+	if strings.Contains(html, `onclick="importNode(`) || strings.Contains(html, `;importNode()`) {
+		t.Fatalf("inline HTML event handler must not call unqualified importNode() (shadows Document.prototype.importNode)")
 	}
 
 	// Verify /api/status JSON structure
@@ -185,5 +190,50 @@ func TestShouldSelfHealFirewall(t *testing.T) {
 	}
 	if shouldSelfHealFirewall(true, tproxy.ModeRule, true, "nftables") {
 		t.Fatal("must not trigger redundant sync when firewall is already active")
+	}
+}
+
+func TestExtractNodeURIsAndWrappedImport(t *testing.T) {
+	l1 := (&gft.Link{V: 4, Host: "10.0.0.1", Port: 443, SNI: "ftp.jaist.ac.jp", PSK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", Verify: "ca", Remark: "LA-GIA"}).Encode()
+	l2 := (&gft.Link{V: 4, Host: "10.0.0.2", Port: 443, SNI: "mirrors.mit.edu", PSK: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=", Verify: "ca", Remark: "JP-SoftBank"}).Encode()
+
+	// 1. Terminal-wrapped link across multiple lines with spaces and trailing terminal prose
+	wrapped := "通用导入链接:\n" + l1[:42] + "\r\n  " + l1[42:96] + "   \n" + l1[96:] + "\nkestrel-core -low-mem"
+	got := extractNodeURIs(wrapped)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 extracted URI from wrapped text, got %d: %#v", len(got), got)
+	}
+	parsed, err := gft.ParseLink(got[0])
+	if err != nil || parsed.Host != "10.0.0.1" || parsed.Remark != "LA-GIA" {
+		t.Fatalf("wrapped link parse failed: parsed=%+v err=%v raw=%q", parsed, err, got[0])
+	}
+
+	// 2. Two links pasted together (even concatenated with zero-width space or no newline)
+	batch := "\ufeff" + strings.ToUpper(l1[:7]) + l1[7:] + "\n" + l2
+	gotBatch := extractNodeURIs(batch)
+	if len(gotBatch) != 2 {
+		t.Fatalf("expected 2 extracted URIs from batch paste, got %d", len(gotBatch))
+	}
+	if p1, err := gft.ParseLink(gotBatch[0]); err != nil || p1.Host != "10.0.0.1" {
+		t.Fatalf("batch[0] parse failed: %+v %v", p1, err)
+	}
+	if p2, err := gft.ParseLink(gotBatch[1]); err != nil || p2.Host != "10.0.0.2" {
+		t.Fatalf("batch[1] parse failed: %+v %v", p2, err)
+	}
+
+	// 3. End-to-end HTTP POST /api/import with terminal-wrapped VPS copy
+	svc, err := NewGatewayService("", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewGatewayService failed: %v", err)
+	}
+	defer svc.Stop()
+	mux := svc.BuildHTTPMux()
+	payload, _ := json.Marshal(map[string]string{"uri": wrapped})
+	req := httptest.NewRequest(http.MethodPost, "http://192.168.1.75/kbox/api/import", strings.NewReader(string(payload)))
+	req.Header.Set("Origin", "http://192.168.1.75")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("wrapped /kbox/api/import failed: code=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
