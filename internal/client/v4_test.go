@@ -451,3 +451,64 @@ func TestTargetTrafficTrackerTop10AndHighUploadAlert(t *testing.T) {
 		t.Fatalf("expected stealer.example.net:443 inside diag snapshot")
 	}
 }
+
+func TestNewEngineDefersSysProxyRecoveryWhenAutoConnectEnabled(t *testing.T) {
+	SetNoSysProxy(true)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "client.json")
+	backupPath := filepath.Join(dir, "sysproxy_backup.json")
+
+	// Seed a config with AutoConnect=true and an active node, plus a pre-crash backup file.
+	cfgJSON := `{
+  "auto_connect": true,
+  "route_mode": "rule",
+  "http_addr": "127.0.0.1:10809",
+  "socks_addr": "127.0.0.1:10808",
+  "active_node": 0,
+  "nodes": [{
+    "v": 4,
+    "host": "127.0.0.1",
+    "port": 443,
+    "sni": "example.com",
+    "psk": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "verify": "ca",
+    "remark": "AutoNode"
+  }]
+}`
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backupPath, []byte(`{"enabled":false,"server":"","applied":"127.0.0.1:10809"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	applyMockSystemProxySnapshot(ProxySnapshot{Enabled: true, Server: "127.0.0.1:10809"})
+
+	eng, err := NewEngine(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	if !eng.ShouldAutoConnect() {
+		t.Fatal("expected ShouldAutoConnect() true")
+	}
+	// Backup baseline must still exist and mock proxy must remain untouched (no first clear broadcast).
+	if _, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("expected sysproxy_backup.json preserved when ShouldAutoConnect=true, err=%v", err)
+	}
+	if snap := queryMockSystemProxy(); !snap.Enabled || snap.Server != "127.0.0.1:10809" {
+		t.Fatalf("expected system proxy untouched before auto-connect, got %+v", snap)
+	}
+
+	// Simulate auto-connect failure fallback -> RecoverSystemProxyIfDirty must restore cleanly.
+	recovered, err := eng.RecoverSystemProxyIfDirty()
+	if err != nil || !recovered {
+		t.Fatalf("expected deferred recovery to succeed, recovered=%v err=%v", recovered, err)
+	}
+	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+		t.Fatalf("expected sysproxy_backup.json removed after deferred recovery, err=%v", err)
+	}
+	if snap := queryMockSystemProxy(); snap.Enabled {
+		t.Fatalf("expected system proxy restored to disabled after fallback recovery, got %+v", snap)
+	}
+}

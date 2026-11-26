@@ -76,6 +76,7 @@ const (
 	LowMemInitWin        = 1024 * 1024
 	LowMemMaxWin         = 4 * 1024 * 1024
 	DefaultSocketBufSize = 8 * 1024 * 1024
+	WindowsSocketBufSize = 2 * 1024 * 1024
 	LowMemSocketBufSize  = 512 * 1024
 
 	FlagPreferChaCha20 uint16 = 0x0001
@@ -125,10 +126,14 @@ func EffectiveMaxStreamWindow() int {
 	return DefaultMaxWin
 }
 
-// EffectiveUDPSocketBuffer returns 8MB by default or 512KB in LowMemMode.
+// EffectiveUDPSocketBuffer returns 8MB on non-Windows, 2MB on Windows (to reduce
+// WFP filter-driver and non-paged pool pressure), or 512KB in LowMemMode.
 func EffectiveUDPSocketBuffer() int {
 	if lowMemMode.Load() {
 		return LowMemSocketBufSize
+	}
+	if runtime.GOOS == "windows" {
+		return WindowsSocketBufSize
 	}
 	return DefaultSocketBufSize
 }

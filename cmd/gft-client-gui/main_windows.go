@@ -94,7 +94,11 @@ func main() {
 	eng.Logf("Kestrel Pro %s (Kestrel-RTC) native desktop initialized", client.Version)
 
 	if *autoConnect || eng.ShouldAutoConnect() {
-		go func() { _ = eng.Connect() }()
+		go func() {
+			if err := eng.Connect(); err != nil {
+				_, _ = eng.RecoverSystemProxyIfDirty()
+			}
+		}()
 	}
 
 	runErr := winui.Run(eng)

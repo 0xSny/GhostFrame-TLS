@@ -2015,6 +2015,7 @@ document.addEventListener("keydown", async (ev) => {
 });
 
 let polling = false;
+let pollTimer = null;
 async function pollStatus() {
   if (polling) return;
   polling = true;
@@ -2027,8 +2028,30 @@ async function pollStatus() {
   }
 }
 
-pollStatus();
-setInterval(pollStatus, 450);
+function syncPollSchedule() {
+  if (document.hidden) {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    return;
+  }
+  if (pollTimer === null) {
+    pollTimer = setInterval(pollStatus, 1000);
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  syncPollSchedule();
+  if (!document.hidden) {
+    pollStatus();
+  }
+});
+
+if (!document.hidden) {
+  pollStatus();
+}
+syncPollSchedule();
 </script>
 </body>
 </html>

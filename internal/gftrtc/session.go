@@ -2518,7 +2518,7 @@ func (s *RTCSession) HopValidated(pickPort func() int, maxAttempts int, probeTim
 				network = "udp6"
 			}
 		}
-		candPC, err := listenClientUDP(network, raddr.IP)
+		candPC, err := listenClientUDPRaw(network, raddr.IP)
 		if err != nil {
 			lastErr = fmt.Errorf("gftrtc: listen %s for %s: %w", network, raddr.String(), err)
 			continue
@@ -2615,6 +2615,7 @@ func (s *RTCSession) HopWithProbePC(newPC net.PacketConn, ownPC bool, newRemoteA
 }
 
 func (s *RTCSession) promoteMigratedSocket(newPC net.PacketConn, ownPC bool, newRemoteAddr net.Addr, newRemotePort int) {
+	TuneUDPSocketBuffers(newPC)
 	s.connMu.Lock()
 	oldPC := s.curConn
 	oldOwn := s.curOwn
@@ -2767,7 +2768,7 @@ type DialOptions struct {
 	Timeout    time.Duration
 }
 
-func listenClientUDP(network string, targetIP net.IP) (*net.UDPConn, error) {
+func listenClientUDPRaw(network string, targetIP net.IP) (*net.UDPConn, error) {
 	var lc net.ListenConfig
 	if targetIP == nil || !targetIP.IsLoopback() {
 		lc.Control = netbind.Control
@@ -2780,6 +2781,14 @@ func listenClientUDP(network string, targetIP net.IP) (*net.UDPConn, error) {
 	if !ok {
 		pc.Close()
 		return nil, errors.New("gftrtc: unexpected non-UDP socket from ListenPacket")
+	}
+	return upc, nil
+}
+
+func listenClientUDP(network string, targetIP net.IP) (*net.UDPConn, error) {
+	upc, err := listenClientUDPRaw(network, targetIP)
+	if err != nil {
+		return nil, err
 	}
 	TuneUDPSocketBuffers(upc)
 	return upc, nil

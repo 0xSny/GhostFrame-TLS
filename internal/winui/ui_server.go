@@ -280,22 +280,11 @@ func decodeJSON(r *http.Request, dst any) error {
 }
 
 func (s *uiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	st := s.eng.Status()
-	// Porcelain light console displays pure numeric traffic cards and never renders a 60s waveform.
-	delete(st, "history")
-
 	tab := r.URL.Query().Get("tab")
+	st := s.eng.StatusForTab(tab)
 	if tab == "routes" {
 		st["top_uploads"] = s.eng.TopUploadTargets(20)
 		st["logs"] = s.eng.Logs()
-	} else {
-		delete(st, "recent_routes")
-	}
-	if tab != "settings" && tab != "routes" {
-		delete(st, "custom_rules")
-	}
-	if tab != "overview" && tab != "" {
-		delete(st, "clash_yaml")
 	}
 	st["rules_updating"] = s.rulesUpdate.Load()
 	if t := s.currentToast(); t != nil {

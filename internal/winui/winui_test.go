@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -74,6 +75,12 @@ func TestUIServerAuthAndEndpoints(t *testing.T) {
 	}
 	if strings.Contains(html, "TrafficWaveform") {
 		t.Fatal("desktop UI must not contain TrafficWaveform chart")
+	}
+	if strings.Contains(html, "setInterval(pollStatus, 450)") {
+		t.Fatal("desktop UI must not use hardcoded 450ms background polling")
+	}
+	if !strings.Contains(html, "visibilitychange") || !strings.Contains(html, "document.hidden") || !strings.Contains(html, "setInterval(pollStatus, 1000)") {
+		t.Fatal("desktop UI must use visibilitychange-aware 1000ms polling")
 	}
 
 	// 3. API without X-Kestrel-Token must return 403.
@@ -181,6 +188,8 @@ func TestWebView2HostInitializationSmoke(t *testing.T) {
 	if _, err := findEmbeddedWebViewDLL(); err != nil {
 		t.Skipf("Edge WebView2 runtime unavailable in test environment: %v", err)
 	}
+	// Isolate WebView2 userDataFolder so the smoke test does not collide with a live Kestrel Pro instance (0x800700AA).
+	t.Setenv("LOCALAPPDATA", t.TempDir())
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -271,4 +280,91 @@ func TestWebView2HostInitializationSmoke(t *testing.T) {
 		t.Fatalf("WebView2 controller did not become ready in time (ready=%v ctrl=0x%x webview=0x%x)", ready, ctrl, wvPtr)
 	}
 	wv.Resize()
+}
+
+func TestEnsureWebView2BrowserArgsAndTabScopedStatus(t *testing.T) {
+	origVal, hadOrig := os.LookupEnv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+	defer func() {
+		if hadOrig {
+			_ = os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", origVal)
+		} else {
+			_ = os.Unsetenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+		}
+	}()
+
+	_ = os.Unsetenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+	ensureWebView2BrowserArgs()
+	if got := os.Getenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"); got != defaultWebView2BrowserArgs {
+		t.Fatalf("expected default software rendering args %q, got %q", defaultWebView2BrowserArgs, got)
+	}
+
+	// Explicit caller value must be preserved.
+	_ = os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--custom-flag")
+	ensureWebView2BrowserArgs()
+	if got := os.Getenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"); got != "--custom-flag" {
+		t.Fatalf("expected explicit browser args preserved, got %q", got)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "cfg.json")
+	eng, err := client.NewEngine(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	uri := (&gft.Link{
+		V: 4, Host: "example.com", Port: 443, SNI: "example.com",
+		PSK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", Verify: "ca", Remark: "TabTest",
+	}).Encode()
+	if _, err := eng.ImportLink(uri, true); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := startUIServer(eng, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	getTab := func(tab string) map[string]any {
+		req, _ := http.NewRequest(http.MethodGet, "http://"+srv.addr+"/api/status?tab="+tab, nil)
+		req.Header.Set("X-Kestrel-Token", srv.Token())
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var m map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+
+	ov := getTab("overview")
+	if _, ok := ov["history"]; ok {
+		t.Fatal("overview tab must omit history")
+	}
+	if _, ok := ov["recent_routes"]; ok {
+		t.Fatal("overview tab must omit recent_routes")
+	}
+	if strVal(ov["clash_yaml"]) == "" || strVal(ov["link_uri"]) == "" {
+		t.Fatal("overview tab must include clash_yaml and link_uri")
+	}
+
+	nd := getTab("nodes")
+	for _, k := range []string{"history", "recent_routes", "clash_yaml", "link_uri", "custom_rules"} {
+		if _, ok := nd[k]; ok {
+			t.Fatalf("nodes tab must omit %q", k)
+		}
+	}
+
+	rt := getTab("routes")
+	if _, ok := rt["recent_routes"]; !ok {
+		t.Fatal("routes tab must include recent_routes")
+	}
+	for _, k := range []string{"history", "clash_yaml", "link_uri"} {
+		if _, ok := rt[k]; ok {
+			t.Fatalf("routes tab must omit %q", k)
+		}
+	}
 }

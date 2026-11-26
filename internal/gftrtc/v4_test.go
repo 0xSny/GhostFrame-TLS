@@ -1610,3 +1610,22 @@ func TestStealthSTUNNoPrivateAttributesAndLegacyCompat(t *testing.T) {
 		t.Fatalf("legacy ParseServerBindingResp failed: ok=%v", ok)
 	}
 }
+
+func TestEffectiveUDPSocketBufferPlatformDefaults(t *testing.T) {
+	prev := IsLowMemMode()
+	defer SetLowMemMode(prev)
+
+	SetLowMemMode(false)
+	want := DefaultSocketBufSize
+	if runtime.GOOS == "windows" {
+		want = WindowsSocketBufSize
+	}
+	if got := EffectiveUDPSocketBuffer(); got != want {
+		t.Fatalf("EffectiveUDPSocketBuffer() on %s = %d, want %d", runtime.GOOS, got, want)
+	}
+
+	SetLowMemMode(true)
+	if got := EffectiveUDPSocketBuffer(); got != LowMemSocketBufSize {
+		t.Fatalf("EffectiveUDPSocketBuffer() in LowMemMode = %d, want %d", got, LowMemSocketBufSize)
+	}
+}

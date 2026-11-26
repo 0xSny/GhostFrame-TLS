@@ -174,7 +174,18 @@ func comRelease(obj uintptr) {
 	}
 }
 
+const defaultWebView2BrowserArgs = "--disable-gpu --disable-gpu-compositing --disable-features=RendererCodeIntegrity"
+
+// ensureWebView2BrowserArgs disables hardware GPU compositing for the lightweight
+// Kestrel Pro console unless the caller explicitly configured WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS.
+func ensureWebView2BrowserArgs() {
+	if _, ok := os.LookupEnv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"); !ok {
+		_ = os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", defaultWebView2BrowserArgs)
+	}
+}
+
 func newWebView2Host(hwnd uintptr, startURL string, onFailed func(string)) (*webView2Host, error) {
+	ensureWebView2BrowserArgs()
 	dllPath, err := findEmbeddedWebViewDLL()
 	if err != nil {
 		return nil, err

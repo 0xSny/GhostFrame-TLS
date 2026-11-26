@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.2.4"
+var Version = "v4.2.5"
 
 type ConnState string
 
@@ -218,17 +218,34 @@ func NewEngine(cfgPath string) (*Engine, error) {
 		e.router.SetCustomRules(combinedRules)
 	}
 
-	if recovered, rerr := RecoverSystemProxyIfDirtyFor(e.proxyBackupPath, e.config.HTTPAddr); recovered {
+	// Defer pre-crash system-proxy recovery when an immediate auto-connect is about to run,
+	// avoiding double WinINET InternetSetOptionW broadcasts (clear then immediately re-enable)
+	// while preserving sysproxy_backup.json as the clean baseline.
+	if !e.ShouldAutoConnect() {
+		_, _ = e.RecoverSystemProxyIfDirty()
+	}
+
+	e.socksSrv = NewSOCKS5Server(e.config.SocksAddr, e)
+	e.httpSrv = NewHTTPProxyServer(e.config.HTTPAddr, e)
+	return e, nil
+}
+
+// RecoverSystemProxyIfDirty recovers pre-crash Windows system proxy settings if a
+// leftover sysproxy_backup.json or dirty loopback proxy remains active.
+func (e *Engine) RecoverSystemProxyIfDirty() (bool, error) {
+	e.mu.RLock()
+	backupPath := e.proxyBackupPath
+	httpAddr := e.config.HTTPAddr
+	e.mu.RUnlock()
+	recovered, rerr := RecoverSystemProxyIfDirtyFor(backupPath, httpAddr)
+	if recovered {
 		if rerr == nil {
 			e.Logf("Recovered pre-crash Windows system proxy settings cleanly")
 		} else {
 			e.Logf("System proxy recovery warning: %v", rerr)
 		}
 	}
-
-	e.socksSrv = NewSOCKS5Server(e.config.SocksAddr, e)
-	e.httpSrv = NewHTTPProxyServer(e.config.HTTPAddr, e)
-	return e, nil
+	return recovered, rerr
 }
 
 func (e *Engine) activeLinkLocked() *gft.Link {
@@ -1827,6 +1844,7 @@ func (e *Engine) Connect() error {
 			e.Logf("System proxy enabled with crash-safe backup (%s)", httpAddr)
 		}
 	} else {
+		_, _ = e.RecoverSystemProxyIfDirty()
 		e.Logf("Core mode active: local proxy ready (%s / %s), system proxy untouched", socksAddr, httpAddr)
 	}
 	return nil
@@ -2273,8 +2291,19 @@ func (e *Engine) TrayStatus() map[string]any {
 	}
 }
 
-// Status returns the full UI status snapshot.
+// Status returns the full UI status snapshot (including 60s history, routes, rules, and exports).
 func (e *Engine) Status() map[string]any {
+	return e.statusSnapshot("", true, true)
+}
+
+// StatusForTab returns a tab-scoped UI status snapshot for the desktop console, omitting
+// unused history slices and skipping RecentRoutes / CustomRules / ClashYAML / LinkURI
+// serialization when not needed by the active tab.
+func (e *Engine) StatusForTab(tab string) map[string]any {
+	return e.statusSnapshot(tab, false, false)
+}
+
+func (e *Engine) statusSnapshot(tab string, includeHistory bool, fullCompat bool) map[string]any {
 	e.mu.RLock()
 	state := e.state
 	lastErr := e.lastErr
@@ -2289,8 +2318,11 @@ func (e *Engine) Status() map[string]any {
 	activeIdx := e.config.ActiveNode
 	switchingNode := e.switchingNode
 	switchingName := e.switchingName
-	histCopy := make([]TrafficPoint, len(e.history))
-	copy(histCopy, e.history)
+	var histCopy []TrafficPoint
+	if includeHistory {
+		histCopy = make([]TrafficPoint, len(e.history))
+		copy(histCopy, e.history)
+	}
 
 	nodes := make([]NodeSummary, 0, len(e.config.Nodes))
 	for i, n := range e.config.Nodes {
@@ -2372,7 +2404,7 @@ func (e *Engine) Status() map[string]any {
 		tPref = "rtc"
 	}
 
-	return map[string]any{
+	out := map[string]any{
 		"version":          Version,
 		"state":            string(state),
 		"last_err":         lastErr,
@@ -2382,8 +2414,6 @@ func (e *Engine) Status() map[string]any {
 		"transport_pref":   tPref,
 		"route_mode":       string(routeMode),
 		"rule_stats":       e.router.Stats(),
-		"custom_rules":     e.CustomRules(),
-		"recent_routes":    e.RecentRoutes(),
 		"verify_mode":      verifyMode,
 		"hop_range":        hopRange,
 		"rtc_port":         rtcPort,
@@ -2405,7 +2435,6 @@ func (e *Engine) Status() map[string]any {
 		"down_bps":         downBps,
 		"total_up":         totalUp,
 		"total_down":       totalDown,
-		"history":          histCopy,
 		"sys_proxy":        sysProxy,
 		"enable_ipv6":      e.IPv6Enabled(),
 		"close_to_tray":    e.CloseToTray(),
@@ -2419,9 +2448,21 @@ func (e *Engine) Status() map[string]any {
 		"sni_rtt_ms":       sniRTTMs,
 		"active_node":      activeIdx,
 		"nodes":            nodes,
-		"link_uri":         e.LinkURI(),
-		"clash_yaml":       e.ClashYAML(),
 	}
+	if includeHistory {
+		out["history"] = histCopy
+	}
+	if fullCompat || tab == "routes" {
+		out["recent_routes"] = e.RecentRoutes()
+	}
+	if fullCompat || tab == "settings" || tab == "routes" {
+		out["custom_rules"] = e.CustomRules()
+	}
+	if fullCompat || tab == "overview" || tab == "" {
+		out["link_uri"] = e.LinkURI()
+		out["clash_yaml"] = e.ClashYAML()
+	}
+	return out
 }
 
 // Logs returns recent log lines.
