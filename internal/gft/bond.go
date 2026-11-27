@@ -386,8 +386,15 @@ func (g *BondGroup) OpenStream(bondID uint64, target string, first []byte) (*Bon
 	if err != nil {
 		return nil, err
 	}
-	if 8+len(addr)+len(first) > MaxPayload {
+	maxFirst := MaxPayload - 8 - len(addr)
+	if maxFirst < 0 {
 		return nil, ErrProtocol
+	}
+	inOpen := first
+	var overflow []byte
+	if len(inOpen) > maxFirst {
+		inOpen = first[:maxFirst]
+		overflow = first[maxFirst:]
 	}
 
 	s := g.pickSendSession(nil)
@@ -402,10 +409,10 @@ func (g *BondGroup) OpenStream(bondID uint64, target string, first []byte) (*Bon
 	g.streams[bondID] = bs
 	g.mu.Unlock()
 
-	pl := make([]byte, 8+len(addr)+len(first))
+	pl := make([]byte, 8+len(addr)+len(inOpen))
 	binary.BigEndian.PutUint64(pl[:8], bondID)
 	copy(pl[8:], addr)
-	copy(pl[8+len(addr):], first)
+	copy(pl[8+len(addr):], inOpen)
 
 	if err := s.writeFrame(CmdBondOpen, 0, 0, pl, 0); err != nil {
 		alt := g.pickSendSession(s)
@@ -416,10 +423,16 @@ func (g *BondGroup) OpenStream(bondID uint64, target string, first []byte) (*Bon
 		s = alt
 		bs.openSess = alt
 	}
-	bs.Up.Add(uint64(len(first)))
-	s.UpBytes.Add(uint64(len(first)))
-	if s.OnBytes != nil && len(first) > 0 {
-		s.OnBytes(len(first), 0)
+	bs.Up.Add(uint64(len(inOpen)))
+	s.UpBytes.Add(uint64(len(inOpen)))
+	if s.OnBytes != nil && len(inOpen) > 0 {
+		s.OnBytes(len(inOpen), 0)
+	}
+	if len(overflow) > 0 {
+		if _, werr := bs.Write(overflow); werr != nil {
+			_ = bs.Close()
+			return nil, werr
+		}
 	}
 	return bs, nil
 }

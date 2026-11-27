@@ -2,7 +2,6 @@ package client
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -214,13 +213,26 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		req.URL.Host = req.Host
 	}
 
-	var reqBuf bytes.Buffer
-	if err := req.Write(&reqBuf); err != nil {
+	pr, pw := io.Pipe()
+	writeDone := make(chan error, 1)
+	go func() {
+		werr := req.Write(pw)
+		_ = pw.CloseWithError(werr)
+		writeDone <- werr
+	}()
+
+	firstBuf := make([]byte, 32*1024)
+	n, rerr := pr.Read(firstBuf)
+	if n == 0 && rerr != nil {
+		_ = pr.Close()
+		_ = c.Close()
+		<-writeDone
 		return
 	}
 
-	st, act, err := s.engine.OpenTargetStream(target, reqBuf.Bytes())
+	st, act, err := s.engine.OpenTargetStream(target, firstBuf[:n])
 	if err != nil {
+		_ = pr.CloseWithError(err)
 		if act == ActionProxy {
 			s.engine.Logf("[HTTP Proxy] %s %s failed: %v", req.Method, target, err)
 		}
@@ -229,12 +241,22 @@ func (s *HTTPProxyServer) handleConn(c net.Conn) {
 		} else {
 			_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		}
+		_ = c.Close()
+		<-writeDone
 		return
 	}
 	defer st.Close()
 
 	_ = c.SetDeadline(time.Time{})
-	gft.Relay(st, c, relayIdleTimeout())
+	sc := &streamHTTPConn{
+		Conn: c,
+		r:    io.MultiReader(pr, br),
+		pr:   pr,
+	}
+	gft.Relay(st, sc, relayIdleTimeout())
+	_ = pr.Close()
+	_ = c.Close()
+	<-writeDone
 }
 
 func isLoopbackRemote(addr net.Addr) bool {
@@ -277,6 +299,30 @@ func (s *HTTPProxyServer) serveLocalMgmt(c net.Conn, req *http.Request, fn Local
 	if len(respBody) > 0 {
 		_, _ = c.Write(respBody)
 	}
+}
+
+type streamHTTPConn struct {
+	net.Conn
+	r  io.Reader
+	pr *io.PipeReader
+}
+
+func (s *streamHTTPConn) Read(p []byte) (int, error) {
+	return s.r.Read(p)
+}
+
+func (s *streamHTTPConn) Close() error {
+	if s.pr != nil {
+		_ = s.pr.Close()
+	}
+	return s.Conn.Close()
+}
+
+func (s *streamHTTPConn) CloseWrite() error {
+	if cw, ok := s.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 type bufferedConn struct {

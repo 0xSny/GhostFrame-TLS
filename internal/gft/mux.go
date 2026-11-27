@@ -886,8 +886,15 @@ func (s *Session) OpenStream(target string, first []byte) (*Stream, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(first) > MaxPayload-len(addr) {
-		first = first[:MaxPayload-len(addr)]
+	maxFirst := MaxPayload - len(addr)
+	if maxFirst < 0 {
+		return nil, ErrProtocol
+	}
+	inOpen := first
+	var overflow []byte
+	if len(inOpen) > maxFirst {
+		inOpen = first[:maxFirst]
+		overflow = first[maxFirst:]
 	}
 	s.mu.Lock()
 	select {
@@ -906,18 +913,24 @@ func (s *Session) OpenStream(target string, first []byte) (*Stream, error) {
 	s.streams[id] = st
 	s.mu.Unlock()
 
-	pl := make([]byte, 0, len(addr)+len(first))
+	pl := make([]byte, 0, len(addr)+len(inOpen))
 	pl = append(pl, addr...)
-	pl = append(pl, first...)
+	pl = append(pl, inOpen...)
 	idx := st.framesSent.Add(1) - 1
 	if err := s.writeFrame(CmdConnect, 0, id, pl, idx); err != nil {
 		s.removeStream(id)
 		return nil, err
 	}
-	st.Up.Add(uint64(len(first)))
-	s.UpBytes.Add(uint64(len(first)))
-	if s.OnBytes != nil && len(first) > 0 {
-		s.OnBytes(len(first), 0)
+	st.Up.Add(uint64(len(inOpen)))
+	s.UpBytes.Add(uint64(len(inOpen)))
+	if s.OnBytes != nil && len(inOpen) > 0 {
+		s.OnBytes(len(inOpen), 0)
+	}
+	if len(overflow) > 0 {
+		if _, werr := st.Write(overflow); werr != nil {
+			_ = st.Close()
+			return nil, werr
+		}
 	}
 	return st, nil
 }

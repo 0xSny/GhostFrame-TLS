@@ -433,3 +433,104 @@ func TestMuxWriteLoopCmdPingSkipsCoalescing(t *testing.T) {
 		t.Fatalf("expected standalone small CmdPing write (no 64KB data coalescing), got len=%d", len(pingWrite))
 	}
 }
+
+func TestMuxOpenStreamLargeFirstOverflow(t *testing.T) {
+	target := "example.org:443"
+	addr, err := EncodeAddr(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maxFirst := MaxPayload - len(addr)
+
+	for _, firstLen := range []int{maxFirst - 1, maxFirst, maxFirst + 1, 96 * 1024, 256 * 1024} {
+		a, b := net.Pipe()
+		ps := NewParamStore(DefaultParams())
+		srv := NewSession(b, false, ps, func(s *Stream, tgt string, first []byte) {
+			defer s.Close()
+			if len(first) > 0 {
+				if _, werr := s.Write(first); werr != nil {
+					return
+				}
+			}
+			buf := make([]byte, 32*1024)
+			for {
+				n, rerr := s.Read(buf)
+				if n > 0 {
+					if _, werr := s.Write(buf[:n]); werr != nil {
+						return
+					}
+				}
+				if rerr != nil {
+					return
+				}
+			}
+		})
+		cli := NewSession(a, true, ps, nil)
+		go srv.Run()
+		go cli.Run()
+
+		first := make([]byte, firstLen)
+		_, _ = rand.Read(first)
+		tail := make([]byte, 2<<20)
+		_, _ = rand.Read(tail)
+
+		st, err := cli.OpenStream(target, first)
+		if err != nil {
+			cli.Close()
+			srv.Close()
+			t.Fatalf("firstLen=%d: OpenStream failed: %v", firstLen, err)
+		}
+		go func() {
+			_, _ = st.Write(tail)
+			_ = st.CloseWrite()
+		}()
+		got, err := io.ReadAll(st)
+		cli.Close()
+		srv.Close()
+		if err != nil {
+			t.Fatalf("firstLen=%d: ReadAll failed: %v", firstLen, err)
+		}
+		if len(got) != len(first)+len(tail) {
+			t.Fatalf("firstLen=%d: byte count mismatch got=%d want=%d", firstLen, len(got), len(first)+len(tail))
+		}
+		if !bytes.Equal(got[:len(first)], first) || !bytes.Equal(got[len(first):], tail) {
+			t.Fatalf("firstLen=%d: echo content mismatch", firstLen)
+		}
+	}
+
+	// Verify overflow write error is propagated when session closes during overflow.
+	a, b := net.Pipe()
+	ps := NewParamStore(DefaultParams())
+	srv := NewSession(b, false, ps, func(s *Stream, tgt string, first []byte) {
+		_ = s.Close()
+	})
+	fc := &failAfterFirstWriteConn{Conn: a}
+	cli := NewSession(fc, true, ps, nil)
+	go srv.Run()
+	go cli.Run()
+	defer cli.Close()
+	defer srv.Close()
+
+	bigFirst := make([]byte, 4*1024*1024)
+	if st, err := cli.OpenStream(target, bigFirst); err == nil {
+		_ = st.Close()
+		t.Fatal("expected OpenStream error when session closes during overflow write")
+	}
+}
+
+type failAfterFirstWriteConn struct {
+	net.Conn
+	mu     sync.Mutex
+	writes int
+}
+
+func (f *failAfterFirstWriteConn) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	f.writes++
+	n := f.writes
+	f.mu.Unlock()
+	if n > 1 {
+		return 0, io.ErrClosedPipe
+	}
+	return f.Conn.Write(p)
+}

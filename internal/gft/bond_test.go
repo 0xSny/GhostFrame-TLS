@@ -425,3 +425,85 @@ func TestSessionPoolEvictsBlackholedSocketViaProbeAllHealth(t *testing.T) {
 	default:
 	}
 }
+
+func TestBondOpenStreamLargeFirstOverflow(t *testing.T) {
+	const numConns = 4
+	ps := NewParamStore(DefaultParams())
+
+	srvGrp := NewBondGroup(func(st DataStream, target string, first []byte) {
+		defer st.Close()
+		if len(first) > 0 {
+			if _, err := st.Write(first); err != nil {
+				return
+			}
+		}
+		_ = CopyBuf(st, st, nil)
+	})
+	cliGrp := NewBondGroup(nil)
+
+	var srvSessions, cliSessions []*Session
+	for i := 0; i < numConns; i++ {
+		cConn, sConn := net.Pipe()
+		srv := NewSession(sConn, false, ps, nil)
+		cli := NewSession(cConn, true, ps, nil)
+		srvGrp.AddSession(srv)
+		cliGrp.AddSession(cli)
+		srvSessions = append(srvSessions, srv)
+		cliSessions = append(cliSessions, cli)
+		go func() { _ = srv.Run() }()
+		go func() { _ = cli.Run() }()
+		_ = srv.SendBondCap()
+	}
+	defer func() {
+		cliGrp.CloseAll(ErrSessionClosed)
+		srvGrp.CloseAll(ErrSessionClosed)
+		for _, s := range cliSessions {
+			s.Close()
+		}
+		for _, s := range srvSessions {
+			s.Close()
+		}
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ready := true
+		for _, c := range cliSessions {
+			if !c.SupportsBond() {
+				ready = false
+				break
+			}
+		}
+		if ready {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	first := make([]byte, 96*1024)
+	_, _ = rand.Read(first)
+	tail := make([]byte, 512*1024)
+	_, _ = rand.Read(tail)
+
+	st, err := cliGrp.OpenStream(2002, "bonded-large-first.example:443", first)
+	if err != nil {
+		t.Fatalf("BondGroup.OpenStream with 96KB first failed: %v", err)
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		_, werr := st.Write(tail)
+		_ = st.CloseWrite()
+		errCh <- werr
+	}()
+
+	got := make([]byte, len(first)+len(tail))
+	if _, rerr := io.ReadFull(st, got); rerr != nil {
+		t.Fatalf("ReadFull failed: %v", rerr)
+	}
+	if werr := <-errCh; werr != nil {
+		t.Fatalf("Write tail failed: %v", werr)
+	}
+	if !bytes.Equal(got[:len(first)], first) || !bytes.Equal(got[len(first):], tail) {
+		t.Fatal("bonded large-first echo mismatch")
+	}
+}
