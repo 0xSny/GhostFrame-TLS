@@ -456,8 +456,22 @@ func (p *Panel) handleUpdateParams(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.srv.params.Set(q)
-	p.srv.saveParams(q)
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "params": q})
+	if err := p.srv.saveParams(q); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":              false,
+			"runtime_applied": true,
+			"persisted":       false,
+			"error":           "params applied in memory but failed to persist: " + err.Error(),
+		})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":              true,
+		"runtime_applied": true,
+		"persisted":       true,
+		"params":          q,
+	})
 }
 
 func parsePanelHopRange(spec string) (string, error) {

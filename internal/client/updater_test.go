@@ -138,3 +138,62 @@ func TestCheckAndDownloadClientUpdate(t *testing.T) {
 		t.Fatalf("unexpected fallback release info: %+v", fbInfo)
 	}
 }
+
+func TestDownloadVerifiedBinaryChunkedMZ(t *testing.T) {
+	payload := make([]byte, 1024*1024+128)
+	payload[0] = 'M'
+	payload[1] = 'Z'
+	sum := sha256.Sum256(payload)
+	wantSHA := hex.EncodeToString(sum[:])
+
+	for _, tc := range []struct {
+		name       string
+		firstChunk int
+		corruptMZ  bool
+		badSHA     bool
+		wantErr    bool
+	}{
+		{name: "first_read_1_byte", firstChunk: 1},
+		{name: "first_read_2_bytes", firstChunk: 2},
+		{name: "normal_chunked", firstChunk: 32 * 1024},
+		{name: "bad_magic_rejected", firstChunk: 1, corruptMZ: true, wantErr: true},
+		{name: "bad_sha_rejected", firstChunk: 1, badSHA: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := append([]byte(nil), payload...)
+			if tc.corruptMZ {
+				data[0] = 'X'
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fl, _ := w.(http.Flusher)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data[:tc.firstChunk])
+				if fl != nil {
+					fl.Flush()
+				}
+				_, _ = w.Write(data[tc.firstChunk:])
+			}))
+			defer srv.Close()
+
+			dest := filepath.Join(t.TempDir(), "Kestrel-Pro.exe")
+			sha := wantSHA
+			if tc.badSHA {
+				sha = "0000000000000000000000000000000000000000000000000000000000000000"
+			}
+			err := downloadVerifiedBinary(context.Background(), srv.Client(), srv.URL, dest, sha, int64(len(data)), "v4.2.6", nil)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got, rerr := os.ReadFile(dest)
+			if rerr != nil || !bytes.Equal(got, data) {
+				t.Fatalf("downloaded file mismatch: err=%v len=%d", rerr, len(got))
+			}
+		})
+	}
+}

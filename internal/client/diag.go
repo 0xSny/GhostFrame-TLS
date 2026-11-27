@@ -77,8 +77,14 @@ func (r *LogRingBuffer) Len() int {
 var (
 	reKestrelLink = regexp.MustCompile(`(?i)(?:ksl4|gft3|gft2)://[^\s"'<>]+`)
 	reIPv4        = regexp.MustCompile(`\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b`)
+	reIPv6        = regexp.MustCompile(`(?i)\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{0,4}\b|::[0-9a-f:]{1,35}`)
 	rePSKJson     = regexp.MustCompile(`(?i)("?(?:psk|password|secret|token|pin)"?\s*[:=]\s*"?)([A-Za-z0-9+/=_-]{8,})("?)`)
 )
+
+// DiagnosticOptions controls optional target visibility in diagnostic exports.
+type DiagnosticOptions struct {
+	IncludeRawTargets bool
+}
 
 // MaskSensitiveText redacts URIs, public IPs, PSKs, passwords, and caller-supplied secrets
 // so exported diagnostic snapshots can be shared safely without credential leakage.
@@ -97,11 +103,24 @@ func MaskSensitiveText(in string, extraSecrets ...string) string {
 		}
 		return "***"
 	})
+	out = reIPv6.ReplaceAllStringFunc(out, func(ip string) string {
+		lower := strings.ToLower(ip)
+		if lower == "::1" || lower == "::" || strings.HasPrefix(lower, "fe80:") {
+			return ip
+		}
+		return "***"
+	})
 	return out
 }
 
-// BuildDiagnosticSnapshot compiles a redacted health, tunnel, routing, and ring-log report.
+// BuildDiagnosticSnapshot compiles a redacted health, tunnel, routing, and ring-log report
+// with Top-10 upload targets anonymized by default.
 func (e *Engine) BuildDiagnosticSnapshot() string {
+	return e.BuildDiagnosticSnapshotWithOptions(DiagnosticOptions{})
+}
+
+// BuildDiagnosticSnapshotWithOptions compiles a diagnostic report with configurable target anonymization.
+func (e *Engine) BuildDiagnosticSnapshotWithOptions(opts DiagnosticOptions) string {
 	st := e.Status()
 	logs := e.Logs()
 
@@ -159,10 +178,28 @@ func (e *Engine) BuildDiagnosticSnapshot() string {
 	if len(topTargets) == 0 {
 		topBuf.WriteString("(no traffic recorded yet)\n")
 	} else {
+		aliases := make(map[string]string, len(topTargets))
+		targetSeq := 0
+		nodeSeq := 0
 		for i, item := range topTargets {
-			tgt := sanitizeExplicitSecrets(item.Target, secrets...)
-			if e.IsNodeHost(tgt) {
-				tgt = "***(node)"
+			var tgt string
+			if opts.IncludeRawTargets {
+				tgt = sanitizeExplicitSecrets(item.Target, secrets...)
+				if e.IsNodeHost(tgt) {
+					tgt = "***(node)"
+				}
+			} else {
+				if alias, ok := aliases[item.Target]; ok {
+					tgt = alias
+				} else if e.IsNodeHost(item.Target) {
+					nodeSeq++
+					tgt = fmt.Sprintf("node-%02d (node)", nodeSeq)
+					aliases[item.Target] = tgt
+				} else {
+					targetSeq++
+					tgt = fmt.Sprintf("target-%02d", targetSeq)
+					aliases[item.Target] = tgt
+				}
 			}
 			fmt.Fprintf(&topBuf, "%2d. %-40s | Up: %8.2f MB (%d B) | Down: %8.2f MB (%d B)\n",
 				i+1, tgt, float64(item.UpBytes)/(1<<20), item.UpBytes, float64(item.DownBytes)/(1<<20), item.DownBytes)
@@ -191,7 +228,12 @@ func sanitizeExplicitSecrets(in string, secrets ...string) string {
 // ExportDiagnosticSnapshot builds a sanitized snapshot, saves it to ~/.kestrel/diag_snapshot.txt,
 // and copies it to the system clipboard on desktop platforms when possible.
 func (e *Engine) ExportDiagnosticSnapshot(hwnd uintptr) (outPath string, copied bool, text string, err error) {
-	text = e.BuildDiagnosticSnapshot()
+	return e.ExportDiagnosticSnapshotWithOptions(hwnd, DiagnosticOptions{})
+}
+
+// ExportDiagnosticSnapshotWithOptions builds and exports a diagnostic snapshot with caller-selected target visibility.
+func (e *Engine) ExportDiagnosticSnapshotWithOptions(hwnd uintptr, opts DiagnosticOptions) (outPath string, copied bool, text string, err error) {
+	text = e.BuildDiagnosticSnapshotWithOptions(opts)
 	dir := ""
 	if e.cfgPath != "" {
 		dir = filepath.Dir(e.cfgPath)

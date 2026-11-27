@@ -26,11 +26,12 @@ type auditFile struct {
 
 // Audit stores failed knock/login records and the manual ban list.
 type Audit struct {
-	mu      sync.Mutex
-	entries map[string]*AuditEntry
-	banned  map[string]bool
-	path    string
-	dirty   bool
+	mu         sync.Mutex
+	entries    map[string]*AuditEntry
+	banned     map[string]bool
+	path       string
+	dirtyVer   uint64
+	flushedVer uint64
 }
 
 const auditMax = 5000
@@ -68,7 +69,7 @@ func (a *Audit) Record(ip, reason string) {
 	e.Count++
 	e.Last = now
 	e.Reasons[reason]++
-	a.dirty = true
+	a.dirtyVer++
 }
 
 func (a *Audit) evictLocked() {
@@ -104,7 +105,7 @@ func (a *Audit) SetBan(ip string, ban bool) bool {
 	} else {
 		delete(a.banned, ip)
 	}
-	a.dirty = true
+	a.dirtyVer++
 	a.mu.Unlock()
 	return true
 }
@@ -140,29 +141,57 @@ func (a *Audit) Clear(clearBans bool) {
 	if clearBans {
 		a.banned = map[string]bool{}
 	}
-	a.dirty = true
+	a.dirtyVer++
 	a.mu.Unlock()
-	a.Flush()
+	_ = a.Flush()
 }
 
-func (a *Audit) Flush() {
+func (a *Audit) Flush() error {
 	if a.path == "" {
-		return
+		return nil
 	}
 	a.mu.Lock()
-	if !a.dirty {
+	if a.dirtyVer == a.flushedVer {
 		a.mu.Unlock()
-		return
+		return nil
 	}
+	ver := a.dirtyVer
 	f := auditFile{Entries: a.entries}
 	for ip := range a.banned {
 		f.Banned = append(f.Banned, ip)
 	}
-	b, _ := json.Marshal(f)
-	a.dirty = false
+	b, err := json.Marshal(f)
 	a.mu.Unlock()
-	tmp := a.path + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil {
-		_ = os.Rename(tmp, a.path)
+	if err != nil {
+		return err
 	}
+	tmp := a.path + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(b); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, a.path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	a.mu.Lock()
+	if ver > a.flushedVer {
+		a.flushedVer = ver
+	}
+	a.mu.Unlock()
+	return nil
 }

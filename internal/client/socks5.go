@@ -134,8 +134,23 @@ func (s *SOCKS5Server) handleConn(c net.Conn) {
 		return
 	}
 	nmethods := int(head[1])
+	if nmethods == 0 {
+		_, _ = c.Write([]byte{0x05, 0xFF})
+		return
+	}
 	methods := make([]byte, nmethods)
 	if _, err := io.ReadFull(c, methods); err != nil {
+		return
+	}
+	hasNoAuth := false
+	for _, m := range methods {
+		if m == 0x00 {
+			hasNoAuth = true
+			break
+		}
+	}
+	if !hasNoAuth {
+		_, _ = c.Write([]byte{0x05, 0xFF})
 		return
 	}
 	if _, err := c.Write([]byte{0x05, 0x00}); err != nil {

@@ -868,6 +868,12 @@ func (s *uiServer) handleClearLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *uiServer) handleDiagnostic(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IncludeRawTargets bool `json:"include_raw_targets"`
+	}
+	if r.Body != nil {
+		_ = decodeJSON(r, &req)
+	}
 	type diagRes struct {
 		path   string
 		copied bool
@@ -875,10 +881,12 @@ func (s *uiServer) handleDiagnostic(w http.ResponseWriter, r *http.Request) {
 		err    error
 	}
 	ch := make(chan diagRes, 1)
-	go func() {
-		outPath, copied, text, err := s.eng.ExportDiagnosticSnapshot(s.hwnd)
+	go func(includeRaw bool) {
+		outPath, copied, text, err := s.eng.ExportDiagnosticSnapshotWithOptions(s.hwnd, client.DiagnosticOptions{
+			IncludeRawTargets: includeRaw,
+		})
 		ch <- diagRes{path: outPath, copied: copied, text: text, err: err}
-	}()
+	}(req.IncludeRawTargets)
 	res := <-ch
 	if res.err != nil && res.text == "" {
 		writeJSONError(w, http.StatusInternalServerError, res.err.Error())

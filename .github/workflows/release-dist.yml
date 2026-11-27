@@ -66,6 +66,10 @@ jobs:
             echo "ERROR: android/app/build.gradle.kts versionName does not match ${APP_VER}" >&2
             exit 1
           fi
+          if ! head -n 1 README.md | grep -q "${REL_VER}"; then
+            echo "ERROR: README.md heading does not match ${REL_VER}" >&2
+            exit 1
+          fi
           echo "rel_ver=${REL_VER}" >> "$GITHUB_OUTPUT"
           echo "app_ver=${APP_VER}" >> "$GITHUB_OUTPUT"
           echo "build_num=${BUILD_NUM}" >> "$GITHUB_OUTPUT"

@@ -558,10 +558,10 @@ func downloadVerifiedBinary(
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
-			if written == 0 && n >= 2 {
-				head[0], head[1] = buf[0], buf[1]
-			} else if written == 1 && n >= 1 {
-				head[1] = buf[0]
+			if written < 2 {
+				for i := 0; i < n && written+int64(i) < 2; i++ {
+					head[written+int64(i)] = buf[i]
+				}
 			}
 			written += int64(n)
 			if written > maxClientBinaryBytes {

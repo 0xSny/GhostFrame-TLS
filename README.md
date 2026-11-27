@@ -1,4 +1,4 @@
-# Kestrel (`v4.0.21-LTS`)
+# Kestrel (`v4.2.6`)
 
 [![CI (Core & Server)](https://github.com/Spittingjiu/GhostFrame-TLS/actions/workflows/ci.yml/badge.svg)](https://github.com/Spittingjiu/GhostFrame-TLS/actions/workflows/ci.yml)
 [![Build Kestrel Pro](https://github.com/Spittingjiu/GhostFrame-TLS/actions/workflows/build-client.yml/badge.svg)](https://github.com/Spittingjiu/GhostFrame-TLS/actions/workflows/build-client.yml)
@@ -35,11 +35,20 @@
 | :--- | :--- | :--- |
 | **Linux Server & TUI** | `cmd/gft-server`, `internal/{server,sni,qr,tui}` | `kestrel-server` / `ksl` TUI, OTA upgrade/rollback, `ksl4://` QR sharing, SSRF guard (`198.18.0.0/15`, `100.64.0.0/10` & private ranges) |
 | **Headless CLI Core** | `cmd/gft-core`, `internal/client` | `kestrel-core` lightweight SOCKS5/HTTP daemon with `-low-mem` mode for Linux / ARM64 routers |
-| **Windows Desktop GUI** | `cmd/gft-client-gui`, `internal/winui` | Single-binary (`Kestrel-Pro.exe`) native Win32/GDI+/DWM GUI & tray, `Rule \| Global \| Core`, Registry backup |
+| **Windows Desktop GUI** | `cmd/gft-client-gui`, `cmd/kestrel-setup`, `internal/{winui,wininstall}` | WebView2 + Win32/DWM GUI & tray, `Kestrel-Pro-Setup` NSIS-free pure-Go installer, GitHub OTA updater (`SHA-256` + `MZ`), Registry backup |
+| **Android Client** | `android/`, `mobile/`, `internal/tunstack/` | Kotlin/Compose UI + `VpnService` + GoMobile AAR + `gVisor` L3/L4 TUN stack (`Rule \| Global \| Core`) |
 | **iOS Dual Editions** | `ios/`, `mobile/`, `internal/tunstack/` | **Kestrel Duo** (`NEPacketTunnelProvider` True TUN L3/L4 `gVisor` stack + Fake-IP persistence + iOS 18 Control Center `AudioPlaybackIntent` widget) & **Kestrel Air** (portable single-process mode) |
-| **iStoreOS / OpenWrt (`KestrelBox`)** | `cmd/0ghost`, `internal/tproxy`, `openwrt/luci-app-0ghost/` | Phicomm N1 (`linux/arm64`) `kbox` `fw4 nftables` TPROXY / `REDIRECT` fallback, Split-DNS (`:7853`), full APNIC `@cn_ipv4` set + `/etc/kbox/cn_ipv4.txt` override, `hotplug.d` + 12s watchdog, CSRF/Host-protected WebUI (`:19080`), LuCI top-pinned `KestrelBox` panel |
+| **iStoreOS / OpenWrt (`KestrelBox`)** | `cmd/0ghost`, `internal/tproxy`, `openwrt/luci-app-0ghost/` | Phicomm N1 (`linux/arm64`) `kbox` `fw4 nftables` TPROXY / `REDIRECT` fallback, Split-DNS (`:7853`), full APNIC `@cn_ipv4` set + `/etc/kbox/cn_ipv4.txt` override, `hotplug.d` + 12s watchdog, bootstrap-token/password-gated WebUI (`127.0.0.1:19080` + `/kbox/`), LuCI top-pinned `KestrelBox` panel |
 
 > Note: `gvisor.dev/gvisor` is strictly isolated inside `internal/tunstack` and `mobile` so server, Windows desktop (`Kestrel Pro`), and `KestrelBox` builds never link `gvisor`.
+
+### Operating Modes & Upgrade Paths
+
+| Concept | Behavior | Notes |
+| :--- | :--- | :--- |
+| **System Interception (`Rule` / `Global`)** | Takes over OS proxy (Windows WinINET) or system VPN/TUN (`Android` / `iOS Duo` / `KestrelBox`) | `Rule` bypasses LAN & Mainland China; `Global` tunnels all non-LAN traffic |
+| **Local Proxy Only (`Core`)** | Runs local SOCKS5 (`:10808`) & HTTP (`:10809`) listeners without modifying OS proxy or mounting TUN/TPROXY | Ideal for manual per-app proxy or upstream chaining |
+| **Installer vs Portable Upgrade** | `Kestrel-Pro-Setup` installs to `%LocalAppData%\Kestrel` with Start Menu shortcut & uninstaller; portable `.exe` updates in-place | Router `install-kbox.sh` verifies signed `kbox-manifest.txt` (`RELEASE_SIGNING_KEY_PEM` / `--pubkey`) before stopping `kbox` |
 
 ---
 
@@ -50,7 +59,8 @@
 ├── cmd/
 │   ├── gft-server/             # Dual-stack server & `ksl` TUI control center (`kestrel-server`)
 │   ├── gft-core/               # Headless SOCKS5/HTTP Linux/router daemon (`kestrel-core`)
-│   ├── gft-client-gui/         # Native Windows Win32/GDI+ client (`Kestrel-Pro.exe`)
+│   ├── gft-client-gui/         # Windows WebView2/Win32 desktop client (`Kestrel-Pro.exe`)
+│   ├── kestrel-setup/          # Pure-Go Windows installer (`Kestrel-Pro-Setup.exe`)
 │   └── 0ghost/                 # iStoreOS arm64 transparent side-router daemon (`kbox`) & WebUI (:19080)
 ├── internal/
 │   ├── gftrtc/                 # Kestrel-RTC UDP engine (ICE-STUN, SRTP, XOR-FEC, SACK, Smart-Brutal)
@@ -58,10 +68,11 @@
 │   ├── netbind/                # SO_MARK, Darwin IP_BOUND_IF, RFC 7050/6052 NAT64 synthesis
 │   ├── client/                 # Engine, RuleSet, embedded APNIC CN IPv4/IPv6 CIDR, smart DNS probe, proxies
 │   ├── server/, sni/, qr/, tui/# Server outbound, non-CDN prober, QR renderer, TUI menu
-│   ├── winui/                  # Pure-Go Win32/GDI+/DWM UI & tray icon
+│   ├── winui/, wininstall/     # Pure-Go WebView2/Win32 UI, tray, shortcut & registry installer
 │   ├── tproxy/                 # Linux nftables/iptables TPROXY, Split-DNS, conflict detection
-│   └── tunstack/               # gVisor L3/L4 Netstack & persistent Fake-IP DNS (iOS Duo only)
-├── mobile/                     # GoMobile bindings (`GhostMobile.xcframework`)
+│   └── tunstack/               # gVisor L3/L4 Netstack & persistent Fake-IP DNS (iOS Duo & Android VpnService)
+├── mobile/                     # GoMobile bindings (`GhostMobile.xcframework` & `GhostMobile.aar`)
+├── android/                    # Kotlin/Compose Android client (`KestrelVpnService`)
 ├── ios/                        # XcodeGen specs & Swift sources (`Kestrel Duo`, `Kestrel Air`, `KestrelControlWidget`)
 ├── openwrt/luci-app-0ghost/    # iStoreOS LuCI JS view (`kbox`), procd init, ACLs & hotplug hooks
 ├── tools/
