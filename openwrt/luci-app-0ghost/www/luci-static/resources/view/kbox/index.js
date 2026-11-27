@@ -17,11 +17,16 @@ return view.extend({
 	handleReset: null,
 
 	load: function() {
-		return callServiceList('kbox').catch(function() { return {}; });
+		return Promise.all([
+			callServiceList('kbox').catch(function() { return {}; }),
+			fs.trimmed('/etc/kbox/admin.token').catch(function() { return ''; })
+		]).then(function(res) {
+			return { svc: res[0], adminToken: res[1] || '' };
+		});
 	},
 
 	getDirectConsoleURL: function() {
-		return 'http://' + window.location.hostname + ':19080/';
+		return '/kbox/';
 	},
 
 	execService: function(action) {
@@ -34,7 +39,9 @@ return view.extend({
 		});
 	},
 
-	render: function(data) {
+	render: function(loaded) {
+		var data = (loaded && loaded.svc) ? loaded.svc : (loaded || {});
+		var adminToken = (loaded && loaded.adminToken) ? String(loaded.adminToken).trim() : '';
 		var running = false;
 		if (data && data['kbox'] && data['kbox'].instances) {
 			var insts = data['kbox'].instances;
@@ -100,8 +107,18 @@ return view.extend({
 			}, '在新标签页打开 KestrelBox 独立控制台 (' + directUrl + ')')
 		]);
 
-		// Verify uhttpd same-origin proxy /kbox/; never inject http:// into an https:// iframe.
-		fetch('/kbox/api/auth/info', { cache: 'no-store' }).then(function(res) {
+		// Verify uhttpd same-origin proxy /kbox/ and pair authenticated LuCI session if bootstrap token exists.
+		var pairPromise = adminToken
+			? fetch('/kbox/api/auth/login', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ password: adminToken })
+			}).catch(function() {})
+			: Promise.resolve();
+
+		pairPromise.then(function() {
+			return fetch('/kbox/api/auth/info', { cache: 'no-store' });
+		}).then(function(res) {
 			if (!res.ok) throw new Error('proxy unavailable');
 		}).catch(function() {
 			if (window.location.protocol === 'https:') {

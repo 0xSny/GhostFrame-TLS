@@ -2,10 +2,16 @@
 	"luci-app-kbox": {
 		"description": "KestrelBox Kestrel-RTC Side-Router Gateway",
 		"read": {
-			"uci": [ "uhttpd" ]
+			"uci": [ "uhttpd" ],
+			"file": {
+				"/etc/kbox/admin.token": [ "read" ]
+			}
 		},
 		"write": {
-			"uci": [ "uhttpd" ]
+			"uci": [ "uhttpd" ],
+			"file": {
+				"/etc/init.d/kbox": [ "exec" ]
+			}
 		}
 	}
 }

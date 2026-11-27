@@ -1,5 +1,6 @@
 import Foundation
 import NetworkExtension
+import Security
 import WidgetKit
 
 @MainActor
@@ -30,6 +31,7 @@ final class VPNManager: GhostBackend {
     private var appliedRouteMode: String = "rule"
     private var appliedEnableIPv6: Bool = false
     private var appliedHTTPPort: Int = 10809
+    private var currentMgmtToken: String = ""
     private var telemetryChannel: String = "pending"
     private var loggedHTTPTelemetry: Bool = false
     private let directSession: URLSession = {
@@ -97,6 +99,9 @@ final class VPNManager: GhostBackend {
         appliedRouteMode = config.routeMode.lowercased()
         appliedEnableIPv6 = config.enableIPv6
         appliedHTTPPort = config.httpPort
+        currentMgmtToken = Self.generateRandomTokenHex()
+        var effectiveConfig = config
+        effectiveConfig.mgmtToken = currentMgmtToken
         telemetryChannel = "pending"
         loggedHTTPTelemetry = false
         connectAttemptToken &+= 1
@@ -113,7 +118,7 @@ final class VPNManager: GhostBackend {
             case .failure(let err):
                 self.handleError(err, stage: "加载系统隧道配置失败")
             case .success(let mgr):
-                self.saveAndStart(manager: mgr, config: config, node: node, attemptToken: attemptToken)
+                self.saveAndStart(manager: mgr, config: effectiveConfig, node: node, attemptToken: attemptToken)
             }
         }
     }
@@ -150,7 +155,12 @@ final class VPNManager: GhostBackend {
 
     func applyLiveConfig(config: GhostEngineConfig, node: GhostNode) {
         currentHTTPPort = config.httpPort
-        let newRouteMode = config.routeMode.lowercased()
+        if currentMgmtToken.isEmpty {
+            currentMgmtToken = Self.generateRandomTokenHex()
+        }
+        var effectiveConfig = config
+        effectiveConfig.mgmtToken = currentMgmtToken
+        let newRouteMode = effectiveConfig.routeMode.lowercased()
         let needsNetworkReconfig = node.host != appliedServerHost ||
             newRouteMode != appliedRouteMode ||
             config.enableIPv6 != appliedEnableIPv6 ||
@@ -161,7 +171,7 @@ final class VPNManager: GhostBackend {
             case .failure(let err):
                 self.handleError(err, stage: "更新系统隧道配置失败")
             case .success(let mgr):
-                self.writeProviderConfiguration(on: mgr, config: config, node: node)
+                self.writeProviderConfiguration(on: mgr, config: effectiveConfig, node: node)
                 mgr.saveToPreferences { [weak self] saveErr in
                     Task { @MainActor in
                         guard let self = self else { return }
@@ -169,7 +179,7 @@ final class VPNManager: GhostBackend {
                             self.handleError(saveErr, stage: "保存 providerConfiguration 失败")
                             return
                         }
-                        let cfgJSON = config.toJSONString()
+                        let cfgJSON = effectiveConfig.toJSONString()
                         self.sendIPC(action: "reload", configJSON: cfgJSON) { [weak self] resp in
                             Task { @MainActor in
                                 guard let self = self else { return }
@@ -302,6 +312,9 @@ final class VPNManager: GhostBackend {
                     if let hp = (mgr.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["httpPort"] as? Int, hp > 0 {
                         self.currentHTTPPort = hp
                     }
+                    if let tok = (mgr.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["mgmtToken"] as? String, !tok.isEmpty {
+                        self.currentMgmtToken = tok
+                    }
                     self.updateVPNStatus(mgr.connection.status, connection: mgr.connection)
                 }
                 completion?(matched)
@@ -337,7 +350,8 @@ final class VPNManager: GhostBackend {
             "socksPort": config.socksPort,
             "httpPort": config.httpPort,
             "routeMode": config.routeMode,
-            "transport": config.transport
+            "transport": config.transport,
+            "mgmtToken": config.mgmtToken ?? currentMgmtToken
         ]
         mgr.protocolConfiguration = proto
         mgr.localizedDescription = "Kestrel Duo (\(node.remark))"
@@ -499,6 +513,16 @@ final class VPNManager: GhostBackend {
         }
     }
 
+    private static func generateRandomTokenHex() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        if status == errSecSuccess {
+            return bytes.map { String(format: "%02x", $0) }.joined()
+        }
+        return UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    }
+
     private static func statusName(_ status: NEVPNStatus) -> String {
         switch status {
         case .invalid: return "invalid"
@@ -574,6 +598,9 @@ final class VPNManager: GhostBackend {
         var req = URLRequest(url: url)
         req.httpMethod = method
         req.timeoutInterval = 2.0
+        if !currentMgmtToken.isEmpty {
+            req.setValue(currentMgmtToken, forHTTPHeaderField: "X-Kestrel-Token")
+        }
         if let body = body {
             req.httpBody = body
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")

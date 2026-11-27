@@ -73,20 +73,18 @@ enum GhostVPNControlBridge {
         if let mgr = preferredManager(from: managers) {
             return isActiveStatus(mgr.connection.status)
         }
-        var ports: [Int] = []
+        var portTokens: [(port: Int, token: String?)] = []
         for mgr in managers {
             let pCfg = (mgr.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
-            if let hp = pCfg?["httpPort"] as? Int, (1...65535).contains(hp), !ports.contains(hp) {
-                ports.append(hp)
+            let tok = pCfg?["mgmtToken"] as? String
+            if let hp = pCfg?["httpPort"] as? Int, (1...65535).contains(hp), !portTokens.contains(where: { $0.port == hp }) {
+                portTokens.append((hp, tok))
             } else if let cfgJSON = pCfg?["configJSON"] as? String,
                       let data = cfgJSON.data(using: .utf8),
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let hp = obj["http_port"] as? Int, (1...65535).contains(hp), !ports.contains(hp) {
-                ports.append(hp)
+                      let hp = obj["http_port"] as? Int, (1...65535).contains(hp), !portTokens.contains(where: { $0.port == hp }) {
+                portTokens.append((hp, tok ?? (obj["mgmt_token"] as? String)))
             }
-        }
-        for fallback in [10809, 7891, 10819] where !ports.contains(fallback) {
-            ports.append(fallback)
         }
         let cfg = URLSessionConfiguration.ephemeral
         cfg.connectionProxyDictionary = [:]
@@ -94,9 +92,12 @@ enum GhostVPNControlBridge {
         cfg.timeoutIntervalForResource = 0.6
         let session = URLSession(configuration: cfg)
         defer { session.invalidateAndCancel() }
-        for port in ports {
-            guard let url = URL(string: "http://127.0.0.1:\(port)/_ksl/ping") else { continue }
-            if let (_, resp) = try? await session.data(from: url),
+        for item in portTokens {
+            guard let tok = item.token, !tok.isEmpty,
+                  let url = URL(string: "http://127.0.0.1:\(item.port)/_ksl/ping") else { continue }
+            var req = URLRequest(url: url)
+            req.setValue(tok, forHTTPHeaderField: "X-Kestrel-Token")
+            if let (_, resp) = try? await session.data(for: req),
                (resp as? HTTPURLResponse)?.statusCode == 200 {
                 return true
             }

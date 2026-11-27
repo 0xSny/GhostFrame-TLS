@@ -2,11 +2,15 @@ package mobile
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -41,6 +45,7 @@ type mobileStartConfig struct {
 	AsyncConnect bool     `json:"async_connect,omitempty"`
 	EnableIPv6   bool     `json:"enable_ipv6,omitempty"`
 	CustomRules  []string `json:"custom_rules,omitempty"`
+	MgmtToken    string   `json:"mgmt_token,omitempty"`
 }
 
 type parsedLinkInfo struct {
@@ -70,6 +75,7 @@ var (
 	engineInst      *client.Engine
 	lastConfigRaw   string
 	lastConnectErr  string
+	mgmtToken       string
 	scrubberStopCh  chan struct{}
 	reconnectStopCh chan struct{}
 	reconnectWakeCh chan struct{}
@@ -245,6 +251,17 @@ func startEngineWithOptions(configJSON string, preserveTUN bool) error {
 	engineInst = nil
 	dir := dataDirState
 	lastConfigRaw = configJSON
+	tok := strings.TrimSpace(cfg.MgmtToken)
+	if tok == "" {
+		if preserveTUN && mgmtToken != "" {
+			tok = mgmtToken
+		} else {
+			var rnd [32]byte
+			_, _ = rand.Read(rnd[:])
+			tok = hex.EncodeToString(rnd[:])
+		}
+	}
+	mgmtToken = tok
 	mu.Unlock()
 
 	var savedWriter TunPacketWriter
@@ -386,6 +403,14 @@ func StartEngineJSON(configJSON string) string {
 	return marshalEnvelope(StartEngine(configJSON), nil)
 }
 
+// GetMgmtToken returns the active loopback management session token (empty when stopped).
+func GetMgmtToken() string {
+	mu.Lock()
+	tok := mgmtToken
+	mu.Unlock()
+	return tok
+}
+
 // StopEngine stops the active GhostFrame engine and reclaims Go heap pages back to iOS.
 func StopEngine() error {
 	StopTUN()
@@ -394,6 +419,7 @@ func StopEngine() error {
 	eng := engineInst
 	engineInst = nil
 	lastConnectErr = ""
+	mgmtToken = ""
 	isTunnel := tunnelExtState
 	stopReconnectLoopLocked()
 	stopMemScrubberLocked()
@@ -434,6 +460,25 @@ func OnNetworkChanged(ifaceName string) {
 	}
 }
 
+func filterMobileStatus(raw map[string]any) map[string]any {
+	out := make(map[string]any, 40)
+	for _, key := range []string{
+		"version", "state", "last_err", "active_transport", "transport_pref",
+		"route_mode", "rule_stats", "verify_mode", "hop_range", "rtc_port",
+		"rtc_ports", "hop_count", "hop_state", "rekey_count", "srtt_ms",
+		"min_rtt_ms", "fec_recovered", "loss_pct", "pacing_mbps", "up_mbps",
+		"down_mbps", "active_conns", "active_streams", "ping_ms", "up_bps",
+		"down_bps", "total_up", "total_down", "enable_ipv6", "socks_addr",
+		"http_addr", "node_name", "node_host", "node_port", "sni", "sni_rtt_ms",
+		"active_node", "nodes", "recent_routes",
+	} {
+		if v, ok := raw[key]; ok {
+			out[key] = v
+		}
+	}
+	return out
+}
+
 // GetStatusJSON returns a combined JSON status + memory + rolling log snapshot.
 func GetStatusJSON() string {
 	mu.Lock()
@@ -445,7 +490,7 @@ func GetStatusJSON() string {
 	var status map[string]any
 	var logs []client.LogEntry
 	if eng != nil {
-		status = eng.Status()
+		status = filterMobileStatus(eng.StatusForTab("routes"))
 		if curErr, _ := status["last_err"].(string); curErr == "" && cachedErr != "" {
 			if st, _ := status["state"].(string); st != string(client.StateConnected) {
 				status["last_err"] = cachedErr
@@ -689,21 +734,61 @@ func ResolveHostIPsJSON(host string) string {
 	return string(b)
 }
 
-func handleLocalMgmt(method, path string, body []byte) (int, string, []byte) {
+func extractMgmtToken(headers http.Header) string {
+	if headers == nil {
+		return ""
+	}
+	if tok := strings.TrimSpace(headers.Get("X-Kestrel-Token")); tok != "" {
+		return tok
+	}
+	if auth := strings.TrimSpace(headers.Get("Authorization")); strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
+}
+
+func handleLocalMgmt(method, path string, headers http.Header, body []byte) (int, string, []byte) {
+	if headers != nil && strings.TrimSpace(headers.Get("Origin")) != "" {
+		return 403, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"cross-origin request blocked"}`)
+	}
+	mu.Lock()
+	wantTok := mgmtToken
+	mu.Unlock()
+	gotTok := extractMgmtToken(headers)
+	if wantTok == "" || len(gotTok) != len(wantTok) || subtle.ConstantTimeCompare([]byte(gotTok), []byte(wantTok)) != 1 {
+		return 401, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"unauthorized"}`)
+	}
+
+	upperMethod := strings.ToUpper(strings.TrimSpace(method))
 	switch path {
 	case "/_ksl/ping", "/_gft/ping":
+		if upperMethod != "GET" {
+			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
+		}
 		return 200, "application/json; charset=utf-8", []byte(`{"ok":true,"pong":true}`)
 	case "/_ksl/status", "/_gft/status":
+		if upperMethod != "GET" {
+			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
+		}
 		return 200, "application/json; charset=utf-8", []byte(GetStatusJSON())
 	case "/_ksl/diag", "/_gft/diag":
+		if upperMethod != "GET" {
+			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
+		}
 		return 200, "text/plain; charset=utf-8", []byte(GetDiagnosticSnapshot())
 	case "/_ksl/clear-logs", "/_gft/clear-logs":
+		if upperMethod != "POST" {
+			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
+		}
 		ClearLogs()
 		return 200, "application/json; charset=utf-8", []byte(`{"ok":true}`)
 	case "/_ksl/rule-stats":
+		if upperMethod != "GET" {
+			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
+		}
 		return 200, "application/json; charset=utf-8", []byte(GetRuleStatsJSON())
 	case "/_ksl/update-rules":
-		if strings.ToUpper(strings.TrimSpace(method)) != "POST" {
+		if upperMethod != "POST" {
 			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
 		}
 		var req struct {
@@ -714,7 +799,7 @@ func handleLocalMgmt(method, path string, body []byte) (int, string, []byte) {
 		}
 		return 200, "application/json; charset=utf-8", []byte(UpdateRuleBundleJSON(req.URL))
 	case "/_ksl/ipv6":
-		if strings.ToUpper(strings.TrimSpace(method)) != "POST" {
+		if upperMethod != "POST" {
 			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
 		}
 		var req struct {
@@ -731,7 +816,7 @@ func handleLocalMgmt(method, path string, body []byte) (int, string, []byte) {
 		}
 		return 200, "application/json; charset=utf-8", []byte(GetStatusJSON())
 	case "/_ksl/reload", "/_gft/reload":
-		if strings.ToUpper(strings.TrimSpace(method)) != "POST" {
+		if upperMethod != "POST" {
 			return 405, "application/json; charset=utf-8", []byte(`{"ok":false,"error":"method not allowed"}`)
 		}
 		return 200, "application/json; charset=utf-8", []byte(marshalEnvelope(reloadEngineFromHTTP(string(body)), nil))

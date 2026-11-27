@@ -34,6 +34,7 @@ type GatewayConfig struct {
 	UDPPort            int         `json:"tproxy_udp_port"`
 	DNSPort            int         `json:"dns_port"`
 	WebAddr            string      `json:"web_addr"`
+	AllowLANWeb        bool        `json:"allow_lan_web,omitempty"`
 	WebPassword        string      `json:"web_password,omitempty"`
 	FWMark             int         `json:"fwmark"`
 }
@@ -48,7 +49,7 @@ func DefaultGatewayConfig() GatewayConfig {
 		TCPPort:            10880,
 		UDPPort:            10881,
 		DNSPort:            7853,
-		WebAddr:            "0.0.0.0:19080",
+		WebAddr:            "127.0.0.1:19080",
 		FWMark:             0xff,
 	}
 }

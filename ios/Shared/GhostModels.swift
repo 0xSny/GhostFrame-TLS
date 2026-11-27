@@ -144,6 +144,7 @@ struct GhostEngineConfig: Codable, Equatable {
     var asyncConnect: Bool = true
     var enableIPv6: Bool = false
     var customRules: [String] = []
+    var mgmtToken: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case linkURI = "link_uri"
@@ -156,6 +157,7 @@ struct GhostEngineConfig: Codable, Equatable {
         case asyncConnect = "async_connect"
         case enableIPv6 = "enable_ipv6"
         case customRules = "custom_rules"
+        case mgmtToken = "mgmt_token"
     }
 
     init(
@@ -168,7 +170,8 @@ struct GhostEngineConfig: Codable, Equatable {
         downMbps: Int,
         asyncConnect: Bool = true,
         enableIPv6: Bool = false,
-        customRules: [String] = []
+        customRules: [String] = [],
+        mgmtToken: String? = nil
     ) {
         self.linkURI = linkURI
         self.socksPort = socksPort
@@ -180,6 +183,7 @@ struct GhostEngineConfig: Codable, Equatable {
         self.asyncConnect = asyncConnect
         self.enableIPv6 = enableIPv6
         self.customRules = customRules
+        self.mgmtToken = mgmtToken
     }
 
     init(from decoder: Decoder) throws {
@@ -194,6 +198,7 @@ struct GhostEngineConfig: Codable, Equatable {
         asyncConnect = (try? c.decode(Bool.self, forKey: .asyncConnect)) ?? true
         enableIPv6 = (try? c.decode(Bool.self, forKey: .enableIPv6)) ?? false
         customRules = (try? c.decode([String].self, forKey: .customRules)) ?? []
+        mgmtToken = try? c.decodeIfPresent(String.self, forKey: .mgmtToken)
     }
 
     func toJSONString() -> String {

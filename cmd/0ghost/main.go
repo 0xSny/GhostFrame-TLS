@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -29,8 +32,10 @@ import (
 var gatewayVersion = "v4.2.6"
 
 type GatewayService struct {
-	cfgPath string
-	engine  *client.Engine
+	cfgPath        string
+	tokenPath      string
+	bootstrapToken string
+	engine         *client.Engine
 
 	mu        sync.RWMutex
 	fwOpMu    sync.Mutex
@@ -65,6 +70,27 @@ func NewGatewayService(cfgPath, webOverride string) (*GatewayService, error) {
 	gwCfg.Normalize()
 	if strings.TrimSpace(webOverride) != "" {
 		gwCfg.WebAddr = strings.TrimSpace(webOverride)
+	} else if strings.TrimSpace(gwCfg.WebPassword) == "" && !isLoopbackListenAddr(gwCfg.WebAddr) {
+		_, port, err := net.SplitHostPort(gwCfg.WebAddr)
+		if err != nil || port == "" {
+			port = "19080"
+		}
+		gwCfg.WebAddr = net.JoinHostPort("127.0.0.1", port)
+		gwCfg.AllowLANWeb = false
+		eng.Logf("[KestrelBox] 安全加固：未设置控制台口令，已将管理监听收紧至 %s（请先设置口令后再开启局域网直连）", gwCfg.WebAddr)
+	}
+
+	var tokenPath, bootstrapToken string
+	if cfgPath != "" {
+		tokenPath = filepath.Join(filepath.Dir(cfgPath), "admin.token")
+	}
+	if strings.TrimSpace(gwCfg.WebPassword) == "" {
+		bootstrapToken = loadOrCreateBootstrapToken(tokenPath)
+		if tokenPath != "" {
+			eng.Logf("[KestrelBox] 首次配对口令已写入 %s（仅本机及已认证 LuCI 会话可用）", tokenPath)
+		}
+	} else if tokenPath != "" {
+		_ = os.Remove(tokenPath)
 	}
 
 	// Explicitly expose SOCKS5 & HTTP on all LAN interfaces (0.0.0.0:10808 / 0.0.0.0:10809).
@@ -82,16 +108,56 @@ func NewGatewayService(cfgPath, webOverride string) (*GatewayService, error) {
 
 	iface, lanIP, gwIP := tproxy.DetectLANEnvironment()
 	s := &GatewayService{
-		cfgPath:  cfgPath,
-		engine:   eng,
-		gwCfg:    gwCfg,
-		lanIface: iface,
-		lanIP:    lanIP,
-		gwIP:     gwIP,
-		stopCh:   make(chan struct{}),
-		syncCh:   make(chan struct{}, 1),
+		cfgPath:        cfgPath,
+		tokenPath:      tokenPath,
+		bootstrapToken: bootstrapToken,
+		engine:         eng,
+		gwCfg:          gwCfg,
+		lanIface:       iface,
+		lanIP:          lanIP,
+		gwIP:           gwIP,
+		stopCh:         make(chan struct{}),
+		syncCh:         make(chan struct{}, 1),
 	}
 	return s, nil
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	host := strings.TrimSpace(addr)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func loadOrCreateBootstrapToken(path string) string {
+	if path != "" {
+		if b, err := os.ReadFile(path); err == nil {
+			if tok := strings.TrimSpace(string(b)); len(tok) >= 32 {
+				return tok
+			}
+		}
+	}
+	var rnd [24]byte
+	_, _ = rand.Read(rnd[:])
+	tok := hex.EncodeToString(rnd[:])
+	if path != "" {
+		_ = os.MkdirAll(filepath.Dir(path), 0o700)
+		_ = os.WriteFile(path, []byte(tok+"\n"), 0o600)
+	}
+	return tok
+}
+
+func (s *GatewayService) BootstrapToken() string {
+	s.mu.RLock()
+	tok := s.bootstrapToken
+	s.mu.RUnlock()
+	return tok
 }
 
 func mapGatewayToRouteMode(m tproxy.GatewayMode) client.RouteMode {
@@ -531,7 +597,7 @@ func (s *GatewayService) ProbeDualConnectivity() map[string]any {
 }
 
 func (s *GatewayService) Snapshot() map[string]any {
-	st := s.engine.Status()
+	raw := s.engine.StatusForTab("routes")
 	cfg := s.getGatewayConfig()
 
 	s.mu.RLock()
@@ -577,6 +643,23 @@ func (s *GatewayService) Snapshot() map[string]any {
 		Conflicts:       conflicts,
 	}
 
+	// Explicit status field whitelist: never expose link_uri, clash_yaml, PSK, or pin.
+	st := make(map[string]any, 48)
+	for _, key := range []string{
+		"version", "state", "last_err", "active_transport", "transport_pref",
+		"route_mode", "rule_stats", "verify_mode", "hop_range", "rtc_port",
+		"rtc_ports", "hop_count", "hop_state", "rekey_count", "srtt_ms",
+		"min_rtt_ms", "fec_recovered", "loss_pct", "pacing_mbps", "up_mbps",
+		"down_mbps", "active_conns", "active_streams", "ping_ms", "up_bps",
+		"down_bps", "total_up", "total_down", "enable_ipv6", "socks_addr",
+		"http_addr", "node_name", "node_host", "node_port", "sni", "sni_rtt_ms",
+		"active_node", "nodes", "recent_routes", "history",
+	} {
+		if v, ok := raw[key]; ok {
+			st[key] = v
+		}
+	}
+
 	st["gateway_version"] = gatewayVersion
 	st["gateway_mode"] = string(cfg.GatewayMode)
 	st["device_mode"] = string(cfg.DeviceMode)
@@ -586,6 +669,8 @@ func (s *GatewayService) Snapshot() map[string]any {
 	st["filter_aaaa"] = !cfg.EnableIPv6
 	st["lan_masquerade"] = cfg.LANMasquerade
 	st["auto_yield_conflicts"] = cfg.AutoYieldConflicts
+	st["allow_lan_web"] = cfg.AllowLANWeb
+	st["web_addr"] = cfg.WebAddr
 	st["web_password_enabled"] = strings.TrimSpace(cfg.WebPassword) != ""
 	st["custom_rules"] = s.engine.CustomRules()
 	st["tproxy_stats"] = tpStats
@@ -601,7 +686,7 @@ func (s *GatewayService) Snapshot() map[string]any {
 
 func main() {
 	cfgPath := flag.String("config", "/etc/kbox/config.json", "path to KestrelBox unified config file")
-	webAddr := flag.String("web", "", "override Web console listen address (default 0.0.0.0:19080)")
+	webAddr := flag.String("web", "", "override Web console listen address (default 127.0.0.1:19080)")
 	cleanupOnly := flag.Bool("cleanup", false, "atomically clean KestrelBox firewall tables/routes and exit")
 	flag.Parse()
 

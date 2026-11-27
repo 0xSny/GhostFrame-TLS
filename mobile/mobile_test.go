@@ -181,7 +181,24 @@ func TestIdleLifecycleAndStatusJSON(t *testing.T) {
 		Timeout:   2 * time.Second,
 		Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
 	}
-	pingResp, err := hc.Get("http://127.0.0.1:29082/_ksl/ping")
+	tok := GetMgmtToken()
+	if len(tok) < 32 {
+		t.Fatalf("expected non-empty auto-generated mgmt token, got %q", tok)
+	}
+
+	// Unauthenticated /_ksl/* must fail closed with 401.
+	unauthResp, err := hc.Get("http://127.0.0.1:29082/_ksl/ping")
+	if err != nil {
+		t.Fatalf("GET unauth /_ksl/ping failed: %v", err)
+	}
+	unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated /_ksl/ping, got %d", unauthResp.StatusCode)
+	}
+
+	reqPing, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:29082/_ksl/ping", nil)
+	reqPing.Header.Set("X-Kestrel-Token", tok)
+	pingResp, err := hc.Do(reqPing)
 	if err != nil {
 		t.Fatalf("GET /_ksl/ping failed: %v", err)
 	}
@@ -191,7 +208,9 @@ func TestIdleLifecycleAndStatusJSON(t *testing.T) {
 		t.Fatalf("unexpected /_ksl/ping response (%d): %s", pingResp.StatusCode, string(pingBody))
 	}
 
-	statusResp, err := hc.Get("http://127.0.0.1:29082/_ksl/status")
+	reqStatus, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:29082/_ksl/status", nil)
+	reqStatus.Header.Set("X-Kestrel-Token", tok)
+	statusResp, err := hc.Do(reqStatus)
 	if err != nil {
 		t.Fatalf("GET /_ksl/status failed: %v", err)
 	}
@@ -206,6 +225,14 @@ func TestIdleLifecycleAndStatusJSON(t *testing.T) {
 	}
 	if _, ok := snap["netbind_enabled"]; !ok {
 		t.Fatalf("expected netbind_enabled in /_ksl/status payload, got: %v", snap)
+	}
+	for _, forbidden := range []string{"link_uri", "clash_yaml", "psk", "pin"} {
+		if _, exists := snap[forbidden]; exists {
+			t.Fatalf("forbidden credential field %q leaked in /_ksl/status", forbidden)
+		}
+	}
+	if strings.Contains(string(statusBody), "ksl4://") || strings.Contains(string(statusBody), "gft3://") || strings.Contains(string(statusBody), link.PSK) {
+		t.Fatalf("raw share link or PSK leaked in /_ksl/status: %s", string(statusBody))
 	}
 
 	if err := StopEngine(); err != nil {
@@ -279,9 +306,26 @@ func TestHTTPReloadPreservesTUNAndDirectDNSBypass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal reload config: %v", err)
 	}
-	code, _, respBody := handleLocalMgmt("POST", "/_ksl/reload", reloadBytes)
+	hdr := http.Header{"X-Kestrel-Token": []string{GetMgmtToken()}}
+	code, _, respBody := handleLocalMgmt("POST", "/_ksl/reload", hdr, reloadBytes)
 	if code != http.StatusOK || !strings.Contains(string(respBody), `"ok":true`) {
 		t.Fatalf("POST /_ksl/reload failed: code=%d body=%s", code, string(respBody))
+	}
+
+	// Verify Origin header is rejected (403) and GET on mutating endpoint is rejected (405).
+	badOriginHdr := http.Header{
+		"X-Kestrel-Token": []string{GetMgmtToken()},
+		"Origin":          []string{"https://evil.example"},
+	}
+	if c, _, _ := handleLocalMgmt("GET", "/_ksl/status", badOriginHdr, nil); c != http.StatusForbidden {
+		t.Fatalf("expected 403 when Origin header present, got %d", c)
+	}
+	if c, _, _ := handleLocalMgmt("GET", "/_ksl/clear-logs", hdr, nil); c != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET /_ksl/clear-logs, got %d", c)
+	}
+	badTokHdr := http.Header{"X-Kestrel-Token": []string{"wrong-token"}}
+	if c, _, _ := handleLocalMgmt("GET", "/_ksl/status", badTokHdr, nil); c != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong token, got %d", c)
 	}
 
 	if stats := currentTUNStats(); stats == nil || !stats.Active {

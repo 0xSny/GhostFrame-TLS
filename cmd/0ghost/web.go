@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -42,10 +43,14 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 
 	mux.HandleFunc("/api/auth/info", func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.getGatewayConfig()
-		required := strings.TrimSpace(cfg.WebPassword) != ""
+		pwdSet := strings.TrimSpace(cfg.WebPassword) != ""
 		writeJSON(w, http.StatusOK, map[string]any{
-			"auth_required": required,
-			"authenticated": !required || s.isAuthorizedRequest(r, cfg.WebPassword),
+			"auth_required":      true,
+			"password_configured": pwdSet,
+			"bootstrap_active":   !pwdSet,
+			"authenticated":      s.isAuthorizedRequest(r, cfg.WebPassword),
+			"allow_lan_web":      cfg.AllowLANWeb,
+			"web_addr":           cfg.WebAddr,
 		})
 	})
 
@@ -63,20 +68,21 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		}
 		cfg := s.getGatewayConfig()
 		want := strings.TrimSpace(cfg.WebPassword)
-		if want != "" && subtle.ConstantTimeCompare([]byte(req.Password), []byte(want)) != 1 {
+		if want == "" {
+			want = s.BootstrapToken()
+		}
+		if want == "" || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(req.Password)), []byte(want)) != 1 {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "口令错误"})
 			return
 		}
-		if want != "" {
-			http.SetCookie(w, &http.Cookie{
-				Name:     "kbox_auth",
-				Value:    computeWebAuthToken(want),
-				Path:     "/",
-				HttpOnly: true,
-				SameSite: http.SameSiteStrictMode,
-				MaxAge:   86400 * 7,
-			})
-		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     "kbox_auth",
+			Value:    computeWebAuthToken(want),
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+			MaxAge:   86400 * 7,
+		})
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
@@ -204,6 +210,26 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}))
 
+	mux.HandleFunc("/api/node/export", postOnly(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Index int `json:"index"`
+		}
+		if r.ContentLength > 0 {
+			if err := readJSON(r, &req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+		} else {
+			req.Index = -1
+		}
+		uri := s.engine.LinkURIForNode(req.Index)
+		if uri == "" {
+			writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "当前无可用节点"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "link_uri": uri})
+	}))
+
 	mux.HandleFunc("/api/settings", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			GatewayMode        *string  `json:"gateway_mode"`
@@ -218,6 +244,8 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 			AutoYieldConflicts *bool    `json:"auto_yield_conflicts"`
 			WebPassword        *string  `json:"web_password"`
 			HasWebPassword     bool     `json:"has_web_password"`
+			AllowLANWeb        *bool    `json:"allow_lan_web"`
+			WebAddr            *string  `json:"web_addr"`
 			Transport          *string  `json:"transport"`
 			HopRange           *string  `json:"hop_range"`
 			UpMbps             *int     `json:"up_mbps"`
@@ -273,13 +301,64 @@ func (s *GatewayService) BuildHTTPMux() http.Handler {
 		if req.AutoYieldConflicts != nil {
 			cfg.AutoYieldConflicts = *req.AutoYieldConflicts
 		}
+		var newAuthSecret string
 		if req.HasWebPassword && req.WebPassword != nil {
 			cfg.WebPassword = strings.TrimSpace(*req.WebPassword)
 		}
+		if req.AllowLANWeb != nil {
+			cfg.AllowLANWeb = *req.AllowLANWeb
+		}
+		if req.WebAddr != nil {
+			addr := strings.TrimSpace(*req.WebAddr)
+			if addr != "" {
+				cfg.WebAddr = addr
+				if !isLoopbackListenAddr(addr) {
+					cfg.AllowLANWeb = true
+				}
+			}
+		}
+		if strings.TrimSpace(cfg.WebPassword) == "" {
+			if cfg.AllowLANWeb || !isLoopbackListenAddr(cfg.WebAddr) {
+				s.mu.Unlock()
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "开放局域网控制台访问前必须先设置管理员访问口令"})
+				return
+			}
+		} else {
+			newAuthSecret = strings.TrimSpace(cfg.WebPassword)
+			if req.AllowLANWeb != nil {
+				_, port, perr := net.SplitHostPort(cfg.WebAddr)
+				if perr != nil || port == "" {
+					port = "19080"
+				}
+				if *req.AllowLANWeb {
+					cfg.WebAddr = net.JoinHostPort("0.0.0.0", port)
+				} else {
+					cfg.WebAddr = net.JoinHostPort("127.0.0.1", port)
+				}
+			}
+		}
 		cfg.Normalize()
 		s.gwCfg = cfg
+		if newAuthSecret != "" {
+			s.bootstrapToken = ""
+			if s.tokenPath != "" {
+				_ = os.Remove(s.tokenPath)
+			}
+		} else if s.bootstrapToken == "" {
+			s.bootstrapToken = loadOrCreateBootstrapToken(s.tokenPath)
+		}
 		dnsSrv := s.dnsSrv
 		s.mu.Unlock()
+		if newAuthSecret != "" {
+			http.SetCookie(w, &http.Cookie{
+				Name:     "kbox_auth",
+				Value:    computeWebAuthToken(newAuthSecret),
+				Path:     "/",
+				HttpOnly: true,
+				SameSite: http.SameSiteStrictMode,
+				MaxAge:   86400 * 7,
+			})
+		}
 
 		if b, err := json.Marshal(cfg); err == nil {
 			_ = s.engine.SetGatewayConfigRaw(b)
@@ -551,7 +630,10 @@ func computeWebAuthToken(secret string) string {
 func (s *GatewayService) isAuthorizedRequest(r *http.Request, password string) bool {
 	want := strings.TrimSpace(password)
 	if want == "" {
-		return true
+		want = s.BootstrapToken()
+	}
+	if want == "" {
+		return false
 	}
 	if auth := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(auth), "bearer ") {
 		tok := strings.TrimSpace(auth[7:])

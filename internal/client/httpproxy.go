@@ -23,7 +23,7 @@ func relayIdleTimeout() time.Duration {
 }
 
 // LocalMgmtHandler handles loopback-only management API calls under /_ksl/* routes.
-type LocalMgmtHandler func(method, path string, body []byte) (statusCode int, contentType string, respBody []byte)
+type LocalMgmtHandler func(method, path string, headers http.Header, body []byte) (statusCode int, contentType string, respBody []byte)
 
 var (
 	localMgmtMu      sync.RWMutex
@@ -278,7 +278,7 @@ func (s *HTTPProxyServer) serveLocalMgmt(c net.Conn, req *http.Request, fn Local
 		body, _ = io.ReadAll(io.LimitReader(req.Body, 64*1024))
 		_ = req.Body.Close()
 	}
-	status, contentType, respBody := fn(req.Method, req.URL.Path, body)
+	status, contentType, respBody := fn(req.Method, req.URL.Path, req.Header, body)
 	if status <= 0 {
 		status = http.StatusOK
 	}
