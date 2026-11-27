@@ -52,7 +52,7 @@ func (s *HTTPProxyServer) logDisconnectedThrottled() {
 	now := time.Now().UnixNano()
 	prev := s.lastDisLogNs.Load()
 	if now-prev >= int64(5*time.Second) && s.lastDisLogNs.CompareAndSwap(prev, now) {
-		st := s.engine.Status()
+		st := s.engine.TrayStatus()
 		stateStr, _ := st["state"].(string)
 		errStr, _ := st["last_err"].(string)
 		if len(errStr) > 120 {

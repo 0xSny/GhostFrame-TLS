@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +23,7 @@ import (
 
 	"ghostframe/internal/client"
 	"ghostframe/internal/qr"
+	"ghostframe/internal/wininstall"
 )
 
 //go:embed ui_assets/index.html
@@ -33,6 +36,16 @@ type toastState struct {
 	Seq     uint64 `json:"seq"`
 }
 
+type updateUIState struct {
+	Status     string                    `json:"status"` // "idle", "checking", "up_to_date", "available", "downloading", "applying", "error"
+	Latest     *client.ClientReleaseInfo `json:"latest,omitempty"`
+	Downloaded int64                     `json:"downloaded"`
+	Total      int64                     `json:"total"`
+	Pct        int                       `json:"pct"`
+	Error      string                    `json:"error,omitempty"`
+	CheckedAt  string                    `json:"checked_at,omitempty"`
+}
+
 // uiServer serves the Porcelain & Slate Light WebView2 UI over a strictly authenticated
 // 127.0.0.1 loopback listener and dispatches all mutating Engine calls off the Win32 UI thread.
 type uiServer struct {
@@ -43,8 +56,15 @@ type uiServer struct {
 	srv         *http.Server
 	addr        string
 	onTraySync  func()
+	onQuitMu    sync.Mutex
+	onQuitFn    func()
 	switchSeq   atomic.Uint64
 	rulesUpdate atomic.Bool
+
+	updAvail atomic.Bool
+	updTag   atomic.Value
+	updMu    sync.Mutex
+	updState updateUIState
 
 	toastMu    sync.Mutex
 	toast      toastState
@@ -76,6 +96,7 @@ func startUIServer(eng *client.Engine, hwnd uintptr, onTraySync func()) (*uiServ
 		listener:   ln,
 		addr:       ln.Addr().String(),
 		onTraySync: onTraySync,
+		updState:   updateUIState{Status: "idle"},
 	}
 	s.srv = &http.Server{
 		Handler:           s,
@@ -84,7 +105,28 @@ func startUIServer(eng *client.Engine, hwnd uintptr, onTraySync func()) (*uiServ
 	go func() {
 		_ = s.srv.Serve(ln)
 	}()
+	if !client.IsMockSysProxy() {
+		go func() {
+			time.Sleep(8 * time.Second)
+			s.runUpdateCheck(true)
+		}()
+	}
 	return s, nil
+}
+
+func (s *uiServer) SetQuitFn(fn func()) {
+	s.onQuitMu.Lock()
+	s.onQuitFn = fn
+	s.onQuitMu.Unlock()
+}
+
+func (s *uiServer) triggerQuit() {
+	s.onQuitMu.Lock()
+	fn := s.onQuitFn
+	s.onQuitMu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 func (s *uiServer) URL() string {
@@ -248,6 +290,20 @@ func (s *uiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.requirePost(w, r, s.handleDiagnostic)
 	case "/api/clipboard":
 		s.handleClipboard(w, r)
+	case "/api/app/info":
+		if r.Method != http.MethodGet {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		s.handleAppInfo(w, r)
+	case "/api/app/install-system":
+		s.requirePost(w, r, s.handleInstallSystem)
+	case "/api/settings/autostart":
+		s.requirePost(w, r, s.handleSetAutostart)
+	case "/api/update/check":
+		s.requirePost(w, r, s.handleUpdateCheck)
+	case "/api/update/apply":
+		s.requirePost(w, r, s.handleUpdateApply)
 	default:
 		writeJSONError(w, http.StatusNotFound, "not found")
 	}
@@ -287,6 +343,14 @@ func (s *uiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		st["logs"] = s.eng.Logs()
 	}
 	st["rules_updating"] = s.rulesUpdate.Load()
+	st["update_available"] = s.updAvail.Load()
+	if tag, _ := s.updTag.Load().(string); tag != "" {
+		st["latest_version"] = tag
+	}
+	if tab == "settings" {
+		st["app_install"] = wininstall.QueryStatus("")
+		st["update_state"] = s.snapshotUpdateState()
+	}
 	if t := s.currentToast(); t != nil {
 		st["toast"] = t
 	}
@@ -857,4 +921,239 @@ func (s *uiServer) handleClipboard(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (s *uiServer) snapshotUpdateState() updateUIState {
+	s.updMu.Lock()
+	cp := s.updState
+	s.updMu.Unlock()
+	return cp
+}
+
+func (s *uiServer) runUpdateCheck(silent bool) (*client.ClientReleaseInfo, error) {
+	s.updMu.Lock()
+	if s.updState.Status == "downloading" || s.updState.Status == "applying" {
+		cur := s.updState.Latest
+		s.updMu.Unlock()
+		return cur, nil
+	}
+	s.updState.Status = "checking"
+	s.updState.Error = ""
+	s.updMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	info, err := s.eng.CheckClientUpdate(ctx, client.UpdateCheckOptions{})
+	cancel()
+
+	s.updMu.Lock()
+	defer s.updMu.Unlock()
+	s.updState.CheckedAt = time.Now().Format("15:04:05")
+	if err != nil {
+		if silent {
+			s.updState.Status = "idle"
+		} else {
+			s.updState.Status = "error"
+			s.updState.Error = err.Error()
+		}
+		return nil, err
+	}
+	s.updState.Latest = info
+	if info.HasUpdate {
+		s.updState.Status = "available"
+		s.updAvail.Store(true)
+		s.updTag.Store(info.TagName)
+	} else {
+		s.updState.Status = "up_to_date"
+		s.updAvail.Store(false)
+		s.updTag.Store(info.TagName)
+	}
+	return info, nil
+}
+
+func (s *uiServer) handleAppInfo(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"version":      client.Version,
+		"app_install":  wininstall.QueryStatus(""),
+		"update_state": s.snapshotUpdateState(),
+	})
+}
+
+func (s *uiServer) handleSetAutostart(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	exe, _ := os.Executable()
+	if wininstall.IsInstalledBinary(exe) {
+		exe = wininstall.InstalledExePath()
+	}
+	if err := wininstall.SetAutoStart(exe, req.Enabled); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if req.Enabled {
+		s.setToastSuccess("已开启 Windows 开机自动启动（后台托盘运行）")
+	} else {
+		s.setToast("已关闭开机自动启动", false)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"auto_start": wininstall.IsAutoStartEnabled(),
+	})
+}
+
+func (s *uiServer) handleInstallSystem(w http.ResponseWriter, r *http.Request) {
+	curExe, err := os.Executable()
+	if err != nil || curExe == "" {
+		writeJSONError(w, http.StatusInternalServerError, "无法获取当前程序路径")
+		return
+	}
+	targetExe := wininstall.InstalledExePath()
+	if strings.EqualFold(filepath.Dir(curExe), filepath.Dir(targetExe)) {
+		if err := wininstall.RegisterWindowsApp(curExe, client.Version, true, wininstall.IsAutoStartEnabled()); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		s.setToastSuccess("已刷新系统快捷方式与开始菜单检索注册")
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "relaunching": false, "app_install": wininstall.QueryStatus(curExe)})
+		return
+	}
+
+	f, err := os.Open(curExe)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "读取当前程序失败: "+err.Error())
+		return
+	}
+	err = wininstall.InstallFromReader(f, targetExe, client.Version, wininstall.InstallOptions{
+		CreateDesktop:   true,
+		AutoStart:       wininstall.IsAutoStartEnabled(),
+		LegacyConfigDir: filepath.Dir(curExe),
+	})
+	_ = f.Close()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "安装到系统失败: "+err.Error())
+		return
+	}
+
+	s.setToastSuccess("已安装至系统并注册开始菜单，正在切换启动...")
+	_ = wininstall.LaunchAfterExit(targetExe, os.Getpid())
+	go func() {
+		time.Sleep(350 * time.Millisecond)
+		s.triggerQuit()
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"relaunching": true,
+		"target_exe":  targetExe,
+	})
+}
+
+func (s *uiServer) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	info, err := s.runUpdateCheck(false)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if info.HasUpdate {
+		s.setToastSuccess("发现新版本 " + info.TagName)
+	} else {
+		s.setToast("当前已是最新版本 ("+client.Version+")", false)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"update_state": s.snapshotUpdateState(),
+	})
+}
+
+func (s *uiServer) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
+	s.updMu.Lock()
+	if s.updState.Status == "downloading" || s.updState.Status == "applying" {
+		s.updMu.Unlock()
+		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "async": true, "already_running": true})
+		return
+	}
+	info := s.updState.Latest
+	s.updMu.Unlock()
+
+	if info == nil || !info.HasUpdate {
+		var err error
+		info, err = s.runUpdateCheck(false)
+		if err != nil {
+			writeJSONError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if !info.HasUpdate {
+			s.setToast("当前已是最新版本 ("+client.Version+")", false)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "up_to_date": true})
+			return
+		}
+	}
+
+	curExe, err := os.Executable()
+	if err != nil || curExe == "" {
+		writeJSONError(w, http.StatusInternalServerError, "无法定位当前程序路径")
+		return
+	}
+
+	s.updMu.Lock()
+	s.updState.Status = "downloading"
+	s.updState.Downloaded = 0
+	s.updState.Total = info.AssetSize
+	s.updState.Pct = 0
+	s.updState.Error = ""
+	s.updMu.Unlock()
+
+	s.setToast("正在从 GitHub 拉取 "+info.TagName+"...", false)
+	go func(rel *client.ClientReleaseInfo, exePath string) {
+		staged := exePath + ".new"
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+		err := s.eng.DownloadAndVerifyClientUpdate(ctx, rel, staged, client.UpdateCheckOptions{}, func(dl, tot int64) {
+			pct := 0
+			if tot > 0 {
+				pct = int((dl * 100) / tot)
+				if pct > 100 {
+					pct = 100
+				}
+			}
+			s.updMu.Lock()
+			s.updState.Downloaded = dl
+			s.updState.Total = tot
+			s.updState.Pct = pct
+			s.updMu.Unlock()
+		})
+		cancel()
+
+		if err != nil {
+			s.updMu.Lock()
+			s.updState.Status = "error"
+			s.updState.Error = err.Error()
+			s.updMu.Unlock()
+			s.setToast("更新下载失败: "+err.Error(), true)
+			return
+		}
+
+		s.updMu.Lock()
+		s.updState.Status = "applying"
+		s.updState.Pct = 100
+		s.updMu.Unlock()
+
+		if err := wininstall.ScheduleSelfReplaceAndRestart(staged, exePath, rel.TagName, os.Getpid(), nil); err != nil {
+			s.updMu.Lock()
+			s.updState.Status = "error"
+			s.updState.Error = "启动升级脚本失败: " + err.Error()
+			s.updMu.Unlock()
+			s.setToast("应用更新失败: "+err.Error(), true)
+			return
+		}
+
+		s.setToastSuccess("已校验 " + rel.TagName + "，正在自动重启更新...")
+		time.Sleep(400 * time.Millisecond)
+		s.triggerQuit()
+	}(info, curExe)
+
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "async": true})
 }

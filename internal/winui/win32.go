@@ -16,10 +16,13 @@ const (
 	windowClassName = "KestrelProWndClass"
 	singleMutexName = `Local\KestrelPro_SingleInstance`
 
-	wmAppWake    = 0x8001 // WM_APP + 1
-	wmAppTray    = 0x8002 // WM_APP + 2
-	wmAppQuit    = 0x8003 // WM_APP + 3
-	wmAppRefresh = 0x8004 // WM_APP + 4
+	wmAppWake       = 0x8001 // WM_APP + 1
+	wmAppTray       = 0x8002 // WM_APP + 2
+	wmAppQuit       = 0x8003 // WM_APP + 3
+	wmAppRefresh    = 0x8004 // WM_APP + 4
+	wmAppWvRecreate = 0x8005 // WM_APP + 5
+
+	sizeMinimized = 1
 
 	wmCreate              = 0x0001
 	wmDestroy             = 0x0002
@@ -134,6 +137,8 @@ var (
 	pSetWindowPos                  = user32.NewProc("SetWindowPos")
 	pSetForegroundWindow           = user32.NewProc("SetForegroundWindow")
 	pIsWindowVisible               = user32.NewProc("IsWindowVisible")
+	pIsIconic                      = user32.NewProc("IsIconic")
+	pMessageBoxW                   = user32.NewProc("MessageBoxW")
 	pGetMessageW                   = user32.NewProc("GetMessageW")
 	pTranslateMessage              = user32.NewProc("TranslateMessage")
 	pDispatchMessageW              = user32.NewProc("DispatchMessageW")
@@ -425,6 +430,30 @@ func GetClipboardText(hwnd uintptr) string {
 		n++
 	}
 	return string(utf16.Decode(src[:n]))
+}
+
+// ShowConfirmBox displays a native Win32 Yes/No confirmation dialog.
+func ShowConfirmBox(title, text string) bool {
+	const mbYesNo = 0x00000004
+	const mbIconQuestion = 0x00000020
+	const idYes = 6
+	tPtr := utf16Ptr(title)
+	mPtr := utf16Ptr(text)
+	r, _, _ := pMessageBoxW.Call(0, uintptr(unsafe.Pointer(mPtr)), uintptr(unsafe.Pointer(tPtr)), mbYesNo|mbIconQuestion)
+	runtime.KeepAlive(tPtr)
+	runtime.KeepAlive(mPtr)
+	return r == idYes
+}
+
+// ShowInfoBox displays a native Win32 OK informational dialog.
+func ShowInfoBox(title, text string) {
+	const mbOK = 0x00000000
+	const mbIconInfo = 0x00000040
+	tPtr := utf16Ptr(title)
+	mPtr := utf16Ptr(text)
+	_, _, _ = pMessageBoxW.Call(0, uintptr(unsafe.Pointer(mPtr)), uintptr(unsafe.Pointer(tPtr)), mbOK|mbIconInfo)
+	runtime.KeepAlive(tPtr)
+	runtime.KeepAlive(mPtr)
 }
 
 func lerpColor(c0, c1 uint32, t float32) uint32 {

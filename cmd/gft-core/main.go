@@ -15,7 +15,7 @@ import (
 	"ghostframe/internal/gft"
 )
 
-var version = "v4.2.5"
+var version = "v4.2.6"
 
 func main() {
 	cfgFlag := flag.String("config", "", "optional path to client.json (e.g. /etc/kestrel/client.json)")

@@ -239,7 +239,7 @@ func TestWebView2HostInitializationSmoke(t *testing.T) {
 
 	wv, err := newWebView2Host(hwnd, srv.URL(), func(reason string) {
 		t.Logf("WebView2 async failure callback: %s", reason)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("newWebView2Host failed: %v", err)
 	}
@@ -280,6 +280,12 @@ func TestWebView2HostInitializationSmoke(t *testing.T) {
 		t.Fatalf("WebView2 controller did not become ready in time (ready=%v ctrl=0x%x webview=0x%x)", ready, ctrl, wvPtr)
 	}
 	wv.Resize()
+	wv.mu.Lock()
+	pfTok := wv.procFailedToken
+	wv.mu.Unlock()
+	if pfTok.Value == 0 {
+		t.Fatalf("expected non-zero EventRegistrationToken from ICoreWebView2::add_ProcessFailed (slot 25)")
+	}
 }
 
 func TestEnsureWebView2BrowserArgsAndTabScopedStatus(t *testing.T) {
@@ -366,5 +372,23 @@ func TestEnsureWebView2BrowserArgsAndTabScopedStatus(t *testing.T) {
 		if _, ok := rt[k]; ok {
 			t.Fatalf("routes tab must omit %q", k)
 		}
+	}
+
+	stTab := getTab("settings")
+	if _, ok := stTab["app_install"]; !ok {
+		t.Fatal("settings tab must include app_install metadata")
+	}
+	if _, ok := stTab["update_state"]; !ok {
+		t.Fatal("settings tab must include update_state metadata")
+	}
+	infoReq, _ := http.NewRequest(http.MethodGet, "http://"+srv.addr+"/api/app/info", nil)
+	infoReq.Header.Set("X-Kestrel-Token", srv.Token())
+	infoResp, err := http.DefaultClient.Do(infoReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer infoResp.Body.Close()
+	if infoResp.StatusCode != http.StatusOK {
+		t.Fatalf("/api/app/info returned %d", infoResp.StatusCode)
 	}
 }

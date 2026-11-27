@@ -6,7 +6,9 @@ on:
     branches: [main]
     paths:
       - "cmd/gft-client-gui/**"
+      - "cmd/kestrel-setup/**"
       - "internal/winui/**"
+      - "internal/wininstall/**"
       - "internal/gft/**"
       - "internal/gftrtc/**"
       - "internal/netbind/**"
@@ -19,7 +21,9 @@ on:
     branches: [main]
     paths:
       - "cmd/gft-client-gui/**"
+      - "cmd/kestrel-setup/**"
       - "internal/winui/**"
+      - "internal/wininstall/**"
       - "internal/gft/**"
       - "internal/gftrtc/**"
       - "internal/netbind/**"
@@ -60,7 +64,7 @@ jobs:
 
       - name: Vet and Test Client Packages (-race)
         run: |
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./cmd/gft-client-gui ./internal/winui
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./cmd/gft-client-gui ./cmd/kestrel-setup ./internal/winui ./internal/wininstall
           go vet ./internal/client ./internal/gft ./internal/gftrtc ./internal/netbind
           CGO_ENABLED=1 go test -race -count=1 -v ./internal/client ./internal/gft ./internal/gftrtc ./internal/netbind
 
@@ -77,11 +81,13 @@ jobs:
           REL_VER="v$(tr -d '\r\n' < VERSION)"
           go run scripts/gen_win_rsrc.go
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H=windowsgui -X ghostframe/internal/client.Version=${REL_VER}" -o dist/Kestrel-Pro.exe ./cmd/gft-client-gui
-          ls -lh dist/Kestrel-Pro.exe
+          go run scripts/pack_setup_payload.go -in dist/Kestrel-Pro.exe -out cmd/kestrel-setup/Kestrel-Pro.payload.zlib
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags setup_embed -trimpath -ldflags="-s -w -H=windowsgui -X main.Version=${REL_VER}" -o dist/Kestrel-Pro-Setup.exe ./cmd/kestrel-setup
+          ls -lh dist/Kestrel-Pro.exe dist/Kestrel-Pro-Setup.exe
 
       - name: Upload Windows Client Binary
         uses: actions/upload-artifact@v4
         with:
           name: Kestrel-Pro-windows-amd64
-          path: dist/Kestrel-Pro.exe
+          path: dist/Kestrel-Pro*.exe
           if-no-files-found: error

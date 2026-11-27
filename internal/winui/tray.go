@@ -263,7 +263,7 @@ func (tm *trayManager) destroy() {
 }
 
 func (tm *trayManager) showContextMenu(eng *client.Engine, onOpen func(), onImport func(), onQuit func(), onToast func(string, bool), onRefresh func()) {
-	st := eng.Status()
+	st := eng.StatusForTab("nodes")
 	state := client.ConnState(strVal(st["state"]))
 	routeMode := strVal(st["route_mode"])
 	transPref := strVal(st["transport_pref"])

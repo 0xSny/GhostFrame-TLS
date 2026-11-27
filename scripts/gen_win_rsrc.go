@@ -653,5 +653,11 @@ func main() {
 	if err := os.WriteFile(filepath.Join(outDir, "rsrc_windows_amd64.syso"), sysoBytes, 0o644); err != nil {
 		panic(err)
 	}
+	setupDir := filepath.Join("cmd", "kestrel-setup")
+	if st, err := os.Stat(setupDir); err == nil && st.IsDir() {
+		if err := os.WriteFile(filepath.Join(setupDir, "rsrc_windows_amd64.syso"), sysoBytes, 0o644); err != nil {
+			panic(err)
+		}
+	}
 	fmt.Printf("Generated kestrel.ico (%d bytes) and rsrc_windows_amd64.syso (%d bytes)\n", len(icoBytes), len(sysoBytes))
 }

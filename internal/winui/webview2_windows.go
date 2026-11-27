@@ -44,6 +44,12 @@ var (
 		Data3: 0x4260,
 		Data4: [8]byte{0x81, 0x27, 0xC9, 0xF5, 0xBD, 0xE7, 0xF6, 0x8C},
 	}
+	iidProcessFailedHandler = windows.GUID{
+		Data1: 0x79E0AEA4,
+		Data2: 0x990B,
+		Data3: 0x42D9,
+		Data4: [8]byte{0xAA, 0x1D, 0x0F, 0xCC, 0x2E, 0x5B, 0xC7, 0xAE},
+	}
 )
 
 type comCallbackVtbl struct {
@@ -65,6 +71,16 @@ type comCtrlCompletedHandler struct {
 	host     *webView2Host
 }
 
+type comProcessFailedHandler struct {
+	vtbl     *comCallbackVtbl
+	refCount atomic.Int32
+	host     *webView2Host
+}
+
+type eventRegistrationToken struct {
+	Value int64
+}
+
 // webView2Host embeds Microsoft Edge WebView2 inside a Win32 HWND using pure Go COM vtables
 // loaded from the system EdgeWebView2 Runtime's EmbeddedBrowserWebView.dll (zero external DLLs).
 type webView2Host struct {
@@ -77,16 +93,20 @@ type webView2Host struct {
 	ctrl    uintptr // *ICoreWebView2Controller
 	webview uintptr // *ICoreWebView2
 
-	envVtbl     comCallbackVtbl
-	ctrlVtbl    comCallbackVtbl
-	envHandler  *comEnvCompletedHandler
-	ctrlHandler *comCtrlCompletedHandler
-	pinner      runtime.Pinner
+	envVtbl           comCallbackVtbl
+	ctrlVtbl          comCallbackVtbl
+	procFailedVtbl    comCallbackVtbl
+	envHandler        *comEnvCompletedHandler
+	ctrlHandler       *comCtrlCompletedHandler
+	procFailedHandler *comProcessFailedHandler
+	procFailedToken   eventRegistrationToken
+	pinner            runtime.Pinner
 
-	ready    bool
-	failed   bool
-	failErr  string
-	onFailed func(err string)
+	ready           bool
+	failed          bool
+	failErr         string
+	onFailed        func(err string)
+	onProcessFailed func(kind uint32)
 }
 
 func webViewArchDir() string {
@@ -174,17 +194,17 @@ func comRelease(obj uintptr) {
 	}
 }
 
-const defaultWebView2BrowserArgs = "--disable-gpu --disable-gpu-compositing --disable-features=RendererCodeIntegrity"
+const defaultWebView2BrowserArgs = "--disable-gpu --disable-gpu-compositing --disable-features=RendererCodeIntegrity --no-proxy-server"
 
-// ensureWebView2BrowserArgs disables hardware GPU compositing for the lightweight
-// Kestrel Pro console unless the caller explicitly configured WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS.
+// ensureWebView2BrowserArgs disables hardware GPU compositing and WinINET proxy interception
+// for the lightweight Kestrel Pro console unless overridden by WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS.
 func ensureWebView2BrowserArgs() {
 	if _, ok := os.LookupEnv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"); !ok {
 		_ = os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", defaultWebView2BrowserArgs)
 	}
 }
 
-func newWebView2Host(hwnd uintptr, startURL string, onFailed func(string)) (*webView2Host, error) {
+func newWebView2Host(hwnd uintptr, startURL string, onFailed func(string), onProcFailed func(uint32)) (*webView2Host, error) {
 	ensureWebView2BrowserArgs()
 	dllPath, err := findEmbeddedWebViewDLL()
 	if err != nil {
@@ -201,10 +221,11 @@ func newWebView2Host(hwnd uintptr, startURL string, onFailed func(string)) (*web
 	}
 
 	h := &webView2Host{
-		hwnd:     hwnd,
-		startURL: startURL,
-		dll:      dll,
-		onFailed: onFailed,
+		hwnd:            hwnd,
+		startURL:        startURL,
+		dll:             dll,
+		onFailed:        onFailed,
+		onProcessFailed: onProcFailed,
 	}
 
 	h.envVtbl = comCallbackVtbl{
@@ -219,14 +240,24 @@ func newWebView2Host(hwnd uintptr, startURL string, onFailed func(string)) (*web
 		Release:        syscall.NewCallback(ctrlHandlerRelease),
 		Invoke:         syscall.NewCallback(ctrlHandlerInvoke),
 	}
+	h.procFailedVtbl = comCallbackVtbl{
+		QueryInterface: syscall.NewCallback(procFailedQueryInterface),
+		AddRef:         syscall.NewCallback(procFailedAddRef),
+		Release:        syscall.NewCallback(procFailedRelease),
+		Invoke:         syscall.NewCallback(procFailedInvoke),
+	}
 	h.envHandler = &comEnvCompletedHandler{vtbl: &h.envVtbl, host: h}
 	h.envHandler.refCount.Store(1)
 	h.ctrlHandler = &comCtrlCompletedHandler{vtbl: &h.ctrlVtbl, host: h}
 	h.ctrlHandler.refCount.Store(1)
+	h.procFailedHandler = &comProcessFailedHandler{vtbl: &h.procFailedVtbl, host: h}
+	h.procFailedHandler.refCount.Store(1)
 	h.pinner.Pin(h.envHandler)
 	h.pinner.Pin(h.ctrlHandler)
+	h.pinner.Pin(h.procFailedHandler)
 	h.pinner.Pin(&h.envVtbl)
 	h.pinner.Pin(&h.ctrlVtbl)
+	h.pinner.Pin(&h.procFailedVtbl)
 
 	userDataPtr := utf16Ptr(defaultWebViewUserDataDir())
 	// CreateWebViewEnvironmentWithOptionsInternal(checkEdgeBinary=1, runtimeType=0, userDataFolder, envOpts=0, handler)
@@ -342,7 +373,16 @@ func ctrlHandlerInvoke(this, errorCode, createdCtrl uintptr) uintptr {
 	h.webview = wv
 	h.ready = true
 	startURL := h.startURL
+	procFailedHandler := h.procFailedHandler
 	h.mu.Unlock()
+
+	// ICoreWebView2::add_ProcessFailed (vtable slot 25) for automatic renderer/browser crash recovery.
+	var pfTok eventRegistrationToken
+	if pfHr, _, _ := syscall.SyscallN(comSlot(wv, 25), wv, uintptr(unsafe.Pointer(procFailedHandler)), uintptr(unsafe.Pointer(&pfTok))); int32(pfHr) >= 0 {
+		h.mu.Lock()
+		h.procFailedToken = pfTok
+		h.mu.Unlock()
+	}
 
 	// Configure ICoreWebView2Settings (get_Settings = vtable slot 3)
 	var settings uintptr
@@ -366,6 +406,47 @@ func ctrlHandlerInvoke(this, errorCode, createdCtrl uintptr) uintptr {
 		// ICoreWebView2::Navigate (vtable slot 5)
 		_, _, _ = syscall.SyscallN(comSlot(wv, 5), wv, uintptr(unsafe.Pointer(u16)))
 		runtime.KeepAlive(u16)
+	}
+	return sOK
+}
+
+func procFailedQueryInterface(this, riid, ppv uintptr) uintptr {
+	if ppv == 0 || riid == 0 {
+		return eNoInterface
+	}
+	g := *(*windows.GUID)(osPtr(riid))
+	if g == iidUnknown || g == iidProcessFailedHandler {
+		*(*uintptr)(osPtr(ppv)) = this
+		procFailedAddRef(this)
+		return sOK
+	}
+	*(*uintptr)(osPtr(ppv)) = 0
+	return eNoInterface
+}
+
+func procFailedAddRef(this uintptr) uintptr {
+	h := (*comProcessFailedHandler)(osPtr(this))
+	return uintptr(h.refCount.Add(1))
+}
+
+func procFailedRelease(this uintptr) uintptr {
+	h := (*comProcessFailedHandler)(osPtr(this))
+	return uintptr(h.refCount.Add(-1))
+}
+
+func procFailedInvoke(this, _sender, args uintptr) uintptr {
+	cb := (*comProcessFailedHandler)(osPtr(this))
+	h := cb.host
+	var kind uint32
+	if args != 0 {
+		// ICoreWebView2ProcessFailedEventArgs::get_ProcessFailedKind (vtable slot 3)
+		_, _, _ = syscall.SyscallN(comSlot(args, 3), args, uintptr(unsafe.Pointer(&kind)))
+	}
+	h.mu.Lock()
+	fn := h.onProcessFailed
+	h.mu.Unlock()
+	if fn != nil {
+		fn(kind)
 	}
 	return sOK
 }

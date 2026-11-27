@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the canonical release identifier (overridable via -ldflags -X).
-var Version = "v4.2.5"
+var Version = "v4.2.6"
 
 type ConnState string
 
@@ -2256,6 +2256,7 @@ func (e *Engine) ClearLogs() {
 func (e *Engine) TrayStatus() map[string]any {
 	e.mu.RLock()
 	state := e.state
+	lastErr := e.lastErr
 	sched := e.sched
 	pingMs := e.pingMs
 	l := e.activeLinkLocked()
@@ -2267,6 +2268,9 @@ func (e *Engine) TrayStatus() map[string]any {
 		activeMode = st.Mode
 		if st.RTTMs > 0 {
 			pingMs = st.RTTMs
+		}
+		if lastErr == "" && st.LastErr != "" && state != StateConnected {
+			lastErr = st.LastErr
 		}
 	}
 
@@ -2284,6 +2288,7 @@ func (e *Engine) TrayStatus() map[string]any {
 
 	return map[string]any{
 		"state":            string(state),
+		"last_err":         lastErr,
 		"active_transport": activeMode,
 		"transport_pref":   tPref,
 		"ping_ms":          pingMs,

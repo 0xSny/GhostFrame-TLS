@@ -5,6 +5,7 @@
 *.so
 *.dylib
 *.syso
+*.payload.zlib
 *-linux-*
 *.tar.gz
 /gft-client-gui

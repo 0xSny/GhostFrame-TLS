@@ -47,6 +47,8 @@ go_updates = [
     ("internal/tui/upgrade.go", r'(var\s+CurrentVersion\s*=\s*")[^"]*(")', rf'\g<1>{tag_ver}\2'),
     ("cmd/gft-core/main.go", r'(var\s+version\s*=\s*")[^"]*(")', rf'\g<1>{tag_ver}\2'),
     ("cmd/0ghost/main.go", r'(var\s+gatewayVersion\s*=\s*")[^"]*(")', rf'\g<1>{tag_ver}\2'),
+    ("cmd/kestrel-setup/main_windows.go", r'(var\s+Version\s*=\s*")[^"]*(")', rf'\g<1>{tag_ver}\2'),
+    ("cmd/kestrel-setup/main_other.go", r'(var\s+Version\s*=\s*")[^"]*(")', rf'\g<1>{tag_ver}\2'),
 ]
 
 for rel, pat, repl in go_updates:

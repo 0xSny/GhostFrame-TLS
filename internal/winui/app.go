@@ -12,9 +12,15 @@ import (
 	"unsafe"
 
 	"ghostframe/internal/client"
+	"ghostframe/internal/wininstall"
 )
 
 const timerRefreshID = 1
+
+// RunOptions configures Kestrel Pro desktop UI startup behavior.
+type RunOptions struct {
+	StartHidden bool
+}
 
 type appUI struct {
 	eng   *client.Engine
@@ -23,11 +29,11 @@ type appUI struct {
 	uiSrv *uiServer
 	wv    *webView2Host
 
-	dpi   int32
-	hIcon uintptr
-
-	wvFailed string
-	shutOnce sync.Once
+	dpi        int32
+	hIcon      uintptr
+	wvRestarts int
+	wvFailed   string
+	shutOnce   sync.Once
 }
 
 var (
@@ -38,9 +44,15 @@ var (
 // Run launches the pure-Go Win32 + Edge WebView2 Porcelain Light console window and system tray
 // message loop, blocking until the user selects Exit or Windows shuts down.
 func Run(eng *client.Engine) error {
+	return RunWithOptions(eng, RunOptions{})
+}
+
+// RunWithOptions launches the Kestrel Pro Win32 + WebView2 UI with explicit startup options.
+func RunWithOptions(eng *client.Engine, opts RunOptions) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	wininstall.SetProcessAppUserModelID()
 	SetHighestAppShutdownPriority()
 	enablePerMonitorDPI()
 
@@ -134,6 +146,11 @@ func Run(eng *client.Engine) error {
 	}
 	app.hwnd = hwnd
 	app.uiSrv.SetHWND(hwnd)
+	app.uiSrv.SetQuitFn(func() {
+		if app.hwnd != 0 {
+			_, _, _ = pPostMessageW.Call(app.hwnd, wmAppQuit, 0, 0)
+		}
+	})
 	app.dpi = windowDPI(hwnd)
 	if app.dpi != 96 {
 		scaledW := (winW * app.dpi) / 96
@@ -152,19 +169,17 @@ func Run(eng *client.Engine) error {
 	}
 
 	app.tray = newTrayManager(hwnd)
-	wv, wvErr := newWebView2Host(hwnd, app.uiSrv.URL(), func(reason string) {
-		app.wvFailed = reason
-		app.postRefresh()
-	})
-	if wvErr != nil {
-		app.wvFailed = wvErr.Error()
-		eng.Logf("[WinUI] WebView2 init failed (%v), fallback prompt active", wvErr)
-	} else {
-		app.wv = wv
-	}
+	app.mountWebView2()
 
-	_, _, _ = pShowWindow.Call(hwnd, swShow)
-	_, _, _ = pUpdateWindow.Call(hwnd)
+	if opts.StartHidden {
+		if app.wv != nil {
+			app.wv.SetVisible(false)
+		}
+		_, _, _ = pShowWindow.Call(hwnd, swHide)
+	} else {
+		_, _, _ = pShowWindow.Call(hwnd, swShow)
+		_, _, _ = pUpdateWindow.Call(hwnd)
+	}
 	_, _, _ = pSetTimer.Call(hwnd, timerRefreshID, 1500, 0)
 
 	var msg msgW
@@ -214,8 +229,20 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 
 	case wmSize:
 		if a.wv != nil {
-			a.wv.Resize()
+			if wParam == sizeMinimized {
+				a.wv.SetVisible(false)
+			} else {
+				vis, _, _ := pIsWindowVisible.Call(hwnd)
+				if vis != 0 {
+					a.wv.SetVisible(true)
+				}
+				a.wv.Resize()
+			}
 		}
+		return 0
+
+	case wmAppWvRecreate:
+		a.handleWebView2Crash(uint32(wParam))
 		return 0
 
 	case wmTimer:
@@ -328,9 +355,53 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	return r
 }
 
+func (a *appUI) mountWebView2() {
+	wv, wvErr := newWebView2Host(a.hwnd, a.uiSrv.URL(), func(reason string) {
+		a.wvFailed = reason
+		a.postRefresh()
+	}, func(kind uint32) {
+		if a.hwnd != 0 {
+			_, _, _ = pPostMessageW.Call(a.hwnd, wmAppWvRecreate, uintptr(kind), 0)
+		}
+	})
+	if wvErr != nil {
+		a.wvFailed = wvErr.Error()
+		a.eng.Logf("[WinUI] WebView2 init failed (%v), fallback prompt active", wvErr)
+		return
+	}
+	a.wvFailed = ""
+	a.wv = wv
+	if a.hwnd != 0 {
+		vis, _, _ := pIsWindowVisible.Call(a.hwnd)
+		if vis == 0 {
+			a.wv.SetVisible(false)
+		}
+	}
+}
+
+func (a *appUI) handleWebView2Crash(kind uint32) {
+	if a.wvRestarts >= 5 {
+		a.eng.Logf("[WinUI] WebView2 process failed (kind=%d); restart limit reached", kind)
+		return
+	}
+	a.wvRestarts++
+	a.eng.Logf("[WinUI] WebView2 renderer/browser exited (kind=%d), auto-recovering (#%d)...", kind, a.wvRestarts)
+	if a.wv != nil {
+		a.wv.Close()
+		a.wv = nil
+	}
+	a.mountWebView2()
+	if a.uiSrv != nil {
+		a.uiSrv.setToast("界面渲染已从驱动异常中自动恢复", false)
+	}
+}
+
 func (a *appUI) showAndFocus() {
+	iconic, _, _ := pIsIconic.Call(a.hwnd)
 	_, _, _ = pShowWindow.Call(a.hwnd, swShow)
-	_, _, _ = pShowWindow.Call(a.hwnd, swRestore)
+	if iconic != 0 {
+		_, _, _ = pShowWindow.Call(a.hwnd, swRestore)
+	}
 	_, _, _ = pSetForegroundWindow.Call(a.hwnd)
 	if a.wv != nil {
 		a.wv.SetVisible(true)

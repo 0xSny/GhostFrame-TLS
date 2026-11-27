@@ -707,6 +707,7 @@ tr.alert-row { background: #FFFBEB; }
         <div class="brand-sub">
           <span id="sideDot" class="status-dot disconnected"></span>
           <span id="sideVer" class="num">--</span>
+          <span id="sideUpdatePill" class="badge blue" style="display:none;cursor:pointer;margin-left:4px;padding:1px 6px;font-size:10px;" data-jump="settings">有新版</span>
         </div>
       </div>
     </div>
@@ -1037,6 +1038,35 @@ tr.alert-row { background: #FFFBEB; }
         </div>
       </div>
 
+      <div class="card" style="margin-bottom:12px;">
+        <div class="card-title">
+          <span>软件版本、系统集成与 GitHub 在线更新</span>
+          <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span id="appInstallBadge" class="badge">检测安装状态...</span>
+            <button id="btnInstallSystem" class="btn btn-sm" style="display:none;">一键安装到系统 (开始菜单可搜)</button>
+            <button id="btnCheckUpdate" class="btn btn-sm">检查 GitHub 更新</button>
+            <button id="btnApplyUpdate" class="btn btn-primary btn-sm" style="display:none;">立即更新并重启</button>
+          </span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;font-size:12.5px;">
+          <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;" class="num">
+            <span>当前版本: <strong id="appVersionText">--</strong></span>
+            <span>更新状态: <strong id="appUpdateText" style="color:var(--text-sub);">点击右侧按钮检查 GitHub 新版本</strong></span>
+          </div>
+          <div class="switch-wrap" id="wrapAutoStartToggle">
+            <div id="swAutoStart" class="switch"></div>
+            <span style="font-size:12px;color:var(--text-sub);">开机自动启动 (托盘运行)</span>
+          </div>
+        </div>
+        <div id="updateProgressWrap" style="display:none;margin-top:10px;">
+          <div style="height:6px;background:var(--border);border-radius:999px;overflow:hidden;">
+            <div id="updateProgressBar" style="height:100%;width:0%;background:var(--blue);transition:width .2s;"></div>
+          </div>
+          <div id="updateProgressLabel" class="num" style="font-size:11.5px;color:var(--text-sub);margin-top:4px;">准备下载...</div>
+        </div>
+        <div id="updateNotesBox" class="mono" style="display:none;margin-top:8px;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:11.5px;white-space:pre-wrap;color:var(--text-sub);"></div>
+      </div>
+
       <div class="grid-2">
         <div class="card">
           <div class="card-title">本地监听端口与系统代理</div>
@@ -1295,6 +1325,15 @@ function renderStatus(st) {
   const isBusy = state === "connecting" || Number(st.switching_node) >= 0;
 
   $("sideVer").textContent = st.version || "--";
+  const sideUpd = $("sideUpdatePill");
+  if (sideUpd) {
+    if (st.update_available && st.latest_version) {
+      sideUpd.style.display = "inline-flex";
+      sideUpd.textContent = "新版 " + st.latest_version;
+    } else {
+      sideUpd.style.display = "none";
+    }
+  }
   $("sideDot").className = "status-dot " + state;
   $("heroDot").className = "status-dot " + state;
 
@@ -1614,6 +1653,83 @@ function renderSettingsTab(st) {
   document.querySelectorAll("#segCloseBehavior .seg-btn").forEach(b => {
     b.classList.toggle("active", b.dataset.val === (toTray ? "tray" : "exit"));
   });
+
+  $("appVersionText").textContent = st.version || "--";
+  const inst = st.app_install;
+  if (inst) {
+    const instBadge = $("appInstallBadge");
+    const btnInst = $("btnInstallSystem");
+    if (inst.installed) {
+      instBadge.className = "badge green";
+      instBadge.textContent = inst.start_menu_present ? "已安装到系统 · 开始菜单可搜" : "已安装到系统目录";
+      btnInst.style.display = inst.start_menu_present ? "none" : "inline-flex";
+      btnInst.textContent = "修复开始菜单快捷方式";
+    } else {
+      instBadge.className = "badge amber";
+      instBadge.textContent = "便携模式 (桌面/下载直接运行)";
+      btnInst.style.display = "inline-flex";
+      btnInst.textContent = "一键安装到系统 (开始菜单可搜)";
+    }
+    $("swAutoStart").classList.toggle("on", !!inst.auto_start);
+  }
+
+  const upd = st.update_state;
+  if (upd) {
+    const uTxt = $("appUpdateText");
+    const btnChk = $("btnCheckUpdate");
+    const btnApp = $("btnApplyUpdate");
+    const progWrap = $("updateProgressWrap");
+    const notesBox = $("updateNotesBox");
+    btnChk.disabled = upd.status === "checking" || upd.status === "downloading" || upd.status === "applying";
+    btnChk.textContent = upd.status === "checking" ? "检查中..." : "检查 GitHub 更新";
+
+    if (upd.status === "downloading") {
+      uTxt.style.color = "var(--blue)";
+      uTxt.textContent = `正在从 GitHub 下载 ${upd.latest ? upd.latest.tag_name : "新版"}...`;
+      btnApp.style.display = "inline-flex";
+      btnApp.disabled = true;
+      btnApp.textContent = `下载中 ${upd.pct || 0}%`;
+      progWrap.style.display = "block";
+      $("updateProgressBar").style.width = `${upd.pct || 0}%`;
+      $("updateProgressLabel").textContent = `已下载 ${fmtBytes(upd.downloaded)} / ${fmtBytes(upd.total)} (${upd.pct || 0}%) · SHA-256 校验就绪`;
+    } else if (upd.status === "applying") {
+      uTxt.style.color = "var(--green)";
+      uTxt.textContent = "校验通过，正在自动替换并重启 Kestrel Pro...";
+      btnApp.style.display = "none";
+      progWrap.style.display = "block";
+      $("updateProgressBar").style.width = "100%";
+      $("updateProgressLabel").textContent = "即将自动重启为新版本，请稍候...";
+    } else if (upd.status === "available" && upd.latest) {
+      uTxt.style.color = "var(--blue)";
+      uTxt.textContent = `发现新版 ${upd.latest.tag_name} (${fmtBytes(upd.latest.asset_size)})`;
+      btnApp.style.display = "inline-flex";
+      btnApp.disabled = false;
+      btnApp.textContent = `立即更新到 ${upd.latest.tag_name} 并重启`;
+      progWrap.style.display = "none";
+    } else if (upd.status === "up_to_date" && upd.latest) {
+      uTxt.style.color = "var(--green)";
+      uTxt.textContent = `已是最新版本 (${upd.latest.tag_name}${upd.checked_at ? " · " + upd.checked_at : ""})`;
+      btnApp.style.display = "none";
+      progWrap.style.display = "none";
+    } else if (upd.status === "error") {
+      uTxt.style.color = "var(--red)";
+      uTxt.textContent = "检查/更新失败: " + (upd.error || "网络异常");
+      btnApp.style.display = (upd.latest && upd.latest.has_update) ? "inline-flex" : "none";
+      btnApp.disabled = false;
+      progWrap.style.display = "none";
+    } else {
+      uTxt.style.color = "var(--text-sub)";
+      uTxt.textContent = "点击右侧按钮检查 GitHub 新版本";
+      btnApp.style.display = "none";
+      progWrap.style.display = "none";
+    }
+    if (upd.latest && upd.latest.release_notes && (upd.status === "available" || upd.status === "downloading")) {
+      notesBox.style.display = "block";
+      notesBox.textContent = upd.latest.release_notes;
+    } else {
+      notesBox.style.display = "none";
+    }
+  }
   const rs = st.rule_stats || {};
   $("kslrDomains").textContent = String(rs.builtin_domains || 0);
   $("kslrCidr").textContent = String(rs.builtin_cidrs || 0);
@@ -1929,6 +2045,56 @@ $("btnDiagExport").addEventListener("click", async () => {
 ["inSocksPort", "inHttpPort"].forEach(id => $(id).addEventListener("input", () => { portsDirty = true; }));
 ["inUpMbps", "inDownMbps", "inHopRange"].forEach(id => $(id).addEventListener("input", () => { paramsDirty = true; }));
 $("txtCustomRules").addEventListener("input", () => { rulesDirty = true; });
+
+$("wrapAutoStartToggle").addEventListener("click", async () => {
+  try {
+    const cur = !!(lastStatus && lastStatus.app_install && lastStatus.app_install.auto_start);
+    await apiFetch("/api/settings/autostart", { method: "POST", body: JSON.stringify({ enabled: !cur }) });
+    pollStatus();
+  } catch (e) { showToast(e.message, "err"); }
+});
+
+$("btnInstallSystem").addEventListener("click", async () => {
+  try {
+    $("btnInstallSystem").disabled = true;
+    $("btnInstallSystem").textContent = "正在安装到系统...";
+    const res = await apiFetch("/api/app/install-system", { method: "POST" });
+    if (res.relaunching) {
+      showToast("已安装到开始菜单与系统目录，正在自动重启...", "ok");
+    } else {
+      pollStatus();
+    }
+  } catch (e) {
+    showToast("安装失败: " + e.message, "err");
+  } finally {
+    $("btnInstallSystem").disabled = false;
+  }
+});
+
+$("btnCheckUpdate").addEventListener("click", async () => {
+  try {
+    $("btnCheckUpdate").disabled = true;
+    $("btnCheckUpdate").textContent = "检查中...";
+    await apiFetch("/api/update/check", { method: "POST" });
+    pollStatus();
+  } catch (e) {
+    showToast("检查更新失败: " + e.message, "err");
+    pollStatus();
+  } finally {
+    $("btnCheckUpdate").disabled = false;
+  }
+});
+
+$("btnApplyUpdate").addEventListener("click", async () => {
+  try {
+    $("btnApplyUpdate").disabled = true;
+    await apiFetch("/api/update/apply", { method: "POST" });
+    pollStatus();
+  } catch (e) {
+    showToast("启动更新失败: " + e.message, "err");
+    $("btnApplyUpdate").disabled = false;
+  }
+});
 
 $("btnSavePorts").addEventListener("click", async () => {
   const sp = parseInt($("inSocksPort").value, 10);
