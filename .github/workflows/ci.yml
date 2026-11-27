@@ -1,6 +1,7 @@
 name: CI (Core & Server)
 
 on:
+  workflow_call:
   workflow_dispatch:
   push:
     branches: [main]
@@ -83,10 +84,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p /tmp/ksl-ci-build
-          REL_VER="v4.2.0"
+          RAW_VER="$(tr -d ' \t\r\n' < VERSION)"
+          REL_VER="v${RAW_VER#v}"
+          REL_VER="${REL_VER%-LTS}"
           VER_X="-X ghostframe/internal/tui.CurrentVersion=${REL_VER} -X ghostframe/internal/client.Version=${REL_VER} -X ghostframe/internal/server.Version=${REL_VER} -X main.version=${REL_VER}"
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w ${VER_X}" -o /tmp/ksl-ci-build/kestrel-server-amd64 ./cmd/gft-server
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w ${VER_X}" -o /tmp/ksl-ci-build/kestrel-server-arm64 ./cmd/gft-server
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w ${VER_X}" -o /tmp/ksl-ci-build/kestrel-core-amd64 ./cmd/gft-core
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w ${VER_X}" -o /tmp/ksl-ci-build/kestrel-core-arm64 ./cmd/gft-core
           rm -rf /tmp/ksl-ci-build
 
       - name: Verify install.sh Syntax (Linux)

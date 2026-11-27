@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       KSL_NO_SYSPROXY: "1"
+      GOMOBILE_VERSION: "v0.0.0-20261117202452-47699113848a"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -71,11 +72,11 @@ jobs:
       - name: Build GhostMobile.aar (gomobile)
         run: |
           set -euo pipefail
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
+          go install "golang.org/x/mobile/cmd/gomobile@${GOMOBILE_VERSION}"
+          go install "golang.org/x/mobile/cmd/gobind@${GOMOBILE_VERSION}"
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
-          go get golang.org/x/mobile/bind
+          go get "golang.org/x/mobile/bind@${GOMOBILE_VERSION}"
           mkdir -p android/app/libs dist
           RAW_VER="$(tr -d ' \t\r\n' < VERSION)"
           APP_VER="${RAW_VER#v}"
@@ -96,29 +97,29 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
-      - name: Build Kestrel Android Release APK
+      - name: Build Kestrel Android CI Preview / Release APK
+        env:
+          KESTREL_ANDROID_KEYSTORE_B64: ${{ secrets.KESTREL_ANDROID_KEYSTORE_B64 }}
+          KESTREL_KEYSTORE_PASS: ${{ secrets.KESTREL_KEYSTORE_PASS }}
+          KESTREL_KEY_ALIAS: ${{ secrets.KESTREL_KEY_ALIAS }}
+          KESTREL_KEY_PASS: ${{ secrets.KESTREL_KEY_PASS }}
         run: |
           set -euo pipefail
-          if [ -z "${KESTREL_KEYSTORE_PATH:-}" ]; then
-            CI_KS="$RUNNER_TEMP/kestrel-ci-release.jks"
-            if [ ! -f "$CI_KS" ]; then
-              keytool -genkeypair -noprompt -v \
-                -keystore "$CI_KS" \
-                -storetype PKCS12 \
-                -keyalg RSA -keysize 2048 -validity 10000 \
-                -alias kestrel \
-                -storepass android -keypass android \
-                -dname "CN=Kestrel,O=GhostFrame,C=US" >/dev/null 2>&1
-            fi
-            export KESTREL_KEYSTORE_PATH="$CI_KS"
-            export KESTREL_KEYSTORE_PASS="android"
-            export KESTREL_KEY_ALIAS="kestrel"
-            export KESTREL_KEY_PASS="android"
+          if [ -n "${KESTREL_ANDROID_KEYSTORE_B64:-}" ]; then
+            echo "$KESTREL_ANDROID_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/kestrel-release.jks"
+            chmod 600 "$RUNNER_TEMP/kestrel-release.jks"
+            export KESTREL_KEYSTORE_PATH="$RUNNER_TEMP/kestrel-release.jks"
+            gradle -p android assembleRelease --no-daemon
+            APK_PATH="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1)"
+            test -f "$APK_PATH"
+            cp "$APK_PATH" dist/Kestrel-Android.apk
+          else
+            echo "Official release keystore secrets not configured; building isolated CI preview APK (.ci) without touching production signing identity."
+            gradle -p android assembleCiPreview --no-daemon
+            APK_PATH="$(find android/app/build/outputs/apk/ciPreview -name '*.apk' | head -n 1)"
+            test -f "$APK_PATH"
+            cp "$APK_PATH" dist/Kestrel-Android.apk
           fi
-          gradle -p android assembleRelease --no-daemon
-          APK_PATH="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1)"
-          test -f "$APK_PATH"
-          cp "$APK_PATH" dist/Kestrel-Android.apk
           ls -lh dist/Kestrel-Android.apk
 
       - name: Upload Android APK Artifact

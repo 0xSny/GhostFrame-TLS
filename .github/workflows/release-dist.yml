@@ -7,18 +7,73 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v4.0.2-lts; auto-generated if empty)"
+        description: "Release tag (must match VERSION, e.g. v4.2.6)"
         required: false
         default: ""
 
 permissions:
   contents: write
 
+env:
+  KSL_NO_SYSPROXY: "1"
+  GOMOBILE_VERSION: "v0.0.0-20261117202452-47699113848a"
+
 jobs:
-  build-binaries:
+  verify-tests:
+    uses: ./.github/workflows/ci.yml
+
+  prepare-release:
     runs-on: ubuntu-latest
-    env:
-      KSL_NO_SYSPROXY: "1"
+    outputs:
+      rel_ver: ${{ steps.ver.outputs.rel_ver }}
+      app_ver: ${{ steps.ver.outputs.app_ver }}
+      build_num: ${{ steps.ver.outputs.build_num }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Derive and Verify Immutable Version Metadata
+        id: ver
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          RAW_VER="$(tr -d ' \t\r\n' < VERSION)"
+          if [ -z "$RAW_VER" ]; then
+            echo "ERROR: VERSION file is empty" >&2
+            exit 1
+          fi
+          APP_VER="${RAW_VER#v}"
+          APP_VER="${APP_VER%-LTS}"
+          if ! [[ "$APP_VER" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "ERROR: VERSION '$RAW_VER' must follow vX.Y.Z" >&2
+            exit 1
+          fi
+          REL_VER="v${APP_VER}"
+          BUILD_NUM="$((BASH_REMATCH[1] * 100 + BASH_REMATCH[2] * 10 + BASH_REMATCH[3]))"
+
+          if [ "$REF_TYPE" = "tag" ] && [ "$REF_NAME" != "$REL_VER" ]; then
+            echo "ERROR: Git tag '$REF_NAME' does not match VERSION '$REL_VER'" >&2
+            exit 1
+          fi
+          if [ -n "$INPUT_TAG" ] && [ "$INPUT_TAG" != "$REL_VER" ]; then
+            echo "ERROR: workflow_dispatch tag '$INPUT_TAG' does not match VERSION '$REL_VER'" >&2
+            exit 1
+          fi
+          if ! grep -q "versionName = \"${APP_VER}\"" android/app/build.gradle.kts; then
+            echo "ERROR: android/app/build.gradle.kts versionName does not match ${APP_VER}" >&2
+            exit 1
+          fi
+          echo "rel_ver=${REL_VER}" >> "$GITHUB_OUTPUT"
+          echo "app_ver=${APP_VER}" >> "$GITHUB_OUTPUT"
+          echo "build_num=${BUILD_NUM}" >> "$GITHUB_OUTPUT"
+          echo "Verified release version: ${REL_VER} (app=${APP_VER}, build=${BUILD_NUM}, sha=${GITHUB_SHA})"
+
+  build-binaries:
+    needs: [prepare-release]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,23 +84,12 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Build Server, Windows GUI & 0Ghost Side-Router
+      - name: Build Server, Core, Windows GUI & KestrelBox Side-Router
         env:
-          INPUT_TAG: ${{ inputs.tag }}
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
-          RUN_NUM: ${{ github.run_number }}
+          REL_VER: ${{ needs.prepare-release.outputs.rel_ver }}
         run: |
           set -euo pipefail
           mkdir -p dist _stage_kbox/usr/bin
-
-          if [ -n "$INPUT_TAG" ]; then
-            REL_VER="$INPUT_TAG"
-          elif [ "$REF_TYPE" = "tag" ]; then
-            REL_VER="$REF_NAME"
-          else
-            REL_VER="v4.2.0"
-          fi
 
           export CGO_ENABLED=0
           VER_X="-X ghostframe/internal/tui.CurrentVersion=${REL_VER} -X ghostframe/internal/client.Version=${REL_VER} -X ghostframe/internal/server.Version=${REL_VER} -X main.gatewayVersion=${REL_VER} -X main.version=${REL_VER}"
@@ -53,12 +97,14 @@ jobs:
 
           GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kestrel-server-linux-amd64 ./cmd/gft-server
           GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kestrel-server-linux-arm64 ./cmd/gft-server
+          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kestrel-core-linux-amd64   ./cmd/gft-core
+          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kestrel-core-linux-arm64   ./cmd/gft-core
           go run scripts/gen_win_rsrc.go
           GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H=windowsgui ${VER_X}" -o dist/Kestrel-Pro-windows-amd64.exe ./cmd/gft-client-gui
           go run scripts/pack_setup_payload.go -in dist/Kestrel-Pro-windows-amd64.exe -out cmd/kestrel-setup/Kestrel-Pro.payload.zlib
           GOOS=windows GOARCH=amd64 go build -tags setup_embed -trimpath -ldflags="-s -w -H=windowsgui ${VER_X}" -o dist/Kestrel-Pro-Setup-windows-amd64.exe ./cmd/kestrel-setup
-          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kbox-linux-amd64     ./cmd/0ghost
-          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kbox-linux-arm64     ./cmd/0ghost
+          GOOS=linux   GOARCH=amd64 go build "${FLAGS[@]}" -o dist/kbox-linux-amd64            ./cmd/0ghost
+          GOOS=linux   GOARCH=arm64 go build "${FLAGS[@]}" -o dist/kbox-linux-arm64            ./cmd/0ghost
 
           cp dist/kbox-linux-arm64 _stage_kbox/usr/bin/kbox
           cp -r openwrt/luci-app-0ghost/etc _stage_kbox/
@@ -86,9 +132,8 @@ jobs:
           if-no-files-found: error
 
   build-ios:
+    needs: [prepare-release]
     runs-on: macos-15
-    env:
-      KSL_NO_SYSPROXY: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -104,32 +149,16 @@ jobs:
 
       - name: Build GhostMobile.xcframework & Dual Unsigned IPAs
         env:
-          INPUT_TAG: ${{ inputs.tag }}
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
-          RUN_NUM: ${{ github.run_number }}
+          REL_VER: ${{ needs.prepare-release.outputs.rel_ver }}
+          IOS_APP_VER: ${{ needs.prepare-release.outputs.app_ver }}
+          DIST_BUILD_NUM: ${{ needs.prepare-release.outputs.build_num }}
         run: |
           set -euo pipefail
-          if [ -n "$INPUT_TAG" ]; then
-            REL_VER="$INPUT_TAG"
-          elif [ "$REF_TYPE" = "tag" ]; then
-            REL_VER="$REF_NAME"
-          else
-            REL_VER="v4.2.0"
-          fi
-          if [[ "$REL_VER" =~ ^v?(([0-9]+)\.([0-9]+)\.([0-9]+)) ]]; then
-            IOS_APP_VER="${BASH_REMATCH[1]}"
-            DIST_BUILD_NUM="$((BASH_REMATCH[2] * 100 + BASH_REMATCH[3] * 10 + BASH_REMATCH[4]))"
-          else
-            DIST_BUILD_NUM=$((410 + RUN_NUM))
-            IOS_APP_VER="4.2.0"
-          fi
-
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
+          go install "golang.org/x/mobile/cmd/gomobile@${GOMOBILE_VERSION}"
+          go install "golang.org/x/mobile/cmd/gobind@${GOMOBILE_VERSION}"
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
-          go get golang.org/x/mobile/bind
+          go get "golang.org/x/mobile/bind@${GOMOBILE_VERSION}"
           mkdir -p ios/Frameworks dist
 
           gomobile bind \
@@ -207,9 +236,8 @@ jobs:
           if-no-files-found: error
 
   build-android:
+    needs: [prepare-release]
     runs-on: ubuntu-latest
-    env:
-      KSL_NO_SYSPROXY: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -252,23 +280,14 @@ jobs:
 
       - name: Build GhostMobile.aar & Kestrel-Android.apk
         env:
-          INPUT_TAG: ${{ inputs.tag }}
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
+          REL_VER: ${{ needs.prepare-release.outputs.rel_ver }}
         run: |
           set -euo pipefail
-          if [ -n "$INPUT_TAG" ]; then
-            REL_VER="$INPUT_TAG"
-          elif [ "$REF_TYPE" = "tag" ]; then
-            REL_VER="$REF_NAME"
-          else
-            REL_VER="v4.2.0"
-          fi
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
+          go install "golang.org/x/mobile/cmd/gomobile@${GOMOBILE_VERSION}"
+          go install "golang.org/x/mobile/cmd/gobind@${GOMOBILE_VERSION}"
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
-          go get golang.org/x/mobile/bind
+          go get "golang.org/x/mobile/bind@${GOMOBILE_VERSION}"
           mkdir -p android/app/libs dist
           gomobile bind \
             -target=android/arm64,android/arm,android/amd64 \
@@ -284,29 +303,32 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
-      - name: Package Android Release APK
+      - name: Package Official Signed Android Release APK
+        env:
+          KESTREL_ANDROID_KEYSTORE_B64: ${{ secrets.KESTREL_ANDROID_KEYSTORE_B64 }}
+          KESTREL_KEYSTORE_PASS: ${{ secrets.KESTREL_KEYSTORE_PASS }}
+          KESTREL_KEY_ALIAS: ${{ secrets.KESTREL_KEY_ALIAS }}
+          KESTREL_KEY_PASS: ${{ secrets.KESTREL_KEY_PASS }}
         run: |
           set -euo pipefail
-          if [ -z "${KESTREL_KEYSTORE_PATH:-}" ]; then
-            CI_KS="$RUNNER_TEMP/kestrel-ci-release.jks"
-            if [ ! -f "$CI_KS" ]; then
-              keytool -genkeypair -noprompt -v \
-                -keystore "$CI_KS" \
-                -storetype PKCS12 \
-                -keyalg RSA -keysize 2048 -validity 10000 \
-                -alias kestrel \
-                -storepass android -keypass android \
-                -dname "CN=Kestrel,O=GhostFrame,C=US" >/dev/null 2>&1
-            fi
-            export KESTREL_KEYSTORE_PATH="$CI_KS"
-            export KESTREL_KEYSTORE_PASS="android"
-            export KESTREL_KEY_ALIAS="kestrel"
-            export KESTREL_KEY_PASS="android"
+          if [ -z "${KESTREL_ANDROID_KEYSTORE_B64:-}" ] || [ -z "${KESTREL_KEYSTORE_PASS:-}" ] || [ -z "${KESTREL_KEY_ALIAS:-}" ] || [ -z "${KESTREL_KEY_PASS:-}" ]; then
+            echo "ERROR: Official Android release signing secrets (KESTREL_ANDROID_KEYSTORE_B64, KESTREL_KEYSTORE_PASS, KESTREL_KEY_ALIAS, KESTREL_KEY_PASS) are required." >&2
+            exit 1
           fi
+          echo "$KESTREL_ANDROID_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/kestrel-release.jks"
+          chmod 600 "$RUNNER_TEMP/kestrel-release.jks"
+          export KESTREL_KEYSTORE_PATH="$RUNNER_TEMP/kestrel-release.jks"
+
           gradle -p android assembleRelease --no-daemon
           APK_PATH="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1)"
           test -f "$APK_PATH"
           cp "$APK_PATH" dist/Kestrel-Android.apk
+
+          APKSIGNER="$(find "${ANDROID_HOME}/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs dist/Kestrel-Android.apk > dist/android-signing-cert.txt
+            cat dist/android-signing-cert.txt
+          fi
           ls -lh dist/Kestrel-Android.apk
 
       - name: Upload Android APK
@@ -316,8 +338,16 @@ jobs:
           path: dist/Kestrel-Android.apk
           if-no-files-found: error
 
+      - name: Upload Android Signing Cert Info
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-android-cert
+          path: dist/android-signing-cert.txt
+          if-no-files-found: ignore
+
   publish-release:
-    needs: [build-binaries, build-ios, build-android]
+    needs: [verify-tests, prepare-release, build-binaries, build-ios, build-android]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -328,14 +358,13 @@ jobs:
         with:
           path: dist-stage
 
-      - name: Assemble Unified Release Bundle, Checksums & Cloud OmniSign source.json
+      - name: Assemble Unified Release Bundle, Signed Manifests & Checksums
         id: prep
         env:
           DIST_PUSH_TOKEN: ${{ secrets.DIST_PUSH_TOKEN }}
-          INPUT_TAG: ${{ inputs.tag }}
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
-          RUN_NUM: ${{ github.run_number }}
+          RELEASE_SIGNING_KEY_PEM: ${{ secrets.RELEASE_SIGNING_KEY_PEM }}
+          TAG: ${{ needs.prepare-release.outputs.rel_ver }}
+          APP_VER: ${{ needs.prepare-release.outputs.app_ver }}
           SOURCE_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -343,15 +372,34 @@ jobs:
           cp dist-stage/release-linux-windows-router/* release-out/
           cp dist-stage/release-ios-ipas/*.ipa release-out/
           cp dist-stage/release-android-apk/Kestrel-Android.apk release-out/
+          if [ -f dist-stage/release-android-cert/android-signing-cert.txt ]; then
+            cp dist-stage/release-android-cert/android-signing-cert.txt release-out/
+          fi
           cp ios/Shared/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png release-out/icon-kestrel.png
 
-          if [ -n "$INPUT_TAG" ]; then
-            TAG="$INPUT_TAG"
-          elif [ "$REF_TYPE" = "tag" ]; then
-            TAG="$REF_NAME"
-          else
-            TAG="v4.2.0"
-          fi
+          for req in \
+            kestrel-server-linux-amd64 \
+            kestrel-server-linux-arm64 \
+            kestrel-core-linux-amd64 \
+            kestrel-core-linux-arm64 \
+            Kestrel-Pro-windows-amd64.exe \
+            Kestrel-Pro-Setup-windows-amd64.exe \
+            kbox-linux-amd64 \
+            kbox-linux-arm64 \
+            kbox-istoreos-arm64.tar.gz \
+            Kestrel-Duo-Unsigned.ipa \
+            Kestrel-Air-Unsigned.ipa \
+            Kestrel-Android.apk \
+            install.sh \
+            install-kbox.sh \
+            install-0ghost.sh \
+            rules_bundle.zlib; do
+            if [ ! -s "release-out/${req}" ]; then
+              echo "ERROR: Missing or empty required release asset: ${req}" >&2
+              exit 1
+            fi
+          done
+
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
 
           TARGET_REPO="$SOURCE_REPO"
@@ -365,16 +413,22 @@ jobs:
 
           DUO_SIZE="$(stat -c%s release-out/Kestrel-Duo-Unsigned.ipa)"
           AIR_SIZE="$(stat -c%s release-out/Kestrel-Air-Unsigned.ipa)"
+          KBOX_SIZE="$(stat -c%s release-out/kbox-istoreos-arm64.tar.gz)"
+          KBOX_SHA="$(sha256sum release-out/kbox-istoreos-arm64.tar.gz | awk '{print $1}')"
           NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          if [[ "$TAG" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-            APP_VER="${BASH_REMATCH[1]}"
-          else
-            APP_VER="4.2.0"
-          fi
           BASE_DL="https://github.com/${TARGET_REPO}/releases/download/${TAG}"
 
+          cat > release-out/kbox-manifest.txt <<EOF
+          version=${TAG}
+          arch=arm64
+          file=kbox-istoreos-arm64.tar.gz
+          size=${KBOX_SIZE}
+          sha256=${KBOX_SHA}
+          commit=${GITHUB_SHA}
+          EOF
+
           python3 - <<PY
-          import json
+          import glob, hashlib, json, os
           manifest = {
               "name": "Kestrel Official Release Source",
               "identifier": "com.kestrel.official.source",
@@ -427,9 +481,44 @@ jobs:
           }
           with open("release-out/source.json", "w", encoding="utf-8") as f:
               json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+          assets = []
+          for p in sorted(glob.glob("release-out/*")):
+              name = os.path.basename(p)
+              if name in ("checksums.txt", "checksums.txt.sig", "release-manifest.json"):
+                  continue
+              with open(p, "rb") as fp:
+                  data = fp.read()
+              assets.append({
+                  "file": name,
+                  "size": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(),
+              })
+          rel_manifest = {
+              "version": "${TAG}",
+              "commit": "${GITHUB_SHA}",
+              "built_at": "${NOW_ISO}",
+              "gomobile_version": "${GOMOBILE_VERSION}",
+              "assets": assets,
+          }
+          with open("release-out/release-manifest.json", "w", encoding="utf-8") as f:
+              json.dump(rel_manifest, f, indent=2, ensure_ascii=False)
           PY
 
           (cd release-out && sha256sum * > /tmp/checksums.txt && mv /tmp/checksums.txt checksums.txt && cat checksums.txt)
+
+          if [ -n "${RELEASE_SIGNING_KEY_PEM:-}" ]; then
+            printf '%s\n' "$RELEASE_SIGNING_KEY_PEM" > "$RUNNER_TEMP/release-signing.pem"
+            chmod 600 "$RUNNER_TEMP/release-signing.pem"
+            openssl pkeyutl -sign -inkey "$RUNNER_TEMP/release-signing.pem" -rawin \
+              -in release-out/kbox-manifest.txt -out release-out/kbox-manifest.txt.sig
+            openssl pkeyutl -sign -inkey "$RUNNER_TEMP/release-signing.pem" -rawin \
+              -in release-out/checksums.txt -out release-out/checksums.txt.sig
+            rm -f "$RUNNER_TEMP/release-signing.pem"
+          elif [ "$HAS_DIST" = "true" ]; then
+            echo "ERROR: RELEASE_SIGNING_KEY_PEM secret is required when publishing to Spittingjiu/Ghost." >&2
+            exit 1
+          fi
 
       - name: Upload Unified Release Bundle Artifact
         uses: actions/upload-artifact@v4
@@ -438,20 +527,20 @@ jobs:
           path: release-out/*
           if-no-files-found: error
 
-      - name: Publish Pure-Binary Release to Spittingjiu/Ghost (if DIST_PUSH_TOKEN configured)
+      - name: Publish Immutable Pure-Binary Release to Spittingjiu/Ghost
         if: steps.prep.outputs.has_dist_token == 'true'
         env:
           GH_TOKEN: ${{ secrets.DIST_PUSH_TOKEN }}
         run: |
           set -euo pipefail
           if gh release view "$RELEASE_TAG" --repo Spittingjiu/Ghost >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release-out/* --clobber --repo Spittingjiu/Ghost
-          else
-            gh release create "$RELEASE_TAG" release-out/* \
-              --repo Spittingjiu/Ghost \
-              --title "Kestrel ${RELEASE_TAG} (All Platforms)" \
-              --notes "Automated pure-binary multi-platform release (${RELEASE_TAG}). Includes Kestrel Server, Kestrel Pro (Windows), KestrelBox (iStoreOS arm64/amd64), Kestrel Duo & Kestrel Air (iOS), Kestrel Android (APK), OmniSign source.json, and sha256 checksums."
+            echo "ERROR: Release $RELEASE_TAG already exists on Spittingjiu/Ghost. Refusing to overwrite immutable release assets." >&2
+            exit 1
           fi
+          gh release create "$RELEASE_TAG" release-out/* \
+            --repo Spittingjiu/Ghost \
+            --title "Kestrel ${RELEASE_TAG} (All Platforms)" \
+            --notes "Automated verified multi-platform release (${RELEASE_TAG}, commit ${GITHUB_SHA})."
 
       - name: Fallback Release on Current Repository (when DIST_PUSH_TOKEN not set)
         if: steps.prep.outputs.has_dist_token != 'true' && (github.ref_type == 'tag' || inputs.tag != '')
