@@ -144,6 +144,7 @@ func TestSystemProxyRegistryAndBackupRecovery(t *testing.T) {
 
 	dir := t.TempDir()
 	backupPath := filepath.Join(dir, "sysproxy_backup.json")
+	t.Cleanup(func() { applyMockSystemProxySnapshot(ProxySnapshot{}) })
 	snap := ProxySnapshot{Enabled: false, Server: "", Override: ""}
 	b, _ := json.Marshal(snap)
 	if err := os.WriteFile(backupPath, b, 0o600); err != nil {
@@ -455,6 +456,7 @@ func TestSetProxyPortsHotSwapAndAtomicRollback(t *testing.T) {
 	// 3. Hot swap while connected must update listeners, config, ClashYAML, and mock sysproxy
 	//    without overwriting sysproxy_backup.json
 	backupPath := filepath.Join(dir, "sysproxy_backup.json")
+	t.Cleanup(func() { applyMockSystemProxySnapshot(ProxySnapshot{}) })
 	origBackup := `{"enabled":false,"server":"127.0.0.1:9999","override":"orig","applied":"127.0.0.1:10809"}`
 	if err := os.WriteFile(backupPath, []byte(origBackup), 0o600); err != nil {
 		t.Fatal(err)

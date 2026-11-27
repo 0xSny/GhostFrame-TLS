@@ -2555,5 +2555,5 @@ func (e *Engine) Close() {
 		_ = httpSrv.Close()
 	}
 	e.disconnectWithWait(1200 * time.Millisecond)
-	_, _ = RecoverSystemProxyIfDirty(e.proxyBackupPath)
+	_, _ = e.RecoverSystemProxyIfDirty()
 }

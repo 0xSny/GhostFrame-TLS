@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -11,6 +12,41 @@ import (
 	"testing"
 	"time"
 )
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	_ = os.Chmod(tmp, perm)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
 
 // ProxySnapshot captures system proxy settings before GhostFrame modifies them.
 type ProxySnapshot struct {
@@ -148,25 +184,52 @@ func isLoopbackProxyDead(server string) bool {
 
 // EnableSystemProxyWithBackup saves the user's pre-existing system proxy into
 // backupPath (if not already backed up) before enabling addr.
-// Never records a dirty/stale GhostFrame loopback proxy as the clean baseline.
+// Fails before modifying OS proxy if querying or persisting the backup fails.
 func EnableSystemProxyWithBackup(addr, backupPath string) error {
 	sysProxyBackupMu.Lock()
 	defer sysProxyBackupMu.Unlock()
 
 	if backupPath != "" {
-		if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+		_, statErr := os.Stat(backupPath)
+		switch {
+		case os.IsNotExist(statErr):
 			snap, qerr := QueryFullSystemProxy()
-			if qerr == nil {
-				if snap.Enabled && IsLocalLoopbackProxy(snap.Server) {
-					if strings.EqualFold(strings.TrimSpace(snap.Server), strings.TrimSpace(addr)) || isLoopbackProxyDead(snap.Server) {
-						snap.Enabled = false
-						snap.Server = ""
-					}
-				}
+			if qerr != nil {
+				return fmt.Errorf("query system proxy before takeover: %w", qerr)
+			}
+			// Only clear if the OS proxy is already pointing at our own addr; never wipe third-party loopback proxies.
+			if snap.Enabled && strings.EqualFold(strings.TrimSpace(snap.Server), strings.TrimSpace(addr)) {
+				snap.Enabled = false
+				snap.Server = ""
+			}
+			snap.Applied = addr
+			b, jerr := json.MarshalIndent(snap, "", "  ")
+			if jerr != nil {
+				return jerr
+			}
+			if werr := writeFileAtomic(backupPath, b, 0o600); werr != nil {
+				return fmt.Errorf("persist system proxy backup: %w", werr)
+			}
+		case statErr != nil:
+			return fmt.Errorf("inspect system proxy backup: %w", statErr)
+		default:
+			raw, rerr := os.ReadFile(backupPath)
+			if rerr != nil {
+				return fmt.Errorf("read existing system proxy backup: %w", rerr)
+			}
+			var snap ProxySnapshot
+			if jerr := json.Unmarshal(raw, &snap); jerr != nil {
+				_ = os.Rename(backupPath, backupPath+".corrupt")
+				return fmt.Errorf("corrupt system proxy backup preserved as %s.corrupt: %w", backupPath, jerr)
+			}
+			if !strings.EqualFold(strings.TrimSpace(snap.Applied), strings.TrimSpace(addr)) {
 				snap.Applied = addr
-				_ = os.MkdirAll(filepath.Dir(backupPath), 0o755)
-				if b, jerr := json.MarshalIndent(snap, "", "  "); jerr == nil {
-					_ = os.WriteFile(backupPath, b, 0o600)
+				b, jerr := json.MarshalIndent(snap, "", "  ")
+				if jerr != nil {
+					return jerr
+				}
+				if werr := writeFileAtomic(backupPath, b, 0o600); werr != nil {
+					return fmt.Errorf("update system proxy backup: %w", werr)
 				}
 			}
 		}
@@ -178,30 +241,86 @@ func EnableSystemProxyWithBackup(addr, backupPath string) error {
 	return nil
 }
 
+// UpdateSystemProxyBackupApplied updates the recorded Applied address after a live proxy port swap.
+func UpdateSystemProxyBackupApplied(backupPath, newAddr string) error {
+	if backupPath == "" {
+		return nil
+	}
+	sysProxyBackupMu.Lock()
+	defer sysProxyBackupMu.Unlock()
+
+	raw, err := os.ReadFile(backupPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var snap ProxySnapshot
+	if jerr := json.Unmarshal(raw, &snap); jerr != nil {
+		_ = os.Rename(backupPath, backupPath+".corrupt")
+		return fmt.Errorf("corrupt system proxy backup preserved as %s.corrupt: %w", backupPath, jerr)
+	}
+	snap.Applied = newAddr
+	b, jerr := json.MarshalIndent(snap, "", "  ")
+	if jerr != nil {
+		return jerr
+	}
+	if werr := writeFileAtomic(backupPath, b, 0o600); werr != nil {
+		return werr
+	}
+	registerSysProxyBootRecovery(backupPath, newAddr)
+	return nil
+}
+
 // DisableAndRestoreSystemProxy restores system proxy from backupPath (if present)
-// and deletes the backup file; otherwise disables system proxy cleanly.
+// only if the OS proxy is still owned by Kestrel, and deletes the backup file.
+// Corrupt backups are preserved as .corrupt and return an error without touching OS proxy.
 func DisableAndRestoreSystemProxy(backupPath string) error {
+	return DisableAndRestoreSystemProxyFor(backupPath, "")
+}
+
+// DisableAndRestoreSystemProxyFor restores system proxy from backupPath if the OS proxy
+// still matches snap.Applied or currentAppliedAddr.
+func DisableAndRestoreSystemProxyFor(backupPath, currentAppliedAddr string) error {
 	sysProxyBackupMu.Lock()
 	defer sysProxyBackupMu.Unlock()
 
 	if backupPath != "" {
-		if b, err := os.ReadFile(backupPath); err == nil {
+		b, err := os.ReadFile(backupPath)
+		switch {
+		case err == nil:
 			var snap ProxySnapshot
-			if json.Unmarshal(b, &snap) == nil {
-				if snap.Enabled && IsLocalLoopbackProxy(snap.Server) {
-					if (snap.Applied != "" && strings.EqualFold(strings.TrimSpace(snap.Server), strings.TrimSpace(snap.Applied))) || isLoopbackProxyDead(snap.Server) {
-						snap.Enabled = false
-						snap.Server = ""
+			if jerr := json.Unmarshal(b, &snap); jerr != nil {
+				_ = os.Rename(backupPath, backupPath+".corrupt")
+				return fmt.Errorf("corrupt system proxy backup preserved as %s.corrupt: %w", backupPath, jerr)
+			}
+			if snap.Applied != "" || currentAppliedAddr != "" {
+				if cur, qerr := QueryFullSystemProxy(); qerr == nil {
+					stillOwned := cur.Enabled && (
+						(snap.Applied != "" && strings.EqualFold(strings.TrimSpace(cur.Server), strings.TrimSpace(snap.Applied))) ||
+							(currentAppliedAddr != "" && strings.EqualFold(strings.TrimSpace(cur.Server), strings.TrimSpace(currentAppliedAddr))))
+					if !stillOwned {
+						// User manually changed or disabled the system proxy; preserve their current setting.
+						_ = os.Remove(backupPath)
+						clearSysProxyBootRecovery()
+						return nil
 					}
 				}
-				if aerr := ApplySystemProxySnapshot(snap); aerr != nil {
-					return aerr
-				}
-				_ = os.Remove(backupPath)
-				clearSysProxyBootRecovery()
-				return nil
+			}
+			if snap.Enabled && snap.Applied != "" && strings.EqualFold(strings.TrimSpace(snap.Server), strings.TrimSpace(snap.Applied)) {
+				snap.Enabled = false
+				snap.Server = ""
+			}
+			snap.Applied = ""
+			if aerr := ApplySystemProxySnapshot(snap); aerr != nil {
+				return aerr
 			}
 			_ = os.Remove(backupPath)
+			clearSysProxyBootRecovery()
+			return nil
+		case !os.IsNotExist(err):
+			return fmt.Errorf("read system proxy backup: %w", err)
 		}
 	}
 	if err := SetSystemProxy("", false); err != nil {
@@ -212,13 +331,13 @@ func DisableAndRestoreSystemProxy(backupPath string) error {
 }
 
 // RecoverSystemProxyIfDirty runs on startup to restore pre-crash proxy state if
-// sysproxy_backup.json was left behind or an orphaned dead loopback proxy remains active.
+// sysproxy_backup.json was left behind or Kestrel's own loopback proxy remains active.
 func RecoverSystemProxyIfDirty(backupPath string) (bool, error) {
 	return RecoverSystemProxyIfDirtyFor(backupPath, "")
 }
 
-// RecoverSystemProxyIfDirtyFor recovers either from a leftover backup file or, on power-loss,
-// when the OS registry still points to a dead or expected local loopback proxy without a backup file.
+// RecoverSystemProxyIfDirtyFor recovers either from a leftover backup file or, when no backup
+// file exists, only when the OS registry still points to expectedHTTPAddr.
 func RecoverSystemProxyIfDirtyFor(backupPath, expectedHTTPAddr string) (bool, error) {
 	if backupPath != "" {
 		if _, err := os.Stat(backupPath); err == nil {
@@ -227,13 +346,11 @@ func RecoverSystemProxyIfDirtyFor(backupPath, expectedHTTPAddr string) (bool, er
 		}
 	}
 	cur, qerr := QueryFullSystemProxy()
-	if qerr == nil && cur.Enabled && IsLocalLoopbackProxy(cur.Server) {
-		sameOwn := expectedHTTPAddr != "" && strings.EqualFold(strings.TrimSpace(cur.Server), strings.TrimSpace(expectedHTTPAddr))
-		if sameOwn || isLoopbackProxyDead(cur.Server) {
-			serr := SetSystemProxy("", false)
-			clearSysProxyBootRecovery()
-			return true, serr
-		}
+	if qerr == nil && cur.Enabled && expectedHTTPAddr != "" &&
+		strings.EqualFold(strings.TrimSpace(cur.Server), strings.TrimSpace(expectedHTTPAddr)) {
+		serr := SetSystemProxy("", false)
+		clearSysProxyBootRecovery()
+		return true, serr
 	}
 	return false, nil
 }
