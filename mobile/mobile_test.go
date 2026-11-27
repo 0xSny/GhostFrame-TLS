@@ -345,4 +345,21 @@ func TestHTTPReloadPreservesTUNAndDirectDNSBypass(t *testing.T) {
 	if w, mtu := peekLastTUN(); w != nil || mtu != 0 {
 		t.Fatalf("expected StopEngine to clear saved TUN writer, got w=%v mtu=%d", w, mtu)
 	}
+
+	// Verify TUN restore failure on reload is propagated (not silently swallowed).
+	if err := StartEngine(string(cfgBytes)); err != nil {
+		t.Fatalf("StartEngine failed: %v", err)
+	}
+	tunMu.Lock()
+	lastTunWriter = noopTunWriter{}
+	lastTunMTU = 1400
+	tunMu.Unlock()
+	origStartTUN := startTUNFn
+	startTUNFn = func(TunPacketWriter, int) error {
+		return http.ErrServerClosed
+	}
+	t.Cleanup(func() { startTUNFn = origStartTUN })
+	if err := startEngineWithOptions(string(reloadBytes), true); err == nil {
+		t.Fatal("expected startEngineWithOptions to propagate TUN restore failure")
+	}
 }

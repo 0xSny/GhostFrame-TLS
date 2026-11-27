@@ -59,6 +59,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastPhysicalIface: String = ""
     private var lastPathSignature: String = ""
     private var pathDebounceWorkItem: DispatchWorkItem?
+    private var currentConfigJSON: String = ""
     private var currentHTTPPort: Int = 10809
     private var currentServerHost: String = ""
     private var currentRouteMode: String = "rule"
@@ -66,6 +67,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var tunWriter: PacketFlowTunWriter?
     private let tunLock = NSLock()
     private var tunReading: Bool = false
+    private var tunGeneration: UInt64 = 0
+    private var reloadGeneration: UInt64 = 0
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         let providerCfg = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
@@ -118,6 +121,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             break
         }
 
+        currentConfigJSON = startConfigJSON
         currentHTTPPort = httpPort
         currentServerHost = serverHost
         currentRouteMode = routeMode
@@ -165,29 +169,29 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         tunLock.lock()
-        let alreadyReading = tunReading
+        tunGeneration &+= 1
+        let gen = tunGeneration
         tunReading = true
         tunLock.unlock()
 
-        if !alreadyReading {
-            readPacketsLoop()
-        }
+        readPacketsLoop(generation: gen)
         return .success(())
     }
 
     private func stopTUNForwarding() {
         tunLock.lock()
         tunReading = false
+        tunGeneration &+= 1
         tunLock.unlock()
         GhostMobileBridge.stopTUN()
         tunWriter = nil
     }
 
-    private func readPacketsLoop() {
+    private func readPacketsLoop(generation: UInt64) {
         packetFlow.readPackets { [weak self] packets, protocols in
             guard let self = self else { return }
             self.tunLock.lock()
-            let active = self.tunReading
+            let active = self.tunReading && self.tunGeneration == generation
             self.tunLock.unlock()
             guard active else { return }
 
@@ -214,7 +218,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     GhostMobileBridge.pushTunPacketBatch(concat, lens: lens, count: validCount)
                 }
             }
-            self.readPacketsLoop()
+            self.readPacketsLoop(generation: generation)
         }
     }
 
@@ -284,14 +288,35 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         completionHandler?(nil)
                         return
                     }
+                    self.reloadGeneration &+= 1
+                    let myReloadGen = self.reloadGeneration
+
+                    let replyLock = NSLock()
+                    var replied = false
+                    let replyOnce: (TunnelIPCResponse) -> Void = { resp in
+                        replyLock.lock()
+                        let shouldSend = !replied
+                        replied = true
+                        replyLock.unlock()
+                        if shouldSend {
+                            self.replyIPC(resp, completionHandler: completionHandler)
+                        }
+                    }
+
+                    let prevConfigJSON = self.currentConfigJSON
+                    let prevHTTPPort = self.currentHTTPPort
+                    let prevServerHost = self.currentServerHost
+                    let prevRouteMode = self.currentRouteMode
+                    let prevEnableIPv6 = self.currentEnableIPv6
+
                     let decodedCfg = GhostEngineConfig.decode(from: cfgJSON)
                     var serverHost = ""
                     if let linkURI = decodedCfg?.linkURI, case .success(let node) = GhostMobileBridge.parseLink(uri: linkURI) {
                         serverHost = node.host
                     }
-                    let newHTTPPort = decodedCfg?.httpPort ?? self.currentHTTPPort
-                    let newRouteMode = (decodedCfg?.routeMode ?? self.currentRouteMode).lowercased()
-                    let newEnableIPv6 = decodedCfg?.enableIPv6 ?? self.currentEnableIPv6
+                    let newHTTPPort = decodedCfg?.httpPort ?? prevHTTPPort
+                    let newRouteMode = (decodedCfg?.routeMode ?? prevRouteMode).lowercased()
+                    let newEnableIPv6 = decodedCfg?.enableIPv6 ?? prevEnableIPv6
                     let startConfigJSON: String
                     if var cfg = decodedCfg {
                         cfg.asyncConnect = true
@@ -300,38 +325,108 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         startConfigJSON = cfgJSON
                     }
 
-                    self.stopTUNForwarding()
-                    _ = GhostMobileBridge.stopEngine()
-                    switch GhostMobileBridge.startEngine(configJSON: startConfigJSON) {
-                    case .failure(let err):
-                        self.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
-                    case .success:
-                        if newHTTPPort != self.currentHTTPPort || serverHost != self.currentServerHost || newRouteMode != self.currentRouteMode || newEnableIPv6 != self.currentEnableIPv6 {
-                            self.currentHTTPPort = newHTTPPort
-                            self.currentServerHost = serverHost
-                            self.currentRouteMode = newRouteMode
-                            self.currentEnableIPv6 = newEnableIPv6
-                            let settings = self.buildNetworkSettings(httpPort: newHTTPPort, serverHost: serverHost, routeMode: newRouteMode, enableIPv6: newEnableIPv6)
-                            let applySem = DispatchSemaphore(value: 0)
-                            self.setTunnelNetworkSettings(settings) { [weak self] err in
-                                if let err = err {
-                                    self?.replyIPC(TunnelIPCResponse(ok: false, payload: nil, error: err.localizedDescription), completionHandler: completionHandler)
-                                } else {
-                                    if newRouteMode != "core" {
-                                        _ = self?.startTUNForwarding(mtu: 1400)
-                                    }
-                                    self?.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
-                                }
-                                applySem.signal()
-                            }
-                            _ = applySem.wait(timeout: .now() + 6)
+                    let needsSettingsUpdate = (
+                        newHTTPPort != prevHTTPPort ||
+                        serverHost != prevServerHost ||
+                        newRouteMode != prevRouteMode ||
+                        newEnableIPv6 != prevEnableIPv6
+                    )
+
+                    let rollbackAndFail: (String) -> Void = { reason in
+                        if myReloadGen != self.reloadGeneration {
+                            replyOnce(TunnelIPCResponse(ok: false, payload: nil, error: "Reload superseded by newer request"))
                             return
                         }
-                        if newRouteMode != "core" {
-                            _ = self.startTUNForwarding(mtu: 1400)
+                        self.stopTUNForwarding()
+                        _ = GhostMobileBridge.stopEngine()
+                        if !prevConfigJSON.isEmpty, case .success = GhostMobileBridge.startEngine(configJSON: prevConfigJSON) {
+                            if needsSettingsUpdate {
+                                let prevSettings = self.buildNetworkSettings(
+                                    httpPort: prevHTTPPort,
+                                    serverHost: prevServerHost,
+                                    routeMode: prevRouteMode,
+                                    enableIPv6: prevEnableIPv6
+                                )
+                                let rbSem = DispatchSemaphore(value: 0)
+                                var rbSettingsErr: Error?
+                                self.setTunnelNetworkSettings(prevSettings) { err in
+                                    rbSettingsErr = err
+                                    rbSem.signal()
+                                }
+                                _ = rbSem.wait(timeout: .now() + 5)
+                                if let rbErr = rbSettingsErr {
+                                    _ = GhostMobileBridge.stopEngine()
+                                    self.cancelTunnelWithError(rbErr)
+                                    replyOnce(TunnelIPCResponse(ok: false, payload: nil, error: reason))
+                                    return
+                                }
+                            }
+                            if prevRouteMode != "core", case .failure(let rbTunErr) = self.startTUNForwarding(mtu: 1400) {
+                                _ = GhostMobileBridge.stopEngine()
+                                self.cancelTunnelWithError(rbTunErr)
+                            }
+                        } else {
+                            let fatalErr = NSError(
+                                domain: "com.kestrel.duo.tunnel",
+                                code: 1002,
+                                userInfo: [NSLocalizedDescriptionKey: reason]
+                            )
+                            self.cancelTunnelWithError(fatalErr)
                         }
-                        self.replyIPC(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil), completionHandler: completionHandler)
+                        replyOnce(TunnelIPCResponse(ok: false, payload: nil, error: reason))
                     }
+
+                    self.stopTUNForwarding()
+                    _ = GhostMobileBridge.stopEngine()
+                    if case .failure(let err) = GhostMobileBridge.startEngine(configJSON: startConfigJSON) {
+                        rollbackAndFail(err.localizedDescription)
+                        return
+                    }
+
+                    if needsSettingsUpdate {
+                        let settings = self.buildNetworkSettings(
+                            httpPort: newHTTPPort,
+                            serverHost: serverHost,
+                            routeMode: newRouteMode,
+                            enableIPv6: newEnableIPv6
+                        )
+                        let applySem = DispatchSemaphore(value: 0)
+                        var settingsErr: Error?
+                        var callbackArrived = false
+                        self.setTunnelNetworkSettings(settings) { err in
+                            settingsErr = err
+                            callbackArrived = true
+                            applySem.signal()
+                        }
+                        let waitRes = applySem.wait(timeout: .now() + 6)
+                        if myReloadGen != self.reloadGeneration {
+                            replyOnce(TunnelIPCResponse(ok: false, payload: nil, error: "Reload superseded by newer request"))
+                            return
+                        }
+                        if waitRes == .timedOut || !callbackArrived {
+                            rollbackAndFail("Timed out applying tunnel network settings")
+                            return
+                        }
+                        if let err = settingsErr {
+                            rollbackAndFail(err.localizedDescription)
+                            return
+                        }
+                    }
+
+                    if newRouteMode != "core" {
+                        if case .failure(let tunErr) = self.startTUNForwarding(mtu: 1400) {
+                            rollbackAndFail(tunErr.localizedDescription)
+                            return
+                        }
+                    }
+
+                    self.currentConfigJSON = startConfigJSON
+                    self.currentHTTPPort = newHTTPPort
+                    self.currentServerHost = serverHost
+                    self.currentRouteMode = newRouteMode
+                    self.currentEnableIPv6 = newEnableIPv6
+                    self.notifyControlCenterReload()
+                    replyOnce(TunnelIPCResponse(ok: true, payload: GhostMobileBridge.getStatusJSON(), error: nil))
                 }
 
             default:

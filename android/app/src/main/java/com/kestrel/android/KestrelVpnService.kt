@@ -31,22 +31,70 @@ class KestrelVpnService : VpnService(), SocketProtector {
         const val EXTRA_ENABLE_IPV6 = "enable_ipv6"
         const val EXTRA_NODE_REMARK = "node_remark"
 
+        private const val PREFS_NAME = "kestrel_android_prefs"
+        private const val KEY_LAST_VPN_CFG = "last_vpn_cfg"
+        private const val KEY_LAST_VPN_ROUTE = "last_vpn_route"
+        private const val KEY_LAST_VPN_IPV6 = "last_vpn_ipv6"
+        private const val KEY_LAST_VPN_REMARK = "last_vpn_remark"
+        private const val KEY_VPN_USER_STOPPED = "vpn_user_stopped"
+
         private const val CHANNEL_ID = "kestrel_vpn_channel"
         private const val NOTIFICATION_ID = 4201
         private const val TUN_MTU = 1400
+
+        fun syncNotificationState(context: android.content.Context, phase: KestrelTunnelPhase, remark: String, lastErr: String) {
+            val nm = context.getSystemService(NotificationManager::class.java) ?: return
+            val active = nm.activeNotifications.any { it.id == NOTIFICATION_ID }
+            if (!active) return
+            val label = when (phase) {
+                KestrelTunnelPhase.PROTECTED -> "VPN 已保护 · ${remark.ifBlank { "Kestrel-RTC" }}"
+                KestrelTunnelPhase.LINK_CONNECTING -> "系统已接管 · 链路连接中..."
+                KestrelTunnelPhase.SYSTEM_CAPTURED -> "系统已接管 · 准备隧道..."
+                KestrelTunnelPhase.FAILED -> "链路异常 (${lastErr.take(40)})"
+                KestrelTunnelPhase.IDLE -> "隧道待机"
+            }
+            val openIntent = PendingIntent.getActivity(
+                context,
+                0,
+                Intent(context, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val stopIntent = PendingIntent.getService(
+                context,
+                1,
+                Intent(context, KestrelVpnService::class.java).apply { action = ACTION_STOP },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notif = NotificationCompat.Builder(context, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_vp_phone_call)
+                .setContentTitle("Kestrel ${KestrelStatusSnapshot.defaultVersionLabel()}")
+                .setContentText(label)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setContentIntent(openIntent)
+                .addAction(0, "断开", stopIntent)
+                .build()
+            nm.notify(NOTIFICATION_ID, notif)
+        }
     }
 
     private val worker = Executors.newSingleThreadExecutor()
     @Volatile
     private var tunPfd: ParcelFileDescriptor? = null
+    @Volatile
+    private var activeEnableIPv6: Boolean = false
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun protectFD(fd: Int): Boolean = protect(fd)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         when (intent?.action) {
             ACTION_STOP -> {
+                prefs.edit().putBoolean(KEY_VPN_USER_STOPPED, true).apply()
                 worker.execute {
                     shutdownTunnel()
                     stopForegroundCompat()
@@ -60,6 +108,12 @@ class KestrelVpnService : VpnService(), SocketProtector {
                 val route = intent.getStringExtra(EXTRA_ROUTE_MODE) ?: "rule"
                 val ipv6 = intent.getBooleanExtra(EXTRA_ENABLE_IPV6, false)
                 val remark = intent.getStringExtra(EXTRA_NODE_REMARK) ?: ""
+                prefs.edit()
+                    .putString(KEY_LAST_VPN_CFG, cfg)
+                    .putString(KEY_LAST_VPN_ROUTE, route)
+                    .putBoolean(KEY_LAST_VPN_IPV6, ipv6)
+                    .putString(KEY_LAST_VPN_REMARK, remark)
+                    .apply()
                 worker.execute {
                     handleReload(cfg, route, ipv6, remark)
                 }
@@ -67,17 +121,41 @@ class KestrelVpnService : VpnService(), SocketProtector {
             }
 
             else -> {
-                val cfg = intent?.getStringExtra(EXTRA_CONFIG_JSON)
+                val cfg: String?
+                val route: String
+                val ipv6: Boolean
+                val remark: String
+                if (intent == null) {
+                    if (prefs.getBoolean(KEY_VPN_USER_STOPPED, true)) {
+                        stopSelf()
+                        return START_NOT_STICKY
+                    }
+                    cfg = prefs.getString(KEY_LAST_VPN_CFG, null)
+                    route = prefs.getString(KEY_LAST_VPN_ROUTE, "rule") ?: "rule"
+                    ipv6 = prefs.getBoolean(KEY_LAST_VPN_IPV6, false)
+                    remark = prefs.getString(KEY_LAST_VPN_REMARK, "") ?: ""
+                } else {
+                    cfg = intent.getStringExtra(EXTRA_CONFIG_JSON)
+                    route = intent.getStringExtra(EXTRA_ROUTE_MODE) ?: "rule"
+                    ipv6 = intent.getBooleanExtra(EXTRA_ENABLE_IPV6, false)
+                    remark = intent.getStringExtra(EXTRA_NODE_REMARK) ?: ""
+                    if (!cfg.isNullOrBlank()) {
+                        prefs.edit()
+                            .putBoolean(KEY_VPN_USER_STOPPED, false)
+                            .putString(KEY_LAST_VPN_CFG, cfg)
+                            .putString(KEY_LAST_VPN_ROUTE, route)
+                            .putBoolean(KEY_LAST_VPN_IPV6, ipv6)
+                            .putString(KEY_LAST_VPN_REMARK, remark)
+                            .apply()
+                    }
+                }
                 if (cfg.isNullOrBlank()) {
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                val route = intent.getStringExtra(EXTRA_ROUTE_MODE) ?: "rule"
-                val ipv6 = intent.getBooleanExtra(EXTRA_ENABLE_IPV6, false)
-                val remark = intent.getStringExtra(EXTRA_NODE_REMARK) ?: ""
 
                 ensureNotificationChannel()
-                startForegroundCompat(buildNotification("正在连接 ${remark.ifBlank { "Kestrel" }}..."))
+                startForegroundCompat(buildNotification("系统已接管 · 正在连接 ${remark.ifBlank { "Kestrel" }}..."))
                 KestrelRuntime.setServiceTransitioning(true)
 
                 worker.execute {
@@ -124,11 +202,12 @@ class KestrelVpnService : VpnService(), SocketProtector {
             }
 
             registerNetworkMonitor()
+            activeEnableIPv6 = enableIPv6
             KestrelRuntime.onServiceStarted(remark)
             val label = if (routeMode == KestrelRouteMode.CORE.rawValue) {
                 "本地代理已就绪 (Core 模式)"
             } else {
-                "VPN 已保护 · ${remark.ifBlank { "Kestrel-RTC" }}"
+                "系统已接管 · 链路连接中..."
             }
             updateNotification(label)
         } catch (t: Throwable) {
@@ -152,14 +231,16 @@ class KestrelVpnService : VpnService(), SocketProtector {
             if (routeMode == KestrelRouteMode.CORE.rawValue) {
                 Mobile.stopTUNJSON()
                 closeTunPfd()
-            } else if (tunPfd == null) {
+            } else if (tunPfd == null || activeEnableIPv6 != enableIPv6) {
+                Mobile.stopTUNJSON()
                 establishAndAttachTun(enableIPv6)
+                activeEnableIPv6 = enableIPv6
             }
             KestrelRuntime.onServiceStarted(remark)
             val label = if (routeMode == KestrelRouteMode.CORE.rawValue) {
                 "本地代理运行中 (Core 模式)"
             } else {
-                "VPN 已保护 · ${remark.ifBlank { "Kestrel-RTC" }}"
+                "系统已接管 · 链路连接中..."
             }
             updateNotification(label)
         } catch (t: Throwable) {

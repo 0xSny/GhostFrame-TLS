@@ -79,6 +79,7 @@ var (
 	scrubberStopCh  chan struct{}
 	reconnectStopCh chan struct{}
 	reconnectWakeCh chan struct{}
+	startTUNFn      = StartTUN
 )
 
 func init() {
@@ -309,17 +310,19 @@ func startEngineWithOptions(configJSON string, preserveTUN bool) error {
 		return fmt.Errorf("mobile: start local proxy failed: %w", err)
 	}
 
-	restoreTUNIfNeeded := func() {
+	restoreTUNIfNeeded := func() error {
 		if !preserveTUN || savedWriter == nil {
-			return
+			return nil
 		}
 		if routeMode == client.RouteCore {
 			StopTUN()
-			return
+			return nil
 		}
-		if tunErr := StartTUN(savedWriter, savedMTU); tunErr != nil {
-			eng.Logf("[TUN] reload restore warning: %v", tunErr)
+		if tunErr := startTUNFn(savedWriter, savedMTU); tunErr != nil {
+			eng.Logf("[TUN] reload restore error: %v", tunErr)
+			return fmt.Errorf("mobile: restore TUN failed: %w", tunErr)
 		}
+		return nil
 	}
 
 	mu.Lock()
@@ -331,7 +334,10 @@ func startEngineWithOptions(configJSON string, preserveTUN bool) error {
 		reconnectStopCh = stopCh
 		reconnectWakeCh = wakeCh
 		mu.Unlock()
-		restoreTUNIfNeeded()
+		if tunErr := restoreTUNIfNeeded(); tunErr != nil {
+			_ = StopEngine()
+			return tunErr
+		}
 		go connectWithRetryAsync(eng, stopCh, wakeCh)
 		return nil
 	}
@@ -347,7 +353,10 @@ func startEngineWithOptions(configJSON string, preserveTUN bool) error {
 		eng.Close()
 		return fmt.Errorf("mobile: tunnel connect failed: %w", err)
 	}
-	restoreTUNIfNeeded()
+	if tunErr := restoreTUNIfNeeded(); tunErr != nil {
+		_ = StopEngine()
+		return tunErr
+	}
 	return nil
 }
 

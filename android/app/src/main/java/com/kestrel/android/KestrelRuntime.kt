@@ -22,6 +22,14 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+enum class KestrelTunnelPhase(val label: String) {
+    IDLE("隧道待机"),
+    SYSTEM_CAPTURED("系统已接管"),
+    LINK_CONNECTING("链路连接中"),
+    PROTECTED("已保护"),
+    FAILED("连接失败")
+}
+
 data class KestrelUiState(
     val nodes: List<KestrelNode> = emptyList(),
     val selectedNodeId: String = "",
@@ -48,6 +56,16 @@ data class KestrelUiState(
 
     val isConnected: Boolean
         get() = serviceActive && status.state.equals("connected", ignoreCase = true)
+
+    val tunnelPhase: KestrelTunnelPhase
+        get() = when {
+            !serviceActive && !isTransitioning && errorBanner.isNotBlank() -> KestrelTunnelPhase.FAILED
+            !serviceActive && !isTransitioning -> KestrelTunnelPhase.IDLE
+            status.state.equals("connected", ignoreCase = true) -> KestrelTunnelPhase.PROTECTED
+            status.lastErr.isNotBlank() -> KestrelTunnelPhase.FAILED
+            status.tunActive -> KestrelTunnelPhase.LINK_CONNECTING
+            else -> KestrelTunnelPhase.SYSTEM_CAPTURED
+        }
 
     val effectiveSocksPort: Int
         get() = socksPortText.trim().toIntOrNull()?.takeIf { it in 1..65535 } ?: 10808
@@ -157,12 +175,21 @@ object KestrelRuntime {
                 snap.lastErr.isNotBlank() -> snap.lastErr
                 else -> cur.errorBanner
             }
-            cur.copy(
+            val next = cur.copy(
                 status = snap,
                 ruleStats = snap.ruleStats,
                 errorBanner = err,
                 serviceActive = cur.serviceActive || snap.state.equals("connected", ignoreCase = true) || snap.tunActive
             )
+            if (initialized && next.serviceActive) {
+                KestrelVpnService.syncNotificationState(
+                    appContext,
+                    next.tunnelPhase,
+                    next.activeNode?.remark ?: "",
+                    err
+                )
+            }
+            next
         }
     }
 
@@ -384,7 +411,8 @@ object KestrelRuntime {
         prefs.edit().putBoolean(KEY_ENABLE_IPV6, enabled).apply()
         _uiState.update { it.copy(enableIPv6 = enabled) }
         if (_uiState.value.serviceActive) {
-            showToast("IPv6 设置已保存，重连后生效")
+            reloadIfActive()
+            showToast("IPv6 设置已应用，正在重建隧道")
         }
     }
 
