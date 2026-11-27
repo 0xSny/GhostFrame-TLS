@@ -74,9 +74,11 @@ var ErrSwitchCancelled = errors.New("node switch cancelled")
 // HTTP proxy, and crash-safe Windows system proxy.
 type Engine struct {
 	mu              sync.RWMutex
+	saveCfgMu       sync.Mutex
 	portSwapMu      sync.Mutex
-	cfgPath            string
-	ruleDataDir        string
+	cfgPath         string
+	configLoadErr   string
+	ruleDataDir     string
 	proxyBackupPath    string
 	config          ClientConfig
 	state           ConnState
@@ -173,9 +175,24 @@ func NewEngine(cfgPath string) (*Engine, error) {
 	}
 
 	if cfgPath != "" {
-		if data, err := os.ReadFile(cfgPath); err == nil {
+		data, rerr := os.ReadFile(cfgPath)
+		if rerr != nil {
+			if !os.IsNotExist(rerr) {
+				e.configLoadErr = fmt.Sprintf("read config %s: %v", cfgPath, rerr)
+				e.Logf("[Config] %s", e.configLoadErr)
+			}
+		} else {
 			data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
-			_ = json.Unmarshal(data, &e.config)
+			if len(bytes.TrimSpace(data)) > 0 {
+				if jerr := json.Unmarshal(data, &e.config); jerr != nil {
+					e.configLoadErr = fmt.Sprintf("parse config %s: %v", cfgPath, jerr)
+					e.Logf("[Config] %s", e.configLoadErr)
+					corruptPath := cfgPath + ".corrupt"
+					if _, serr := os.Stat(corruptPath); os.IsNotExist(serr) {
+						_ = writeFileAtomic(corruptPath, data, 0o600)
+					}
+				}
+			}
 		}
 	}
 
@@ -445,21 +462,71 @@ func (e *Engine) SetProxyPorts(socksPort, httpPort int) error {
 	return nil
 }
 
-// SaveConfig writes current client configuration to disk cleanly.
-func (e *Engine) SaveConfig() error {
-	e.mu.RLock()
-	cfgCopy := e.config
-	cfgPath := e.cfgPath
-	e.mu.RUnlock()
-	if cfgPath == "" {
+func cloneLink(l *gft.Link) *gft.Link {
+	if l == nil {
 		return nil
 	}
-	_ = os.MkdirAll(filepath.Dir(cfgPath), 0o755)
+	cp := *l
+	if l.Params != nil {
+		p := *l.Params
+		cp.Params = &p
+	}
+	return &cp
+}
+
+func (e *Engine) cloneClientConfigLocked() ClientConfig {
+	cp := e.config
+	cp.Link = cloneLink(e.config.Link)
+	if len(e.config.Nodes) > 0 {
+		cp.Nodes = make([]*gft.Link, len(e.config.Nodes))
+		for i, n := range e.config.Nodes {
+			cp.Nodes[i] = cloneLink(n)
+		}
+	} else {
+		cp.Nodes = nil
+	}
+	if len(e.config.CustomRules) > 0 {
+		cp.CustomRules = append([]string(nil), e.config.CustomRules...)
+	} else {
+		cp.CustomRules = nil
+	}
+	if e.config.CloseToTray != nil {
+		v := *e.config.CloseToTray
+		cp.CloseToTray = &v
+	}
+	if len(e.config.Gateway) > 0 {
+		cp.Gateway = append(json.RawMessage(nil), e.config.Gateway...)
+	}
+	return cp
+}
+
+// ConfigLoadError returns any startup config read/parse error recorded by NewEngine.
+func (e *Engine) ConfigLoadError() string {
+	e.mu.RLock()
+	msg := e.configLoadErr
+	e.mu.RUnlock()
+	return msg
+}
+
+// SaveConfig writes an immutable, deep-copied snapshot of client configuration atomically to disk.
+func (e *Engine) SaveConfig() error {
+	e.saveCfgMu.Lock()
+	defer e.saveCfgMu.Unlock()
+
+	e.mu.RLock()
+	cfgPath := e.cfgPath
+	if cfgPath == "" {
+		e.mu.RUnlock()
+		return nil
+	}
+	cfgCopy := e.cloneClientConfigLocked()
+	e.mu.RUnlock()
+
 	b, err := json.MarshalIndent(cfgCopy, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfgPath, b, 0o600)
+	return writeFileAtomic(cfgPath, b, 0o600)
 }
 
 // SetLink replaces or sets the active node.
@@ -2453,6 +2520,7 @@ func (e *Engine) statusSnapshot(tab string, includeHistory bool, fullCompat bool
 		"sni_rtt_ms":       sniRTTMs,
 		"active_node":      activeIdx,
 		"nodes":            nodes,
+		"config_load_err":  e.ConfigLoadError(),
 	}
 	if includeHistory {
 		out["history"] = histCopy
