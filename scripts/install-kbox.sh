@@ -15,8 +15,10 @@ ALLOW_UNSIGNED_DEV=0
 DRY_RUN_VERIFY=0
 
 # Pinned Ed25519 public key (PEM) for Kestrel release manifests.
-# CI signs kbox-manifest.txt with secrets.RELEASE_SIGNING_KEY_PEM; replace with your release pubkey or pass --pubkey.
-PINNED_PUBKEY_PEM="${KBOX_PUBKEY_PEM:-}"
+DEFAULT_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAzGauZN3SoguIJrE/D8racRLmW9lRkbzxHpox8m+KnqI=
+-----END PUBLIC KEY-----'
+PINNED_PUBKEY_PEM="${KBOX_PUBKEY_PEM:-$DEFAULT_PUBKEY_PEM}"
 
 while [ $# -gt 0 ]; do
 	case "$1" in

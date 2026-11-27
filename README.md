@@ -1,4 +1,4 @@
-# Kestrel (`v4.2.6`)
+# Kestrel (`v4.2.7`)
 
 [![CI (Core & Server)](https://github.com/Spittingjiu/GhostFrame-TLS/actions/workflows/ci.yml/badge.svg)](https://github.com/Spittingjiu/GhostFrame-TLS/actions/workflows/ci.yml)
 [![Build Kestrel Pro](https://github.com/Spittingjiu/GhostFrame-TLS/actions/workflows/build-client.yml/badge.svg)](https://github.com/Spittingjiu/GhostFrame-TLS/actions/workflows/build-client.yml)
